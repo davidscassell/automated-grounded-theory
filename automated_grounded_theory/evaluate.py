@@ -463,6 +463,7 @@ def _score(run: Mapping[str, Any], context_text: str) -> dict:
         metrics["verbatim_quote_pct"] = round(100 * verbatim / len(segments), 1)
     else:
         metrics["verbatim_quote_pct"] = None
+    metrics.update(_quote_anchor_rates(segments))
     labels = [str(entry.get("code") or "") for entry in codebook if entry.get("code")]
     if labels:
         metrics["gerund_first_word_pct"] = round(
@@ -585,6 +586,37 @@ def _confidence_values(values) -> list[float]:
         if number == number:
             scores.append(number)
     return scores
+
+
+def _quote_anchor_rates(segments: Sequence[Mapping[str, Any]]) -> dict:
+    """Shares of quote_status values. Flagged means possibly_modified or unanchored."""
+    empty = {
+        "quote_status_counts": {},
+        "quote_flag_rate": None,
+        "quote_possibly_modified_rate": None,
+        "quote_unanchored_rate": None,
+        "quote_fuzzy_match_rate": None,
+        "quote_exact_rate": None,
+        "quote_normalized_match_rate": None,
+    }
+    if not segments:
+        return empty
+    counts = collections.Counter(str(segment.get("quote_status") or "unspecified") for segment in segments)
+    total = len(segments)
+
+    def rate(status: str) -> float:
+        return round(counts.get(status, 0) / total, 4)
+
+    flagged = counts.get("possibly_modified", 0) + counts.get("unanchored", 0)
+    return {
+        "quote_status_counts": dict(sorted(counts.items())),
+        "quote_flag_rate": round(flagged / total, 4),
+        "quote_possibly_modified_rate": rate("possibly_modified"),
+        "quote_unanchored_rate": rate("unanchored"),
+        "quote_fuzzy_match_rate": rate("fuzzy_match"),
+        "quote_exact_rate": rate("exact"),
+        "quote_normalized_match_rate": rate("normalized_match"),
+    }
 
 
 def _consistency(run: Mapping[str, Any]) -> dict:

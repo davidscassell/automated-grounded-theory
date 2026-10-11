@@ -83,8 +83,9 @@ words are the participant's. A label that could have been written from the conte
 alone, without this passage, is a leak. Do not write it. Do not quote or cite the \
 context in a memo.
 
-Quotes must be exact contiguous copies from inside the passage markers. Do not quote \
-neighbors, attributes, or the context. Do not paraphrase.
+Quotes should be copied from the participant's words. Prefer the passage. If the \
+incident continues in the previous or next context, copy from there instead of \
+paraphrasing. Use ... only for words you skip. Do not invent wording.
 
 Do not use generic labels such as "experience", "discussion", "theme", or "response".
 
@@ -652,13 +653,15 @@ def build_rewrite_messages(
 
 def validation_feedback(rejections: Sequence[Mapping[str, Any]]) -> str:
     lines = [
-        "The previous coding was checked against the passage and these items were rejected.",
-        "Copy quotes exactly from the passage markers. Do not repeat a rejected quote.",
+        "The previous coding was checked against the passage, its neighbors, and the document.",
+        "Copy the participant's words. A closer quote is better.",
+        "quote_not_verbatim means the quote was not found as written. The code is kept either way.",
     ]
     for item in rejections:
+        status = item.get("quote_status") or item.get("reason", "rejected")
         lines.append(
             f"- code {item.get('code', '')!r}: {item.get('reason', 'rejected')} "
-            f"(quote_not_verbatim means the quote was not found in the passage)"
+            f"(quote_status={status}; quote_not_verbatim means the quote was not found in the passage)"
         )
     if any(item.get("reason") == "context_restatement" for item in rejections):
         lines.append(

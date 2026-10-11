@@ -11,12 +11,13 @@ from typing import Any, Mapping, Sequence
 
 from automated_grounded_theory.retrieval import jaccard
 from automated_grounded_theory.validation import (
+    QUOTE_FLAG_STATUSES,
     assess_label,
     attribute_leak,
     bounded_unit,
     code_key,
     label_restates_context,
-    locate_quote,
+    anchor_quote,
     review_passage_flags,
     substantive_memo,
 )
@@ -29,6 +30,28 @@ _ACTION_ALIASES = {
     "add": "new",
     "update": "refine",
 }
+
+
+def _span_rows(anchor) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    """Pair local spans with document spans. Missing document offsets stay unset."""
+    local = list(anchor.spans)
+    docs = list(anchor.doc_spans)
+    if len(docs) != len(local):
+        docs = [(None, None)] * len(local)
+    return list(zip(local, docs))
+
+
+def _quote_flag_rationale(status: str, similarity: float | None) -> str:
+    if status == "possibly_modified":
+        score = f"{similarity:.2f}" if isinstance(similarity, (int, float)) else "unknown"
+        return (
+            f"The closest source span is only similar to the quote (similarity {score}), "
+            "so the wording may have been modified. The code was kept."
+        )
+    return (
+        "The quote could not be anchored in the passage, its neighbors, or the document. "
+        "The code was kept and flagged for review."
+    )
 
 
 def _code_id(key: str) -> str:
@@ -62,6 +85,12 @@ def _fallback_rationale(op: str, reason: str) -> str:
         "in_vivo_below_review_threshold": "The in-vivo flag is not confident enough to apply, so the code stays a composed label.",
         "merge_cap": "This merge was past the cap for this sweep, so it was not applied.",
         "quote_split": "This quote does not fit the rewritten code, so it was split back out.",
+        "quote_possibly_modified": (
+            "The closest source span only partly matches the quote, so the wording may have been modified."
+        ),
+        "quote_unanchored": (
+            "The quote could not be anchored in the passage, its neighbors, or the document, so the code was kept and flagged."
+        ),
         "definition_not_survivor": "A definition for a retired code was ignored so it would not replace the survivor.",
     }.get(reason)
     if text:
@@ -333,11 +362,16 @@ def interpret_coding(
     long_passage_chars: int,
     review_below: float = 0.5,
     context_terms: set[str] | None = None,
+    document_text: str = "",
 ) -> dict[str, Any]:
     """Validate one model response. Does not mutate the codebook.
 
     A decision whose confidence is below ``review_below`` is not applied.
     It is returned on ``review``. Unknown code ids are rejected.
+    A quote that cannot be anchored does not reject the code. The quote is
+    flagged ``possibly_modified`` or ``unanchored`` and coding continues.
+    ``quote_retries`` lists those flags so the caller can ask for a closer
+    quote once, then keep the code anyway.
     """
     payload = coding.model_dump() if hasattr(coding, "model_dump") else dict(coding)
     proposals = list(payload.get("codes") or [])
@@ -345,6 +379,7 @@ def interpret_coding(
     accepted: list[dict] = []
     ops: list[dict] = []
     review: list[dict] = []
+    quote_retries: list[dict] = []
     seen_keys: set[str] = set()
     low_confidence = bool(payload.get("low_confidence"))
     passage_text = str(passage.get("text") or "")
@@ -378,12 +413,17 @@ def interpret_coding(
     for proposal in proposals:
         label = str(proposal.get("code") or "")
         quote = str(proposal.get("quote") or "")
-        span = locate_quote(quote, passage_text)
-        if span is None:
-            rejections.append({"code": label, "reason": "quote_not_verbatim", "quote": quote})
-            continue
-        start, end = span
-        verbatim = passage_text[start:end]
+        anchor = anchor_quote(
+            quote,
+            passage_text,
+            prev_text=str(passage.get("prev_text") or ""),
+            next_text=str(passage.get("next_text") or ""),
+            document_text=str(passage.get("document_text") or document_text or ""),
+            passage_start=int(passage.get("start_offset") or 0),
+            passage_end=int(passage.get("end_offset") or 0) or None,
+        )
+        verbatim = anchor.quote
+        quote_flag = f"quote_{anchor.status}" if anchor.status in QUOTE_FLAG_STATUSES else ""
         raw_action = str(proposal.get("action") or "").strip().casefold()
         action = _ACTION_ALIASES.get(raw_action)
         provisional_key = code_key(label)
@@ -425,6 +465,16 @@ def interpret_coding(
         if not ok:
             rejections.append({"code": label, "reason": reasons[0] if reasons else "rejected", "quote": verbatim})
             continue
+        if quote_flag:
+            quote_retries.append(
+                {
+                    "code": label,
+                    "reason": "quote_not_verbatim",
+                    "quote": quote,
+                    "quote_status": anchor.status,
+                    "quote_similarity": anchor.similarity,
+                }
+            )
         if in_vivo and in_vivo_confidence < review_below:
             fields = dict(fields)
             fields["in_vivo"] = False
@@ -465,6 +515,8 @@ def interpret_coding(
             confidence=confidence,
         )
         flags.extend(reasons)
+        if quote_flag:
+            flags.append(quote_flag)
         review_flags = flags
         definition = str(proposal.get("definition") or "").strip()
         if action == "new" and not definition:
@@ -521,10 +573,18 @@ def interpret_coding(
                 "previous_key": provisional_key if action == "refine" and key != provisional_key else None,
                 "definition": definition,
                 "quote": verbatim,
-                "local_start": start,
-                "local_end": end,
-                "doc_start": int(passage["start_offset"]) + start,
-                "doc_end": int(passage["start_offset"]) + end,
+                "model_quote": anchor.model_quote,
+                "quote_status": anchor.status,
+                "quote_similarity": anchor.similarity,
+                "quote_source": anchor.source,
+                "quote_spans": [
+                    {"start": start, "end": end, "doc_start": doc_start, "doc_end": doc_end}
+                    for (start, end), (doc_start, doc_end) in _span_rows(anchor)
+                ],
+                "local_start": anchor.spans[0][0] if anchor.spans else None,
+                "local_end": anchor.spans[-1][1] if anchor.spans else None,
+                "doc_start": anchor.doc_start,
+                "doc_end": anchor.doc_end,
                 "in_vivo": fields["in_vivo"],
                 "gerund_ok": fields["gerund_ok"],
                 "rationale": str(proposal.get("rationale") or ""),
@@ -549,6 +609,28 @@ def interpret_coding(
             rationale=str(proposal.get("rationale") or ""),
         )
         ops.append(applied)
+        if quote_flag:
+            held_quote = _op(
+                op="assign_quote",
+                status="review",
+                confidence=confidence,
+                ids={
+                    "passage_id": passage_id,
+                    "code_id": _code_id(key),
+                    "quote_status": anchor.status,
+                    "quote_similarity": anchor.similarity,
+                    "doc_start": anchor.doc_start,
+                    "doc_end": anchor.doc_end,
+                },
+                reason=quote_flag,
+                rationale=_quote_flag_rationale(anchor.status, anchor.similarity),
+            )
+            held_quote["quote_status"] = anchor.status
+            held_quote["quote_similarity"] = anchor.similarity
+            held_quote["quote"] = verbatim
+            held_quote["model_quote"] = anchor.model_quote
+            ops.append(held_quote)
+            review.append(held_quote)
         if "context_restatement" in review_flags:
             held_context = _op(
                 op="create",
@@ -619,6 +701,7 @@ def interpret_coding(
         "low_confidence": low_confidence,
         "ops": ops,
         "review": review,
+        "quote_retries": quote_retries,
     }
 
 
@@ -705,7 +788,13 @@ def commit_passage(
         elif item["in_vivo"]:
             book[key]["in_vivo"] = True
 
-        span_key = f"{passage.get('doc_id')}:{item['doc_start']}:{item['doc_end']}"
+        if item.get("doc_start") is None or item.get("doc_end") is None:
+            span_key = (
+                f"{passage.get('doc_id')}:{passage.get('passage_id')}:"
+                f"{item.get('quote_status')}:{item.get('model_quote')}"
+            )
+        else:
+            span_key = f"{passage.get('doc_id')}:{item['doc_start']}:{item['doc_end']}"
         if span_key not in highlights:
             highlights[span_key] = _next(counters, "highlight", "h")
         segment = {
@@ -717,6 +806,11 @@ def commit_passage(
             "code": book[key]["code"],
             "code_key": key,
             "quote": item["quote"],
+            "model_quote": item.get("model_quote") or item["quote"],
+            "quote_status": item.get("quote_status") or "",
+            "quote_similarity": item.get("quote_similarity"),
+            "quote_source": item.get("quote_source") or "",
+            "quote_spans": list(item.get("quote_spans") or []),
             "doc_start": item["doc_start"],
             "doc_end": item["doc_end"],
             "code_id": book[key].get("code_id") or _code_id(key),
@@ -807,6 +901,8 @@ def sync_counts(codebook: dict[str, dict], segments: list[dict]) -> dict[str, di
                     "passage_id": item.get("passage_id"),
                     "doc_start": item.get("doc_start"),
                     "doc_end": item.get("doc_end"),
+                    "quote_status": item.get("quote_status") or "",
+                    "quote_similarity": item.get("quote_similarity"),
                 }
             )
             if len(examples) >= 8:
