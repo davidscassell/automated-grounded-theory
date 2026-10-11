@@ -11,7 +11,14 @@ from langchain_core.runnables import RunnableLambda
 from pydantic import Field
 
 from automated_grounded_theory.prompts import message_text
-from automated_grounded_theory.schemas import ThemeCoding, ThemeNegative, ThemeProposal, ThemeTension
+from automated_grounded_theory.schemas import (
+    ThemeCoding,
+    ThemeGroup,
+    ThemeMergePlan,
+    ThemeNegative,
+    ThemeProposal,
+    ThemeTension,
+)
 
 _DEFS = {
     "Packing to leave": "Getting possessions together in order to go.",
@@ -60,6 +67,23 @@ class FakeThemer(BaseChatModel):
         def _call(messages):
             self.call_count += 1
             text = "\n".join(message_text(message) for message in messages)
+            if getattr(schema, "__name__", "") == "ThemeMergePlan":
+                names: list[str] = []
+                seen: set[str] = set()
+                for found in re.findall(r"^THEME_NAME: (.+)$", text, re.M):
+                    if found not in seen:
+                        seen.add(found)
+                        names.append(found)
+                plan = ThemeMergePlan(
+                    themes=[ThemeGroup(name=name, members=[name]) for name in names]
+                )
+                if not include_raw:
+                    return plan
+                raw = AIMessage(
+                    content="{}",
+                    usage_metadata={"input_tokens": 20, "output_tokens": 10, "total_tokens": 30},
+                )
+                return {"raw": raw, "parsed": plan, "parsing_error": None}
             labels = re.findall(r"^CODE_LABEL: (.+)$", text, re.M)
             if self.drop_last == "always" or (self.drop_last == "until_feedback" and "VALIDATION FAILED" not in text):
                 labels = labels[:-1]

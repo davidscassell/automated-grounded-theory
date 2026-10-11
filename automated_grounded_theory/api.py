@@ -67,7 +67,7 @@ def open_code(
     concurrency: int = 2,
     top_k_codes: int = 12,
     frequent_codes: int = 8,
-    merge_threshold: float = 0.85,
+    merge_threshold: float = 0.65,
     lexical_merge_threshold: float = 0.5,
     checkpoint_path: str | Path | None = None,
     thread_id: str | None = None,
@@ -128,9 +128,13 @@ def open_code(
     When ``pipeline`` is true, synthesis of the passages just coded runs while
     the next document or wave is coded against the pre-merge snapshot. The
     merge map is applied afterwards, in a fixed order. ``sweep_model`` defaults
-    to ``model``. Sweep chunks default to 20 codes. Each candidate is logged as
-    accepted or rejected. A sweep chunk that still times out after retries is
-    skipped with a warning instead of failing the run.
+    to ``model``. Sweep chunks default to 20 codes, sorted alphabetically by
+    label and then by definition. The sweep model reads each chunk and proposes
+    duplicate merges with a reason. Token overlap, and embeddings when you pass
+    them, are optional hints. Merging does not require an embeddings model.
+    Every hinted pair and every model-proposed merge is logged. A sweep chunk
+    that still times out after retries is skipped with a warning instead of
+    failing the run.
 
     Models built from a ``provider:model`` string use ``request_timeout``
     (120 seconds). Every call also has that deadline. Rate limits, timeouts,
@@ -210,7 +214,7 @@ async def aopen_code(
     concurrency: int = 2,
     top_k_codes: int = 12,
     frequent_codes: int = 8,
-    merge_threshold: float = 0.85,
+    merge_threshold: float = 0.65,
     lexical_merge_threshold: float = 0.5,
     checkpoint_path: str | Path | None = None,
     thread_id: str | None = None,

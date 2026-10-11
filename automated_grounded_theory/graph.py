@@ -22,7 +22,6 @@ from typing_extensions import TypedDict
 
 from automated_grounded_theory.async_support import is_transient, parse_structured, structured_runnable
 from automated_grounded_theory.batching import pack_indices
-from automated_grounded_theory.clustering import cluster_pairs
 from automated_grounded_theory.codebook import (
     apply_sweep,
     commit_passage,
@@ -48,9 +47,9 @@ from automated_grounded_theory.retrieval import (
     LexicalCodeRetriever,
     aembed_texts,
     code_text,
-    score_pairs,
+    comparison_order,
+    hint_pairs,
     select_prompt_codes,
-    union_candidates,
 )
 from automated_grounded_theory.validation import code_key
 from automated_grounded_theory.saturation import saturation_point
@@ -97,7 +96,7 @@ class RunConfig:
     prompt_cache: bool
     top_k_codes: int = 12
     frequent_codes: int = 8
-    merge_threshold: float = 0.85
+    merge_threshold: float = 0.65
     lexical_merge_threshold: float = 0.5
     max_codes_per_passage: int = 6
     neighbor_chars: int = 400
@@ -751,8 +750,7 @@ def _sweep_node(runtime: RunConfig):
             jobs = _wave(state, runtime, upcoming=True)
             if jobs:
                 code_task = asyncio.create_task(_pending_rows(runtime, state, jobs))
-        codes = list(codebook.values())
-        codes.sort(key=lambda entry: (-int(entry.get("frequency") or 0), str(entry.get("code") or "").casefold()))
+        codes = comparison_order(list(codebook.values()))
         try:
             parsed, candidates, chunk_count = await _sweep_chunks(runtime, codes, sweep_index)
             overlap_pending: list = []
@@ -835,7 +833,12 @@ def _sweep_node(runtime: RunConfig):
             )
         record = {
             "sweep_index": sweep_index,
-            "candidate_method": candidates[0]["method"] if candidates else ("embedding" if runtime.embeddings else "lexical"),
+            "candidate_method": (
+                "lexical+embedding" if runtime.embeddings is not None and not any(
+                    "label overlap" in warning for warning in warnings
+                )
+                else "lexical"
+            ),
             "candidates": candidates,
             "accepted_merges": applied["accepted_merges"],
             "rejected_merges": applied["rejected_merges"],
@@ -1031,7 +1034,6 @@ async def _sweep_chunks(runtime: RunConfig, codes: list, sweep_index: int) -> tu
     not by which chunk returned first.
     """
     chunks = iter_sweep_chunks(codes, runtime.sweep_chunk)
-    positions = {id(entry): index for index, entry in enumerate(codes)}
     vectors = None
     embed_note = ""
     if runtime.embeddings is not None:
@@ -1050,53 +1052,36 @@ async def _sweep_chunks(runtime: RunConfig, codes: list, sweep_index: int) -> tu
                 f"Sweep embeddings failed ({exc}). Merge candidates used label overlap instead."
             )
 
-    async def detect(chunk: list) -> list:
-        indexes = [positions[id(entry)] for entry in chunk]
-        lexical_or_cosine = await asyncio.to_thread(
-            score_pairs,
-            codes,
-            vectors,
-            embedding_threshold=runtime.merge_threshold,
-            lexical_threshold=runtime.lexical_merge_threshold,
-            limit=runtime.candidate_limit,
-            chunk_indexes=indexes,
-        )
-        if vectors is None:
-            return lexical_or_cosine
-        labels = [str(entry.get("code") or "") for entry in codes]
-        grouped = await asyncio.to_thread(
-            cluster_pairs,
-            labels,
-            vectors,
-            cosine_threshold=runtime.merge_threshold,
-        )
-        allowed = set(indexes)
-        extra = []
-        for left, right, score in grouped:
-            if left not in allowed and right not in allowed:
-                continue
-            left_label = labels[left]
-            right_label = labels[right]
-            if not left_label or not right_label or code_key(left_label) == code_key(right_label):
-                continue
-            if code_key(right_label) < code_key(left_label):
-                left_label, right_label = right_label, left_label
-            extra.append(
-                {
-                    "source": right_label,
-                    "target": left_label,
-                    "score": float(score),
-                    "method": "agglomerative",
-                }
-            )
-        return union_candidates([lexical_or_cosine, extra])
-
-    per_chunk_candidates = await asyncio.gather(*(detect(chunk) for chunk in chunks))
-    for chunk_number, group in enumerate(per_chunk_candidates, start=1):
-        for pair_number, item in enumerate(group, start=1):
-            item["pair_id"] = f"s{sweep_index}c{chunk_number}p{pair_number:04d}"
-    candidates = union_candidates(per_chunk_candidates)
+    hints = await asyncio.to_thread(
+        hint_pairs,
+        codes,
+        vectors,
+        embedding_threshold=runtime.merge_threshold,
+        lexical_threshold=runtime.lexical_merge_threshold,
+        limit=runtime.candidate_limit,
+    )
+    for index, hint in enumerate(hints, start=1):
+        hint["pair_id"] = f"s{sweep_index}p{index:04d}"
+    key_chunk: dict[str, int] = {}
+    for number, chunk in enumerate(chunks, start=1):
+        for entry in chunk:
+            key_chunk[code_key(str(entry.get("code") or ""))] = number
+    per_chunk_candidates: list[list] = [[] for _ in chunks]
+    for hint in hints:
+        owners = {
+            key_chunk.get(code_key(str(hint.get("source") or ""))),
+            key_chunk.get(code_key(str(hint.get("target") or ""))),
+        }
+        owners.discard(None)
+        for number in sorted(owners):
+            per_chunk_candidates[number - 1].append(hint)
+    candidates = hints
     warnings: list[str] = [embed_note] if embed_note else []
+    if len(codes) >= 2 and not hints:
+        warnings.append(
+            f"Sweep {sweep_index} found no similarity hints among {len(codes)} codes. "
+            "The model still reviews the codebook and may propose duplicate merges."
+        )
     skipped_candidates: list[dict] = []
 
     async def confirm(index: int, chunk: list) -> tuple[int, dict, str | None]:

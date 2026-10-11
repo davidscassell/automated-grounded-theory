@@ -715,6 +715,22 @@ def _candidate_decision_rows(applied: Mapping[str, Any], hinted: Mapping[frozens
                 "reason": reason,
             }
         )
+    for item in applied.get("accepted_merges") or []:
+        if item.get("from_candidate"):
+            continue
+        pair = _pair_key(item.get("source"), item.get("target"))
+        if pair is None or pair in hinted:
+            continue
+        rows.append(
+            {
+                "pair_id": item.get("pair_id") or "",
+                "source": item.get("source"),
+                "target": item.get("target"),
+                "decision": "accept",
+                "reason": "model_proposed",
+                "rationale": item.get("rationale") or "",
+            }
+        )
     return rows
 
 

@@ -76,16 +76,24 @@ If several passages are in the user message, code every one of them."""
 
 SWEEP_SYSTEM = """You are comparing codes with codes during open coding.
 
-You will see a codebook and, when any were found, candidate pairs that look similar \
-in wording or in embedding space. Each candidate has a pair_id. Decide every \
-pair_id once. Put a pair you accept in merges. Put a pair you reject in rejections, \
-with that pair_id and a rationale. Do not omit a candidate. Do not reject a pair \
-that is not in the candidate list. Extra pairs are discarded. An empty merge list \
-is allowed only when every candidate is in rejections. You may propose one extra \
-merge, without a rejection, when two codes in this chunk are the same incident and \
-were not listed. Do not merge codes that merely share a verb, a topic, or a \
-sensitizing concept. When you merge, keep the clearer and more specific label as \
-the target and name the other code as the source.
+The codebook chunk is the evidence. It is sorted alphabetically by label, then by \
+definition, so near-duplicate wording sits together. Read every code. Compare each \
+one with the others in the chunk. Propose a merge when two codes name the same \
+incident, and put a rationale on that merge that says what incident they share. \
+Do this whether or not a similarity hint lists the pair.
+
+Hints, when the user message includes any, are optional and cheap. They come from \
+token overlap, and from embeddings only when the caller supplied an embeddings \
+model. A hint is not a merge. The absence of a hint is not a reason to keep two \
+codes apart. Embeddings are not required.
+
+Each hint has a pair_id. Decide every hinted pair_id once. Put a hint you accept \
+in merges. Put a hint you reject in rejections, with that pair_id and a rationale. \
+Do not omit a hinted pair. Do not reject a pair that was not hinted. Also propose \
+every other duplicate pair you find in this chunk, each with a rationale. Do not \
+merge codes that merely share a verb, a topic, or a sensitizing concept. When you \
+merge, keep the clearer and more specific label as the target and name the other \
+code as the source.
 
 Sharpen definitions so each one says what incident the code captures, in words that \
 could apply to another respondent. Do not put a person's department, tenure, role, \
@@ -304,10 +312,13 @@ def build_sweep_messages(
             json.dumps(payload, indent=2),
             "CANDIDATES>>>",
             "",
-            "Candidate pairs are hints from embeddings when those were supplied, otherwise from "
-            "label overlap. Return exactly one decision for each pair_id: merges if you "
-            "accept it, rejections if you do not, copying pair_id, source, and target. "
-            "Do not reject a pair that is not in that list. Extra decisions are ignored. "
+            "Read every CODE_LABEL above and propose duplicate or near-duplicate pairs yourself. "
+            "Each merge needs a rationale naming the shared incident. "
+            "The candidate list is optional hints (token overlap, plus embeddings only when "
+            "those were supplied). Decide every pair_id once: merges if you accept the hint, "
+            "rejections if you do not, copying pair_id, source, and target. "
+            "Do not reject a pair that is not in that list. "
+            "Do propose extra merges for duplicates the hints missed. "
             "You may swap source and target so the clearer label survives.",
         ]
     )

@@ -97,10 +97,16 @@ class PassageCoding(_LLMModel):
 
 
 class MergeDecision(_LLMModel):
-    pair_id: str = Field(default="", description="pair_id from the candidate list. Empty only for an extra merge.")
+    pair_id: str = Field(
+        default="",
+        description="pair_id copied from a hint. Empty when you found the duplicate yourself.",
+    )
     source: str = Field(description="Code to fold into the target. This label is retired.")
     target: str = Field(description="Code that remains. Prefer the clearer, more specific gerund.")
-    rationale: str = ""
+    rationale: str = Field(
+        default="",
+        description="Why these codes name the same incident. Required on every merge.",
+    )
 
 
 class MergeRejection(_LLMModel):
@@ -181,6 +187,10 @@ class ThemeGroup(_LLMModel):
     name: str
     definition: str = ""
     members: list[str] = Field(default_factory=list)
+    rationale: str = Field(
+        default="",
+        description="Why these themes are the same incident, when members lists more than one theme. Empty for a theme that stands alone.",
+    )
 
 
 class ThemeMergePlan(_LLMModel):
@@ -210,13 +220,13 @@ class SweepCoding(_LLMModel):
     merges: list[MergeDecision] = Field(
         default_factory=list,
         description=(
-            "Candidate pairs you accept, plus any other pair that names the same incident. "
-            "Every candidate must be here or in rejections."
+            "Duplicates you found by comparing the codes, including hinted pairs you accept. "
+            "Every hint must be here or in rejections. Each merge needs a rationale."
         ),
     )
     rejections: list[MergeRejection] = Field(
         default_factory=list,
-        description="Every candidate pair you do not merge. One entry per rejected candidate, with the reason.",
+        description="Every hinted pair you do not merge. One entry per rejected hint, with the reason. Do not reject a pair that was not hinted.",
     )
     definitions: list[DefinitionUpdate] = Field(default_factory=list)
     overloaded_codes: list[str] = Field(

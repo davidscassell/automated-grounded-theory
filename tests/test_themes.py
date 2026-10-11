@@ -108,8 +108,8 @@ def test_prevalence_quotes_breakdowns_and_exports(tmp_path):
         chart=True,
         n_themes=2,
     )
-    assert model.call_count == 1
-    assert result.metadata["calls"] == 1
+    assert model.call_count == 2
+    assert result.metadata["calls"] == 2
     assert result.prompt_log[0]["usage"]["total_tokens"] == 30
     assert result.totals == {"n_passages": 7, "n_documents": 7, "n_respondents": 6, "n_codes": 3}
     labels = [code for theme in result.themes for code in theme["codes"]]
@@ -208,7 +208,7 @@ def test_seed_does_not_change_quotes():
 def test_retry_assigns_the_code_the_first_call_dropped():
     model = FakeThemer(drop_last="until_feedback")
     result = build_themes(_result(), "How do students describe leaving?", model=model, seed=3)
-    assert model.call_count == 2
+    assert model.call_count == 3
     assert "VALIDATION FAILED" in result.prompt_log[1]["messages"][1]["content"]
     assert len(model.seen_labels[0]) == 2
     assert len(model.seen_labels[1]) == 3
@@ -219,7 +219,7 @@ def test_retry_assigns_the_code_the_first_call_dropped():
 def test_still_missing_after_retry_is_ungrouped():
     model = FakeThemer(drop_last="always")
     result = build_themes(_result(), CONTEXT, model=model, seed=1, chart=False)
-    assert model.call_count == 3
+    assert model.call_count == 4
     labels = [code for theme in result.themes for code in theme["codes"]]
     assert sorted(labels) == ["crying at the station", "packing bags", "starting a new job"]
     assert any(theme["name"] == "Ungrouped incidents" for theme in result.themes)

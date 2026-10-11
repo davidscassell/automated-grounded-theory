@@ -21,9 +21,10 @@ from pydantic import Field
 from automated_grounded_theory import load_run, open_code
 from automated_grounded_theory.async_support import CallLimiter
 from automated_grounded_theory.backends import resolve_chat_model
-from automated_grounded_theory.codebook import commit_passage, finalize_candidate_decisions
+from automated_grounded_theory.codebook import apply_sweep, commit_passage, finalize_candidate_decisions
 from automated_grounded_theory.graph import _append_reading_notes
-from automated_grounded_theory.prompts import CODING_SYSTEM, message_text
+from automated_grounded_theory.prompts import CODING_SYSTEM, SWEEP_SYSTEM, message_text
+from automated_grounded_theory.retrieval import comparison_order, hint_pairs
 from automated_grounded_theory.results import OpenCodeResult
 from automated_grounded_theory.schemas import ThemeCoding, ThemeProposal
 from automated_grounded_theory.themes import build_themes, collapse_themes
@@ -325,7 +326,7 @@ def test_leftovers_are_ungrouped_instead_of_raising():
         max_retries=0,
         retry_backoff=0,
     )
-    assert model.call_count == 2
+    assert model.call_count == 3
     assert any(theme["name"] == "Ungrouped incidents" for theme in result.themes)
     labels = [code for theme in result.themes for code in theme["codes"]]
     assert sorted(labels) == ["crying at the station", "packing bags", "starting a new job"]
@@ -417,10 +418,13 @@ def test_merge_timeout_keeps_deterministic_grouping():
     assert any("starting a new job" in codes for codes in grouped.values())
 
 
-def test_unchanged_themes_do_not_call_the_merge_model():
+def test_theme_review_leaves_distinct_themes_split():
     model = FakeThemer()
-    build_themes(_result(), CONTEXT, model=model, chart=False, max_retries=0, retry_backoff=0)
-    assert model.call_count == 1
+    result = build_themes(_result(), CONTEXT, model=model, chart=False, max_retries=0, retry_backoff=0)
+    assert model.call_count == 2
+    assert result.metadata["duplicate_decisions"] == []
+    assert any(theme["codes"] == ["packing bags"] for theme in result.themes)
+    assert any(theme["codes"] == ["crying at the station"] for theme in result.themes)
 
 
 def test_in_vivo_prompt_requires_a_vivid_phrase():
@@ -634,3 +638,124 @@ def test_rejected_fold_stays_split():
     grouped = {theme["name"]: theme["codes"] for theme in result.themes}
     assert any(codes == ["packing bags"] for codes in grouped.values())
     assert any(codes == ["crying at the station"] for codes in grouped.values())
+
+
+def test_sweep_prompt_makes_the_model_propose_duplicates():
+    assert "Read every code" in SWEEP_SYSTEM
+    assert "Embeddings are not required" in SWEEP_SYSTEM
+    assert "absence of a hint is not a reason" in SWEEP_SYSTEM
+    assert "Extra pairs are discarded" not in SWEEP_SYSTEM
+
+
+def test_comparison_order_is_alphabetical_then_definition():
+    ordered = comparison_order(
+        [
+            {"code": "questioning ongoing job security", "definition": "b"},
+            {"code": "questioning job security", "definition": "z"},
+            {"code": "questioning job security", "definition": "a"},
+        ]
+    )
+    assert [item["definition"] for item in ordered] == ["a", "z", "b"]
+
+
+def test_lexical_hints_remain_when_embeddings_are_orthogonal():
+    entries = [
+        {"code": "packing bags", "definition": "packing", "frequency": 1},
+        {"code": "packing bags up", "definition": "packing more", "frequency": 1},
+        {"code": "crying at the station", "definition": "crying", "frequency": 1},
+    ]
+    vectors = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    hints = hint_pairs(entries, vectors, embedding_threshold=0.85, lexical_threshold=0.5, limit=30)
+    assert len(hints) == 1
+    assert {hints[0]["source"], hints[0]["target"]} == {"packing bags", "packing bags up"}
+    assert hints[0]["method"] == "lexical"
+
+
+def test_orthogonal_embeddings_do_not_block_a_lexical_merge():
+    from langchain_core.embeddings import Embeddings
+
+    class Orthogonal(Embeddings):
+        def embed_documents(self, texts):
+            return [[1.0 if i == index else 0.0 for i in range(len(texts))] for index in range(len(texts))]
+
+        def embed_query(self, text):
+            return [1.0, 0.0]
+
+    result = open_code(
+        CORPUS,
+        CONTEXT,
+        model=FakeCoder(),
+        embeddings=Orthogonal(),
+        seed=7,
+        sweep_every=25,
+        pipeline=False,
+        batch_size=1,
+        concurrency=1,
+        max_retries=0,
+        retry_backoff=0,
+    )
+    packing = [entry for entry in result.codebook if "packing" in entry["code"]]
+    assert len(packing) == 1
+    assert result.sweep_log
+    assert result.sweep_log[-1]["candidates"]
+    assert result.sweep_log[-1]["candidate_method"] == "lexical+embedding"
+
+
+def test_model_proposed_merge_is_logged():
+    applied = apply_sweep(
+        {
+            "paying more": {"code": "paying more", "key": "paying more", "definition": "pay", "frequency": 1, "examples": []},
+            "asking for pay": {
+                "code": "asking for pay",
+                "key": "asking for pay",
+                "definition": "pay",
+                "frequency": 1,
+                "examples": [],
+            },
+        },
+        [],
+        merges=[{"source": "paying more", "target": "asking for pay", "rationale": "Same pay incident."}],
+        candidates=[],
+    )
+    finalize_candidate_decisions(applied, candidates=[])
+    assert applied["candidate_decisions"] == [
+        {
+            "pair_id": "",
+            "source": "paying more",
+            "target": "asking for pay",
+            "decision": "accept",
+            "reason": "model_proposed",
+            "rationale": "Same pay incident.",
+        }
+    ]
+
+
+def test_sweep_with_no_hints_still_reviews_the_codebook():
+    thin = [
+        {
+            "id": "casey",
+            "name": "Casey",
+            "text": "I was crying at the station when the train doors closed.",
+        },
+        {
+            "id": "drew",
+            "name": "Drew",
+            "text": "They hired me on a Friday. Starting the new job meant moving.",
+        },
+    ]
+    result = open_code(
+        thin,
+        CONTEXT,
+        model=FakeCoder(),
+        seed=1,
+        sweep_every=25,
+        pipeline=False,
+        batch_size=1,
+        concurrency=1,
+        max_retries=0,
+        retry_backoff=0,
+    )
+    assert len(result.codebook) == 2
+    assert any("no similarity hints" in warning for warning in result.warnings)
+    assert any(item["kind"] == "sweep" for item in result.prompt_log)
+    assert "Read every CODE_LABEL" in json.dumps(result.prompt_log)
