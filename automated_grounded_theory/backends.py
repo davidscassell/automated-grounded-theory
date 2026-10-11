@@ -15,6 +15,9 @@ from langchain_core.language_models.chat_models import BaseChatModel
 
 _SECRET_TOKENS = ("key", "token", "secret", "password", "credential")
 
+# Applied when this package builds a model from a provider:model string.
+DEFAULT_REQUEST_TIMEOUT = 120.0
+
 
 class BackendError(TypeError):
     """Raised when a model or embeddings argument cannot be resolved."""
@@ -60,6 +63,7 @@ def resolve_chat_model(
     temperature: float | None = None,
     llm_seed: int | None = None,
     model_kwargs: dict[str, Any] | None = None,
+    timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
 ) -> BaseChatModel:
     """Return a chat model.
 
@@ -82,6 +86,13 @@ def resolve_chat_model(
         kwargs["api_key"] = api_key
     if llm_seed is not None and "seed" not in kwargs:
         kwargs["seed"] = llm_seed
+    if (
+        timeout is not None
+        and timeout > 0
+        and "timeout" not in kwargs
+        and "request_timeout" not in kwargs
+    ):
+        kwargs["timeout"] = timeout
     try:
         from langchain.chat_models import init_chat_model
     except ImportError as exc:  # pragma: no cover - dependency is required
@@ -110,6 +121,7 @@ def resolve_embeddings(
     *,
     api_key: str | None = None,
     embeddings_kwargs: dict[str, Any] | None = None,
+    timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
 ) -> Embeddings | None:
     """Return embeddings, or None when the caller wants lexical comparisons.
 
@@ -128,6 +140,13 @@ def resolve_embeddings(
     kwargs: dict[str, Any] = dict(embeddings_kwargs or {})
     if api_key is not None:
         kwargs["api_key"] = api_key
+    if (
+        timeout is not None
+        and timeout > 0
+        and "timeout" not in kwargs
+        and "request_timeout" not in kwargs
+    ):
+        kwargs["timeout"] = timeout
     try:
         from langchain.embeddings import init_embeddings
     except ImportError as exc:  # pragma: no cover - dependency is required

@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,14 +21,19 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
-from automated_grounded_theory.async_support import parse_structured, structured_runnable
+from automated_grounded_theory.async_support import ainvoke_structured, is_transient
 from automated_grounded_theory.batching import pack_indices
-from automated_grounded_theory.clustering import cluster_pairs
 from automated_grounded_theory.codebook import (
+    agreement_confidence,
+    apply_post_merge,
     apply_sweep,
     commit_passage,
     empty_counters,
+    frozen_pair_keys,
     interpret_coding,
+    remember_pair_decisions,
+    replay_accepted_pairs,
+    trivial_merges,
     union_codebooks,
 )
 from automated_grounded_theory.context import ResearchContext
@@ -37,6 +43,8 @@ from automated_grounded_theory.prompts import (
     CODING_SYSTEM,
     SWEEP_SYSTEM,
     build_coding_messages,
+    build_merge_check_messages,
+    build_rewrite_messages,
     build_sweep_messages,
     serialize_messages,
     validation_feedback,
@@ -45,15 +53,23 @@ from automated_grounded_theory.results import result_from_state
 from automated_grounded_theory.retrieval import (
     CodeRetriever,
     EmbeddingCodeRetriever,
+    LexicalCodeRetriever,
     aembed_texts,
     code_text,
-    score_pairs,
+    comparison_order,
+    hint_pairs,
     select_prompt_codes,
-    union_candidates,
 )
-from automated_grounded_theory.validation import code_key
+from automated_grounded_theory.validation import code_key, context_term_set, label_restates_context
 from automated_grounded_theory.saturation import saturation_point
-from automated_grounded_theory.schemas import BatchCoding, SweepCoding
+from automated_grounded_theory.schemas import (
+    BatchCoding,
+    DefinitionRewriteBatch,
+    LeakCheckBatch,
+    MergeCheckBatch,
+    QuoteFitBatch,
+    SweepCoding,
+)
 from automated_grounded_theory.segment import plan_coding
 
 logger = logging.getLogger("automated_grounded_theory")
@@ -84,6 +100,11 @@ class CodingState(TypedDict, total=False):
     warnings: list[str]
     export_paths: dict[str, str]
     finished: bool
+    ops: list[dict]
+    review: list[dict]
+    pair_decisions: list[dict]
+    consolidated: bool
+    stage_seconds: dict
 
 
 @dataclass
@@ -96,7 +117,7 @@ class RunConfig:
     prompt_cache: bool
     top_k_codes: int = 12
     frequent_codes: int = 8
-    merge_threshold: float = 0.85
+    merge_threshold: float = 0.65
     lexical_merge_threshold: float = 0.5
     max_codes_per_passage: int = 6
     neighbor_chars: int = 400
@@ -106,9 +127,13 @@ class RunConfig:
     candidate_limit: int = 30
     batch_size: int = 8
     concurrency: int = 2
-    sweep_chunk: int = 40
+    sweep_chunk: int = 20
     embed_batch_size: int = 64
     review_mode: str = "document"
+    review_below: float = 0.5
+    min_merge_confidence: float = 0.5
+    max_merges_per_sweep: int = 12
+    check_model: Any = None
     pipeline: bool = True
     token_budget: int = 4000
     model_name: str = ""
@@ -117,6 +142,7 @@ class RunConfig:
     output_dir: str | None = None
     limiter: Any = None
     prompt_records: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
     _log_lock: threading.Lock | None = None
 
     def __post_init__(self) -> None:
@@ -167,6 +193,11 @@ def initial_state(documents: list[LoadedDocument], metadata: dict) -> CodingStat
         "warnings": [],
         "export_paths": {},
         "finished": False,
+        "ops": [],
+        "review": [],
+        "pair_decisions": [],
+        "consolidated": False,
+        "stage_seconds": {},
     }
 
 
@@ -177,6 +208,7 @@ def build_graph(runtime: RunConfig):
     builder.add_node("code_passage", _code_node(runtime))
     builder.add_node("validate_passage", _validate_node(runtime))
     builder.add_node("sweep", _sweep_node(runtime))
+    builder.add_node("consolidate", _sweep_node(runtime, consolidation=True))
     builder.add_node("export", _export_node(runtime))
     builder.add_edge(START, "segment_and_shuffle")
     builder.add_conditional_edges(
@@ -193,8 +225,9 @@ def build_graph(runtime: RunConfig):
     builder.add_conditional_edges(
         "sweep",
         _route_after_sweep,
-        {"code_passage": "code_passage", "export": "export"},
+        {"code_passage": "code_passage", "consolidate": "consolidate", "export": "export"},
     )
+    builder.add_edge("consolidate", "export")
     builder.add_edge("export", END)
     return builder
 
@@ -236,6 +269,8 @@ def _route_after_validate(state: CodingState) -> str:
 def _route_after_sweep(state: CodingState) -> str:
     if _remaining(state):
         return "code_passage"
+    if not state.get("consolidated") and len(state.get("codebook") or {}) >= 2:
+        return "consolidate"
     return "export"
 
 
@@ -284,12 +319,17 @@ def _segment_node(state: CodingState) -> dict:
 
 def _code_node(runtime: RunConfig):
     async def code_passage(state: CodingState) -> dict:
+        started = time.perf_counter()
         jobs = _wave(state, runtime)
         if not jobs:
-            return {"pending": []}
-
-        rows = await _pending_rows(runtime, state, jobs)
-        return {"pending": rows}
+            update: dict = {"pending": []}
+        else:
+            rows = await _pending_rows(runtime, state, jobs)
+            update = {"pending": rows}
+        timing = dict(state.get("stage_seconds") or {})
+        timing["coding"] = round(float(timing.get("coding") or 0) + time.perf_counter() - started, 4)
+        update["stage_seconds"] = timing
+        return update
 
     return code_passage
 
@@ -417,15 +457,27 @@ async def _code_batch(runtime: RunConfig, passages: list[dict], codebook: dict) 
                 max_codes=runtime.max_codes_per_passage,
                 require_gerund=runtime.require_gerund,
                 long_passage_chars=runtime.long_passage_chars,
+                review_below=runtime.review_below,
+                context_terms=context_term_set(runtime.context),
             )
-            quote_failures = [item for item in interpreted["rejections"] if item.get("reason") == "quote_not_verbatim"]
-            if quote_failures and attempt < attempts - 1:
-                errors[passage_id].append(quote_failures)
+            quote_failures = [
+                item for item in interpreted["rejections"] if item.get("reason") == "quote_not_verbatim"
+            ]
+            restated = [
+                {"code": item.get("code"), "reason": "context_restatement", "quote": item.get("quote")}
+                for item in interpreted["accepted"]
+                if "context_restatement" in (item.get("review_reasons") or [])
+            ]
+            retryable = quote_failures + restated
+            if retryable and attempt < attempts - 1:
+                errors[passage_id].append(retryable)
                 still_pending.append(passage)
-                feedback[passage_id] = validation_feedback(quote_failures)
+                feedback[passage_id] = validation_feedback(retryable)
             else:
                 done[passage_id] = (coding, errors[passage_id])
         pending = still_pending
+    if runtime.check_model is not None:
+        await _annotate_leaks(runtime, done)
     for passage in passages:
         passage_id = str(passage.get("passage_id"))
         done.setdefault(passage_id, ({"passage_id": passage_id, "codes": [], "memo": ""}, errors[passage_id]))
@@ -442,13 +494,25 @@ async def _invoke_coding(
     seen: set[str] = set()
     entries = list(codebook.values())
     if isinstance(runtime.retriever, EmbeddingCodeRetriever):
-        per_passage = await runtime.retriever.arank_many(
-            [str(passage.get("text") or "") for passage in passages],
-            entries,
-            k=runtime.top_k_codes,
-            limiter=runtime.limiter,
-            batch_size=runtime.embed_batch_size,
-        )
+        try:
+            per_passage = await runtime.retriever.arank_many(
+                [str(passage.get("text") or "") for passage in passages],
+                entries,
+                k=runtime.top_k_codes,
+                limiter=runtime.limiter,
+                batch_size=runtime.embed_batch_size,
+            )
+        except Exception as exc:
+            if not is_transient(exc):
+                raise
+            runtime.notes.append(
+                f"Code retrieval embeddings failed ({exc}). Nearest codes used label overlap instead."
+            )
+            lexical = LexicalCodeRetriever()
+            per_passage = [
+                lexical.rank(str(passage.get("text") or ""), entries, k=runtime.top_k_codes)
+                for passage in passages
+            ]
     else:
         per_passage = [
             runtime.retriever.rank(str(passage.get("text") or ""), entries, k=runtime.top_k_codes)
@@ -469,6 +533,7 @@ async def _invoke_coding(
         neighbor_chars=runtime.neighbor_chars,
         feedback=feedback,
         prompt_cache=runtime.prompt_cache,
+        nearest=per_passage,
     )
     passage_ids = ",".join(str(passage.get("passage_id")) for passage in passages)
     parsed = await _ainvoke_structured(
@@ -510,6 +575,8 @@ def _validate_node(runtime: RunConfig):
         highlights = dict(state.get("highlight_ids") or {})
         counters = dict(state.get("counters") or empty_counters())
         validation_log = list(state.get("validation_log") or [])
+        ops = list(state.get("ops") or [])
+        review = list(state.get("review") or [])
         prompt_log = _take_prompts(runtime, state) if take_prompts else list(state.get("prompt_log") or [])
         branch_queues = {key: list(value) for key, value in (state.get("branch_queues") or {}).items()}
         branch_books = {key: dict(value) for key, value in (state.get("branch_codebooks") or {}).items()}
@@ -539,6 +606,8 @@ def _validate_node(runtime: RunConfig):
                 max_codes=runtime.max_codes_per_passage,
                 require_gerund=runtime.require_gerund,
                 long_passage_chars=runtime.long_passage_chars,
+                review_below=runtime.review_below,
+                context_terms=context_term_set(runtime.context),
             )
             for earlier in item.get("attempt_errors") or []:
                 validation_log.append(
@@ -572,6 +641,8 @@ def _validate_node(runtime: RunConfig):
             memos = committed["memos"]
             highlights = committed["highlight_ids"]
             counters = committed["counters"]
+            ops.extend(committed.get("ops") or [])
+            review.extend(item for item in (committed.get("ops") or []) if item.get("status") == "review")
             new_codes += committed["new_codes"]
             global_keys.update(committed["codebook"])
             if state.get("parallel") and doc_id:
@@ -589,6 +660,8 @@ def _validate_node(runtime: RunConfig):
             passages_coded += 1
 
         _append_reading_notes(memos, counters, pending_sorted, state)
+        notes = list(runtime.notes)
+        runtime.notes.clear()
 
         if state.get("parallel"):
             codebook = union_codebooks(list(branch_books.values()))
@@ -609,6 +682,9 @@ def _validate_node(runtime: RunConfig):
             "passages_since_sweep": passages_since,
             "passages_coded": passages_coded,
             "pending": [],
+            "ops": ops,
+            "review": review,
+            "warnings": list(state.get("warnings") or []) + notes,
         }
 
     runtime._commit = validate_passage
@@ -631,27 +707,29 @@ def _append_reading_notes(memos: list, counters: dict, pending_sorted: list, sta
         groups[-1][2].append(passage)
     for doc_id, doc_name, passages in groups:
         passage_ids = {str(passage.get("passage_id") or "") for passage in passages}
+        from automated_grounded_theory.validation import substantive_memo
+
         comparisons = [
             str(memo.get("text") or "").strip()
             for memo in memos
-            if memo.get("kind") == "passage" and str(memo.get("passage_id") or "") in passage_ids and str(memo.get("text") or "").strip()
+            if memo.get("kind") == "passage"
+            and str(memo.get("passage_id") or "") in passage_ids
+            and substantive_memo(str(memo.get("text") or ""))
         ]
-        body = "\n\n".join(comparisons) if comparisons else (
-            "No property, dimension, condition, consequence, or comparison was recorded while reading this document."
-        )
-        memo_id = f"m{counters.get('memo', 0) + 1:05d}"
-        counters["memo"] = counters.get("memo", 0) + 1
         listed = ", ".join(str(passage.get("passage_id") or "") for passage in passages)
-        memos.append(
-            {
-                "memo_id": memo_id,
-                "kind": "document",
-                "doc_id": doc_id,
-                "passage_id": None,
-                "sweep_index": None,
-                "text": f"While reading {doc_name} ({listed}):\n{body}",
-            }
-        )
+        if comparisons:
+            memo_id = f"m{counters.get('memo', 0) + 1:05d}"
+            counters["memo"] = counters.get("memo", 0) + 1
+            memos.append(
+                {
+                    "memo_id": memo_id,
+                    "kind": "document",
+                    "doc_id": doc_id,
+                    "passage_id": None,
+                    "sweep_index": None,
+                    "text": f"While reading {doc_name} ({listed}):\n" + "\n\n".join(comparisons),
+                }
+            )
         memo_id = f"m{counters.get('memo', 0) + 1:05d}"
         counters["memo"] = counters.get("memo", 0) + 1
         memos.append(
@@ -676,8 +754,21 @@ def _resync(codebook: dict, segments: list[dict]) -> dict:
     return sync_counts(codebook, segments)
 
 
-def _sweep_node(runtime: RunConfig):
+def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
     async def sweep(state: CodingState) -> dict:
+        started = time.perf_counter()
+        extras = {"rewrites": 0.0}
+
+        def finish(update: dict) -> dict:
+            timing = dict(state.get("stage_seconds") or {})
+            elapsed = time.perf_counter() - started
+            timing["sweeps"] = round(float(timing.get("sweeps") or 0) + elapsed, 4)
+            timing["rewrites"] = round(float(timing.get("rewrites") or 0) + extras["rewrites"], 4)
+            if consolidation:
+                timing["consolidation"] = round(float(timing.get("consolidation") or 0) + elapsed, 4)
+            update["stage_seconds"] = timing
+            update["consolidated"] = True if consolidation else bool(state.get("consolidated"))
+            return update
         codebook = dict(state.get("codebook") or {})
         if state.get("parallel") and state.get("branch_codebooks"):
             codebook = union_codebooks(list(state["branch_codebooks"].values()))
@@ -691,13 +782,23 @@ def _sweep_node(runtime: RunConfig):
         sweep_log = list(state.get("sweep_log") or [])
         segments = list(state.get("segments") or [])
 
-        def _point(book: dict) -> dict:
+        prior_points = list(state.get("saturation") or [])
+        prior_codes = 0
+        if prior_points:
+            prior_codes = int(
+                prior_points[-1].get("cumulative_codes_post_merge", prior_points[-1].get("cumulative_codes")) or 0
+            )
+
+        def _point(book: dict, *, pre_len: int | None = None) -> dict:
+            post_len = len(book)
             return saturation_point(
                 batch=sweep_index,
                 passages_in_batch=passages_since,
                 new_codes=new_codes,
                 cumulative_passages=int(state.get("passages_coded") or 0),
-                cumulative_codes=len(book),
+                cumulative_codes=post_len,
+                cumulative_codes_pre_merge=post_len if pre_len is None else pre_len,
+                new_codes_post_merge=post_len - prior_codes,
             )
 
         if not codebook:
@@ -713,16 +814,19 @@ def _sweep_node(runtime: RunConfig):
                     "text": "Sweep skipped: the codebook is empty.",
                 }
             )
-            return _sweep_update(
-                state,
-                codebook=codebook,
-                segments=segments,
-                memos=memos,
-                counters=counters,
-                saturation=list(state.get("saturation") or []) + [_point(codebook)],
-                sweep_log=sweep_log
-                + [{"sweep_index": sweep_index, "candidates": [], "accepted_merges": [], "rejected_merges": []}],
-                prompt_log=_take_prompts(runtime, state),
+            return finish(
+                _sweep_update(
+                    state,
+                    codebook=codebook,
+                    segments=segments,
+                    memos=memos,
+                    counters=counters,
+                    saturation=list(state.get("saturation") or []) + [_point(codebook)],
+                    sweep_log=sweep_log
+                    + [{"sweep_index": sweep_index, "candidates": [], "accepted_merges": [], "rejected_merges": []}],
+                    prompt_log=_take_prompts(runtime, state),
+                    warnings=list(state.get("warnings") or []),
+                )
             )
 
         code_task = None
@@ -730,10 +834,12 @@ def _sweep_node(runtime: RunConfig):
             jobs = _wave(state, runtime, upcoming=True)
             if jobs:
                 code_task = asyncio.create_task(_pending_rows(runtime, state, jobs))
-        codes = list(codebook.values())
-        codes.sort(key=lambda entry: (-int(entry.get("frequency") or 0), str(entry.get("code") or "").casefold()))
+        codes = comparison_order(list(codebook.values()))
+        frozen = frozen_pair_keys(list(state.get("pair_decisions") or []), codebook)
         try:
-            parsed, candidates, chunk_count = await _sweep_chunks(runtime, codes, sweep_index)
+            parsed, candidates, chunk_count = await _sweep_chunks(
+                runtime, codes, sweep_index, frozen=frozen, consolidation=consolidation
+            )
             overlap_pending: list = []
             if code_task is not None:
                 overlap_pending = await code_task
@@ -750,15 +856,122 @@ def _sweep_node(runtime: RunConfig):
             counters = dict(overlap_state["counters"])
             counters["sweep"] = sweep_index
         prompt_log = _take_prompts(runtime, state)
+        from automated_grounded_theory.codebook import finalize_candidate_decisions
+
+        pre_merge_book = codebook
+        pre_len = len(codebook)
+        cache = list(state.get("pair_decisions") or [])
+        frozen = frozen_pair_keys(cache, codebook)
+        replay = replay_accepted_pairs(cache, codebook)
+        replay_pairs = {
+            frozenset((code_key(str(item.get("source") or "")), code_key(str(item.get("target") or ""))))
+            for item in replay
+        }
+        def _stamp(merge) -> dict:
+            row = dict(merge)
+            agreed = agreement_confidence(row)
+            row["model_confidence"] = row.get("confidence", 1.0)
+            if agreed is not None:
+                row["agreement_confidence"] = agreed
+            elif row.get("agreement_confidence") is None:
+                row["agreement_confidence"] = row["model_confidence"]
+            source_key = code_key(str(row.get("source") or ""))
+            target_key = code_key(str(row.get("target") or ""))
+            if not row.get("source_valence"):
+                row["source_valence"] = str(codebook.get(source_key, {}).get("valence") or "")
+            if not row.get("target_valence"):
+                row["target_valence"] = str(codebook.get(target_key, {}).get("valence") or "")
+            if not str(row.get("rationale") or "").strip():
+                row["rationale"] = (
+                    "The sweep judged this pair with the same-action, same-object, same-stance rubric."
+                )
+            return row
+
+        proposed = []
+        already = []
+        seen_pairs: set[frozenset[str]] = set()
+        for merge in parsed.get("merges") or []:
+            pair = frozenset(
+                (code_key(str(merge.get("source") or "")), code_key(str(merge.get("target") or "")))
+            )
+            if pair in replay_pairs:
+                continue
+            if pair in frozen:
+                already.append(
+                    {
+                        **dict(merge),
+                        "reason": "already_decided",
+                        "decision": "reject",
+                        "confidence": merge.get("confidence", 1.0),
+                        "rationale": merge.get("rationale")
+                        or "This pair was already decided in this run, and neither definition has changed in substance.",
+                    }
+                )
+            else:
+                proposed.append(_stamp(merge))
+                seen_pairs.add(pair)
+        for merge in trivial_merges(list(codebook.values()), frozen):
+            pair = frozenset((code_key(str(merge.get("source") or "")), code_key(str(merge.get("target") or ""))))
+            if pair in seen_pairs or pair in replay_pairs:
+                continue
+            proposed.append(merge)
+            seen_pairs.add(pair)
+        pre_segments = list(segments)
+        rewrite_started = time.perf_counter()
         applied = apply_sweep(
             codebook,
             segments,
-            merges=list(parsed.get("merges") or []),
+            merges=list(proposed) + [_stamp(item) for item in replay],
             candidates=candidates,
             definitions=list(parsed.get("definitions") or []),
             overloaded=list(parsed.get("overloaded_codes") or []),
             relation_hints=list(parsed.get("relation_hints") or []),
+            min_merge_confidence=runtime.min_merge_confidence,
+            review_below=runtime.review_below,
+            frozen_pairs=frozen - replay_pairs,
+            max_merges_per_sweep=runtime.max_merges_per_sweep,
         )
+        applied["rejected_merges"] = list(already) + list(applied.get("rejected_merges") or [])
+        book, rows, post_ops, quote_stats = apply_post_merge(
+            applied["codebook"],
+            applied["segments"],
+            applied["accepted_merges"],
+            pre_merge_book,
+            pre_segments,
+        )
+        applied["codebook"] = book
+        applied["segments"] = rows
+        applied.setdefault("ops", []).extend(post_ops)
+        applied.setdefault("review", []).extend(op for op in post_ops if op.get("status") == "review")
+        if runtime.check_model is not None and applied["accepted_merges"] and quote_stats["quotes_checked"] == 0:
+            checked = await _check_quotes(runtime, applied["codebook"], applied["segments"], applied["accepted_merges"], sweep_index)
+            if checked:
+                book, rows, more_ops, extra = apply_post_merge(
+                    applied["codebook"],
+                    applied["segments"],
+                    checked,
+                    pre_merge_book,
+                    pre_segments,
+                )
+                applied["codebook"] = book
+                applied["segments"] = rows
+                applied.setdefault("ops", []).extend(more_ops)
+                quote_stats["quotes_checked"] += extra["quotes_checked"]
+                quote_stats["quotes_split"] += extra["quotes_split"]
+        extras["rewrites"] = time.perf_counter() - rewrite_started
+        finalize_candidate_decisions(
+            applied,
+            candidates,
+            rejections=list(parsed.get("rejections") or []),
+            skipped=list(parsed.get("skipped_candidates") or []),
+        )
+        warnings = list(state.get("warnings") or []) + list(parsed.get("warnings") or []) + list(runtime.notes)
+        runtime.notes.clear()
+        ignored = list(applied.get("ignored_decisions") or [])
+        if ignored:
+            warnings.append(
+                f"Ignored {len(ignored)} sweep decisions that were not offered candidate pairs."
+            )
         for merge in applied["accepted_merges"]:
             logger.info("merged code %s into %s", merge.get("source"), merge.get("target"))
         integrative = str(parsed.get("integrative_memo") or "").strip()
@@ -799,16 +1012,50 @@ def _sweep_node(runtime: RunConfig):
             )
         record = {
             "sweep_index": sweep_index,
-            "candidate_method": candidates[0]["method"] if candidates else ("embedding" if runtime.embeddings else "lexical"),
+            "candidate_method": (
+                "lexical+embedding" if runtime.embeddings is not None and not any(
+                    "label overlap" in warning for warning in warnings
+                )
+                else "lexical"
+            ),
             "candidates": candidates,
             "accepted_merges": applied["accepted_merges"],
             "rejected_merges": applied["rejected_merges"],
+            "ignored_decisions": list(applied.get("ignored_decisions") or []),
+            "candidate_decisions": list(applied.get("candidate_decisions") or []),
             "merge_map": applied["merge_map"],
             "relation_hints": applied["relation_hints"],
             "overloaded_codes": overloaded,
             "codes_sent": len(codes),
             "chunks": chunk_count,
+            "review": list(applied.get("review") or []),
+            "consolidation": consolidation,
+            "quotes_checked": quote_stats["quotes_checked"],
+            "quotes_split": quote_stats["quotes_split"],
         }
+        decision_rows = []
+        for item in applied["accepted_merges"]:
+            decision_rows.append({**item, "decision": "accept"})
+        for item in applied["rejected_merges"]:
+            if item.get("reason") in {"unknown_or_same", "unknown_definition", "not_offered", "already_decided", "merge_cap"}:
+                continue
+            decision_rows.append({**item, "decision": "reject"})
+        pair_decisions = remember_pair_decisions(
+            list(state.get("pair_decisions") or []),
+            pre_merge_book,
+            decision_rows,
+        )
+        carried = overlap_state if overlap_state is not None else state
+        ops = list(carried.get("ops") or [])
+        review = list(carried.get("review") or [])
+        for op in applied.get("ops") or []:
+            op = dict(op)
+            if not op.get("op_id"):
+                counters["op"] = int(counters.get("op", 0)) + 1
+                op["op_id"] = f"o{counters['op']:05d}"
+            ops.append(op)
+            if op.get("status") == "review":
+                review.append(op)
         branch_books = state.get("branch_codebooks") or {}
         if state.get("parallel"):
             branch_books = {doc_id: deepcopy(applied["codebook"]) for doc_id in branch_books}
@@ -818,10 +1065,14 @@ def _sweep_node(runtime: RunConfig):
             segments=applied["segments"],
             memos=memos,
             counters=counters,
-            saturation=list(state.get("saturation") or []) + [_point(applied["codebook"])],
+            saturation=list(state.get("saturation") or []) + [_point(applied["codebook"], pre_len=pre_len)],
             sweep_log=sweep_log + [record],
             branch_codebooks=branch_books,
             prompt_log=prompt_log,
+            warnings=warnings,
+            ops=ops,
+            review=review,
+            pair_decisions=pair_decisions,
         )
         if overlap_state is not None:
             coded_before = int(state.get("passages_since_sweep") or 0)
@@ -835,7 +1086,7 @@ def _sweep_node(runtime: RunConfig):
             update["new_codes_since_sweep"] = int(overlap_state["new_codes_since_sweep"]) - new_before
             if not state.get("parallel"):
                 update["branch_codebooks"] = overlap_state["branch_codebooks"]
-        return update
+        return finish(update)
 
     return sweep
 
@@ -851,6 +1102,10 @@ def _sweep_update(
     sweep_log: list,
     branch_codebooks: dict | None = None,
     prompt_log: list | None = None,
+    warnings: list | None = None,
+    ops: list | None = None,
+    review: list | None = None,
+    pair_decisions: list | None = None,
 ) -> dict:
     return {
         "codebook": codebook,
@@ -859,10 +1114,14 @@ def _sweep_update(
         "counters": counters,
         "saturation": saturation,
         "sweep_log": sweep_log,
+        "warnings": list(state.get("warnings") or []) if warnings is None else warnings,
         "prompt_log": prompt_log if prompt_log is not None else list(state.get("prompt_log") or []),
         "new_codes_since_sweep": 0,
         "passages_since_sweep": 0,
         "branch_codebooks": branch_codebooks if branch_codebooks is not None else state.get("branch_codebooks") or {},
+        "ops": list(state.get("ops") or []) if ops is None else ops,
+        "review": list(state.get("review") or []) if review is None else review,
+        "pair_decisions": list(state.get("pair_decisions") or []) if pair_decisions is None else pair_decisions,
     }
 
 
@@ -920,7 +1179,9 @@ def reconcile_sweep_parts(parts: list[dict]) -> dict:
             ):
                 definitions[key] = {
                     "code": update.get("code"),
+                    "code_id": update.get("code_id") or "",
                     "definition": text,
+                    "confidence": update.get("confidence", 1.0),
                     "chunk_index": chunk_index,
                 }
     overloaded: list[str] = []
@@ -931,6 +1192,19 @@ def reconcile_sweep_parts(parts: list[dict]) -> dict:
             if key and key not in seen_over:
                 seen_over.add(key)
                 overloaded.append(str(label))
+    rejections: list[dict] = []
+    seen_rejections: set[frozenset[str]] = set()
+    for part in ordered:
+        for rejection in part.get("rejections") or []:
+            source = code_key(str(rejection.get("source") or ""))
+            target = code_key(str(rejection.get("target") or ""))
+            if not source or not target or source == target:
+                continue
+            pair = frozenset((source, target))
+            if pair in seen_pairs or pair in seen_rejections:
+                continue
+            seen_rejections.add(pair)
+            rejections.append(dict(rejection))
     hints: list[dict] = []
     seen_hints: set[tuple] = set()
     for part in ordered:
@@ -948,11 +1222,17 @@ def reconcile_sweep_parts(parts: list[dict]) -> dict:
     return {
         "merges": merges,
         "definitions": [
-            {"code": item["code"], "definition": item["definition"]}
+            {
+                "code": item["code"],
+                "code_id": item.get("code_id") or "",
+                "definition": item["definition"],
+                "confidence": item.get("confidence", 1.0),
+            }
             for item in sorted(definitions.values(), key=lambda item: code_key(str(item["code"] or "")))
         ],
         "overloaded_codes": overloaded,
         "relation_hints": hints,
+        "rejections": rejections,
         "integrative_memo": _join_unique(str(part.get("integrative_memo") or "") for part in ordered),
         "reflexive_memo": _join_unique(str(part.get("reflexive_memo") or "") for part in ordered),
     }
@@ -969,96 +1249,393 @@ def _join_unique(texts) -> str:
     return "\n\n".join(kept)
 
 
-async def _sweep_chunks(runtime: RunConfig, codes: list, sweep_index: int) -> tuple[dict, list, int]:
+def _quotes_for(segments: list, key: str, limit: int = 6) -> list[str]:
+    quotes = []
+    for segment in segments:
+        if (segment.get("code_key") or code_key(str(segment.get("code") or ""))) != key:
+            continue
+        quote = str(segment.get("quote") or "").strip()
+        if quote and quote not in quotes:
+            quotes.append(quote)
+        if len(quotes) >= limit:
+            break
+    return quotes
+
+
+async def _annotate_leaks(runtime: RunConfig, done: dict) -> None:
+    """Ask ``check_model`` whether flagged labels really restate the context."""
+    if runtime.check_model is None:
+        return
+    from automated_grounded_theory.prompts import build_leak_messages
+
+    labels = []
+    for coding, _errors in done.values():
+        for proposal in coding.get("codes") or []:
+            label = str(proposal.get("code") or "")
+            if label and label_restates_context(label, context_term_set(runtime.context)):
+                labels.append(proposal)
+    if not labels:
+        return
+    messages = build_leak_messages(context=runtime.context, labels=labels, prompt_cache=runtime.prompt_cache)
+    payload = await _ainvoke_structured(
+        runtime.check_model,
+        LeakCheckBatch,
+        messages,
+        kind="context_leak",
+        model_name="check",
+        passage_id="context-leak",
+        runtime=runtime,
+    )
+    by_label = {str(item.get("label") or "").casefold(): item for item in payload.get("checks") or []}
+    for proposal in labels:
+        check = by_label.get(str(proposal.get("code") or "").casefold())
+        if not check:
+            continue
+        proposal["context_leak_rationale"] = check.get("rationale") or ""
+        if not check.get("leaks", True):
+            proposal["context_leak_cleared"] = True
+        elif check.get("reworded_label"):
+            proposal["context_leak_reword"] = check.get("reworded_label")
+
+
+async def _check_quotes(runtime: RunConfig, codebook: dict, segments: list, accepted: list, sweep_index: int) -> list:
+    """Optional cheap model: which member quotes do not fit the merged code."""
+    from automated_grounded_theory.prompts import build_quote_fit_messages
+
+    rows = []
+    for merge in accepted:
+        source = code_key(str(merge.get("source") or ""))
+        target = code_key(str(merge.get("target") or ""))
+        survivor = source if source in codebook else target if target in codebook else ""
+        if not survivor:
+            continue
+        quotes = _quotes_for(segments, survivor)
+        if not quotes:
+            continue
+        rows.append({"code_id": codebook[survivor].get("code_id") or "", "label": codebook[survivor].get("code"), "quotes": quotes, "merge": merge})
+    if not rows:
+        return []
+    messages = build_quote_fit_messages(context=runtime.context, codes=rows, prompt_cache=runtime.prompt_cache)
+    payload = await _ainvoke_structured(
+        runtime.check_model,
+        QuoteFitBatch,
+        messages,
+        kind="quote_fit",
+        model_name="check",
+        passage_id=f"sweep-{sweep_index}-quotes",
+        runtime=runtime,
+    )
+    fits_by_code: dict[str, list] = {}
+    for check in payload.get("checks") or []:
+        fits_by_code.setdefault(str(check.get("code_id") or ""), []).append(check)
+    stamped = []
+    for row in rows:
+        fits = fits_by_code.get(str(row["code_id"]) or "")
+        if not fits:
+            continue
+        merge = dict(row["merge"])
+        merge["quote_fits"] = fits
+        stamped.append(merge)
+    return stamped
+
+
+async def _verify_proposed_merges(
+    runtime: RunConfig,
+    codebook: dict,
+    merges: list,
+    sweep_index: int,
+) -> tuple[list, list]:
+    """Second structured look at each proposed merge. Opposite stances are not sent."""
+    from automated_grounded_theory.codebook import opposite_valence
+
+    eligible = []
+    rejected = []
+    for merge in merges:
+        source = code_key(str(merge.get("source") or ""))
+        target = code_key(str(merge.get("target") or ""))
+        if source in codebook and target in codebook and opposite_valence(
+            codebook[source].get("valence"), codebook[target].get("valence")
+        ):
+            rejected.append({**dict(merge), "reason": "opposite_valence", "confidence": merge.get("confidence", 1.0)})
+            continue
+        eligible.append(merge)
+    if not eligible:
+        return [], rejected
+    messages = build_merge_check_messages(
+        context=runtime.context,
+        codebook=codebook,
+        merges=eligible,
+        prompt_cache=runtime.prompt_cache,
+    )
+    payload = await _ainvoke_structured(
+        runtime.sweeper,
+        MergeCheckBatch,
+        messages,
+        kind="merge_verify",
+        model_name=runtime.sweep_model_name,
+        passage_id=f"sweep-{sweep_index}-verify",
+        runtime=runtime,
+    )
+    by_pair = {}
+    for check in payload.get("checks") or []:
+        pair = frozenset(
+            (
+                code_key(str(check.get("source") or "")),
+                code_key(str(check.get("target") or "")),
+            )
+        )
+        if len(pair) == 2:
+            by_pair[pair] = check
+    kept = []
+    for merge in eligible:
+        pair = frozenset((code_key(str(merge.get("source") or "")), code_key(str(merge.get("target") or ""))))
+        check = by_pair.get(pair)
+        if check is None or str(check.get("action") or "") != "accept":
+            rejected.append(
+                {
+                    **dict(merge),
+                    "reason": "verify_rejected" if check else "verify_omitted",
+                    "confidence": 1.0 if check is None else check.get("confidence", 1.0),
+                    "rationale": "" if check is None else check.get("rationale") or merge.get("rationale") or "",
+                }
+            )
+            continue
+        confirmed = dict(merge)
+        confirmed["confidence"] = check.get("confidence", merge.get("confidence", 1.0))
+        confirmed["rationale"] = check.get("rationale") or merge.get("rationale") or ""
+        kept.append(confirmed)
+    return kept, rejected
+
+
+async def _rewrite_survivor_definitions(
+    runtime: RunConfig,
+    codebook: dict,
+    segments: list,
+    accepted: list,
+    pre_merge_book: dict,
+    sweep_index: int,
+) -> tuple[dict, list]:
+    """Keep each survivor's label. Rewrite its definition from the quotes it now holds."""
+    from automated_grounded_theory.codebook import _code_id
+
+    groups: dict[str, list[str]] = {}
+    for merge in accepted:
+        source = code_key(str(merge.get("source") or ""))
+        target = code_key(str(merge.get("target") or ""))
+        survivor = source if source in codebook else target if target in codebook else ""
+        retired = target if survivor == source else source
+        if not survivor:
+            continue
+        label = str(pre_merge_book.get(retired, {}).get("code") or merge.get("source") or merge.get("target") or "")
+        groups.setdefault(survivor, [])
+        if label and label not in groups[survivor] and label != codebook[survivor].get("code"):
+            groups[survivor].append(label)
+    if not groups:
+        return codebook, []
+    rows = []
+    for key, retired in groups.items():
+        entry = codebook[key]
+        rows.append(
+            {
+                "code_id": entry.get("code_id") or _code_id(key),
+                "code": entry.get("code"),
+                "definition": entry.get("definition") or "",
+                "retired_labels": retired,
+                "quotes": _quotes_for(segments, key),
+            }
+        )
+    messages = build_rewrite_messages(context=runtime.context, codes=rows, prompt_cache=runtime.prompt_cache)
+    try:
+        payload = await _ainvoke_structured(
+            runtime.sweeper,
+            DefinitionRewriteBatch,
+            messages,
+            kind="definition_rewrite",
+            model_name=runtime.sweep_model_name,
+            passage_id=f"sweep-{sweep_index}-rewrite",
+            runtime=runtime,
+        )
+    except CodingError as exc:
+        if not is_transient(exc):
+            raise
+        runtime.notes.append(f"Definition rewrite after sweep {sweep_index} was skipped: {exc}")
+        return codebook, []
+    book = {key: dict(entry) for key, entry in codebook.items()}
+    by_id = {str(entry.get("code_id") or _code_id(key)): key for key, entry in book.items()}
+    ops = []
+    for rewrite in payload.get("rewrites") or []:
+        code_id = str(rewrite.get("code_id") or "")
+        confidence = float(rewrite.get("confidence") or 0)
+        key = by_id.get(code_id) or code_key(str(rewrite.get("code") or ""))
+        definition = str(rewrite.get("definition") or "").strip()
+        if key not in groups or key not in book or not definition:
+            ops.append(
+                {
+                    "op_id": "",
+                    "op": "refine_definition",
+                    "status": "rejected",
+                    "confidence": confidence,
+                    "ids": {"code_id": code_id},
+                    "reason": "unknown_code_id",
+                }
+            )
+            continue
+        if confidence < runtime.review_below:
+            ops.append(
+                {
+                    "op_id": "",
+                    "op": "refine_definition",
+                    "status": "review",
+                    "confidence": confidence,
+                    "ids": {"code_id": book[key].get("code_id") or code_id},
+                    "reason": "below_review_threshold",
+                }
+            )
+            continue
+        book[key]["definition"] = definition
+        book[key].setdefault("history", []).append({"event": "definition_rewritten", "definition": definition})
+        ops.append(
+            {
+                "op_id": "",
+                "op": "refine_definition",
+                "status": "applied",
+                "confidence": confidence,
+                "ids": {"code_id": book[key].get("code_id") or code_id},
+                "reason": "",
+            }
+        )
+    return book, ops
+
+
+async def _sweep_chunks(
+    runtime: RunConfig,
+    codes: list,
+    sweep_index: int,
+    *,
+    frozen: set[frozenset[str]] | None = None,
+    consolidation: bool = False,
+) -> tuple[dict, list, int]:
     """Detect candidates, confirm merges, and refine definitions per chunk, concurrently.
 
     Chunks share one ``abatch``. Their merge maps are reconciled by chunk index,
     not by which chunk returned first.
     """
     chunks = iter_sweep_chunks(codes, runtime.sweep_chunk)
-    positions = {id(entry): index for index, entry in enumerate(codes)}
     vectors = None
+    embed_note = ""
     if runtime.embeddings is not None:
-        vectors = await aembed_texts(
-            runtime.embeddings,
-            [code_text(entry) for entry in codes],
-            batch_size=runtime.embed_batch_size,
-            limiter=runtime.limiter,
-        )
-
-    async def detect(chunk: list) -> list:
-        indexes = [positions[id(entry)] for entry in chunk]
-        lexical_or_cosine = await asyncio.to_thread(
-            score_pairs,
-            codes,
-            vectors,
-            embedding_threshold=runtime.merge_threshold,
-            lexical_threshold=runtime.lexical_merge_threshold,
-            limit=runtime.candidate_limit,
-            chunk_indexes=indexes,
-        )
-        if vectors is None:
-            return lexical_or_cosine
-        labels = [str(entry.get("code") or "") for entry in codes]
-        grouped = await asyncio.to_thread(
-            cluster_pairs,
-            labels,
-            vectors,
-            cosine_threshold=runtime.merge_threshold,
-        )
-        allowed = set(indexes)
-        extra = []
-        for left, right, score in grouped:
-            if left not in allowed and right not in allowed:
-                continue
-            left_label = labels[left]
-            right_label = labels[right]
-            if not left_label or not right_label or code_key(left_label) == code_key(right_label):
-                continue
-            if code_key(right_label) < code_key(left_label):
-                left_label, right_label = right_label, left_label
-            extra.append(
-                {
-                    "source": right_label,
-                    "target": left_label,
-                    "score": float(score),
-                    "method": "agglomerative",
-                }
+        try:
+            vectors = await aembed_texts(
+                runtime.embeddings,
+                [code_text(entry) for entry in codes],
+                batch_size=runtime.embed_batch_size,
+                limiter=runtime.limiter,
             )
-        return union_candidates([lexical_or_cosine, extra])
-
-    per_chunk_candidates = await asyncio.gather(*(detect(chunk) for chunk in chunks))
-    candidates = union_candidates(per_chunk_candidates)
-    messages = []
-    passage_ids = []
-    for index, chunk in enumerate(chunks, start=1):
-        messages.append(
-            build_sweep_messages(
-                context=runtime.context,
-                codes=chunk,
-                candidates=per_chunk_candidates[index - 1],
-                prompt_cache=runtime.prompt_cache,
-                all_codes=codes if len(chunks) > 1 else None,
-                chunk_index=index,
-                chunk_count=len(chunks),
+        except Exception as exc:
+            if not is_transient(exc):
+                raise
+            vectors = None
+            embed_note = (
+                f"Sweep embeddings failed ({exc}). Merge candidates used label overlap instead."
             )
-        )
-        passage_ids.append(f"sweep-{sweep_index}" if len(chunks) == 1 else f"sweep-{sweep_index}-chunk-{index:04d}")
-    parsed_rows = await _abatch_structured(
-        runtime.sweeper,
-        SweepCoding,
-        messages,
-        kind="sweep",
-        model_name=runtime.sweep_model_name,
-        passage_ids=passage_ids,
-        runtime=runtime,
+
+    hints = await asyncio.to_thread(
+        hint_pairs,
+        codes,
+        vectors,
+        embedding_threshold=runtime.merge_threshold,
+        lexical_threshold=runtime.lexical_merge_threshold,
+        limit=runtime.candidate_limit,
     )
+    if frozen:
+        hints = [
+            hint
+            for hint in hints
+            if frozenset(
+                (
+                    code_key(str(hint.get("source") or "")),
+                    code_key(str(hint.get("target") or "")),
+                )
+            )
+            not in frozen
+        ]
+    for index, hint in enumerate(hints, start=1):
+        hint["pair_id"] = f"s{sweep_index}p{index:04d}"
+    key_chunk: dict[str, int] = {}
+    for number, chunk in enumerate(chunks, start=1):
+        for entry in chunk:
+            key_chunk[code_key(str(entry.get("code") or ""))] = number
+    per_chunk_candidates: list[list] = [[] for _ in chunks]
+    for hint in hints:
+        owners = {
+            key_chunk.get(code_key(str(hint.get("source") or ""))),
+            key_chunk.get(code_key(str(hint.get("target") or ""))),
+        }
+        owners.discard(None)
+        for number in sorted(owners):
+            per_chunk_candidates[number - 1].append(hint)
+    candidates = hints
+    warnings: list[str] = [embed_note] if embed_note else []
+    if len(codes) >= 2 and not hints:
+        warnings.append(
+            f"Sweep {sweep_index} found no similarity hints among {len(codes)} codes. "
+            "The model still reviews the codebook and may propose duplicate merges."
+        )
+    skipped_candidates: list[dict] = []
+
+    async def confirm(index: int, chunk: list) -> tuple[int, dict, str | None]:
+        passage_id = f"sweep-{sweep_index}" if len(chunks) == 1 else f"sweep-{sweep_index}-chunk-{index:04d}"
+        messages = build_sweep_messages(
+            context=runtime.context,
+            codes=chunk,
+            candidates=per_chunk_candidates[index - 1],
+            prompt_cache=runtime.prompt_cache,
+            all_codes=codes if len(chunks) > 1 else None,
+            chunk_index=index,
+            chunk_count=len(chunks),
+            consolidation=consolidation,
+        )
+        try:
+            payload = await _ainvoke_structured(
+                runtime.sweeper,
+                SweepCoding,
+                messages,
+                kind="sweep",
+                model_name=runtime.sweep_model_name,
+                passage_id=passage_id,
+                runtime=runtime,
+            )
+            return index, payload, None
+        except CodingError as exc:
+            if not is_transient(exc):
+                raise
+            note = (
+                f"Sweep {sweep_index} chunk {index} of {len(chunks)} was skipped after a "
+                f"timeout or connection error: {exc}"
+            )
+            return index, {
+                "merges": [],
+                "rejections": [],
+                "definitions": [],
+                "overloaded_codes": [],
+                "relation_hints": [],
+                "integrative_memo": "",
+                "reflexive_memo": "",
+            }, note
+
+    confirmed = await asyncio.gather(*(confirm(index, chunk) for index, chunk in enumerate(chunks, start=1)))
+    confirmed.sort(key=lambda item: item[0])
     parts = []
-    for index, parsed in enumerate(parsed_rows, start=1):
+    for index, parsed, note in confirmed:
+        if note:
+            warnings.append(note)
+            for candidate in per_chunk_candidates[index - 1]:
+                skipped_candidates.append({**candidate, "rationale": note})
         parts.append(
             {
                 "chunk_index": index,
                 "merges": list(parsed.get("merges") or []),
+                "rejections": list(parsed.get("rejections") or []),
                 "definitions": list(parsed.get("definitions") or []),
                 "overloaded_codes": list(parsed.get("overloaded_codes") or []),
                 "relation_hints": list(parsed.get("relation_hints") or []),
@@ -1066,7 +1643,10 @@ async def _sweep_chunks(runtime: RunConfig, codes: list, sweep_index: int) -> tu
                 "reflexive_memo": parsed.get("reflexive_memo") or "",
             }
         )
-    return reconcile_sweep_parts(parts), candidates, len(chunks)
+    reconciled = reconcile_sweep_parts(parts)
+    reconciled["skipped_candidates"] = skipped_candidates
+    reconciled["warnings"] = warnings
+    return reconciled, candidates, len(chunks)
 
 
 async def _ainvoke_structured(
@@ -1079,14 +1659,9 @@ async def _ainvoke_structured(
     passage_id: str,
     runtime: RunConfig,
 ) -> dict:
-    runnable = structured_runnable(model, schema)
     try:
-        result = await runtime.limiter.ainvoke(runnable, messages)
+        (payload, usage), used = await ainvoke_structured(model, schema, messages, runtime.limiter)
     except Exception as exc:
-        raise CodingError(f"{kind} failed for {passage_id}: {exc}") from exc
-    try:
-        payload, usage = parse_structured(result, schema)
-    except ValueError as exc:
         raise CodingError(f"{kind} failed for {passage_id}: {exc}") from exc
     _append_prompt_log(
         runtime,
@@ -1094,7 +1669,7 @@ async def _ainvoke_structured(
             "kind": kind,
             "passage_id": passage_id,
             "model": model_name,
-            "messages": serialize_messages(messages),
+            "messages": serialize_messages(used),
             "output": payload,
             "usage": usage,
         },
@@ -1115,6 +1690,8 @@ async def _abatch_structured(
     """One ``abatch`` for every message list. Logs are written in input order."""
     if not message_lists:
         return []
+    from automated_grounded_theory.async_support import parse_structured, structured_runnable
+
     runnable = structured_runnable(model, schema)
     try:
         results = await runtime.limiter.abatch(runnable, message_lists)
@@ -1125,15 +1702,19 @@ async def _abatch_structured(
     for messages, result, passage_id in zip(message_lists, results, passage_ids):
         try:
             payload, usage = parse_structured(result, schema)
-        except ValueError as exc:
-            raise CodingError(f"{kind} failed for {passage_id}: {exc}") from exc
+            used = messages
+        except ValueError:
+            try:
+                (payload, usage), used = await ainvoke_structured(model, schema, messages, runtime.limiter)
+            except Exception as exc:
+                raise CodingError(f"{kind} failed for {passage_id}: {exc}") from exc
         _append_prompt_log(
             runtime,
             {
                 "kind": kind,
                 "passage_id": passage_id,
                 "model": model_name,
-                "messages": serialize_messages(messages),
+                "messages": serialize_messages(used),
                 "output": payload,
                 "usage": usage,
             },

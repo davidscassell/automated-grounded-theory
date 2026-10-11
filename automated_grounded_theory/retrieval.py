@@ -136,7 +136,7 @@ def _rank_vectors(labels: Sequence[str], vectors: Sequence[Sequence[float]], que
 async def aembed_texts(embeddings, texts: Sequence[str], *, batch_size: int, limiter) -> list[list[float]]:
     """Embed ``texts`` in batches. Uses ``aembed_documents`` when the object has it.
 
-    Rate-limit errors retry with the limiter's backoff. Other errors propagate.
+    Timeouts, connection errors, and rate limits retry with the limiter's backoff.
     """
     if not texts:
         return []
@@ -144,20 +144,27 @@ async def aembed_texts(embeddings, texts: Sequence[str], *, batch_size: int, lim
     batches = [list(texts[start : start + size]) for start in range(0, len(texts), size)]
 
     async def one(batch: list[str]) -> list[list[float]]:
-        delay = limiter.backoff
         async with limiter.embed_semaphore:
             for attempt in range(limiter.max_retries + 1):
                 try:
                     embed = getattr(embeddings, "aembed_documents", None)
-                    if embed is None:
-                        return await asyncio.to_thread(embeddings.embed_documents, batch)
-                    return await embed(batch)
+
+                    async def _embed():
+                        if embed is None:
+                            return await asyncio.to_thread(embeddings.embed_documents, batch)
+                        return await embed(batch)
+
+                    if limiter.request_timeout and limiter.request_timeout > 0:
+                        return await asyncio.wait_for(_embed(), limiter.request_timeout)
+                    return await _embed()
                 except Exception as exc:
-                    if attempt >= limiter.max_retries or not _rate_limit(exc):
+                    if attempt >= limiter.max_retries or not _transient(exc):
                         raise
-                    limiter.rate_limit_retries += 1
-                    await asyncio.sleep(delay)
-                    delay = min(limiter.max_backoff, delay * 2)
+                    if _rate_limit(exc):
+                        limiter.rate_limit_retries += 1
+                    else:
+                        limiter.timeout_retries += 1
+                    await asyncio.sleep(limiter._wait(attempt, exc))
         raise RuntimeError("embedding retry loop exited without a result")
 
     groups = await asyncio.gather(*(one(batch) for batch in batches))
@@ -170,27 +177,46 @@ def _rate_limit(exc: BaseException) -> bool:
     return is_rate_limit(exc)
 
 
+def _transient(exc: BaseException) -> bool:
+    from automated_grounded_theory.async_support import is_transient
+
+    return is_transient(exc)
+
+
+def comparison_order(rows: Sequence[Mapping], *, label: str = "code") -> list:
+    """Sort rows alphabetically by label, then by definition.
+
+    Sweeps and duplicate-theme review use this order so near-duplicate wording
+    lands in the same chunk. The sort does not depend on frequency or on embeddings.
+    """
+    ordered = [row for row in rows]
+    ordered.sort(
+        key=lambda row: (
+            str(row.get(label) or "").casefold(),
+            str(row.get("definition") or "").casefold(),
+        )
+    )
+    return ordered
+
+
 def merge_candidates(
     codebook: Sequence[Mapping],
     *,
     embeddings=None,
-    embedding_threshold: float = 0.82,
+    embedding_threshold: float = 0.65,
     lexical_threshold: float = 0.5,
     limit: int = 30,
 ) -> list[dict]:
-    """Pair codes that are close enough for a sweep model to confirm or reject.
+    """Optional similarity hints. The sweep model may merge pairs that are not here.
 
-    Embeddings are used when ``embeddings`` is provided. Otherwise pairs are
-    token-Jaccard matches. The sweep prompt is only allowed to merge pairs
-    returned here.
+    Token overlap is always considered. Embeddings add pairs when ``embeddings``
+    is provided. They never replace the lexical hints.
     """
     entries = [entry for entry in codebook if entry.get("code")]
-    if len(entries) < 2:
-        return []
     vectors = None
-    if embeddings is not None:
+    if embeddings is not None and entries:
         vectors = embeddings.embed_documents([code_text(entry) for entry in entries])
-    return score_pairs(
+    return hint_pairs(
         entries,
         vectors,
         embedding_threshold=embedding_threshold,
@@ -199,13 +225,54 @@ def merge_candidates(
     )
 
 
+def hint_pairs(
+    entries: Sequence[Mapping],
+    vectors: Sequence[Sequence[float]] | None = None,
+    *,
+    embedding_threshold: float = 0.65,
+    lexical_threshold: float = 0.5,
+    limit: int | None = 30,
+) -> list[dict]:
+    """Union of lexical hints and, when vectors are present, embedding hints.
+
+    An empty list does not mean there is nothing to merge. The model still
+    reads the codebook. ``limit`` caps how many hints are shown, highest score
+    first.
+    """
+    if len(entries) < 2:
+        return []
+    groups = [
+        score_pairs(
+            entries,
+            None,
+            embedding_threshold=embedding_threshold,
+            lexical_threshold=lexical_threshold,
+            limit=None,
+        )
+    ]
+    if vectors is not None:
+        groups.append(
+            score_pairs(
+                entries,
+                vectors,
+                embedding_threshold=embedding_threshold,
+                lexical_threshold=lexical_threshold,
+                limit=None,
+            )
+        )
+    paired = union_candidates(groups)
+    if limit is not None:
+        return paired[: max(0, int(limit))]
+    return paired
+
+
 def score_pairs(
     entries: Sequence[Mapping],
     vectors: Sequence[Sequence[float]] | None,
     *,
-    embedding_threshold: float = 0.82,
+    embedding_threshold: float = 0.65,
     lexical_threshold: float = 0.5,
-    limit: int = 30,
+    limit: int | None = 30,
     chunk_indexes: Sequence[int] | None = None,
 ) -> list[dict]:
     """Pair codes that are close enough for a sweep to confirm.
@@ -252,7 +319,9 @@ def score_pairs(
             }
         )
     pairs.sort(key=lambda item: (-item["score"], item["source"].casefold(), item["target"].casefold()))
-    return pairs[:limit]
+    if limit is None:
+        return pairs
+    return pairs[: max(0, int(limit))]
 
 
 def union_candidates(groups: Sequence[Sequence[Mapping]]) -> list[dict]:

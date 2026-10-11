@@ -17,15 +17,32 @@ def saturation_point(
     new_codes: int,
     cumulative_passages: int,
     cumulative_codes: int,
+    cumulative_codes_pre_merge: int | None = None,
+    new_codes_post_merge: int | None = None,
 ) -> dict:
+    """One window of the saturation curve.
+
+    ``new_codes`` is the count before merges. ``new_codes_post_merge`` is the
+    net change in codebook size after merges, against the previous window.
+    ``cumulative_codes`` is the codebook size after merges.
+    """
     rate = (new_codes / passages_in_batch) if passages_in_batch else 0.0
+    pre_total = cumulative_codes if cumulative_codes_pre_merge is None else cumulative_codes_pre_merge
+    post_new = new_codes if new_codes_post_merge is None else new_codes_post_merge
+    post_rate = (post_new / passages_in_batch) if passages_in_batch else 0.0
     return {
         "batch": batch,
         "passages_in_batch": passages_in_batch,
         "new_codes": new_codes,
         "new_codes_per_passage": rate,
+        "new_codes_pre_merge": new_codes,
+        "new_codes_per_passage_pre_merge": rate,
+        "new_codes_post_merge": post_new,
+        "new_codes_per_passage_post_merge": post_rate,
         "cumulative_passages": cumulative_passages,
         "cumulative_codes": cumulative_codes,
+        "cumulative_codes_pre_merge": pre_total,
+        "cumulative_codes_post_merge": cumulative_codes,
     }
 
 

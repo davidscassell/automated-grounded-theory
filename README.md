@@ -1,6 +1,6 @@
 # automated_grounded_theory
 
-**Open coding**, then **focused coding**, in the grounded theory tradition (Glaser and Strauss 1967; Glaser 1978, 1992; Strauss and Corbin 1990/1998; Charmaz 2006/2014). By default the model reads every document in a seeded order, and every passage of that document in reading order, comparing each incident with the codebook earned so far. It does not decide that the data are saturated. How each step maps onto those sources is in [docs/methodology.md](docs/methodology.md). A short notebook with the same citations and the Taguette import steps is [docs/open_coding.ipynb](docs/open_coding.ipynb). A full walkthrough on a fictional employee survey, including an offline mode that needs no API key, is [examples/demo.ipynb](examples/demo.ipynb).
+**Open coding**, then **focused coding**, in the grounded theory tradition (Glaser and Strauss 1967; Glaser 1978, 1992; Strauss and Corbin 1990/1998; Charmaz 2006/2014). By default the model reads every document in a seeded order, and every passage of that document in reading order, comparing each incident with the codebook earned so far. It does not decide that the data are saturated. How each step maps onto those sources is in [docs/methodology.md](docs/methodology.md). A short notebook with the same citations and the Taguette import steps is [docs/open_coding.ipynb](docs/open_coding.ipynb). A full walkthrough on a fictional employee survey, including an offline mode that needs no API key, is [examples/demo.ipynb](examples/demo.ipynb). The notebook writes its outputs to a temporary directory.
 
 `build_themes` is the next round: it groups those open codes into themes. It does not do axial coding, selective coding, or theoretical sampling.
 
@@ -70,7 +70,9 @@ result = open_code(
 )
 ```
 
-`model` is a `provider:model-name` string, passed to LangChain `init_chat_model`, or a `BaseChatModel` you built yourself. `sweep_model` defaults to the same model. `embeddings` is optional. When it is omitted, merge candidates are lexical and the sweep is still a chat-model call. You only need a chat model to run.
+`model` is a `provider:model-name` string, passed to LangChain `init_chat_model`, or a `BaseChatModel` you built yourself. `sweep_model` defaults to the same model. A blank string is the same as omitting it. `embeddings` is optional. When it is omitted, merge candidates are lexical and the sweep is still a chat-model call. You only need a chat model to run.
+
+Models this package builds from a `provider:model` string get `timeout=120` seconds (`request_timeout`). A `BaseChatModel` you pass in is not modified; the same deadline still wraps each call. `request_timeout=0` waits with no deadline. Timeouts and connection errors are retried with full-jitter backoff, the same as rate limits. Only a rate limit lowers the concurrency ceiling.
 
 ```python
 from langchain.chat_models import init_chat_model
@@ -87,7 +89,7 @@ A corpus item can be a mapping with `text` or `path`, optional `id` / `name`, an
 
 `review_mode` defaults to `document`. Documents are shuffled with the seed. Passages inside a document stay in reading order and are coded with that document's neighbors. The codebook is updated after the document (or after each passage when `batch_size` is 1). `review_mode="wave"` may code passages from several documents in one step against one frozen snapshot. That weakens constant comparison (Glaser and Strauss 1967): a later passage can be coded before an earlier one, and new codes are invisible to the rest of the wave. Use it only when you have accepted that tradeoff. `parallel_documents=True` is a second opt-in that gives each document its own codebook until a sweep. It is off by default.
 
-`batch_size` (default 8, meant to stay in the 5–10 range) is how many passages share one model call. Batches are packed in coding order by an approximate token budget (`token_budget`, characters/4) so the split is a function of the seed, not of which call returns first. `concurrency` (default 2) is the ceiling on in-flight calls. A 429 halves that ceiling and a streak of successes raises it again (AIMD). Retries use full-jitter backoff and honor `Retry-After`. The system prompt and research context stay a stable prefix so a provider can cache them; the codebook snapshot and the passages come after.
+`batch_size` (default 8, meant to stay in the 5–10 range) is how many passages share one model call. Batches are packed in coding order by an approximate token budget (`token_budget`, characters/4) so the split is a function of the seed, not of which call returns first. `concurrency` (default 2) is the ceiling on in-flight calls. A 429 halves that ceiling and a streak of successes raises it again (AIMD). Retries use full-jitter backoff and honor `Retry-After`. A timeout or a dropped connection retries too, and does not halve the ceiling. The system prompt and research context stay a stable prefix so a provider can cache them; the codebook snapshot and the passages come after.
 
 `pipeline=True` (the default) runs synthesis of the passages just coded while the next document or wave is coded against the pre-merge snapshot. The merge map is applied when the sweep returns, in chunk order, and the surviving label is the lexicographically smaller code id. Set `pipeline=False` and `batch_size=1` for a fully sequential reading. Async entry points are `aopen_code`, `abuild_themes`, `aevaluate`, and `amulti_seed_stability`. The sync wrappers work inside a running event loop (a notebook) by using a worker thread.
 
@@ -107,7 +109,7 @@ A later decision model can be passed as `code_retriever` if it implements `rank(
 
 ## What the model is asked to do
 
-For each passage the model says which code each incident indicates, and whether that code is already in the book. One passage can receive several codes, one per distinct incident. Codes should be short gerunds, close to the quote (Charmaz). When a vivid participant phrase does analytic work, the label should be that phrase and `in_vivo` should be true; the phrase has to occur in the passage. Before a new code, the model has to name the nearest existing code and why it does not fit. Definitions stay at the level of the incident: respondent attributes and the question wording do not belong in them. A memo is written only when the passage adds a property, a dimension, a condition, a consequence, or a comparison with a named code (Charmaz; Corbin and Strauss). A restatement is not a memo.
+For each passage the model says which code each incident indicates, and whether that code is already in the book. One passage can receive several codes, one per distinct incident. Codes should be short gerunds, close to the quote (Charmaz), and they have to come from the participant's language. The research context only sensitizes attention. It is not a source of labels. Before settling on a gerund, the model is asked to look for a vivid participant phrase. `in_vivo` is true only when the label is a contiguous copy, the words are a metaphor, a repetition, or a coined phrase, and a gerund would lose that point. The prompt includes "Pay. Pay. Pay." and "feels like a number", and "I like my team" as a gerund with `in_vivo` false. The nearest existing codes, retrieved by embeddings when you pass them and otherwise by label overlap, are listed on the passage. Before a new code the model has to name one of those and why it does not fit. Reuse or refinement is preferred. Definitions stay at the level of the incident: respondent attributes and the question wording do not belong in them. A memo, when written, should be about 50 to 120 words and include a comparison, a property or dimension, and an emerging question. A restatement is not a memo, and a note that only says no property was recorded is dropped. `evaluate_run` reports `code_reuse_pct`, the share of segments that reuse a code already applied earlier.
 
 A plain check then runs, with no model:
 
@@ -117,7 +119,9 @@ A plain check then runs, with no model:
 - a non-gerund label is kept and flagged, unless `require_gerund=True`
 - a new code with no nearest code, or a definition that repeats respondent metadata, is kept and flagged for review
 
-Every `sweep_every` passages (and once at the end) a sweep model may merge codes. The whole codebook is sent, in chunks of 40 when it is larger than that, so later codes are not dropped. Chunks run concurrently and are reconciled by chunk index. When you pass `embeddings`, candidates are cosine similarity of label plus definition (default threshold 0.85) grouped by average-linkage agglomerative clustering. Without embeddings, candidates are label overlap. Those pairs are hints. The sweep model may also propose a duplicate pair itself. It can sharpen definitions. It can flag an overloaded code. It does not split one, because that would reassign old segments without rereading them. Accepted merges become a union-find map whose root is the lexicographically smaller code id, then that map relabels segments. A response cache replays an identical prompt on a rerun. After each document the run also stores a document memo (the incident memos from that reading) and a reflexivity note that the document was read in seeded order.
+Code-management calls send Pydantic JSON (stable ids for passages, codes, hints, and themes) and return Pydantic decisions. Every decision carries `confidence` from 0 to 1 and a `rationale` of one to three sentences. A coding action, in-vivo flag, definition rewrite, theme assignment, or tension below `review_below` (default 0.5) is written to `review.json` and is not applied. A merge below `min_merge_confidence` (default 0.5) is not applied either. One sweep call proposes the merge, checks the rubric (same action, same object, same stance), and rewrites the survivor label and definition from the member quotes. A quote that does not fit is split back out. Near-duplicate labels with the same stance merge without a model call. A positive code is never merged with a negative code (`valence` on the code), and both valences are stored on the merge. Each pair is decided once per run, keyed by the sorted code ids. A later sweep revisits it only when a definition changes in substance (token overlap below 0.5). At most `max_merges_per_sweep` merges (default 12) are applied in one sweep; the rest wait on the review list. After the last document, a consolidation sweep reads the codebook again in sorted chunks. The saturation curve reports new codes before merges and the net change after merges. A new label whose content words mostly restate the research context is flagged for review. Pass `check_model` when you want a cheaper model to double-check quote fit and context leakage. `evaluate_run` reports the confidence distribution. `run_metadata.json` records seconds spent coding, sweeping, rewriting, and, from the later stages, building themes and evaluating. Taguette CSVs stay on Taguette's columns. Embeddings are still optional.
+
+Every `sweep_every` passages (and once at the end) a sweep model compares codes with codes. The codebook is sorted alphabetically by label, then by definition, and sent in chunks of `sweep_chunk` (default 20) so later codes are not dropped and near-duplicate wording sits together. Chunks run concurrently and are reconciled by chunk index. The model reads every code in the chunk and proposes duplicate merges itself. Each merge needs a rationale. Token overlap is an optional hint. Embeddings, when you pass them, add further hints (cosine of label plus definition, default threshold 0.65) and never replace the lexical hints. If that embedding call fails, the hints are token overlap only. Merging works with no embeddings model. Each hint has a `pair_id`. The decision log has one row per hint: accepted, `model_rejected`, `model_omitted` when the model skipped it, or `chunk_skipped` when that chunk timed out. A merge the model proposes that was not a hint is logged as `model_proposed`. Rejections of pairs that were not hinted are ignored and counted in a warning. A sweep with no hints still asks the model to review the codebook, and says so in a warning. A chunk that times out or loses its connection is skipped with a warning. The rest of the run continues. The sweep model can sharpen definitions. It can flag an overloaded code. It does not split one, because that would reassign old segments without rereading them. Accepted merges become a union-find map whose root is the lexicographically smaller code id, then that map relabels segments. A response cache replays an identical prompt on a rerun. After each document the run stores a reflexivity note that the document was read in seeded order. A document memo is written only when that reading produced a substantive passage memo. The placeholder sentence about no property or dimension is not stored.
 
 `result.saturation` is new codes per batch. `result.saturation_report["judgment"]` is always `None`.
 
@@ -157,9 +161,13 @@ themes = build_themes(
 )
 ```
 
-`model` is the same kind of argument as in `open_code`: a `provider:model-name` string or a `BaseChatModel`. `n_themes=None` lets the model choose how many themes the codes support. Set it to ask for a specific number. `seed` only shuffles the order of codes in the prompt. Representative quotes do not use it.
+`model` is the same kind of argument as in `open_code`: a `provider:model-name` string or a `BaseChatModel`. `n_themes=None` asks for about 6 to `max_themes` themes (default 12) when the codebook is large enough, and fewer when it is small. One theme per code is not the goal. Set `n_themes` to ask for that exact number; it is not silently capped at 12. `seed` only shuffles the order of codes in the prompt. Representative quotes do not use it.
 
-A small LangGraph calls the model, then checks the assignment. Every open code must be assigned, and every name must be a code from the codebook. Unknown names are dropped. A code named twice keeps the first theme. If anything is missing, the model is shown that list and called again (`validation_retries`, default 1). `ThemeError` is raised when codes are still missing after those retries.
+`build_themes` also accepts the `output_dir` from `open_code`. `load_run(directory)` (and `OpenCodeResult.load`) reads `run.json` when it is there, otherwise the split JSON files.
+
+A small LangGraph calls the model, then checks the assignment. Every open code must be assigned, and every name must be a code from the codebook. Unknown names are dropped. A code named twice keeps the first theme. If anything is missing, the model is shown that list and called again (`validation_retries`, default 1). Codes still missing get one targeted reassignment call. Whatever that call does not place goes into `Ungrouped incidents`. A few leftovers do not raise `ThemeError`.
+
+After that assignment the model reviews the themes in alphabetical order and proposes duplicate groups, with a reason on each fold. Token overlap is an optional hint. Embeddings, when you pass them, are an extra hint and are not required. A fold that would put more than `max_theme_share` of the codes (default 0.30) in one theme is split. The list is not forced down to `max_themes`. If the review times out, hinted near-duplicates keep the wording grouping. Every hinted pair and every model-proposed pair is logged on `metadata["duplicate_decisions"]`. If one theme still holds more than the share limit, the result warns.
 
 Counts are computed from the coded segments, not by the model:
 
@@ -220,11 +228,23 @@ The checks and the sweep exist because that JMIR tutorial found LLM coding weak 
 
 | Mode | What it does | Seconds | Calls | Passages/s | Codes | Merges | Near-duplicate pairs left |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| sequential | `review_mode="document"`, `pipeline=False`, `batch_size=1`, `concurrency=1` | 1.455 | 27 | 16.50 | 3 | 3 | 0 |
-| document | `review_mode="document"`, background synthesis, `batch_size=4`, `concurrency=4` | 0.389 | 9 | 61.64 | 3 | 3 | 0 |
-| wave | `review_mode="wave"`, background synthesis, `batch_size=4`, `concurrency=4` | 0.177 | 8 | 135.34 | 3 | 1 | 0 |
+| sequential | `review_mode="document"`, `pipeline=False`, `batch_size=1`, `concurrency=1` | 1.588 | 28 | 15.11 | 3 | 3 | 0 |
+| document | `review_mode="document"`, background synthesis, `batch_size=4`, `concurrency=4` | 0.525 | 10 | 45.73 | 3 | 3 | 0 |
+| wave | `review_mode="wave"`, background synthesis, `batch_size=4`, `concurrency=4` | 0.315 | 9 | 76.19 | 3 | 1 | 0 |
 
 On this fake coder, exact repeated labels collapse when they are committed, so none of the three left a near-duplicate pair behind. Document mode kept the same final code count as the sequential reading and still ran a merge on each synthesis. Wave mode was the fastest and needed only one merge pass, because passages from different documents shared a snapshot. That speed is the constant-comparison tradeoff described above: later incidents in a document can be coded before earlier ones. Re-run the script after you change the delay or the corpus; do not treat these times as a provider benchmark.
+
+## Benchmark
+
+`benchmarks/run_benchmark.py` downloads the RAND Muse eval files and the BC Stats 2018 WES sample, runs `open_code` and `build_themes`, and asks the model to map each LLM code onto a human code. The report has per-code precision, recall, and F1, Cohen's kappa where the units line up, coverage of the human codes, novel LLM codes, and theme agreement for the BC Stats sample. Mapping rows carry a confidence and a rationale. Downloaded files go to `benchmarks/data/`, which is gitignored.
+
+```bash
+python benchmarks/run_benchmark.py --download
+python benchmarks/run_benchmark.py --dataset muse-e10 --model xai:grok-4
+python benchmarks/run_benchmark.py --dataset bcstats --model xai:grok-4
+```
+
+`--fixture` scores a tiny local directory and does not download anything.
 
 ## Tests
 

@@ -10,8 +10,15 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableLambda
 from pydantic import Field
 
-from automated_grounded_theory.prompts import message_text
-from automated_grounded_theory.schemas import ThemeCoding, ThemeNegative, ThemeProposal, ThemeTension
+from automated_grounded_theory.prompts import extract_payload, message_text
+from automated_grounded_theory.schemas import (
+    ThemeCoding,
+    ThemeGroup,
+    ThemeMergePlan,
+    ThemeNegative,
+    ThemeProposal,
+    ThemeTension,
+)
 
 _DEFS = {
     "Packing to leave": "Getting possessions together in order to go.",
@@ -60,7 +67,37 @@ class FakeThemer(BaseChatModel):
         def _call(messages):
             self.call_count += 1
             text = "\n".join(message_text(message) for message in messages)
-            labels = re.findall(r"^CODE_LABEL: (.+)$", text, re.M)
+            payload = extract_payload(text)
+            if getattr(schema, "__name__", "") == "ThemeMergePlan":
+                names: list[str] = []
+                seen: set[str] = set()
+                for theme in payload.get("themes") or []:
+                    found = str(theme.get("name") or "")
+                    if found and found not in seen:
+                        seen.add(found)
+                        names.append(found)
+                if not names:
+                    for found in re.findall(r"^THEME_NAME: (.+)$", text, re.M):
+                        if found not in seen:
+                            seen.add(found)
+                            names.append(found)
+                plan = ThemeMergePlan(
+                    themes=[ThemeGroup(name=name, members=[name]) for name in names]
+                )
+                if not include_raw:
+                    return plan
+                raw = AIMessage(
+                    content="{}",
+                    usage_metadata={"input_tokens": 20, "output_tokens": 10, "total_tokens": 30},
+                )
+                return {"raw": raw, "parsed": plan, "parsing_error": None}
+            labels = [
+                str(item.get("label") or item.get("code") or "")
+                for item in (payload.get("codes") or [])
+                if item.get("label") or item.get("code")
+            ]
+            if not labels:
+                labels = re.findall(r"^CODE_LABEL: (.+)$", text, re.M)
             if self.drop_last == "always" or (self.drop_last == "until_feedback" and "VALIDATION FAILED" not in text):
                 labels = labels[:-1]
             self.seen_labels.append(list(labels))
@@ -80,9 +117,18 @@ class FakeThemer(BaseChatModel):
                 if codes
             ]
             example = ""
-            match = re.search(r"^EXAMPLE: (.+)$", text, re.M)
-            if match:
-                example = match.group(1).strip()
+            for item in payload.get("codes") or []:
+                for sample in item.get("examples") or []:
+                    quote = str(sample.get("quote") or "").strip()
+                    if quote:
+                        example = quote
+                        break
+                if example:
+                    break
+            if not example:
+                match = re.search(r"^EXAMPLE: (.+)$", text, re.M)
+                if match:
+                    example = match.group(1).strip()
             names = [theme.name for theme in themes]
             tensions = []
             if len(names) >= 2:

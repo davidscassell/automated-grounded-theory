@@ -16,16 +16,22 @@ from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableLambda
 
-from automated_grounded_theory.prompts import message_text
+from automated_grounded_theory.prompts import extract_payload, message_text
 from automated_grounded_theory.retrieval import jaccard
 from automated_grounded_theory.schemas import (
     BatchCoding,
     CodeProposal,
+    DefinitionRewrite,
+    DefinitionRewriteBatch,
     DefinitionUpdate,
+    MergeCheck,
+    MergeCheckBatch,
     MergeDecision,
     PassageCoding,
     SweepCoding,
     ThemeCoding,
+    ThemeGroup,
+    ThemeMergePlan,
     ThemeNegative,
     ThemeProposal,
     ThemeTension,
@@ -160,6 +166,10 @@ _THEME_COPY = {
 
 
 def _passage_blocks(text: str) -> list[tuple[str, str]]:
+    payload = extract_payload(text)
+    rows = payload.get("passages") or []
+    if rows:
+        return [(str(row.get("passage_id") or ""), str(row.get("text") or "")) for row in rows]
     ids = re.findall(r"^passage_id: (.+)$", text, re.M)
     blocks = re.findall(r"<<<PASSAGE\n(.*?)\nPASSAGE>>>", text, re.S)
     pairs = []
@@ -214,6 +224,14 @@ def _matches(passage: str) -> list[tuple[str, str]]:
 
 
 def _labels(text: str) -> list[str]:
+    payload = extract_payload(text)
+    labels = [
+        str(item.get("label") or item.get("code") or "")
+        for item in list(payload.get("codebook") or []) + list(payload.get("codes") or [])
+        if item.get("label") or item.get("code")
+    ]
+    if labels:
+        return labels
     return re.findall(r"^CODE_LABEL: (.+)$", text, re.M)
 
 
@@ -246,6 +264,10 @@ class SurveyCoder(BaseChatModel):
             name = getattr(schema, "__name__", "")
             if name == "SweepCoding":
                 parsed = self.sweep(text)
+            elif name == "MergeCheckBatch":
+                parsed = self.verify(text)
+            elif name == "DefinitionRewriteBatch":
+                parsed = self.rewrite(text)
             elif name == "BatchCoding":
                 parsed = self.batch(text)
             else:
@@ -261,21 +283,19 @@ class SurveyCoder(BaseChatModel):
         return RunnableLambda(_call)
 
     def batch(self, text: str) -> BatchCoding:
-        header = text.split("PASSAGE TO CODE", 1)[0]
-        feedback = ""
-        if "VALIDATION FEEDBACK" in text:
+        payload = extract_payload(text)
+        feedback = "\n".join(str(item) for item in (payload.get("feedback") or []))
+        if "VALIDATION FEEDBACK" in text and not feedback:
             feedback = text[text.index("VALIDATION FEEDBACK") :]
         items = []
         for passage_id, block in _passage_blocks(text):
-            one = (
-                header
-                + "\nPASSAGE TO CODE\n"
-                + f"passage_id: {passage_id}\n"
-                + "<<<PASSAGE\n"
-                + block
-                + "\nPASSAGE>>>\n"
-                + feedback
-            )
+            one = json.dumps(
+                {
+                    "codebook": payload.get("codebook") or [],
+                    "passages": [{"passage_id": passage_id, "text": block}],
+                    "feedback": payload.get("feedback") or [],
+                }
+            ) + "\n" + feedback
             coded = self.code(one)
             coded.passage_id = passage_id
             items.append(coded)
@@ -317,9 +337,44 @@ class SurveyCoder(BaseChatModel):
             memo="Compared with the codebook: this passage adds a condition the nearest code does not cover.",
         )
 
+    def verify(self, text: str) -> MergeCheckBatch:
+        checks = []
+        for pair in extract_payload(text).get("pairs") or []:
+            checks.append(
+                MergeCheck(
+                    pair_id=str(pair.get("pair_id") or ""),
+                    source_id=str(pair.get("source_id") or ""),
+                    target_id=str(pair.get("target_id") or ""),
+                    source=str(pair.get("source") or ""),
+                    target=str(pair.get("target") or ""),
+                    action="accept",
+                    rationale="These labels name the same incident.",
+                    confidence=0.9,
+                )
+            )
+        return MergeCheckBatch(checks=checks)
+
+    def rewrite(self, text: str) -> DefinitionRewriteBatch:
+        rewrites = []
+        for code in extract_payload(text).get("codes") or []:
+            label = str(code.get("label") or "")
+            definition = str(code.get("definition") or "").strip() or f"Incidents of {label}."
+            rewrites.append(
+                DefinitionRewrite(
+                    code_id=str(code.get("code_id") or ""),
+                    code=label,
+                    definition=definition,
+                    confidence=0.9,
+                )
+            )
+        return DefinitionRewriteBatch(rewrites=rewrites)
+
     def sweep(self, text: str) -> SweepCoding:
-        match = re.search(r"<<<CANDIDATES\n(.*)\nCANDIDATES>>>", text, re.S)
-        pairs = json.loads(match.group(1)) if match else []
+        payload = extract_payload(text)
+        pairs = payload.get("hints") or []
+        if not pairs:
+            match = re.search(r"<<<CANDIDATES\n(.*)\nCANDIDATES>>>", text, re.S)
+            pairs = json.loads(match.group(1)) if match else []
         merges = []
         for pair in pairs:
             source, target = pair["source"], pair["target"]
@@ -366,7 +421,18 @@ class SurveyThemer(BaseChatModel):
         def _call(messages):
             self.call_count += 1
             text = "\n".join(message_text(message) for message in messages)
-            parsed = self.themes(text)
+            if getattr(schema, "__name__", "") == "ThemeMergePlan":
+                payload = extract_payload(text)
+                names = []
+                seen = set()
+                for theme in payload.get("themes") or []:
+                    found = str(theme.get("name") or "")
+                    if found and found not in seen:
+                        seen.add(found)
+                        names.append(found)
+                parsed = ThemeMergePlan(themes=[ThemeGroup(name=name, members=[name]) for name in names])
+            else:
+                parsed = self.themes(text)
             if not include_raw:
                 return parsed
             raw = AIMessage(
@@ -378,7 +444,14 @@ class SurveyThemer(BaseChatModel):
         return RunnableLambda(_call)
 
     def themes(self, text: str) -> ThemeCoding:
-        labels = re.findall(r"^CODE_LABEL: (.+)$", text, re.M)
+        payload = extract_payload(text)
+        labels = [
+            str(item.get("label") or item.get("code") or "")
+            for item in (payload.get("codes") or [])
+            if item.get("label") or item.get("code")
+        ]
+        if not labels:
+            labels = re.findall(r"^CODE_LABEL: (.+)$", text, re.M)
         groups: dict[str, list[str]] = {}
         for label in labels:
             groups.setdefault(_theme_name(label), []).append(label)
@@ -394,13 +467,20 @@ class SurveyThemer(BaseChatModel):
                 )
             )
         example = ""
-        match = re.search(r"^EXAMPLE: (.+)$", text, re.M)
-        if match and "…" not in match.group(1):
-            example = match.group(1).strip()
         passage_id = ""
-        id_match = re.search(r"^PASSAGE_ID: (.+)$", text, re.M)
-        if id_match:
-            passage_id = id_match.group(1).strip()
+        for item in payload.get("codes") or []:
+            for sample in item.get("examples") or []:
+                quote = str(sample.get("quote") or "").strip()
+                if quote and "…" not in quote and not example:
+                    example = quote
+                    passage_id = str(sample.get("passage_id") or "")
+        if not example:
+            match = re.search(r"^EXAMPLE: (.+)$", text, re.M)
+            if match and "…" not in match.group(1):
+                example = match.group(1).strip()
+            id_match = re.search(r"^PASSAGE_ID: (.+)$", text, re.M)
+            if id_match:
+                passage_id = id_match.group(1).strip()
         names = [theme.name for theme in themes]
         tensions = []
         if len(names) >= 2:

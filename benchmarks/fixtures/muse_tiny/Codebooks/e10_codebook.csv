@@ -1,0 +1,5 @@
+id,parent_id,label,definition,dataset
+1,,Pay,Pay and benefits,Eval10
+2,1,wanting better pay,Pay is below what the work is worth,Eval10
+3,,Leadership,How managers show up,Eval10
+4,3,having a manager who listens,A manager who hears the person out,Eval10

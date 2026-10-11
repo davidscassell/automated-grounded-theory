@@ -7,14 +7,18 @@ double-count applications.
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
+from automated_grounded_theory.retrieval import jaccard
 from automated_grounded_theory.validation import (
     assess_label,
     attribute_leak,
+    bounded_unit,
     code_key,
+    label_restates_context,
     locate_quote,
     review_passage_flags,
+    substantive_memo,
 )
 
 _ACTION_ALIASES = {
@@ -43,6 +47,282 @@ def _next(counters: dict[str, int], name: str, prefix: str) -> str:
     return f"{prefix}{counters[name]:05d}"
 
 
+def _fallback_rationale(op: str, reason: str) -> str:
+    """A one-sentence decision text when the model did not supply one."""
+    text = {
+        "context_restatement": (
+            "The label mostly restates the research context, so it needs wording grounded in the participant's passage."
+        ),
+        "already_decided": (
+            "This pair was already decided in this run, and neither definition has changed in substance."
+        ),
+        "opposite_valence": "These codes take opposite stances, so they stay separate.",
+        "below_merge_confidence": "The agreement confidence is below the merge threshold, so the merge waits for review.",
+        "below_review_threshold": "The confidence is below the review threshold, so this decision waits for a person.",
+        "in_vivo_below_review_threshold": "The in-vivo flag is not confident enough to apply, so the code stays a composed label.",
+        "merge_cap": "This merge was past the cap for this sweep, so it was not applied.",
+        "quote_split": "This quote does not fit the rewritten code, so it was split back out.",
+        "definition_not_survivor": "A definition for a retired code was ignored so it would not replace the survivor.",
+    }.get(reason)
+    if text:
+        return text
+    if op == "merge_accept":
+        return "These codes name the same incident, so they were merged."
+    if op == "merge_reject":
+        return "These codes do not name the same incident, so they stay separate."
+    if op == "memo":
+        return "The memo records a comparison, a property, and a question."
+    return f"This {op or 'decision'} was recorded."
+
+
+def _op(
+    *,
+    op: str,
+    status: str,
+    confidence: float,
+    ids: Mapping[str, Any] | None = None,
+    reason: str = "",
+    rationale: str = "",
+) -> dict[str, Any]:
+    text = str(rationale or "").strip() or _fallback_rationale(op, reason)
+    return {
+        "op_id": "",
+        "op": op,
+        "decision": op,
+        "status": status,
+        "confidence": confidence,
+        "ids": dict(ids or {}),
+        "reason": reason,
+        "rationale": text,
+    }
+
+
+def _index_ids(codebook: Mapping[str, Mapping[str, Any]]) -> dict[str, str]:
+    index: dict[str, str] = {}
+    for key, entry in codebook.items():
+        index[str(entry.get("code_id") or _code_id(key))] = key
+    return index
+
+
+def opposite_valence(left: Any, right: Any) -> bool:
+    """True when one code is positive and the other is negative."""
+    pair = {str(left or "").strip().casefold(), str(right or "").strip().casefold()}
+    return pair == {"positive", "negative"}
+
+
+def definitions_changed_materially(previous: str, current: str) -> bool:
+    """True when a definition change is large enough to reopen a pair decision.
+
+    Wording tweaks stay frozen. A change is material when the token overlap
+    of the two definitions falls below 0.5.
+    """
+    old = str(previous or "").strip()
+    new = str(current or "").strip()
+    if old == new:
+        return False
+    return jaccard(old, new) < 0.5
+
+
+def agreement_confidence(merge: Mapping[str, Any]) -> float | None:
+    """Rubric agreement as a second confidence, using the 0.2 / 0.5 / 0.95 anchors.
+
+    ``None`` means the model did not set the rubric, so the caller's own
+    confidence stands. An accept needs the same action, the same object, and
+    the same stance. A reject is confident when that rubric fails.
+    """
+    flags = [merge.get("same_action"), merge.get("same_object"), merge.get("same_stance")]
+    if all(flag is None for flag in flags):
+        return None
+    hits = sum(bool(flag) for flag in flags)
+    action = str(merge.get("action") or "accept")
+    if action == "reject":
+        if hits == 0:
+            return 0.95
+        if hits == 1:
+            return 0.5
+        return 0.2
+    if hits == 3:
+        return 0.95
+    if hits == 2:
+        return 0.5
+    return 0.2
+
+
+def decision_confidence(merge: Mapping[str, Any]) -> float:
+    """Confidence that drives the review gate. Prefer the rubric agreement."""
+    agreed = merge.get("agreement_confidence")
+    if agreed is None:
+        agreed = agreement_confidence(merge)
+    if agreed is not None:
+        return min(bounded_unit(merge.get("confidence"), 1.0), bounded_unit(agreed, 1.0))
+    return bounded_unit(merge.get("confidence"), 1.0)
+
+
+TRIVIAL_LABEL_JACCARD = 0.8
+
+
+def trivial_pair(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    """Near-identical labels with the same stance can merge without a model call."""
+    if opposite_valence(left.get("valence"), right.get("valence")):
+        return False
+    left_stance = str(left.get("valence") or "neutral").strip().casefold() or "neutral"
+    right_stance = str(right.get("valence") or "neutral").strip().casefold() or "neutral"
+    if left_stance != right_stance:
+        return False
+    return jaccard(str(left.get("code") or ""), str(right.get("code") or "")) >= TRIVIAL_LABEL_JACCARD
+
+
+def trivial_merges(codes: Sequence[Mapping[str, Any]], frozen: set[frozenset[str]] | None = None) -> list[dict]:
+    """Deterministic merges for near-duplicate labels. These skip the sweep model."""
+    blocked = frozen or set()
+    ordered = sorted(codes, key=lambda entry: code_key(str(entry.get("code") or "")))
+    merges: list[dict] = []
+    for index, left in enumerate(ordered):
+        left_key = code_key(str(left.get("code") or ""))
+        if not left_key:
+            continue
+        for right in ordered[index + 1 :]:
+            right_key = code_key(str(right.get("code") or ""))
+            if not right_key or frozenset((left_key, right_key)) in blocked:
+                continue
+            if not trivial_pair(left, right):
+                continue
+            merges.append(
+                {
+                    "source": left.get("code"),
+                    "target": right.get("code"),
+                    "source_valence": str(left.get("valence") or ""),
+                    "target_valence": str(right.get("valence") or ""),
+                    "rationale": (
+                        "These labels are near-duplicates and share the same stance, "
+                        "so the merge did not need a model call."
+                    ),
+                    "confidence": 0.95,
+                    "agreement_confidence": 0.95,
+                    "same_action": True,
+                    "same_object": True,
+                    "same_stance": True,
+                    "trivial": True,
+                    "action": "accept",
+                }
+            )
+    return merges
+
+
+def _pair_still_current(
+    row: Mapping[str, Any],
+    codebook: Mapping[str, Mapping[str, Any]],
+    by_id: Mapping[str, str],
+) -> tuple[str, str] | None:
+    """Code keys for a cached pair that still exists with the same definitions."""
+    ids = [str(item) for item in (row.get("ids") or []) if str(item)]
+    if len(ids) != 2:
+        return None
+    keys = [by_id.get(item) for item in ids]
+    if any(key is None for key in keys) or keys[0] == keys[1]:
+        return None
+    stored = {str(key): str(value or "") for key, value in (row.get("definitions") or {}).items()}
+    current = {item: str(codebook[by_id[item]].get("definition") or "") for item in ids}
+    if any(definitions_changed_materially(stored.get(item, ""), current[item]) for item in ids):
+        return None
+    return str(keys[0]), str(keys[1])
+
+
+def frozen_pair_keys(cache: Sequence[Mapping[str, Any]], codebook: Mapping[str, Mapping[str, Any]]) -> set[frozenset[str]]:
+    """Pairs already decided this run whose definitions have not changed.
+
+    The key is the two code keys. A later sweep skips asking the model again
+    until one definition is different from the definition stored with the decision.
+    """
+    by_id = _index_ids(codebook)
+    frozen: set[frozenset[str]] = set()
+    for row in cache:
+        keys = _pair_still_current(row, codebook, by_id)
+        if keys is not None:
+            frozen.add(frozenset(keys))
+    return frozen
+
+
+def replay_accepted_pairs(
+    cache: Sequence[Mapping[str, Any]],
+    codebook: Mapping[str, Mapping[str, Any]],
+) -> list[dict]:
+    """Merges to apply again when an accepted pair's codes both exist.
+
+    A later passage can recreate a code an earlier sweep retired. The accept
+    stands, so the merge is applied again without another model call while
+    both definitions are unchanged. A rejection is not replayed.
+    """
+    by_id = _index_ids(codebook)
+    merges: list[dict] = []
+    seen: set[frozenset[str]] = set()
+    for row in cache:
+        if str(row.get("decision") or "") != "accept":
+            continue
+        keys = _pair_still_current(row, codebook, by_id)
+        if keys is None:
+            continue
+        left, right = keys
+        pair = frozenset((left, right))
+        if pair in seen:
+            continue
+        seen.add(pair)
+        merges.append(
+            {
+                "source": codebook[left].get("code") or left,
+                "target": codebook[right].get("code") or right,
+                "source_id": str(codebook[left].get("code_id") or ""),
+                "target_id": str(codebook[right].get("code_id") or ""),
+                "rationale": str(row.get("reason") or ""),
+                "confidence": bounded_unit(row.get("confidence"), 1.0),
+                "pair_id": "",
+            }
+        )
+    return merges
+
+
+def remember_pair_decisions(
+    cache: Sequence[Mapping[str, Any]],
+    codebook: Mapping[str, Mapping[str, Any]],
+    rows: Sequence[Mapping[str, Any]],
+) -> list[dict]:
+    """Record one decision per pair, keyed by the sorted code ids."""
+    by_key = _index_ids(codebook)
+    id_by_key = {key: code_id for code_id, key in by_key.items()}
+    stored = {tuple(sorted(str(item) for item in (row.get("ids") or []))): dict(row) for row in cache}
+    for row in rows:
+        source = code_key(str(row.get("source") or ""))
+        target = code_key(str(row.get("target") or ""))
+        if not source or not target or source == target:
+            continue
+        if source not in id_by_key or target not in id_by_key:
+            continue
+        ids = tuple(sorted((id_by_key[source], id_by_key[target])))
+        decision = row.get("decision") or "reject"
+        previous = stored.get(ids)
+        current_defs = {
+            ids[0]: str(codebook[by_key[ids[0]]].get("definition") or ""),
+            ids[1]: str(codebook[by_key[ids[1]]].get("definition") or ""),
+        }
+        if previous and str(previous.get("decision")) == "reject" and str(decision) == "accept":
+            stored_defs = previous.get("definitions") or {}
+            if not any(
+                definitions_changed_materially(str(stored_defs.get(item) or ""), current_defs[item]) for item in ids
+            ):
+                continue
+        stored[ids] = {
+            "ids": list(ids),
+            "decision": decision,
+            "confidence": bounded_unit(row.get("confidence"), 1.0),
+            "reason": str(row.get("reason") or ""),
+            "rationale": str(row.get("rationale") or ""),
+            "source_valence": str(row.get("source_valence") or codebook[source].get("valence") or ""),
+            "target_valence": str(row.get("target_valence") or codebook[target].get("valence") or ""),
+            "definitions": current_defs,
+        }
+    return [stored[key] for key in sorted(stored)]
+
+
 def interpret_coding(
     coding: Mapping[str, Any] | Any,
     passage: Mapping[str, Any],
@@ -51,15 +331,36 @@ def interpret_coding(
     max_codes: int,
     require_gerund: bool,
     long_passage_chars: int,
+    review_below: float = 0.5,
+    context_terms: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Validate one model response. Does not mutate the codebook."""
+    """Validate one model response. Does not mutate the codebook.
+
+    A decision whose confidence is below ``review_below`` is not applied.
+    It is returned on ``review``. Unknown code ids are rejected.
+    """
     payload = coding.model_dump() if hasattr(coding, "model_dump") else dict(coding)
     proposals = list(payload.get("codes") or [])
     rejections: list[dict] = []
     accepted: list[dict] = []
+    ops: list[dict] = []
+    review: list[dict] = []
     seen_keys: set[str] = set()
     low_confidence = bool(payload.get("low_confidence"))
     passage_text = str(passage.get("text") or "")
+    passage_id = str(passage.get("passage_id") or "")
+    id_to_key = _index_ids(codebook)
+    model_passage = str(payload.get("passage_id") or "")
+    if model_passage and passage_id and model_passage != passage_id:
+        review.append(
+            _op(
+                op="assign_quote",
+                status="review",
+                confidence=1.0,
+                ids={"passage_id": passage_id, "model_passage_id": model_passage},
+                reason="passage_id_mismatch",
+            )
+        )
 
     if len(proposals) > max_codes:
         for extra in proposals[max_codes:]:
@@ -94,7 +395,27 @@ def interpret_coding(
         if action in {"reuse", "refine"} and not exists:
             action = "new"
 
+        sent_id = str(proposal.get("code_id") or "").strip()
+        if action in {"reuse", "refine"} and sent_id:
+            if sent_id not in id_to_key:
+                rejections.append({"code": label, "reason": "unknown_code_id", "quote": verbatim})
+                ops.append(
+                    _op(
+                        op=action,
+                        status="rejected",
+                        confidence=bounded_unit(proposal.get("confidence"), 1.0),
+                        ids={"code_id": sent_id, "passage_id": passage_id},
+                        reason="unknown_code_id",
+                    )
+                )
+                continue
+            id_key = id_to_key[sent_id]
+            if provisional_key and provisional_key != id_key:
+                label = str(codebook[id_key].get("code") or label)
+                provisional_key = id_key
+
         in_vivo = bool(proposal.get("in_vivo"))
+        in_vivo_confidence = bounded_unit(proposal.get("in_vivo_confidence"), 1.0)
         ok, reasons, fields = assess_label(
             label,
             in_vivo=in_vivo,
@@ -104,6 +425,10 @@ def interpret_coding(
         if not ok:
             rejections.append({"code": label, "reason": reasons[0] if reasons else "rejected", "quote": verbatim})
             continue
+        if in_vivo and in_vivo_confidence < review_below:
+            fields = dict(fields)
+            fields["in_vivo"] = False
+            reasons.append("in_vivo_below_review_threshold")
 
         refined = proposal.get("refined_label")
         refined_label = str(refined).strip() if refined else ""
@@ -126,28 +451,63 @@ def interpret_coding(
             fields = refined_fields
             reasons = list(reasons) + [reason for reason in refined_reasons if reason not in reasons]
 
-        try:
-            confidence = float(proposal.get("confidence", 1.0))
-        except (TypeError, ValueError):
-            confidence = 1.0
-            reasons.append("confidence_unparsed")
-        confidence = min(1.0, max(0.0, confidence))
-        review = review_passage_flags(
+        confidence = bounded_unit(proposal.get("confidence"), 1.0)
+        if proposal.get("confidence") is not None:
+            try:
+                float(proposal.get("confidence"))
+            except (TypeError, ValueError):
+                reasons.append("confidence_unparsed")
+        flags = review_passage_flags(
             passage_text,
             quote=verbatim,
             long_passage_chars=long_passage_chars,
             low_confidence=low_confidence,
             confidence=confidence,
         )
-        review.extend(reasons)
+        flags.extend(reasons)
+        review_flags = flags
         definition = str(proposal.get("definition") or "").strip()
         if action == "new" and not definition:
             definition = str(proposal.get("rationale") or "").strip() or "Definition not yet specified."
-            review.append("missing_definition")
+            review_flags.append("missing_definition")
         if action == "new" and known and not str(proposal.get("nearest_code") or "").strip():
-            review.append("missing_nearest_code")
+            review_flags.append("missing_nearest_code")
         if attribute_leak(definition, passage.get("metadata") or {}):
-            review.append("definition_contains_respondent_attribute")
+            review_flags.append("definition_contains_respondent_attribute")
+        nearest_ids = [str(item).strip() for item in (proposal.get("nearest_code_ids") or []) if str(item).strip()]
+        known_nearest = [item for item in nearest_ids if item in id_to_key]
+        if len(known_nearest) != len(nearest_ids):
+            review_flags.append("unknown_nearest_code_id")
+        if action == "new" and sent_id and sent_id != _code_id(code_key(str(fields.get("code") or label))):
+            review_flags.append("code_id_ignored")
+        if (
+            action == "new"
+            and context_terms
+            and not proposal.get("context_leak_cleared")
+            and label_restates_context(str(fields.get("code") or label), context_terms)
+        ):
+            review_flags.append("context_restatement")
+        op_name = {"new": "create", "reuse": "reuse", "refine": "refine"}[action]
+        if confidence < review_below:
+            rejections.append(
+                {
+                    "code": fields.get("code") or label,
+                    "reason": "below_review_threshold",
+                    "quote": verbatim,
+                    "confidence": confidence,
+                }
+            )
+            held = _op(
+                op=op_name,
+                status="review",
+                confidence=confidence,
+                ids={"passage_id": passage_id, "code_id": sent_id},
+                reason="below_review_threshold",
+                rationale=str(proposal.get("rationale") or ""),
+            )
+            ops.append(held)
+            review.append(held)
+            continue
 
         key = fields["key"]
         if key in seen_keys and action == "new":
@@ -170,10 +530,82 @@ def interpret_coding(
                 "rationale": str(proposal.get("rationale") or ""),
                 "nearest_code": str(proposal.get("nearest_code") or "").strip(),
                 "why_not_nearest": str(proposal.get("why_not_nearest") or "").strip(),
+                "nearest_code_ids": known_nearest,
                 "confidence": confidence,
-                "needs_review": bool(review),
-                "review_reasons": review,
+                "in_vivo_confidence": in_vivo_confidence,
+                "valence": str(proposal.get("valence") or "neutral"),
+                "in_vivo_rationale": str(proposal.get("in_vivo_rationale") or proposal.get("rationale") or ""),
+                "code_id": _code_id(key),
+                "needs_review": bool(review_flags),
+                "review_reasons": review_flags,
             }
+        )
+        applied = _op(
+            op=op_name if action != "reuse" else "reuse",
+            status="applied",
+            confidence=confidence,
+            ids={"passage_id": passage_id, "code_id": _code_id(key)},
+            reason="",
+            rationale=str(proposal.get("rationale") or ""),
+        )
+        ops.append(applied)
+        if "context_restatement" in review_flags:
+            held_context = _op(
+                op="create",
+                status="review",
+                confidence=confidence,
+                ids={"passage_id": passage_id, "code_id": _code_id(key)},
+                reason="context_restatement",
+                rationale=str(proposal.get("context_leak_rationale") or proposal.get("rationale") or ""),
+            )
+            ops.append(held_context)
+            review.append(held_context)
+        if "in_vivo_below_review_threshold" in review_flags:
+            held_flag = _op(
+                op="in_vivo",
+                status="review",
+                confidence=in_vivo_confidence,
+                ids={"passage_id": passage_id, "code_id": _code_id(key)},
+                reason="in_vivo_below_review_threshold",
+                rationale=str(proposal.get("in_vivo_rationale") or proposal.get("rationale") or ""),
+            )
+            ops.append(held_flag)
+            review.append(held_flag)
+        elif fields["in_vivo"]:
+            ops.append(
+                _op(
+                    op="in_vivo",
+                    status="applied",
+                    confidence=in_vivo_confidence,
+                    ids={"passage_id": passage_id, "code_id": _code_id(key)},
+                    rationale=str(proposal.get("in_vivo_rationale") or proposal.get("rationale") or ""),
+                )
+            )
+
+    memo_body = str(payload.get("memo") or "").strip()
+    memo_confidence = bounded_unit(payload.get("memo_confidence"), 1.0)
+    if memo_body and memo_confidence < review_below:
+        held_memo = _op(
+            op="memo",
+            status="review",
+            confidence=memo_confidence,
+            ids={"passage_id": passage_id},
+            reason="below_review_threshold",
+            rationale=memo_body,
+        )
+        ops.append(held_memo)
+        review.append(held_memo)
+        memo_body = ""
+    elif memo_body:
+        ops.append(
+            _op(
+                op="memo",
+                status="applied",
+                confidence=memo_confidence,
+                ids={"passage_id": passage_id},
+                reason="",
+                rationale=memo_body,
+            )
         )
 
     if not accepted and len(passage_text) >= long_passage_chars:
@@ -182,8 +614,11 @@ def interpret_coding(
     return {
         "accepted": accepted,
         "rejections": rejections,
-        "memo": str(payload.get("memo") or "").strip(),
+        "memo": memo_body,
+        "memo_confidence": memo_confidence,
         "low_confidence": low_confidence,
+        "ops": ops,
+        "review": review,
     }
 
 
@@ -208,6 +643,8 @@ def commit_passage(
     new_codes = 0
 
     memo_body = str(interpreted.get("memo") or "").strip()
+    if memo_body and not substantive_memo(memo_body):
+        memo_body = ""
     memo_id = None
     if memo_body:
         memo_id = _next(counters, "memo", "m")
@@ -237,6 +674,7 @@ def commit_passage(
                 "code_id": _code_id(key),
                 "definition": item["definition"],
                 "in_vivo": item["in_vivo"],
+                "valence": item.get("valence") or "neutral",
                 "gerund_ok": item["gerund_ok"],
                 "frequency": 0,
                 "document_ids": [],
@@ -281,7 +719,11 @@ def commit_passage(
             "quote": item["quote"],
             "doc_start": item["doc_start"],
             "doc_end": item["doc_end"],
+            "code_id": book[key].get("code_id") or _code_id(key),
             "in_vivo": item["in_vivo"],
+            "in_vivo_confidence": item.get("in_vivo_confidence", 1.0),
+            "in_vivo_rationale": item.get("in_vivo_rationale") or "",
+            "valence": item.get("valence") or book[key].get("valence") or "neutral",
             "action": item["action"],
             "rationale": item["rationale"],
             "nearest_code": item.get("nearest_code") or "",
@@ -295,6 +737,11 @@ def commit_passage(
         new_segments.append(segment)
 
     book = sync_counts(book, new_segments)
+    ops = []
+    for op in interpreted.get("ops") or []:
+        row = dict(op)
+        row["op_id"] = _next(counters, "op", "o")
+        ops.append(row)
     return {
         "codebook": book,
         "segments": new_segments,
@@ -302,6 +749,7 @@ def commit_passage(
         "highlight_ids": highlights,
         "counters": counters,
         "new_codes": new_codes,
+        "ops": ops,
     }
 
 
@@ -320,11 +768,13 @@ def _rename_code(codebook: dict[str, dict], segments: list[dict], old: str, new:
         if entry.get("definition") and not survivor.get("definition"):
             survivor["definition"] = entry["definition"]
     else:
+        entry["code_id"] = _code_id(new)
         book[new] = entry
     for segment in segments:
         if segment.get("code_key") == old:
             segment["code_key"] = new
             segment["code"] = book[new]["code"] if new in book else display
+            segment["code_id"] = book[new].get("code_id") or _code_id(new)
     return book
 
 
@@ -362,6 +812,17 @@ def sync_counts(codebook: dict[str, dict], segments: list[dict]) -> dict[str, di
             if len(examples) >= 8:
                 break
         updated["examples"] = examples
+        scores = []
+        for item in applications:
+            if item.get("confidence") is None or item.get("confidence") == "":
+                continue
+            try:
+                scores.append(float(item["confidence"]))
+            except (TypeError, ValueError):
+                continue
+        if scores:
+            updated["confidence_mean"] = round(sum(scores) / len(scores), 4)
+            updated["confidence_min"] = min(scores)
         if applications and not updated.get("first_seen"):
             updated["first_seen"] = applications[0].get("passage_id")
         label = str(updated.get("code") or "")
@@ -398,6 +859,127 @@ def union_codebooks(books: list[dict[str, dict]]) -> dict[str, dict]:
     return united
 
 
+def apply_post_merge(
+    codebook: dict[str, dict],
+    segments: list[dict],
+    accepted: Sequence[Mapping[str, Any]],
+    pre_merge_book: Mapping[str, Mapping[str, Any]],
+    pre_segments: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, dict], list[dict], list[dict], dict[str, int]]:
+    """Rewrite each survivor from the merge, then split quotes that do not fit.
+
+    ``rewritten_label`` and ``rewritten_definition`` come from the same sweep
+    response as the merge. A quote with ``fits`` false moves back to ``split_to``
+    or to the code it had before the merge.
+    """
+    book = codebook
+    rows = [dict(segment) for segment in segments]
+    original: dict[str, str] = {}
+    for segment in pre_segments:
+        quote = str(segment.get("quote") or "").strip()
+        key = str(segment.get("code_key") or code_key(str(segment.get("code") or "")))
+        if quote and key and quote not in original:
+            original[quote] = key
+    ops: list[dict] = []
+    checked = 0
+    split = 0
+    for merge in accepted:
+        source = code_key(str(merge.get("source") or ""))
+        target = code_key(str(merge.get("target") or ""))
+        survivor = source if source in book else target if target in book else ""
+        if not survivor:
+            continue
+        label = str(merge.get("rewritten_label") or "").strip()
+        definition = str(merge.get("rewritten_definition") or "").strip()
+        rationale = str(merge.get("rationale") or "")
+        confidence = float(merge.get("confidence") or 0)
+        if label and code_key(label) != survivor:
+            new_key = code_key(label)
+            book = _rename_code(book, rows, survivor, new_key, label)
+            survivor = new_key if new_key in book else survivor
+            ops.append(
+                _op(
+                    op="refine_definition",
+                    status="applied",
+                    confidence=confidence,
+                    ids={"code_id": str(book.get(survivor, {}).get("code_id") or "")},
+                    rationale=rationale or f"The survivor label was rewritten to {label}.",
+                )
+            )
+        if definition and survivor in book:
+            book[survivor]["definition"] = definition
+            book[survivor].setdefault("history", []).append({"event": "definition_rewritten", "definition": definition})
+            ops.append(
+                _op(
+                    op="refine_definition",
+                    status="applied",
+                    confidence=confidence,
+                    ids={"code_id": str(book[survivor].get("code_id") or "")},
+                    rationale=rationale or definition,
+                )
+            )
+        for check in merge.get("quote_fits") or []:
+            checked += 1
+            fits = check.get("fits", True)
+            if isinstance(check, Mapping) and fits:
+                continue
+            quote = str(check.get("quote") or "").strip()
+            if not quote:
+                continue
+            split_to = str(check.get("split_to") or "").strip()
+            dest = code_key(split_to) if split_to else original.get(quote, "")
+            if not dest or dest == survivor:
+                dest = original.get(quote, dest)
+            if not dest or dest == survivor:
+                continue
+            if dest not in book:
+                previous = pre_merge_book.get(dest)
+                if previous:
+                    restored = deepcopy(dict(previous))
+                    restored["key"] = dest
+                    book[dest] = restored
+                elif split_to:
+                    book[dest] = {
+                        "code": split_to,
+                        "key": dest,
+                        "code_id": _code_id(dest),
+                        "definition": f"Incidents of {split_to}.",
+                        "valence": "neutral",
+                        "history": [{"event": "split_out", "quote": quote}],
+                        "frequency": 0,
+                        "document_ids": [],
+                        "examples": [],
+                    }
+                else:
+                    continue
+            moved = False
+            for segment in rows:
+                if str(segment.get("quote") or "").strip() != quote:
+                    continue
+                if segment.get("code_key") != survivor:
+                    continue
+                segment["code_key"] = dest
+                segment["code"] = book[dest].get("code") or split_to or dest
+                segment["code_id"] = book[dest].get("code_id") or _code_id(dest)
+                moved = True
+                break
+            if not moved:
+                continue
+            split += 1
+            ops.append(
+                _op(
+                    op="split_quote",
+                    status="applied",
+                    confidence=bounded_unit(check.get("confidence"), confidence or 1.0),
+                    ids={"code_id": str(book[dest].get("code_id") or ""), "quote": quote},
+                    reason="quote_split",
+                    rationale=str(check.get("rationale") or ""),
+                )
+            )
+    book = sync_counts(book, rows)
+    return book, rows, ops, {"quotes_checked": checked, "quotes_split": split}
+
+
 def apply_sweep(
     codebook: dict[str, dict],
     segments: list[dict],
@@ -407,6 +989,10 @@ def apply_sweep(
     definitions: list[Mapping[str, Any]] | None = None,
     overloaded: list[str] | None = None,
     relation_hints: list[Mapping[str, Any]] | None = None,
+    min_merge_confidence: float = 0.5,
+    review_below: float = 0.5,
+    frozen_pairs: set[frozenset[str]] | None = None,
+    max_merges_per_sweep: int | None = 12,
 ) -> dict[str, Any]:
     """Apply model-proposed merges, sharpen definitions, and relabel segments.
 
@@ -431,30 +1017,155 @@ def apply_sweep(
 
     accepted: list[dict] = []
     rejected: list[dict] = []
+    eligible: list[tuple[dict, str, str]] = []
+    ignored: list[dict] = []
+    review: list[dict] = []
+    ops: list[dict] = []
+    id_to_key = _index_ids(codebook)
+    frozen = frozen_pairs or set()
     for merge in merges:
-        source = code_key(str(merge.get("source") or ""))
-        target = code_key(str(merge.get("target") or ""))
+        source_id = str(merge.get("source_id") or "").strip()
+        target_id = str(merge.get("target_id") or "").strip()
+        if source_id and source_id not in id_to_key:
+            rejected.append(
+                {
+                    "source": merge.get("source"),
+                    "target": merge.get("target"),
+                    "pair_id": merge.get("pair_id") or "",
+                    "source_id": source_id,
+                    "reason": "unknown_code_id",
+                    "confidence": bounded_unit(merge.get("confidence"), 1.0),
+                    "from_candidate": False,
+                }
+            )
+            continue
+        if target_id and target_id not in id_to_key:
+            rejected.append(
+                {
+                    "source": merge.get("source"),
+                    "target": merge.get("target"),
+                    "pair_id": merge.get("pair_id") or "",
+                    "target_id": target_id,
+                    "reason": "unknown_code_id",
+                    "confidence": bounded_unit(merge.get("confidence"), 1.0),
+                    "from_candidate": False,
+                }
+            )
+            continue
+        source = id_to_key[source_id] if source_id else code_key(str(merge.get("source") or ""))
+        target = id_to_key[target_id] if target_id else code_key(str(merge.get("target") or ""))
+        offered = frozenset((source, target)) in hinted if source and target else False
+        confidence = decision_confidence(merge)
         record = {
-            "source": merge.get("source"),
-            "target": merge.get("target"),
-            "rationale": merge.get("rationale", ""),
-            "from_candidate": frozenset((source, target)) in hinted,
+            "source": codebook.get(source, {}).get("code", merge.get("source")),
+            "target": codebook.get(target, {}).get("code", merge.get("target")),
+            "source_id": source_id or str(codebook.get(source, {}).get("code_id") or ""),
+            "target_id": target_id or (codebook.get(target, {}).get("code_id") or ""),
+            "pair_id": merge.get("pair_id") or "",
+            "rationale": str(merge.get("rationale") or "").strip() or _fallback_rationale("merge_accept", ""),
+            "confidence": confidence,
+            "model_confidence": bounded_unit(merge.get("model_confidence", merge.get("confidence")), 1.0),
+            "agreement_confidence": merge.get("agreement_confidence", agreement_confidence(merge)),
+            "source_valence": str(
+                merge.get("source_valence") or codebook.get(source, {}).get("valence") or ""
+            ),
+            "target_valence": str(
+                merge.get("target_valence") or codebook.get(target, {}).get("valence") or ""
+            ),
+            "from_candidate": offered,
+            "decision": "reject",
+            "rewritten_label": str(merge.get("rewritten_label") or ""),
+            "rewritten_definition": str(merge.get("rewritten_definition") or ""),
+            "quote_fits": list(merge.get("quote_fits") or []),
         }
+        if source in codebook and target in codebook and opposite_valence(
+            codebook[source].get("valence"), codebook[target].get("valence")
+        ):
+            rejected.append({**record, "reason": "opposite_valence"})
+            ops.append(
+                _op(
+                    op="merge_reject",
+                    status="rejected",
+                    confidence=confidence,
+                    ids={"source_id": record["source_id"], "target_id": record["target_id"]},
+                    reason="opposite_valence",
+                )
+            )
+            continue
+        if source and target and frozenset((source, target)) in frozen:
+            rejected.append(
+                {
+                    **record,
+                    "reason": "already_decided",
+                    "decision": "reject",
+                    "rationale": str(merge.get("rationale") or "").strip() or _fallback_rationale("merge_reject", "already_decided"),
+                }
+            )
+            continue
+        if confidence < min_merge_confidence:
+            held = {**record, "reason": "below_merge_confidence", "status": "review"}
+            review.append(held)
+            rejected.append({**record, "reason": "below_merge_confidence"})
+            ops.append(
+                _op(
+                    op="merge_accept",
+                    status="review",
+                    confidence=confidence,
+                    ids={"source_id": record["source_id"], "target_id": record["target_id"], "pair_id": record["pair_id"]},
+                    reason="below_merge_confidence",
+                    rationale=record["rationale"],
+                )
+            )
+            continue
         if source not in parent or target not in parent or source == target:
-            rejected.append({**record, "reason": "unknown_or_same"})
+            if offered:
+                rejected.append({**record, "reason": "unknown_or_same"})
+            else:
+                ignored.append({**record, "reason": "not_offered"})
+            continue
+        eligible.append((record, source, target))
+
+    eligible.sort(key=lambda item: (-float(item[0].get("confidence") or 0), str(item[0].get("source") or ""), str(item[0].get("target") or "")))
+    cap = None if max_merges_per_sweep is None else max(0, int(max_merges_per_sweep))
+    applied_count = 0
+    for record, source, target in eligible:
+        if cap is not None and applied_count >= cap:
+            held = {**record, "reason": "merge_cap", "status": "review", "decision": "defer"}
+            review.append(held)
+            ops.append(
+                _op(
+                    op="merge_accept",
+                    status="review",
+                    confidence=float(record.get("confidence") or 0),
+                    ids={"source_id": record["source_id"], "target_id": record["target_id"], "pair_id": record["pair_id"]},
+                    reason="merge_cap",
+                    rationale=record.get("rationale") or "",
+                )
+            )
             continue
         root_source, root_target = find(source), find(target)
         if root_source == root_target:
             rejected.append({**record, "reason": "already_merged"})
             continue
-        # The survivor is the lexicographically smaller code id. The model's
-        # source/target direction does not change which label remains, so two
-        # chunks that disagree about direction still produce one merge map.
+        # The survivor is the lexicographically smaller code key. The model's
+        # source/target direction does not change which label remains.
         if root_target < root_source:
             parent[root_source] = root_target
         else:
             parent[root_target] = root_source
+        record = {**record, "decision": "accept"}
         accepted.append(record)
+        applied_count += 1
+        ops.append(
+            _op(
+                op="merge_accept",
+                status="applied",
+                confidence=float(record.get("confidence") or 0),
+                ids={"source_id": record["source_id"], "target_id": record["target_id"], "pair_id": record["pair_id"]},
+                reason="",
+                rationale=record.get("rationale") or "",
+            )
+        )
 
     book: dict[str, dict] = {}
     merge_map: dict[str, str] = {}
@@ -481,15 +1192,62 @@ def apply_sweep(
             )
 
     for update in definitions or []:
-        key = code_key(str(update.get("code") or ""))
+        update_id = str(update.get("code_id") or "").strip()
+        if update_id and update_id not in id_to_key:
+            rejected.append(
+                {
+                    "source": update.get("code"),
+                    "target": None,
+                    "code_id": update_id,
+                    "reason": "unknown_code_id",
+                    "confidence": bounded_unit(update.get("confidence"), 1.0),
+                }
+            )
+            continue
+        key = id_to_key[update_id] if update_id else code_key(str(update.get("code") or ""))
+        confidence = bounded_unit(update.get("confidence"), 1.0)
         if key not in parent:
-            rejected.append({"source": update.get("code"), "target": None, "reason": "unknown_definition"})
+            rejected.append({"source": update.get("code"), "target": None, "reason": "unknown_definition", "confidence": confidence})
             continue
         root = find(key)
         definition = str(update.get("definition") or "").strip()
+        if key != root:
+            # The post-merge rewrite owns the survivor wording. A definition
+            # aimed at a retired code is dropped so it does not become review noise.
+            continue
+        if confidence < review_below:
+            held = {
+                "source": update.get("code"),
+                "target": None,
+                "reason": "below_review_threshold",
+                "confidence": confidence,
+                "status": "review",
+            }
+            review.append(held)
+            ops.append(
+                _op(
+                    op="refine_definition",
+                    status="review",
+                    confidence=confidence,
+                    ids={"code_id": update_id or str(codebook.get(key, {}).get("code_id") or "")},
+                    reason="below_review_threshold",
+                    rationale=str(update.get("rationale") or ""),
+                )
+            )
+            continue
         if root in book and definition:
             book[root]["definition"] = definition
             book[root].setdefault("history", []).append({"event": "definition_sharpened", "definition": definition})
+            ops.append(
+                _op(
+                    op="refine_definition",
+                    status="applied",
+                    confidence=confidence,
+                    ids={"code_id": str(book[root].get("code_id") or "")},
+                    reason="",
+                    rationale=str(update.get("rationale") or update.get("definition") or ""),
+                )
+            )
 
     for label in overloaded or []:
         key = code_key(str(label))
@@ -542,9 +1300,193 @@ def apply_sweep(
         "segments": new_segments,
         "accepted_merges": accepted,
         "rejected_merges": rejected,
+        "ignored_decisions": ignored,
+        "review": review,
+        "ops": ops,
         "merge_map": display_map,
         "relation_hints": hints_applied,
     }
+
+
+def _pair_key(source: Any, target: Any) -> frozenset[str] | None:
+    left = code_key(str(source or ""))
+    right = code_key(str(target or ""))
+    if not left or not right or left == right:
+        return None
+    return frozenset((left, right))
+
+
+def finalize_candidate_decisions(
+    applied: dict[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+    rejections: Sequence[Mapping[str, Any]] | None = None,
+    skipped: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Log exactly one decision for each offered candidate pair.
+
+    A pair the model never mentions is ``model_omitted``. A pair whose sweep
+    chunk timed out is ``chunk_skipped``. A decision whose pair_id or labels
+    are not in the candidate list is stored on ``ignored_decisions`` and is
+    not counted as a candidate decision.
+    """
+    hinted: dict[frozenset[str], dict] = {}
+    by_id: dict[str, frozenset[str]] = {}
+    for item in candidates:
+        pair = _pair_key(item.get("source"), item.get("target"))
+        if pair is None or pair in hinted:
+            continue
+        hinted[pair] = dict(item)
+        pair_id = str(item.get("pair_id") or "").strip()
+        if pair_id and pair_id not in by_id:
+            by_id[pair_id] = pair
+    for item in skipped or []:
+        pair = _pair_key(item.get("source"), item.get("target"))
+        if pair is None or pair in hinted:
+            continue
+        hinted[pair] = dict(item)
+        pair_id = str(item.get("pair_id") or "").strip()
+        if pair_id and pair_id not in by_id:
+            by_id[pair_id] = pair
+
+    decided: set[frozenset[str]] = set()
+    for item in list(applied.get("accepted_merges") or []) + list(applied.get("rejected_merges") or []):
+        pair = _offered_pair(item, hinted, by_id)
+        if pair:
+            decided.add(pair)
+
+    ignored = list(applied.get("ignored_decisions") or [])
+
+    def add(item: Mapping[str, Any], *, reason: str, rationale: str) -> None:
+        pair = _offered_pair(item, hinted, by_id)
+        if pair is None:
+            ignored.append(
+                {
+                    "source": item.get("source"),
+                    "target": item.get("target"),
+                    "pair_id": item.get("pair_id") or "",
+                    "rationale": rationale,
+                    "from_candidate": False,
+                    "reason": "not_offered",
+                }
+            )
+            return
+        if pair in decided:
+            return
+        decided.add(pair)
+        offered = hinted[pair]
+        applied.setdefault("rejected_merges", []).append(
+            {
+                "source": offered.get("source"),
+                "target": offered.get("target"),
+                "pair_id": offered.get("pair_id") or "",
+                "rationale": rationale,
+                "from_candidate": True,
+                "reason": reason,
+            }
+        )
+
+    for item in rejections or []:
+        add(
+            item,
+            reason="model_rejected",
+            rationale=str(item.get("rationale") or ""),
+        )
+    skipped_rows = sorted(
+        list(skipped or []),
+        key=lambda item: (str(item.get("source") or "").casefold(), str(item.get("target") or "").casefold()),
+    )
+    for item in skipped_rows:
+        add(
+            item,
+            reason="chunk_skipped",
+            rationale=str(item.get("rationale") or "This sweep chunk hit a deadline and was skipped."),
+        )
+    omitted = [
+        item
+        for item in candidates
+        if (pair := _pair_key(item.get("source"), item.get("target"))) is not None and pair not in decided
+    ]
+    omitted.sort(key=lambda item: (str(item.get("source") or "").casefold(), str(item.get("target") or "").casefold()))
+    for item in omitted:
+        add(
+            item,
+            reason="model_omitted",
+            rationale="The model did not accept or reject this candidate.",
+        )
+    applied["ignored_decisions"] = ignored
+    applied["candidate_decisions"] = _candidate_decision_rows(applied, hinted)
+    return applied
+
+
+def _offered_pair(
+    item: Mapping[str, Any],
+    hinted: Mapping[frozenset[str], Mapping[str, Any]],
+    by_id: Mapping[str, frozenset[str]],
+) -> frozenset[str] | None:
+    """The candidate this decision names, or None when it was not offered."""
+    pair = _pair_key(item.get("source"), item.get("target"))
+    pair_id = str(item.get("pair_id") or "").strip()
+    if pair_id:
+        expected = by_id.get(pair_id)
+        if expected is None:
+            return None
+        if pair is not None and pair != expected:
+            return None
+        return expected
+    if pair in hinted:
+        return pair
+    return None
+
+
+def _candidate_decision_rows(applied: Mapping[str, Any], hinted: Mapping[frozenset[str], Mapping[str, Any]]) -> list[dict]:
+    """One row per offered pair, in candidate order."""
+    rows = []
+    for pair, offered in hinted.items():
+        decision = "reject"
+        reason = "model_omitted"
+        for item in applied.get("accepted_merges") or []:
+            if _pair_key(item.get("source"), item.get("target")) == pair:
+                decision = "accept"
+                reason = "accepted"
+                break
+        else:
+            for item in applied.get("rejected_merges") or []:
+                if _pair_key(item.get("source"), item.get("target")) == pair:
+                    reason = str(item.get("reason") or "model_rejected")
+                    break
+        matched = None
+        for item in list(applied.get("accepted_merges") or []) + list(applied.get("rejected_merges") or []):
+            if _pair_key(item.get("source"), item.get("target")) == pair:
+                matched = item
+                break
+        rows.append(
+            {
+                "pair_id": offered.get("pair_id") or "",
+                "source": offered.get("source"),
+                "target": offered.get("target"),
+                "decision": decision,
+                "reason": reason,
+                "confidence": None if matched is None else matched.get("confidence", 1.0),
+            }
+        )
+    for item in applied.get("accepted_merges") or []:
+        if item.get("from_candidate"):
+            continue
+        pair = _pair_key(item.get("source"), item.get("target"))
+        if pair is None or pair in hinted:
+            continue
+        rows.append(
+            {
+                "pair_id": item.get("pair_id") or "",
+                "source": item.get("source"),
+                "target": item.get("target"),
+                "decision": "accept",
+                "reason": "model_proposed",
+                "rationale": item.get("rationale") or "",
+                "confidence": item.get("confidence", 1.0),
+            }
+        )
+    return rows
 
 
 def codebook_list(codebook: Mapping[str, Mapping[str, Any]]) -> list[dict]:

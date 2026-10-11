@@ -67,7 +67,7 @@ def open_code(
     concurrency: int = 2,
     top_k_codes: int = 12,
     frequent_codes: int = 8,
-    merge_threshold: float = 0.85,
+    merge_threshold: float = 0.65,
     lexical_merge_threshold: float = 0.5,
     checkpoint_path: str | Path | None = None,
     thread_id: str | None = None,
@@ -87,16 +87,21 @@ def open_code(
     require_gerund: bool = False,
     candidate_limit: int = 30,
     review_mode: str = "document",
+    review_below: float = 0.5,
+    min_merge_confidence: float = 0.5,
+    max_merges_per_sweep: int = 12,
+    check_model: BaseChatModel | str | None = None,
     pipeline: bool = True,
     token_budget: int = 4000,
     prompt_cache: bool | None = None,
     recursion_limit: int | None = None,
     checkpointer: Any = None,
-    sweep_chunk: int = 40,
+    sweep_chunk: int = 20,
     embed_batch_size: int = 64,
     max_retries: int = 4,
     retry_backoff: float = 0.5,
     retry_max_backoff: float = 8.0,
+    request_timeout: float = 120.0,
 ) -> OpenCodeResult:
     """Run first-round grounded-theory open coding over ``corpus``.
 
@@ -126,9 +131,19 @@ def open_code(
 
     When ``pipeline`` is true, synthesis of the passages just coded runs while
     the next document or wave is coded against the pre-merge snapshot. The
-    merge map is applied afterwards, in a fixed order. Rate-limit errors retry
-    with full-jitter backoff and honor ``Retry-After``. This wrapper works
-    inside a running event loop.
+    merge map is applied afterwards, in a fixed order. ``sweep_model`` defaults
+    to ``model``. Sweep chunks default to 20 codes, sorted alphabetically by
+    label and then by definition. The sweep model reads each chunk and proposes
+    duplicate merges with a reason. Token overlap, and embeddings when you pass
+    them, are optional hints. Merging does not require an embeddings model.
+    Every hinted pair and every model-proposed merge is logged. A sweep chunk
+    that still times out after retries is skipped with a warning instead of
+    failing the run.
+
+    Models built from a ``provider:model`` string use ``request_timeout``
+    (120 seconds). Every call also has that deadline. Rate limits, timeouts,
+    and connection errors retry with full-jitter backoff and honor
+    ``Retry-After``. This wrapper works inside a running event loop.
     """
     return run_sync(
         aopen_code(
@@ -168,6 +183,10 @@ def open_code(
             validation_retries=validation_retries,
             require_gerund=require_gerund,
             review_mode=review_mode,
+            review_below=review_below,
+            min_merge_confidence=min_merge_confidence,
+            max_merges_per_sweep=max_merges_per_sweep,
+            check_model=check_model,
             pipeline=pipeline,
             token_budget=token_budget,
             candidate_limit=candidate_limit,
@@ -179,6 +198,7 @@ def open_code(
             max_retries=max_retries,
             retry_backoff=retry_backoff,
             retry_max_backoff=retry_max_backoff,
+            request_timeout=request_timeout,
         )
     )
 
@@ -202,7 +222,7 @@ async def aopen_code(
     concurrency: int = 2,
     top_k_codes: int = 12,
     frequent_codes: int = 8,
-    merge_threshold: float = 0.85,
+    merge_threshold: float = 0.65,
     lexical_merge_threshold: float = 0.5,
     checkpoint_path: str | Path | None = None,
     thread_id: str | None = None,
@@ -222,16 +242,21 @@ async def aopen_code(
     require_gerund: bool = False,
     candidate_limit: int = 30,
     review_mode: str = "document",
+    review_below: float = 0.5,
+    min_merge_confidence: float = 0.5,
+    max_merges_per_sweep: int = 12,
+    check_model: BaseChatModel | str | None = None,
     pipeline: bool = True,
     token_budget: int = 4000,
     prompt_cache: bool | None = None,
     recursion_limit: int | None = None,
     checkpointer: Any = None,
-    sweep_chunk: int = 40,
+    sweep_chunk: int = 20,
     embed_batch_size: int = 64,
     max_retries: int = 4,
     retry_backoff: float = 0.5,
     retry_max_backoff: float = 8.0,
+    request_timeout: float = 120.0,
     limiter: CallLimiter | None = None,
 ) -> OpenCodeResult:
     """Async form of :func:`open_code`."""
@@ -249,7 +274,12 @@ async def aopen_code(
         retry_backoff=retry_backoff,
         review_mode=review_mode,
         token_budget=token_budget,
+        review_below=review_below,
+        min_merge_confidence=min_merge_confidence,
+        request_timeout=request_timeout,
     )
+    if max_merges_per_sweep < 1:
+        raise ValueError("max_merges_per_sweep must be at least 1.")
     parsed_context = parse_context(context)
     documents = load_corpus(corpus)
     coder = resolve_chat_model(
@@ -258,20 +288,39 @@ async def aopen_code(
         temperature=temperature,
         llm_seed=llm_seed,
         model_kwargs=model_kwargs,
+        timeout=request_timeout,
     )
-    sweeper_source = model if sweep_model is None else sweep_model
-    if sweep_model is None:
+    if sweep_model is None or (isinstance(sweep_model, str) and not sweep_model.strip()):
+        sweeper_source = model
         sweeper = coder
     else:
+        sweeper_source = sweep_model
         sweeper = resolve_chat_model(
             sweep_model,
             api_key=api_key,
             temperature=temperature if sweep_temperature is None else sweep_temperature,
             llm_seed=llm_seed,
             model_kwargs=sweep_model_kwargs,
+            timeout=request_timeout,
         )
+    checker = None
+    checker_name = ""
+    if check_model is not None and not (isinstance(check_model, str) and not str(check_model).strip()):
+        checker = resolve_chat_model(
+            check_model,
+            api_key=api_key,
+            temperature=0.0,
+            llm_seed=llm_seed,
+            timeout=request_timeout,
+        )
+        checker_name = describe_model(check_model if isinstance(check_model, str) else checker)
     embed_key = api_key if embeddings_api_key is None else embeddings_api_key
-    embedding_model = resolve_embeddings(embeddings, api_key=embed_key, embeddings_kwargs=embeddings_kwargs)
+    embedding_model = resolve_embeddings(
+        embeddings,
+        api_key=embed_key,
+        embeddings_kwargs=embeddings_kwargs,
+        timeout=request_timeout,
+    )
     retriever = code_retriever
     if retriever is None:
         retriever = EmbeddingCodeRetriever(embedding_model) if embedding_model is not None else LexicalCodeRetriever()
@@ -308,6 +357,10 @@ async def aopen_code(
         batch_size=batch_size,
         concurrency=concurrency,
         review_mode=review_mode,
+        review_below=review_below,
+        min_merge_confidence=min_merge_confidence,
+        max_merges_per_sweep=max_merges_per_sweep,
+        check_model=checker_name,
         pipeline=pipeline,
         token_budget=token_budget,
         prompt_cache=cache,
@@ -345,6 +398,10 @@ async def aopen_code(
         validation_retries=validation_retries,
         require_gerund=require_gerund,
         review_mode=review_mode,
+        review_below=review_below,
+        min_merge_confidence=min_merge_confidence,
+        max_merges_per_sweep=max_merges_per_sweep,
+        check_model=checker,
         pipeline=pipeline,
         token_budget=token_budget,
         candidate_limit=candidate_limit,
@@ -362,6 +419,7 @@ async def aopen_code(
             max_retries=max_retries,
             backoff=retry_backoff,
             max_backoff=retry_max_backoff,
+            request_timeout=request_timeout,
         ),
     )
     limit = recursion_limit if recursion_limit is not None else 250_000
@@ -485,6 +543,7 @@ async def amulti_seed_stability(
             max_retries=int(open_code_kwargs.get("max_retries", 4)),
             backoff=float(open_code_kwargs.get("retry_backoff", 0.5)),
             max_backoff=float(open_code_kwargs.get("retry_max_backoff", 8.0)),
+            request_timeout=float(open_code_kwargs.get("request_timeout", 120.0)),
         )
     base_thread = open_code_kwargs.get("thread_id")
     base_output = open_code_kwargs.get("output_dir")
@@ -523,6 +582,9 @@ def _validate_params(
     retry_backoff: float,
     review_mode: str,
     token_budget: int,
+    request_timeout: float,
+    review_below: float = 0.5,
+    min_merge_confidence: float = 0.5,
 ) -> None:
     if unit not in UNITS:
         raise ValueError(f"unit must be one of {', '.join(UNITS)}. Got {unit!r}.")
@@ -534,8 +596,12 @@ def _validate_params(
         raise ValueError("sweep_chunk and embed_batch_size must be at least 1.")
     if max_retries < 0 or retry_backoff < 0:
         raise ValueError("max_retries and retry_backoff must be zero or more.")
+    if request_timeout < 0:
+        raise ValueError("request_timeout must be zero or more. Zero waits with no per-call deadline.")
     if review_mode not in {"document", "wave"}:
         raise ValueError("review_mode must be 'document' or 'wave'.")
+    if not 0 <= review_below <= 1 or not 0 <= min_merge_confidence <= 1:
+        raise ValueError("review_below and min_merge_confidence must be between 0 and 1.")
     if token_budget < 1:
         raise ValueError("token_budget must be at least 1.")
     if top_k_codes < 0 or max_codes_per_passage < 1 or validation_retries < 0:
@@ -559,6 +625,10 @@ def _metadata(**kwargs: Any) -> dict:
         "batch_size": kwargs["batch_size"],
         "concurrency": kwargs["concurrency"],
         "review_mode": kwargs["review_mode"],
+        "review_below": kwargs.get("review_below", 0.5),
+        "min_merge_confidence": kwargs.get("min_merge_confidence", 0.5),
+        "max_merges_per_sweep": kwargs.get("max_merges_per_sweep", 12),
+        "check_model": kwargs.get("check_model") or "",
         "pipeline": kwargs["pipeline"],
         "token_budget": kwargs["token_budget"],
         "prompt_cache": kwargs["prompt_cache"],
@@ -573,6 +643,8 @@ def _metadata(**kwargs: Any) -> dict:
             "frequent_codes": kwargs["frequent_codes"],
             "merge_threshold": kwargs["merge_threshold"],
             "lexical_merge_threshold": kwargs["lexical_merge_threshold"],
+            "review_below": kwargs.get("review_below", 0.5),
+            "min_merge_confidence": kwargs.get("min_merge_confidence", 0.5),
             "long_passage_chars": kwargs["long_passage_chars"],
             "max_codes_per_passage": kwargs["max_codes_per_passage"],
             "neighbor_chars": kwargs["neighbor_chars"],
