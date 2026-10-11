@@ -7,7 +7,7 @@ double-count applications.
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from automated_grounded_theory.validation import (
     assess_label,
@@ -15,6 +15,7 @@ from automated_grounded_theory.validation import (
     code_key,
     locate_quote,
     review_passage_flags,
+    substantive_memo,
 )
 
 _ACTION_ALIASES = {
@@ -208,6 +209,8 @@ def commit_passage(
     new_codes = 0
 
     memo_body = str(interpreted.get("memo") or "").strip()
+    if memo_body and not substantive_memo(memo_body):
+        memo_body = ""
     memo_id = None
     if memo_body:
         memo_id = _next(counters, "memo", "m")
@@ -545,6 +548,85 @@ def apply_sweep(
         "merge_map": display_map,
         "relation_hints": hints_applied,
     }
+
+
+def _pair_key(source: Any, target: Any) -> frozenset[str] | None:
+    left = code_key(str(source or ""))
+    right = code_key(str(target or ""))
+    if not left or not right or left == right:
+        return None
+    return frozenset((left, right))
+
+
+def finalize_candidate_decisions(
+    applied: dict[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+    rejections: Sequence[Mapping[str, Any]] | None = None,
+    skipped: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Log an accept or a reject for every candidate.
+
+    A pair the model never mentions is a rejection with reason ``model_omitted``.
+    A pair whose sweep chunk timed out is ``chunk_skipped``. Neither is dropped.
+    """
+    decided: set[frozenset[str]] = set()
+    for item in list(applied.get("accepted_merges") or []) + list(applied.get("rejected_merges") or []):
+        pair = _pair_key(item.get("source"), item.get("target"))
+        if pair:
+            decided.add(pair)
+    hinted: set[frozenset[str]] = set()
+    for item in candidates:
+        pair = _pair_key(item.get("source"), item.get("target"))
+        if pair:
+            hinted.add(pair)
+
+    def add(source: Any, target: Any, *, reason: str, rationale: str) -> None:
+        pair = _pair_key(source, target)
+        if pair is None or pair in decided:
+            return
+        decided.add(pair)
+        applied.setdefault("rejected_merges", []).append(
+            {
+                "source": source,
+                "target": target,
+                "rationale": rationale,
+                "from_candidate": pair in hinted,
+                "reason": reason,
+            }
+        )
+
+    for item in rejections or []:
+        add(
+            item.get("source"),
+            item.get("target"),
+            reason="model_rejected",
+            rationale=str(item.get("rationale") or ""),
+        )
+    skipped_rows = sorted(
+        list(skipped or []),
+        key=lambda item: (str(item.get("source") or "").casefold(), str(item.get("target") or "").casefold()),
+    )
+    for item in skipped_rows:
+        add(
+            item.get("source"),
+            item.get("target"),
+            reason="chunk_skipped",
+            rationale=str(item.get("rationale") or "This sweep chunk hit a deadline and was skipped."),
+        )
+    omitted = [
+        item
+        for item in candidates
+        if (pair := _pair_key(item.get("source"), item.get("target"))) is not None and pair not in decided
+    ]
+    omitted.sort(key=lambda item: (str(item.get("source") or "").casefold(), str(item.get("target") or "").casefold()))
+    for item in omitted:
+        add(
+            item.get("source"),
+            item.get("target"),
+            reason="model_omitted",
+            rationale="The model did not accept or reject this candidate.",
+        )
+    return applied
 
 
 def codebook_list(codebook: Mapping[str, Mapping[str, Any]]) -> list[dict]:

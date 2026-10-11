@@ -25,6 +25,8 @@ def test_demo_notebook_is_saved_executed_offline():
     nb = nbformat.read(NOTEBOOK, as_version=4)
     source = _source(nb)
     assert "OFFLINE = True" in source
+    assert "tempfile.mkdtemp" in source
+    assert 'examples" / "run"' not in source
     assert "FICTIONAL" in source or "fictional" in source
     assert "aopen_code" in source
     assert "xai:grok-4" in source
@@ -79,8 +81,7 @@ def test_demo_notebook_runs_offline(tmp_path):
     assert "mean Jaccard 1.0" in rendered
     assert "taguette_codebook.csv" in rendered
     assert "taguette_themes.csv" in rendered
-    assert (ROOT / "examples" / "run" / "open-coding" / "taguette_codebook.csv").is_file()
-    assert (ROOT / "examples" / "run" / "themes" / "taguette_themes.csv").is_file()
+    assert "examples/run" not in rendered
     images = [
         output
         for cell in nb.cells

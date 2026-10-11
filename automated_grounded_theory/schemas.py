@@ -54,7 +54,11 @@ class CodeProposal(_LLMModel):
     )
     in_vivo: bool = Field(
         default=False,
-        description="True when the label is a vivid participant phrase copied from the passage.",
+        description=(
+            "True when the label is a vivid participant phrase copied from the passage "
+            "(a metaphor, a repetition, or a complaint in their words). Consider that "
+            "phrase before leaving this false. False when the label is a gerund you composed."
+        ),
     )
     rationale: str = Field(
         default="",
@@ -93,6 +97,14 @@ class MergeDecision(_LLMModel):
     source: str = Field(description="Code to fold into the target. This label is retired.")
     target: str = Field(description="Code that remains. Prefer the clearer, more specific gerund.")
     rationale: str = ""
+
+
+class MergeRejection(_LLMModel):
+    """A candidate pair that should stay as two codes."""
+
+    source: str = Field(description="One label from a candidate pair. Copy it exactly.")
+    target: str = Field(description="The other label from that candidate pair. Copy it exactly.")
+    rationale: str = Field(default="", description="Why these are different incidents.")
 
 
 class DefinitionUpdate(_LLMModel):
@@ -158,6 +170,20 @@ class ThemeNegative(_LLMModel):
     passage_id: str = Field(default="")
 
 
+class ThemeGroup(_LLMModel):
+    """One theme after a merge pass. Members are the theme names being folded in."""
+
+    name: str
+    definition: str = ""
+    members: list[str] = Field(default_factory=list)
+
+
+class ThemeMergePlan(_LLMModel):
+    """Rename and combine themes. Every input theme name appears in exactly one group."""
+
+    themes: list[ThemeGroup] = Field(default_factory=list)
+
+
 class ThemeCoding(_LLMModel):
     """Focused coding of one codebook. Does not invent open codes."""
 
@@ -178,7 +204,14 @@ class SweepCoding(_LLMModel):
 
     merges: list[MergeDecision] = Field(
         default_factory=list,
-        description="Pairs that name the same incident. Candidates are hints; other pairs are allowed.",
+        description=(
+            "Candidate pairs you accept, plus any other pair that names the same incident. "
+            "Every candidate must be here or in rejections."
+        ),
+    )
+    rejections: list[MergeRejection] = Field(
+        default_factory=list,
+        description="Every candidate pair you do not merge. One entry per rejected candidate, with the reason.",
     )
     definitions: list[DefinitionUpdate] = Field(default_factory=list)
     overloaded_codes: list[str] = Field(

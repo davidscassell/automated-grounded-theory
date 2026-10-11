@@ -26,9 +26,18 @@ Code with short gerunds: simple, active, close to the data, usually two to six w
 Code the incident, not the topic. Return one code per distinct incident. A passage \
 that both praises and criticizes needs a separate code for each incident.
 
-In-vivo codes: when a vivid participant phrase does analytic work, use that phrase as \
-the label and set in_vivo to true. The phrase must appear in the passage. In-vivo \
-labels do not have to be gerunds.
+In-vivo codes: before you settle on a gerund, look for a vivid participant phrase \
+that does analytic work. A metaphor, a repetition, or a complaint in their own words \
+counts. When you find one, the label is that phrase and in_vivo is true. The phrase \
+must appear in the passage. In-vivo labels do not have to be gerunds. Set in_vivo \
+to false only after you have looked and the incident is better named by a gerund you \
+compose.
+
+Examples:
+- "Pay. Pay. Pay. We're 10-15% below market" → code "Pay. Pay. Pay.", in_vivo true. \
+The repetition is the incident.
+- "now it feels like a number" → code "feels like a number", in_vivo true.
+- "I like my team" has no vivid phrase → code "staying for the team", in_vivo false.
 
 Constant comparison: the user message lists codes already earned from earlier passages. \
 Reuse a code when it fits. Refine the label or definition when this incident shows the \
@@ -61,11 +70,13 @@ If several passages are in the user message, code every one of them."""
 SWEEP_SYSTEM = """You are comparing codes with codes during open coding.
 
 You will see a codebook and, when any were found, candidate pairs that look similar \
-in wording or in embedding space. Candidates are hints, not a limit. Propose a merge \
-whenever two codes name the same kind of incident, including pairs that are not in \
-the candidate list. Do not merge codes that merely share a verb, a topic, or a \
-sensitizing concept. When you merge, keep the clearer and more specific label as \
-the target and name the other code as the source.
+in wording or in embedding space. Decide every candidate. Put a pair you accept in \
+merges. Put a pair you reject in rejections, with a rationale. Do not omit a \
+candidate. An empty merge list is allowed only when every candidate is in \
+rejections. You may also merge a pair that was not a candidate when the two codes \
+name the same kind of incident. Do not merge codes that merely share a verb, a \
+topic, or a sensitizing concept. When you merge, keep the clearer and more specific \
+label as the target and name the other code as the source.
 
 Sharpen definitions so each one says what incident the code captures, in words that \
 could apply to another respondent. Do not put a person's department, tenure, role, \
@@ -263,9 +274,10 @@ def build_sweep_messages(
             "CANDIDATES>>>",
             "",
             "Candidate pairs are hints from embeddings when those were supplied, otherwise from "
-            "label overlap. Also propose any other pair in this codebook that names the same "
-            "incident. You may swap source and target so the clearer label survives. "
-            "Return an empty merge list when the codes are merely similar words.",
+            "label overlap. Return a decision for every pair in that list: merges if you "
+            "accept it, rejections if you do not, each with a rationale. Do not leave a "
+            "candidate out of both lists. Also propose any other pair in this codebook that "
+            "names the same incident. You may swap source and target so the clearer label survives.",
         ]
     )
     system = SWEEP_SYSTEM + "\n\n" + render_context(context)
@@ -293,13 +305,21 @@ Leave the quote empty rather than paraphrase. passage_id, when you set it, must 
 the one shown next to that example."""
 
 
-def theme_system_text(context: ResearchContext, n_themes: int | None) -> str:
+def theme_system_text(context: ResearchContext, n_themes: int | None, max_themes: int = 12) -> str:
     if n_themes:
-        count = f"Propose exactly {n_themes} themes."
-    else:
         count = (
-            "Propose as many themes as the codes support. A handful is typical. "
-            "Do not add themes to hit a round number, and do not drop codes to keep the list short."
+            f"Propose exactly {n_themes} themes. "
+            "Do not split one incident across near-duplicate theme names."
+        )
+    else:
+        ceiling = max(1, int(max_themes))
+        floor = min(6, ceiling)
+        count = (
+            f"Propose at most {ceiling} themes, and about {floor} to {ceiling} when the codes "
+            "support that many distinct incidents. Fewer is right when the codebook is small. "
+            "Do not create one theme per code. Fold near-duplicate themes (two names for pay, "
+            "two names for staffing, two names for tools) into one. "
+            "Do not drop a code to keep the list short."
         )
     return THEME_SYSTEM + "\n\n" + count + "\n\n" + render_context(context)
 
@@ -338,6 +358,7 @@ def build_theme_messages(
     prompt_cache: bool,
     chunk_index: int = 1,
     chunk_count: int = 1,
+    max_themes: int = 12,
 ) -> list:
     parts = []
     if chunk_count > 1:
@@ -357,7 +378,7 @@ def build_theme_messages(
     )
     if feedback:
         parts.extend(["", feedback])
-    system = theme_system_text(context, n_themes)
+    system = theme_system_text(context, n_themes, max_themes)
     return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content="\n".join(parts))]
 
 

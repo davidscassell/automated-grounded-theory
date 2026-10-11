@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from automated_grounded_theory.codebook import codebook_list
@@ -51,6 +53,84 @@ class OpenCodeResult:
             "thread_id": self.thread_id,
             "resumable": self.resumable,
         }
+
+    @classmethod
+    def load(cls, directory: str | Path) -> "OpenCodeResult":
+        """Read a run written by ``open_code``.
+
+        ``run.json`` is the whole result. When it is absent, the split files
+        are used. ``saturation.json`` is the report dict (its ``points`` list
+        is the curve).
+        """
+        place = Path(directory)
+        if not place.is_dir():
+            raise FileNotFoundError(f"No output directory at {place}")
+        run_path = place / "run.json"
+        if run_path.is_file():
+            return cls.from_dict(json.loads(run_path.read_text(encoding="utf-8")))
+
+        def read(name: str, default: Any) -> Any:
+            path = place / name
+            if not path.is_file():
+                return default
+            return json.loads(path.read_text(encoding="utf-8"))
+
+        report = read("saturation.json", {})
+        if isinstance(report, list):
+            points = report
+            report = {"points": points, "judgment": None}
+        elif isinstance(report, dict):
+            points = list(report.get("points") or [])
+        else:
+            points = []
+            report = {}
+        return cls.from_dict(
+            {
+                "codebook": read("codebook.json", []),
+                "segments": read("coded_segments.json", []),
+                "memos": read("memos.json", []),
+                "passages": read("passages.json", []),
+                "saturation": points,
+                "saturation_report": report,
+                "validation_log": read("validation_log.json", []),
+                "sweep_log": read("sweep_log.json", []),
+                "prompt_log": read("prompt_log.json", []),
+                "metadata": read("run_metadata.json", {}),
+                "warnings": [],
+            }
+        )
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "OpenCodeResult":
+        saturation = payload.get("saturation") or []
+        report = payload.get("saturation_report")
+        if isinstance(saturation, dict):
+            report = saturation
+            saturation = list(saturation.get("points") or [])
+        if not isinstance(report, dict):
+            report = {}
+        return cls(
+            codebook=list(payload.get("codebook") or []),
+            segments=list(payload.get("segments") or []),
+            memos=list(payload.get("memos") or []),
+            passages=list(payload.get("passages") or []),
+            saturation=list(saturation or []),
+            saturation_report=report,
+            validation_log=list(payload.get("validation_log") or []),
+            sweep_log=list(payload.get("sweep_log") or []),
+            prompt_log=list(payload.get("prompt_log") or []),
+            metadata=dict(payload.get("metadata") or {}),
+            warnings=list(payload.get("warnings") or []),
+            export_paths=dict(payload.get("export_paths") or {}),
+            interrupted=bool(payload.get("interrupted") or False),
+            thread_id=str(payload.get("thread_id") or ""),
+            resumable=bool(payload.get("resumable") or False),
+        )
+
+
+def load_run(directory: str | Path) -> OpenCodeResult:
+    """Load an open-coding output directory. Same as :meth:`OpenCodeResult.load`."""
+    return OpenCodeResult.load(directory)
 
 
 def result_from_state(

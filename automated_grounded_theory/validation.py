@@ -219,6 +219,29 @@ _TRIVIAL_EXACT = frozenset(
 )
 
 
+_EMPTY_MEMO = re.compile(
+    r"no property, dimension|no comparison was recorded|nothing to memo|no memo\b",
+    re.IGNORECASE,
+)
+
+
+def substantive_memo(text: str) -> bool:
+    """True when a memo says something about the incidents.
+
+    The placeholder that only reports the absence of a property is not a memo.
+    Short leftovers ("none", "n/a") are not either.
+    """
+    cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    if len(cleaned) < 12:
+        return False
+    folded = cleaned.casefold().strip(" .")
+    if folded in {"none", "n/a", "na", "no comparison", "nothing to add"}:
+        return False
+    if _EMPTY_MEMO.search(cleaned):
+        return False
+    return True
+
+
 def is_trivial_passage(text: str) -> bool:
     """True when a passage has no incident worth a model call.
 

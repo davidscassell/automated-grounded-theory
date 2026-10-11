@@ -1,4 +1,4 @@
-"""Shared concurrency limit, rate-limit backoff, and a notebook-safe sync runner.
+"""Shared concurrency limit, retry backoff, and a notebook-safe sync runner.
 
 LLM calls go through :meth:`CallLimiter.ainvoke` or :meth:`CallLimiter.abatch`.
 Embeddings use a separate semaphore of the same size so a coding task can embed
@@ -20,13 +20,18 @@ import threading
 from typing import Any, Callable, Sequence
 
 class CallLimiter:
-    """Cap in-flight work, adapt on 429, and retry with full-jitter backoff.
+    """Cap in-flight work, adapt on 429, and retry transient failures with full-jitter backoff.
+
+    Each call is cancelled when it runs longer than ``request_timeout`` (120
+    seconds unless you set another value; 0 waits with no deadline). Timeouts
+    and connection errors are retried the same way as rate limits. Only a rate
+    limit lowers the AIMD ceiling.
 
     ``ainvoke`` takes one slot from an AIMD limit (the configured concurrency
     is the ceiling; a rate limit halves it, and a streak of successes adds one
-    back). ``abatch`` calls LangChain ``abatch`` with that same limit as
-    ``max_concurrency``. A response cache keyed by the payload replays an
-    identical prompt without calling the model again.
+    back). ``abatch`` runs one ``ainvoke`` per input under that same limit.
+    A response cache keyed by the payload replays an identical prompt without
+    calling the model again.
 
     Jitter changes only the wait, never the stored result. ``Retry-After``
     on the exception, when present, replaces the computed wait.
@@ -41,6 +46,7 @@ class CallLimiter:
         max_backoff: float = 8.0,
         tokens_per_minute: float = 0,
         cache: dict | None = None,
+        request_timeout: float = 120.0,
     ) -> None:
         self.concurrency = max(1, int(concurrency))
         self.max_concurrency = self.concurrency
@@ -49,6 +55,7 @@ class CallLimiter:
         self.backoff = max(0.0, float(backoff))
         self.max_backoff = max(self.backoff, float(max_backoff))
         self.tokens_per_minute = max(0.0, float(tokens_per_minute))
+        self.request_timeout = float(request_timeout)
         self._tokens = self.tokens_per_minute
         self._token_stamp = 0.0
         self.semaphore = asyncio.Semaphore(self.concurrency)
@@ -57,6 +64,7 @@ class CallLimiter:
         self.max_in_flight = 0
         self._in_flight = 0
         self.rate_limit_retries = 0
+        self.timeout_retries = 0
         self._success_streak = 0
         self.cache = cache if cache is not None else {}
         self.cache_hits = 0
@@ -70,7 +78,7 @@ class CallLimiter:
             return cached
         await self._acquire()
         try:
-            result = await self._retry(lambda: runnable.ainvoke(payload))
+            result = await self._retry(lambda: self._invoke(runnable, payload))
             self._on_success()
             self.cache[key] = result
             return result
@@ -100,37 +108,33 @@ class CallLimiter:
                 break
             batch = [inputs[index] for index in pending]
             try:
-                results = await runnable.abatch(
-                    batch,
-                    config={"max_concurrency": self.limit},
-                    return_exceptions=True,
-                )
+                results = await self._gather(runnable, batch)
             except Exception as exc:
-                if attempt >= self.max_retries or not is_rate_limit(exc):
+                if attempt >= self.max_retries or not is_transient(exc):
                     raise
-                self._on_rate_limit()
+                self._note_transient(exc)
                 await asyncio.sleep(self._wait(attempt, exc))
                 continue
             still: list[int] = []
-            rate_exc: BaseException | None = None
+            retry_exc: BaseException | None = None
             for index, result in zip(pending, results):
-                if isinstance(result, Exception) and is_rate_limit(result) and attempt < self.max_retries:
+                if isinstance(result, Exception) and is_transient(result) and attempt < self.max_retries:
                     still.append(index)
-                    rate_exc = result
+                    retry_exc = result
                 elif isinstance(result, Exception):
                     raise result
                 else:
                     output[index] = result
                     self.cache[_cache_key(inputs[index])] = result
             if still:
-                self._on_rate_limit(len(still))
-                await asyncio.sleep(self._wait(attempt, rate_exc))
+                self._note_transient(retry_exc, len(still))
+                await asyncio.sleep(self._wait(attempt, retry_exc))
             else:
                 self._on_success()
             pending = still
             attempt_base = attempt
         if pending:
-            raise RuntimeError(f"{len(pending)} calls were still rate limited after {attempt_base + 1} attempts")
+            raise RuntimeError(f"{len(pending)} calls still failed after {attempt_base + 1} attempts")
         return output
 
     async def call(self, func: Callable, /, *args, **kwargs):
@@ -182,6 +186,34 @@ class CallLimiter:
         self.limit = max(1, self.limit // 2)
         self._success_streak = 0
 
+    def _note_transient(self, exc: BaseException | None, count: int = 1) -> None:
+        """Count a retry. Only a rate limit narrows the AIMD ceiling."""
+        if exc is not None and is_rate_limit(exc):
+            self._on_rate_limit(count)
+            return
+        self.timeout_retries += count
+        self._success_streak = 0
+
+    async def _invoke(self, runnable, payload):
+        """One model call, cut off at ``request_timeout`` seconds.
+
+        A timeout of 0 or less waits for the provider. The default is 120.
+        """
+        call = runnable.ainvoke(payload)
+        if self.request_timeout and self.request_timeout > 0:
+            return await asyncio.wait_for(call, self.request_timeout)
+        return await call
+
+    async def _gather(self, runnable, batch: Sequence[Any]) -> list[Any]:
+        """Run a batch with one deadline per call and the current concurrency cap."""
+        gate = asyncio.Semaphore(max(1, self.limit))
+
+        async def one(payload):
+            async with gate:
+                return await self._invoke(runnable, payload)
+
+        return list(await asyncio.gather(*(one(payload) for payload in batch), return_exceptions=True))
+
     def _wait(self, attempt: int, exc: BaseException | None) -> float:
         retry_after = _retry_after(exc)
         if retry_after is not None:
@@ -196,9 +228,9 @@ class CallLimiter:
             try:
                 return await factory()
             except Exception as exc:
-                if attempt >= self.max_retries or not is_rate_limit(exc):
+                if attempt >= self.max_retries or not is_transient(exc):
                     raise
-                self._on_rate_limit()
+                self._note_transient(exc)
                 await asyncio.sleep(self._wait(attempt, exc))
         raise RuntimeError("retry loop exited without a result")
 
@@ -253,6 +285,54 @@ def _retry_after(exc: BaseException | None) -> float | None:
         return max(0.0, float(raw))
     except (TypeError, ValueError):
         return None
+
+
+def is_timeout(exc: BaseException) -> bool:
+    """True for deadline and provider read-timeout errors."""
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return True
+    name = type(exc).__name__.casefold()
+    if "timeout" in name:
+        return True
+    text = str(exc).casefold()
+    return "timed out" in text or "timeout" in text or "deadline exceeded" in text
+
+
+def is_connection_error(exc: BaseException) -> bool:
+    """True for dropped connections. Not every OSError."""
+    if isinstance(exc, (ConnectionError, ConnectionResetError, BrokenPipeError)):
+        return True
+    name = type(exc).__name__.casefold()
+    if "connect" in name or "connection" in name:
+        return True
+    text = str(exc).casefold()
+    return any(
+        phrase in text
+        for phrase in (
+            "connection reset",
+            "connection error",
+            "connection aborted",
+            "connect error",
+            "server disconnected",
+            "network error",
+            "name or service not known",
+        )
+    )
+
+
+def is_transient(exc: BaseException) -> bool:
+    """True when the call should be retried: rate limit, timeout, or connection loss.
+
+    Walks ``__cause__`` so a wrapped CodingError still counts.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if is_rate_limit(current) or is_timeout(current) or is_connection_error(current):
+            return True
+        current = current.__cause__
+    return False
 
 
 def is_rate_limit(exc: BaseException) -> bool:

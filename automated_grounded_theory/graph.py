@@ -106,7 +106,7 @@ class RunConfig:
     candidate_limit: int = 30
     batch_size: int = 8
     concurrency: int = 2
-    sweep_chunk: int = 40
+    sweep_chunk: int = 20
     embed_batch_size: int = 64
     review_mode: str = "document"
     pipeline: bool = True
@@ -631,27 +631,29 @@ def _append_reading_notes(memos: list, counters: dict, pending_sorted: list, sta
         groups[-1][2].append(passage)
     for doc_id, doc_name, passages in groups:
         passage_ids = {str(passage.get("passage_id") or "") for passage in passages}
+        from automated_grounded_theory.validation import substantive_memo
+
         comparisons = [
             str(memo.get("text") or "").strip()
             for memo in memos
-            if memo.get("kind") == "passage" and str(memo.get("passage_id") or "") in passage_ids and str(memo.get("text") or "").strip()
+            if memo.get("kind") == "passage"
+            and str(memo.get("passage_id") or "") in passage_ids
+            and substantive_memo(str(memo.get("text") or ""))
         ]
-        body = "\n\n".join(comparisons) if comparisons else (
-            "No property, dimension, condition, consequence, or comparison was recorded while reading this document."
-        )
-        memo_id = f"m{counters.get('memo', 0) + 1:05d}"
-        counters["memo"] = counters.get("memo", 0) + 1
         listed = ", ".join(str(passage.get("passage_id") or "") for passage in passages)
-        memos.append(
-            {
-                "memo_id": memo_id,
-                "kind": "document",
-                "doc_id": doc_id,
-                "passage_id": None,
-                "sweep_index": None,
-                "text": f"While reading {doc_name} ({listed}):\n{body}",
-            }
-        )
+        if comparisons:
+            memo_id = f"m{counters.get('memo', 0) + 1:05d}"
+            counters["memo"] = counters.get("memo", 0) + 1
+            memos.append(
+                {
+                    "memo_id": memo_id,
+                    "kind": "document",
+                    "doc_id": doc_id,
+                    "passage_id": None,
+                    "sweep_index": None,
+                    "text": f"While reading {doc_name} ({listed}):\n" + "\n\n".join(comparisons),
+                }
+            )
         memo_id = f"m{counters.get('memo', 0) + 1:05d}"
         counters["memo"] = counters.get("memo", 0) + 1
         memos.append(
@@ -723,6 +725,7 @@ def _sweep_node(runtime: RunConfig):
                 sweep_log=sweep_log
                 + [{"sweep_index": sweep_index, "candidates": [], "accepted_merges": [], "rejected_merges": []}],
                 prompt_log=_take_prompts(runtime, state),
+                warnings=list(state.get("warnings") or []),
             )
 
         code_task = None
@@ -750,6 +753,8 @@ def _sweep_node(runtime: RunConfig):
             counters = dict(overlap_state["counters"])
             counters["sweep"] = sweep_index
         prompt_log = _take_prompts(runtime, state)
+        from automated_grounded_theory.codebook import finalize_candidate_decisions
+
         applied = apply_sweep(
             codebook,
             segments,
@@ -759,6 +764,13 @@ def _sweep_node(runtime: RunConfig):
             overloaded=list(parsed.get("overloaded_codes") or []),
             relation_hints=list(parsed.get("relation_hints") or []),
         )
+        finalize_candidate_decisions(
+            applied,
+            candidates,
+            rejections=list(parsed.get("rejections") or []),
+            skipped=list(parsed.get("skipped_candidates") or []),
+        )
+        warnings = list(state.get("warnings") or []) + list(parsed.get("warnings") or [])
         for merge in applied["accepted_merges"]:
             logger.info("merged code %s into %s", merge.get("source"), merge.get("target"))
         integrative = str(parsed.get("integrative_memo") or "").strip()
@@ -822,6 +834,7 @@ def _sweep_node(runtime: RunConfig):
             sweep_log=sweep_log + [record],
             branch_codebooks=branch_books,
             prompt_log=prompt_log,
+            warnings=warnings,
         )
         if overlap_state is not None:
             coded_before = int(state.get("passages_since_sweep") or 0)
@@ -851,6 +864,7 @@ def _sweep_update(
     sweep_log: list,
     branch_codebooks: dict | None = None,
     prompt_log: list | None = None,
+    warnings: list | None = None,
 ) -> dict:
     return {
         "codebook": codebook,
@@ -859,6 +873,7 @@ def _sweep_update(
         "counters": counters,
         "saturation": saturation,
         "sweep_log": sweep_log,
+        "warnings": list(state.get("warnings") or []) if warnings is None else warnings,
         "prompt_log": prompt_log if prompt_log is not None else list(state.get("prompt_log") or []),
         "new_codes_since_sweep": 0,
         "passages_since_sweep": 0,
@@ -931,6 +946,19 @@ def reconcile_sweep_parts(parts: list[dict]) -> dict:
             if key and key not in seen_over:
                 seen_over.add(key)
                 overloaded.append(str(label))
+    rejections: list[dict] = []
+    seen_rejections: set[frozenset[str]] = set()
+    for part in ordered:
+        for rejection in part.get("rejections") or []:
+            source = code_key(str(rejection.get("source") or ""))
+            target = code_key(str(rejection.get("target") or ""))
+            if not source or not target or source == target:
+                continue
+            pair = frozenset((source, target))
+            if pair in seen_pairs or pair in seen_rejections:
+                continue
+            seen_rejections.add(pair)
+            rejections.append(dict(rejection))
     hints: list[dict] = []
     seen_hints: set[tuple] = set()
     for part in ordered:
@@ -953,6 +981,7 @@ def reconcile_sweep_parts(parts: list[dict]) -> dict:
         ],
         "overloaded_codes": overloaded,
         "relation_hints": hints,
+        "rejections": rejections,
         "integrative_memo": _join_unique(str(part.get("integrative_memo") or "") for part in ordered),
         "reflexive_memo": _join_unique(str(part.get("reflexive_memo") or "") for part in ordered),
     }
@@ -1027,38 +1056,65 @@ async def _sweep_chunks(runtime: RunConfig, codes: list, sweep_index: int) -> tu
             )
         return union_candidates([lexical_or_cosine, extra])
 
+    from automated_grounded_theory.async_support import is_transient
+
     per_chunk_candidates = await asyncio.gather(*(detect(chunk) for chunk in chunks))
     candidates = union_candidates(per_chunk_candidates)
-    messages = []
-    passage_ids = []
-    for index, chunk in enumerate(chunks, start=1):
-        messages.append(
-            build_sweep_messages(
-                context=runtime.context,
-                codes=chunk,
-                candidates=per_chunk_candidates[index - 1],
-                prompt_cache=runtime.prompt_cache,
-                all_codes=codes if len(chunks) > 1 else None,
-                chunk_index=index,
-                chunk_count=len(chunks),
-            )
+    warnings: list[str] = []
+    skipped_candidates: list[dict] = []
+
+    async def confirm(index: int, chunk: list) -> tuple[int, dict, str | None]:
+        passage_id = f"sweep-{sweep_index}" if len(chunks) == 1 else f"sweep-{sweep_index}-chunk-{index:04d}"
+        messages = build_sweep_messages(
+            context=runtime.context,
+            codes=chunk,
+            candidates=per_chunk_candidates[index - 1],
+            prompt_cache=runtime.prompt_cache,
+            all_codes=codes if len(chunks) > 1 else None,
+            chunk_index=index,
+            chunk_count=len(chunks),
         )
-        passage_ids.append(f"sweep-{sweep_index}" if len(chunks) == 1 else f"sweep-{sweep_index}-chunk-{index:04d}")
-    parsed_rows = await _abatch_structured(
-        runtime.sweeper,
-        SweepCoding,
-        messages,
-        kind="sweep",
-        model_name=runtime.sweep_model_name,
-        passage_ids=passage_ids,
-        runtime=runtime,
-    )
+        try:
+            payload = await _ainvoke_structured(
+                runtime.sweeper,
+                SweepCoding,
+                messages,
+                kind="sweep",
+                model_name=runtime.sweep_model_name,
+                passage_id=passage_id,
+                runtime=runtime,
+            )
+            return index, payload, None
+        except CodingError as exc:
+            if not is_transient(exc):
+                raise
+            note = (
+                f"Sweep {sweep_index} chunk {index} of {len(chunks)} was skipped after a "
+                f"timeout or connection error: {exc}"
+            )
+            return index, {
+                "merges": [],
+                "rejections": [],
+                "definitions": [],
+                "overloaded_codes": [],
+                "relation_hints": [],
+                "integrative_memo": "",
+                "reflexive_memo": "",
+            }, note
+
+    confirmed = await asyncio.gather(*(confirm(index, chunk) for index, chunk in enumerate(chunks, start=1)))
+    confirmed.sort(key=lambda item: item[0])
     parts = []
-    for index, parsed in enumerate(parsed_rows, start=1):
+    for index, parsed, note in confirmed:
+        if note:
+            warnings.append(note)
+            for candidate in per_chunk_candidates[index - 1]:
+                skipped_candidates.append({**candidate, "rationale": note})
         parts.append(
             {
                 "chunk_index": index,
                 "merges": list(parsed.get("merges") or []),
+                "rejections": list(parsed.get("rejections") or []),
                 "definitions": list(parsed.get("definitions") or []),
                 "overloaded_codes": list(parsed.get("overloaded_codes") or []),
                 "relation_hints": list(parsed.get("relation_hints") or []),
@@ -1066,7 +1122,10 @@ async def _sweep_chunks(runtime: RunConfig, codes: list, sweep_index: int) -> tu
                 "reflexive_memo": parsed.get("reflexive_memo") or "",
             }
         )
-    return reconcile_sweep_parts(parts), candidates, len(chunks)
+    reconciled = reconcile_sweep_parts(parts)
+    reconciled["skipped_candidates"] = skipped_candidates
+    reconciled["warnings"] = warnings
+    return reconciled, candidates, len(chunks)
 
 
 async def _ainvoke_structured(
