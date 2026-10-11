@@ -56,4 +56,4 @@ Import `taguette_codebook.csv` or `taguette_themes.csv` from Project info → Im
 
 ## Evaluation
 
-`evaluate_run` without `model` is offline: coverage, verbatim quotes, gerund and in-vivo rates, singletons, the saturation curve, and lexical Chen metrics when a second codebook is passed. `adjusted_rand_index` compares passage→code assignments across those codebooks. With `model`, near-duplicate pairs are judged concurrently and Chen metrics use those judgments. None of these scores assert saturation.
+`evaluate_run` without `model` is offline: coverage, verbatim quotes, quote-anchor flag rates (`possibly_modified` and `unanchored` are kept and counted, not dropped), gerund and in-vivo rates, singletons, the saturation curve, and lexical Chen metrics when a second codebook is passed. `adjusted_rand_index` compares passage→code assignments across those codebooks. With `model`, near-duplicate pairs are judged concurrently and Chen metrics use those judgments. None of these scores assert saturation.

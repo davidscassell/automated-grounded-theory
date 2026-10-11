@@ -113,7 +113,7 @@ For each passage the model says which code each incident indicates, and whether 
 
 A plain check then runs, with no model:
 
-- the quote must be found in the passage; the stored quote is that slice
+- a quote is anchored, never dropped: exact, normalized (whitespace, case, punctuation), fuzzy (small edits, with a similarity), possibly modified, or unanchored. `...` can match several spans. Search is the passage, then neighbors, then the document. Possibly modified and unanchored quotes are flagged and coding continues
 - empty and generic labels (`experience`, `theme`, `discussion`, ...) are dropped
 - an in-vivo flag is cleared when the label is not in the passage
 - a non-gerund label is kept and flagged, unless `require_gerund=True`
@@ -201,7 +201,7 @@ from automated_grounded_theory import evaluate_run
 metrics = evaluate_run("coding_run", context="context.md", log_path="run.log")
 ```
 
-The report includes coverage, codes per passage, verbatim-quote accuracy, gerund and in-vivo rates, label length, singleton share, redundant pairs, the saturation curve and the first batch whose new-code rate is under 10%, merges, memo stats, context-leakage, calls, and tokens per passage.
+The report includes coverage, codes per passage, verbatim-quote accuracy, quote-status rates (`quote_flag_rate` is the share flagged `possibly_modified` or `unanchored`), gerund and in-vivo rates, label length, singleton share, redundant pairs, the saturation curve and the first batch whose new-code rate is under 10%, merges, memo stats, context-leakage, calls, and tokens per passage.
 
 Pass `other_sources` (more output directories or results on the same corpus) for Chen et al. coverage, overlap, novelty, and divergence (arXiv:2411.12142). The same scores are in `chen_metrics`. Without `model`, clustering is lexical Jaccard at 0.5, not the paper's model-based merge, so the default stays offline.
 

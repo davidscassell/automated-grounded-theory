@@ -410,7 +410,7 @@ async def _pending_rows(runtime: RunConfig, state: CodingState, jobs: list[tuple
     async def one(doc_id: str | None, indices: list[int]) -> list[dict]:
         passages = [state["passages"][index] for index in indices]
         book = _book_for(state, doc_id)
-        coded = await _code_batch(runtime, passages, book)
+        coded = await _code_batch(runtime, passages, book, documents=_document_texts(state))
         rows = []
         for index in indices:
             passage = state["passages"][index]
@@ -429,18 +429,54 @@ async def _pending_rows(runtime: RunConfig, state: CodingState, jobs: list[tuple
     return [row for group in groups for row in group]
 
 
+def _document_texts(state: CodingState) -> dict[str, str]:
+    return {str(doc.get("doc_id")): str(doc.get("text") or "") for doc in state.get("documents") or []}
+
+
+def _coding_payload(coding: Any) -> dict:
+    if hasattr(coding, "model_dump"):
+        return coding.model_dump()
+    return dict(coding)
+
+
+def _preserve_flagged_codes(previous: dict, current: Any, keys: set[str]) -> dict:
+    """Keep a code the retry dropped after a quote mismatch.
+
+    The retry may improve the quote. It must not erase the code.
+    """
+    payload = _coding_payload(current)
+    if not keys:
+        return payload
+    codes = list(payload.get("codes") or [])
+    present = {code_key(str(item.get("code") or "")) for item in codes}
+    for item in previous.get("codes") or []:
+        key = code_key(str(item.get("code") or ""))
+        if key in keys and key not in present:
+            codes.append(dict(item))
+            present.add(key)
+    payload["codes"] = codes
+    return payload
+
+
 def _book_for(state: CodingState, doc_id: str | None) -> dict:
     if state.get("parallel") and doc_id is not None:
         return state.get("branch_codebooks", {}).get(doc_id) or {}
     return state.get("codebook") or {}
 
 
-async def _code_batch(runtime: RunConfig, passages: list[dict], codebook: dict) -> dict[str, tuple[dict, list]]:
-    """Code a batch. Quote failures are retried on their own, not with the batch."""
+async def _code_batch(
+    runtime: RunConfig,
+    passages: list[dict],
+    codebook: dict,
+    documents: dict[str, str] | None = None,
+) -> dict[str, tuple[dict, list]]:
+    """Code a batch. Weak quotes are retried once, then kept and flagged."""
     pending = list(passages)
     feedback: dict[str, str] = {}
     errors: dict[str, list] = {str(passage.get("passage_id")): [] for passage in passages}
     done: dict[str, tuple[dict, list]] = {}
+    earlier_coding: dict[str, dict] = {}
+    flagged_keys: dict[str, set[str]] = {}
     attempts = max(0, runtime.validation_retries) + 1
     for attempt in range(attempts):
         if not pending:
@@ -459,10 +495,9 @@ async def _code_batch(runtime: RunConfig, passages: list[dict], codebook: dict) 
                 long_passage_chars=runtime.long_passage_chars,
                 review_below=runtime.review_below,
                 context_terms=context_term_set(runtime.context),
+                document_text=(documents or {}).get(str(passage.get("doc_id") or ""), ""),
             )
-            quote_failures = [
-                item for item in interpreted["rejections"] if item.get("reason") == "quote_not_verbatim"
-            ]
+            quote_failures = list(interpreted.get("quote_retries") or [])
             restated = [
                 {"code": item.get("code"), "reason": "context_restatement", "quote": item.get("quote")}
                 for item in interpreted["accepted"]
@@ -471,9 +506,19 @@ async def _code_batch(runtime: RunConfig, passages: list[dict], codebook: dict) 
             retryable = quote_failures + restated
             if retryable and attempt < attempts - 1:
                 errors[passage_id].append(retryable)
+                earlier_coding[passage_id] = _coding_payload(coding)
+                flagged_keys[passage_id] = {
+                    code_key(str(item.get("code") or "")) for item in quote_failures if item.get("code")
+                }
                 still_pending.append(passage)
                 feedback[passage_id] = validation_feedback(retryable)
             else:
+                if passage_id in earlier_coding:
+                    coding = _preserve_flagged_codes(
+                        earlier_coding[passage_id],
+                        coding,
+                        flagged_keys.get(passage_id) or set(),
+                    )
                 done[passage_id] = (coding, errors[passage_id])
         pending = still_pending
     if runtime.check_model is not None:
@@ -608,7 +653,29 @@ def _validate_node(runtime: RunConfig):
                 long_passage_chars=runtime.long_passage_chars,
                 review_below=runtime.review_below,
                 context_terms=context_term_set(runtime.context),
+                document_text=_document_texts(state).get(str(passage.get("doc_id") or ""), ""),
             )
+            kept_quotes = [
+                {
+                    "code": row.get("code"),
+                    "reason": f"quote_{row.get('quote_status')}",
+                    "quote": row.get("model_quote") or row.get("quote"),
+                    "quote_status": row.get("quote_status"),
+                    "quote_similarity": row.get("quote_similarity"),
+                    "kept": True,
+                }
+                for row in interpreted["accepted"]
+                if row.get("quote_status") in {"possibly_modified", "unanchored"}
+            ]
+            if kept_quotes:
+                validation_log.append(
+                    {
+                        "passage_id": passage.get("passage_id"),
+                        "doc_id": passage.get("doc_id"),
+                        "stage": "kept",
+                        "rejections": kept_quotes,
+                    }
+                )
             for earlier in item.get("attempt_errors") or []:
                 validation_log.append(
                     {

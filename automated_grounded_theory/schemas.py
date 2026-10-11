@@ -60,7 +60,11 @@ class CodeProposal(_LLMModel):
         description="What incident this code captures, grounded in the quote. Empty only when reusing unchanged.",
     )
     quote: str = Field(
-        description="Exact contiguous substring copied from the passage. Not from the neighboring context."
+        description=(
+            "Copy the participant's words. Prefer an exact span of the passage. "
+            "If the incident continues in the previous or next context, copy from there. "
+            "Use ... only to skip words you are not quoting. Do not paraphrase."
+        )
     )
     in_vivo: bool = Field(
         default=False,
