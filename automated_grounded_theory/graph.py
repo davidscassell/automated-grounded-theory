@@ -15,11 +15,24 @@ import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send
 from typing_extensions import TypedDict
+
+from automated_grounded_theory.records import (
+    POLICY_VERSION,
+    evidence_revision,
+    freeze_snapshot,
+    percentile,
+    proposal_buffer_reducer,
+    proposal_id,
+    select_committable,
+)
 
 from automated_grounded_theory.async_support import ainvoke_structured, is_transient
 from automated_grounded_theory.batching import pack_indices
@@ -105,6 +118,17 @@ class CodingState(TypedDict, total=False):
     pair_decisions: list[dict]
     consolidated: bool
     stage_seconds: dict
+    snapshot_id: str
+    snapshot_version: int
+    definition_revision: str
+    evidence_revision: str
+    policy_version: str
+    batch_id: str
+    round_jobs: list
+    proposal_buffer: Annotated[dict, proposal_buffer_reducer]
+    committed_ids: list
+    metrics: dict
+    lost_distinction_candidates: list
 
 
 @dataclass
@@ -125,7 +149,7 @@ class RunConfig:
     validation_retries: int = 1
     require_gerund: bool = False
     candidate_limit: int = 30
-    batch_size: int = 8
+    batch_size: int = 1
     concurrency: int = 2
     sweep_chunk: int = 20
     embed_batch_size: int = 64
@@ -198,15 +222,31 @@ def initial_state(documents: list[LoadedDocument], metadata: dict) -> CodingStat
         "pair_decisions": [],
         "consolidated": False,
         "stage_seconds": {},
+        "snapshot_id": "s00000",
+        "snapshot_version": 0,
+        "definition_revision": "",
+        "evidence_revision": "",
+        "policy_version": POLICY_VERSION,
+        "batch_id": "",
+        "round_jobs": [],
+        "proposal_buffer": {"items": [], "duplicates": 0, "conflicts": []},
+        "committed_ids": [],
+        "metrics": {},
+        "lost_distinction_candidates": [],
     }
 
 
 def build_graph(runtime: RunConfig):
-    """Return an uncompiled graph. The caller attaches a checkpointer."""
+    """Return an uncompiled graph. Coding rounds fan out with :class:`Send`.
+
+    Workers read one frozen snapshot. ``commit`` is the only writer.
+    """
+    _validate_node(runtime)
     builder = StateGraph(CodingState)
     builder.add_node("segment_and_shuffle", _segment_node)
-    builder.add_node("code_passage", _code_node(runtime))
-    builder.add_node("validate_passage", _validate_node(runtime))
+    builder.add_node("prepare_round", _prepare_round(runtime))
+    builder.add_node("code_worker", _code_worker(runtime), input_schema=WorkerInput)
+    builder.add_node("commit", _commit_node(runtime))
     builder.add_node("sweep", _sweep_node(runtime))
     builder.add_node("consolidate", _sweep_node(runtime, consolidation=True))
     builder.add_node("export", _export_node(runtime))
@@ -214,22 +254,83 @@ def build_graph(runtime: RunConfig):
     builder.add_conditional_edges(
         "segment_and_shuffle",
         _route_after_segment,
-        {"code_passage": "code_passage", "export": "export"},
+        {"prepare_round": "prepare_round", "export": "export"},
     )
-    builder.add_edge("code_passage", "validate_passage")
     builder.add_conditional_edges(
-        "validate_passage",
-        _route_after_validate,
-        {"code_passage": "code_passage", "sweep": "sweep", "export": "export"},
+        "prepare_round",
+        _route_round,
+        ["code_worker", "sweep", "consolidate", "export"],
+    )
+    builder.add_edge("code_worker", "commit")
+    builder.add_conditional_edges(
+        "commit",
+        _route_after_commit,
+        {"prepare_round": "prepare_round", "sweep": "sweep", "consolidate": "consolidate", "export": "export"},
     )
     builder.add_conditional_edges(
         "sweep",
         _route_after_sweep,
-        {"code_passage": "code_passage", "consolidate": "consolidate", "export": "export"},
+        {"prepare_round": "prepare_round", "consolidate": "consolidate", "export": "export"},
     )
     builder.add_edge("consolidate", "export")
     builder.add_edge("export", END)
     return builder
+
+
+class WorkerInput(TypedDict, total=False):
+    """Payload for one Send worker. These keys are not parent-state channels."""
+
+    worker_job_id: str
+    worker_batch_id: str
+    worker_snapshot_id: str
+    worker_snapshot_version: int
+    worker_definition_revision: str
+    worker_evidence_revision: str
+    worker_policy_version: str
+    worker_doc_id: str | None
+    worker_indices: list
+    worker_passages: list
+    worker_codebook: dict
+    worker_documents: dict
+
+
+class _IdleModel(BaseChatModel):
+    """Placeholder so :func:`get_graph` can draw a graph without a provider."""
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="{}"))])
+
+    @property
+    def _llm_type(self) -> str:
+        return "idle"
+
+
+def get_graph(kind: str = "open_code"):
+    """Return the LangGraph for ``open_code`` or ``themes``.
+
+    Both graphs fan out with ``Send``. ``draw_mermaid_png`` posts the diagram
+    to ``mermaid.ink``. ``draw_ascii`` needs the ``viz`` extra (``grandalf``).
+    ``draw_png`` needs optional ``pygraphviz`` and a Graphviz install.
+    """
+    name = str(kind or "open_code").strip().casefold()
+    if name == "open_code":
+        from automated_grounded_theory.context import ResearchContext
+        from automated_grounded_theory.retrieval import LexicalCodeRetriever
+
+        runtime = RunConfig(
+            coder=_IdleModel(),
+            sweeper=_IdleModel(),
+            retriever=LexicalCodeRetriever(),
+            embeddings=None,
+            context=ResearchContext(research_question="What is happening in this text?"),
+            prompt_cache=False,
+        )
+        return build_graph(runtime)
+    if name == "themes":
+        from automated_grounded_theory.themes import build_theme_graph
+
+        return build_theme_graph()
+    raise ValueError("kind must be 'open_code' or 'themes'.")
 
 
 def compile_graph(runtime: RunConfig, checkpointer, *, interrupt_before_sweep: bool = False):
@@ -243,7 +344,49 @@ def compile_graph(runtime: RunConfig, checkpointer, *, interrupt_before_sweep: b
 def _route_after_segment(state: CodingState) -> str:
     if not state.get("passages"):
         return "export"
-    return "code_passage"
+    return "prepare_round"
+
+
+def _route_after_commit(state: CodingState) -> str:
+    destination = _route_after_validate(state)
+    if destination == "code_passage":
+        return "prepare_round"
+    return destination
+
+
+def _route_round(state: CodingState):
+    """Fan out one Send per batch, or leave the round when nothing is queued."""
+    jobs = list(state.get("round_jobs") or [])
+    if not jobs:
+        destination = _route_after_validate(state)
+        if destination == "code_passage":
+            return "export"
+        return destination
+    documents = _document_texts(state)
+    sends = []
+    for job in jobs:
+        doc_id = job.get("doc_id")
+        indices = list(job.get("indices") or [])
+        sends.append(
+            Send(
+                "code_worker",
+                {
+                    "worker_job_id": job.get("job_id"),
+                    "worker_batch_id": state.get("batch_id") or state.get("snapshot_id"),
+                    "worker_snapshot_id": state.get("snapshot_id"),
+                    "worker_snapshot_version": state.get("snapshot_version"),
+                    "worker_definition_revision": state.get("definition_revision"),
+                    "worker_evidence_revision": state.get("evidence_revision"),
+                    "worker_policy_version": state.get("policy_version") or POLICY_VERSION,
+                    "worker_doc_id": doc_id,
+                    "worker_indices": indices,
+                    "worker_passages": [state["passages"][index] for index in indices],
+                    "worker_codebook": deepcopy(_book_for(state, doc_id)),
+                    "worker_documents": documents,
+                },
+            )
+        )
+    return sends
 
 
 def _remaining(state: CodingState) -> bool:
@@ -268,10 +411,155 @@ def _route_after_validate(state: CodingState) -> str:
 
 def _route_after_sweep(state: CodingState) -> str:
     if _remaining(state):
-        return "code_passage"
+        return "prepare_round"
     if not state.get("consolidated") and len(state.get("codebook") or {}) >= 2:
         return "consolidate"
     return "export"
+
+
+def _prepare_round(runtime: RunConfig):
+    def prepare_round(state: CodingState) -> dict:
+        version = int(state.get("snapshot_version") or 0) + 1
+        frozen = freeze_snapshot(state, version=version)
+        jobs = _wave(state, runtime)
+        packaged = []
+        for index, (doc_id, indices) in enumerate(jobs):
+            packaged.append(
+                {
+                    "doc_id": doc_id,
+                    "indices": list(indices),
+                    "job_id": f"{frozen['snapshot_id']}-j{index:03d}",
+                }
+            )
+        return {
+            **frozen,
+            "batch_id": frozen["snapshot_id"],
+            "round_jobs": packaged,
+            "proposal_buffer": {"__reset__": True},
+        }
+
+    return prepare_round
+
+
+def _code_worker(runtime: RunConfig):
+    async def code_worker(state: CodingState) -> dict:
+        started = time.perf_counter()
+        snapshot_id = str(state.get("worker_snapshot_id") or "")
+        passages = list(state.get("worker_passages") or [])
+        indices = list(state.get("worker_indices") or [])
+        runtime.limiter.cache_context = {
+            "snapshot_id": snapshot_id,
+            "definition_revision": state.get("worker_definition_revision") or "",
+            "evidence_revision": state.get("worker_evidence_revision") or "",
+            "policy_version": state.get("worker_policy_version") or POLICY_VERSION,
+        }
+        book = dict(state.get("worker_codebook") or {})
+        coded = await _code_batch(
+            runtime,
+            passages,
+            book,
+            documents=dict(state.get("worker_documents") or {}),
+        )
+        elapsed = time.perf_counter() - started
+        items = []
+        for index, passage in zip(indices, passages):
+            passage_key = str(passage.get("passage_id"))
+            coding, attempt_errors = coded[passage_key]
+            items.append(
+                {
+                    "proposal_id": proposal_id(snapshot_id, passage_key),
+                    "job_id": state.get("worker_job_id"),
+                    "batch_id": state.get("worker_batch_id"),
+                    "snapshot_id": snapshot_id,
+                    "snapshot_version": state.get("worker_snapshot_version"),
+                    "passage_index": index,
+                    "doc_id": state.get("worker_doc_id"),
+                    "coding": coding,
+                    "attempt_errors": attempt_errors,
+                    "elapsed": round(elapsed, 4),
+                }
+            )
+        return {"proposal_buffer": {"items": items, "duplicates": 0, "conflicts": []}}
+
+    return code_worker
+
+
+def _commit_node(runtime: RunConfig):
+    def commit(state: CodingState) -> dict:
+        started = time.perf_counter()
+        buffer = state.get("proposal_buffer") or {}
+        fresh, stale, _skipped = select_committable(
+            list(buffer.get("items") or []),
+            snapshot_id=str(state.get("snapshot_id") or ""),
+            committed_ids=list(state.get("committed_ids") or []),
+        )
+        pending = [
+            {
+                "passage_index": item["passage_index"],
+                "doc_id": item.get("doc_id"),
+                "coding": item.get("coding") or {},
+                "attempt_errors": item.get("attempt_errors") or [],
+            }
+            for item in fresh
+        ]
+        update = runtime._commit(state, pending=pending) if pending else {}
+        if not isinstance(update, dict):
+            update = {}
+        committed = list(state.get("committed_ids") or [])
+        for item in fresh:
+            pid = str(item.get("proposal_id") or "")
+            if pid and pid not in committed:
+                committed.append(pid)
+        review = list(update.get("review") or state.get("review") or [])
+        for item in stale:
+            review.append(
+                {
+                    "op": "commit",
+                    "status": "rejected",
+                    "reason": "stale_snapshot",
+                    "proposal_id": item.get("proposal_id"),
+                    "snapshot_id": item.get("snapshot_id"),
+                }
+            )
+        metrics = dict(state.get("metrics") or {})
+        metrics["duplicates_before_reconciliation"] = int(metrics.get("duplicates_before_reconciliation") or 0) + int(
+            buffer.get("duplicates") or 0
+        )
+        metrics["reconciliation_calls"] = int(metrics.get("reconciliation_calls") or 0) + 1
+        metrics["reconciliation_seconds"] = round(
+            float(metrics.get("reconciliation_seconds") or 0) + time.perf_counter() - started,
+            4,
+        )
+        metrics["stale_proposals"] = int(metrics.get("stale_proposals") or 0) + len(stale)
+        metrics["conflicts"] = list(buffer.get("conflicts") or [])
+        samples = list(metrics.get("coding_seconds") or [])
+        samples.extend(float(item.get("elapsed") or 0) for item in fresh)
+        metrics["coding_seconds"] = samples
+        metrics["coding_p50"] = percentile(samples, 50)
+        metrics["coding_p95"] = percentile(samples, 95)
+        timing = dict(update.get("stage_seconds") or state.get("stage_seconds") or {})
+        timing["coding"] = round(
+            float(timing.get("coding") or 0) + sum(float(item.get("elapsed") or 0) for item in fresh),
+            4,
+        )
+        update["stage_seconds"] = timing
+        limiter = runtime.limiter
+        metrics["transport_retries"] = int(getattr(limiter, "timeout_retries", 0) or 0) + int(
+            getattr(limiter, "rate_limit_retries", 0) or 0
+        )
+        metrics["schema_repairs"] = int(getattr(limiter, "schema_repairs", 0) or 0)
+        metrics["cache_hits"] = int(getattr(limiter, "cache_hits", 0) or 0)
+        update["review"] = review
+        update["committed_ids"] = committed
+        update["proposal_buffer"] = {"__reset__": True}
+        update["round_jobs"] = []
+        update["metrics"] = metrics
+        update["evidence_revision"] = evidence_revision(update.get("segments") or state.get("segments") or [])
+        if stale and "codebook" not in update:
+            update["codebook"] = state.get("codebook") or {}
+        return update
+
+    return commit
 
 
 def _segment_node(state: CodingState) -> dict:
@@ -594,16 +882,34 @@ async def _invoke_coding(
 
 
 def _align_batch(payload: dict, passages: list[dict]) -> list[dict]:
+    """One output slot per passage. A missing slot is a failure, not an empty coding."""
     items = list(payload.get("passages") or [])
     by_id = {str(item.get("passage_id")): item for item in items if item.get("passage_id")}
     aligned = []
     for index, passage in enumerate(passages):
         passage_id = str(passage.get("passage_id") or "")
         item = by_id.get(passage_id)
-        if item is None and index < len(items):
-            item = items[index]
+        if item is None and index < len(items) and not str(items[index].get("passage_id") or ""):
+            item = dict(items[index])
+            item["passage_id"] = passage_id
+        failed = False
         if item is None:
-            item = {"passage_id": passage_id, "codes": [], "memo": "", "low_confidence": True}
+            failed = True
+            item = {
+                "passage_id": passage_id,
+                "codes": [],
+                "memo": "",
+                "low_confidence": True,
+                "coverage_status": "failed",
+            }
+        else:
+            item = dict(item)
+        if failed:
+            item["coverage_status"] = "failed"
+        elif item.get("codes"):
+            item["coverage_status"] = item.get("coverage_status") or "coded"
+        else:
+            item["coverage_status"] = item.get("coverage_status") or "context_only"
         aligned.append(item)
     return aligned
 
@@ -644,8 +950,11 @@ def _validate_node(runtime: RunConfig):
             passage = state["passages"][item["passage_index"]]
             doc_id = item.get("doc_id")
             book = branch_books.get(doc_id, {}) if state.get("parallel") and doc_id else codebook
+            coding = item.get("coding") or {}
+            if hasattr(coding, "model_dump"):
+                coding = coding.model_dump()
             interpreted = interpret_coding(
-                item["coding"],
+                coding,
                 passage,
                 book,
                 max_codes=runtime.max_codes_per_passage,
@@ -685,6 +994,13 @@ def _validate_node(runtime: RunConfig):
                         "rejections": earlier,
                     }
                 )
+            coverage = str(coding.get("coverage_status") or "")
+            if coverage == "failed":
+                passage["coverage_status"] = "failed"
+            elif interpreted["accepted"]:
+                passage["coverage_status"] = "coded"
+            else:
+                passage["coverage_status"] = "context_only"
             if interpreted["rejections"]:
                 validation_log.append(
                     {
@@ -752,6 +1068,7 @@ def _validate_node(runtime: RunConfig):
             "ops": ops,
             "review": review,
             "warnings": list(state.get("warnings") or []) + notes,
+            "passages": state.get("passages") or [],
         }
 
     runtime._commit = validate_passage
@@ -825,6 +1142,12 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
     async def sweep(state: CodingState) -> dict:
         started = time.perf_counter()
         extras = {"rewrites": 0.0}
+        runtime.limiter.cache_context = {
+            "snapshot_id": state.get("snapshot_id") or "",
+            "definition_revision": state.get("definition_revision") or "",
+            "evidence_revision": state.get("evidence_revision") or "",
+            "policy_version": POLICY_VERSION,
+        }
 
         def finish(update: dict) -> dict:
             timing = dict(state.get("stage_seconds") or {})
@@ -1141,6 +1464,12 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
             review=review,
             pair_decisions=pair_decisions,
         )
+        update["lost_distinction_candidates"] = list(state.get("lost_distinction_candidates") or []) + list(
+            applied.get("lost_distinction_candidates") or []
+        )
+        metrics = dict(state.get("metrics") or {})
+        metrics["lost_distinction_candidates"] = len(update["lost_distinction_candidates"])
+        update["metrics"] = metrics
         if overlap_state is not None:
             coded_before = int(state.get("passages_since_sweep") or 0)
             new_before = int(state.get("new_codes_since_sweep") or 0)
@@ -1412,19 +1741,10 @@ async def _verify_proposed_merges(
     merges: list,
     sweep_index: int,
 ) -> tuple[list, list]:
-    """Second structured look at each proposed merge. Opposite stances are not sent."""
-    from automated_grounded_theory.codebook import opposite_valence
-
+    """Second structured look at each proposed merge. Stance is context, not a veto."""
     eligible = []
     rejected = []
     for merge in merges:
-        source = code_key(str(merge.get("source") or ""))
-        target = code_key(str(merge.get("target") or ""))
-        if source in codebook and target in codebook and opposite_valence(
-            codebook[source].get("valence"), codebook[target].get("valence")
-        ):
-            rejected.append({**dict(merge), "reason": "opposite_valence", "confidence": merge.get("confidence", 1.0)})
-            continue
         eligible.append(merge)
     if not eligible:
         return [], rejected

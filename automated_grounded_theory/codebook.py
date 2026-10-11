@@ -11,6 +11,7 @@ from typing import Any, Mapping, Sequence
 
 from automated_grounded_theory.retrieval import jaccard
 from automated_grounded_theory.validation import (
+    is_code_id_text,
     QUOTE_FLAG_STATUSES,
     assess_label,
     attribute_leak,
@@ -413,6 +414,12 @@ def interpret_coding(
     for proposal in proposals:
         label = str(proposal.get("code") or "")
         quote = str(proposal.get("quote") or "")
+        if is_code_id_text(label):
+            if label in id_to_key:
+                label = str(codebook[id_to_key[label]].get("code") or label)
+            else:
+                rejections.append({"code": label, "reason": "code_id_as_label", "quote": quote})
+                continue
         anchor = anchor_quote(
             quote,
             passage_text,
@@ -565,6 +572,18 @@ def interpret_coding(
         if key in seen_keys and action == "new":
             action = "reuse"
         seen_keys.add(key)
+        uncertainty: list[str] = []
+        for flag in proposal.get("uncertainty_flags") or []:
+            name = str(flag)
+            if name in {"ambiguous_span", "insufficient_context", "competing_code", "unsupported_inference"}:
+                if name not in uncertainty:
+                    uncertainty.append(name)
+        if "ambiguous_span" in getattr(anchor, "flags", ()) and "ambiguous_span" not in uncertainty:
+            uncertainty.append("ambiguous_span")
+        for flag in uncertainty:
+            if flag not in review_flags:
+                review_flags.append(flag)
+        nearest_code_id = known_nearest[0] if known_nearest else None
         accepted.append(
             {
                 "action": action,
@@ -589,8 +608,10 @@ def interpret_coding(
                 "gerund_ok": fields["gerund_ok"],
                 "rationale": str(proposal.get("rationale") or ""),
                 "nearest_code": str(proposal.get("nearest_code") or "").strip(),
+                "nearest_code_id": nearest_code_id,
                 "why_not_nearest": str(proposal.get("why_not_nearest") or "").strip(),
                 "nearest_code_ids": known_nearest,
+                "uncertainty_flags": uncertainty,
                 "confidence": confidence,
                 "in_vivo_confidence": in_vivo_confidence,
                 "valence": str(proposal.get("valence") or "neutral"),
@@ -762,6 +783,13 @@ def commit_passage(
                 "frequency": 0,
                 "document_ids": [],
                 "examples": [],
+                "revision": 1,
+                "inclusion": "",
+                "exclusion": "",
+                "lifecycle": "active",
+                "anchor_span_ids": [],
+                "contrast_span_ids": [],
+                "category_links": [],
                 "first_seen": passage.get("passage_id"),
                 "history": [
                     {
@@ -776,6 +804,7 @@ def commit_passage(
             }
         elif item["action"] == "refine" and item["definition"]:
             book[key]["definition"] = item["definition"]
+            book[key]["revision"] = int(book[key].get("revision") or 1) + 1
             book[key]["history"].append(
                 {
                     "event": "refined",
@@ -821,7 +850,9 @@ def commit_passage(
             "action": item["action"],
             "rationale": item["rationale"],
             "nearest_code": item.get("nearest_code") or "",
+            "nearest_code_id": item.get("nearest_code_id"),
             "why_not_nearest": item.get("why_not_nearest") or "",
+            "uncertainty_flags": list(item.get("uncertainty_flags") or []),
             "metadata": dict(passage.get("metadata") or {}),
             "confidence": item["confidence"],
             "needs_review": item["needs_review"],
@@ -862,7 +893,8 @@ def _rename_code(codebook: dict[str, dict], segments: list[dict], old: str, new:
         if entry.get("definition") and not survivor.get("definition"):
             survivor["definition"] = entry["definition"]
     else:
-        entry["code_id"] = _code_id(new)
+        # The id stays with the concept. A new label is a new revision, not a new code.
+        entry["revision"] = int(entry.get("revision") or 1) + 1
         book[new] = entry
     for segment in segments:
         if segment.get("code_key") == old:
@@ -1174,20 +1206,7 @@ def apply_sweep(
             "rewritten_definition": str(merge.get("rewritten_definition") or ""),
             "quote_fits": list(merge.get("quote_fits") or []),
         }
-        if source in codebook and target in codebook and opposite_valence(
-            codebook[source].get("valence"), codebook[target].get("valence")
-        ):
-            rejected.append({**record, "reason": "opposite_valence"})
-            ops.append(
-                _op(
-                    op="merge_reject",
-                    status="rejected",
-                    confidence=confidence,
-                    ids={"source_id": record["source_id"], "target_id": record["target_id"]},
-                    reason="opposite_valence",
-                )
-            )
-            continue
+        # Stance is context. Opposite valence does not reject the comparison.
         if source and target and frozenset((source, target)) in frozen:
             rejected.append(
                 {
@@ -1222,6 +1241,11 @@ def apply_sweep(
         eligible.append((record, source, target))
 
     eligible.sort(key=lambda item: (-float(item[0].get("confidence") or 0), str(item[0].get("source") or ""), str(item[0].get("target") or "")))
+    from automated_grounded_theory.records import component_aliases_are_direct
+
+    eligible_pairs = {frozenset((source, target)) for _record, source, target in eligible}
+    components: dict[str, set[str]] = {key: {key} for key in codebook}
+    lost: list[dict] = []
     cap = None if max_merges_per_sweep is None else max(0, int(max_merges_per_sweep))
     applied_count = 0
     for record, source, target in eligible:
@@ -1243,18 +1267,37 @@ def apply_sweep(
         if root_source == root_target:
             rejected.append({**record, "reason": "already_merged"})
             continue
+        group = set(components.get(root_source) or {root_source}) | set(components.get(root_target) or {root_target})
+        if not component_aliases_are_direct(group, eligible_pairs):
+            rejected.append({**record, "reason": "non_transitive", "comparison_op": "alias_duplicate"})
+            lost.append({"codes": sorted(group), "edge": [source, target], "reason": "non_transitive"})
+            ops.append(
+                _op(
+                    op="alias_duplicate",
+                    status="rejected",
+                    confidence=float(record.get("confidence") or 0),
+                    ids={"source_id": record["source_id"], "target_id": record["target_id"]},
+                    reason="non_transitive",
+                    rationale=record.get("rationale") or "",
+                )
+            )
+            continue
         # The survivor is the lexicographically smaller code key. The model's
         # source/target direction does not change which label remains.
         if root_target < root_source:
             parent[root_source] = root_target
+            survivor_root, retired_root = root_target, root_source
         else:
             parent[root_target] = root_source
-        record = {**record, "decision": "accept"}
+            survivor_root, retired_root = root_source, root_target
+        components[survivor_root] = group
+        components.pop(retired_root, None)
+        record = {**record, "decision": "accept", "comparison_op": "alias_duplicate"}
         accepted.append(record)
         applied_count += 1
         ops.append(
             _op(
-                op="merge_accept",
+                op="alias_duplicate",
                 status="applied",
                 confidence=float(record.get("confidence") or 0),
                 ids={"source_id": record["source_id"], "target_id": record["target_id"], "pair_id": record["pair_id"]},
@@ -1401,6 +1444,7 @@ def apply_sweep(
         "ops": ops,
         "merge_map": display_map,
         "relation_hints": hints_applied,
+        "lost_distinction_candidates": lost,
     }
 
 

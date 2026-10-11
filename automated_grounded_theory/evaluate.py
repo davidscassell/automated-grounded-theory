@@ -464,6 +464,16 @@ def _score(run: Mapping[str, Any], context_text: str) -> dict:
     else:
         metrics["verbatim_quote_pct"] = None
     metrics.update(_quote_anchor_rates(segments))
+    eligible = [passage for passage in passages if not passage.get("skipped")]
+    uncoded = [
+        passage
+        for passage in eligible
+        if counts.get(_passage_id(passage), 0) == 0 and passage.get("coverage_status") != "failed"
+    ]
+    failed = [passage for passage in passages if passage.get("coverage_status") == "failed"]
+    metrics["uncoded_share"] = round(len(uncoded) / len(eligible), 4) if eligible else 0.0
+    metrics["failed_slot_share"] = round(len(failed) / len(passages), 4) if passages else 0.0
+    metrics["excluded_passages"] = sum(1 for passage in passages if passage.get("coverage_status") == "excluded" or passage.get("skipped"))
     labels = [str(entry.get("code") or "") for entry in codebook if entry.get("code")]
     if labels:
         metrics["gerund_first_word_pct"] = round(

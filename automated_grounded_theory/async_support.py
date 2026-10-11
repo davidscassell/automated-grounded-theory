@@ -68,10 +68,12 @@ class CallLimiter:
         self._success_streak = 0
         self.cache = cache if cache is not None else {}
         self.cache_hits = 0
+        self.cache_context: dict = {}
+        self.schema_repairs = 0
 
     async def ainvoke(self, runnable, payload):
         """``await runnable.ainvoke(payload)`` under the AIMD cap, with rate-limit retries."""
-        key = _cache_key(payload)
+        key = cache_key(payload, **(self.cache_context or {}))
         cached = self.cache.get(key)
         if cached is not None:
             self.cache_hits += 1
@@ -96,7 +98,7 @@ class CallLimiter:
         output: list[Any] = [None] * len(inputs)
         pending: list[int] = []
         for index, payload in enumerate(inputs):
-            cached = self.cache.get(_cache_key(payload))
+            cached = self.cache.get(cache_key(payload, **(self.cache_context or {})))
             if cached is not None:
                 self.cache_hits += 1
                 output[index] = cached
@@ -125,7 +127,7 @@ class CallLimiter:
                     raise result
                 else:
                     output[index] = result
-                    self.cache[_cache_key(inputs[index])] = result
+                    self.cache[cache_key(inputs[index], **(self.cache_context or {}))] = result
             if still:
                 self._note_transient(retry_exc, len(still))
                 await asyncio.sleep(self._wait(attempt, retry_exc))
@@ -243,12 +245,23 @@ class CallLimiter:
         self._in_flight -= 1
 
 
-def _cache_key(payload: Any) -> str:
+def cache_key(payload: Any, **context: Any) -> str:
+    """Hash the request plus snapshot, definition, evidence, and policy versions.
+
+    A frequency change does not alter the key. A new definition or evidence
+    revision does. With no version fields this matches the older payload hash.
+    """
+    clean = {key: value for key, value in context.items() if value not in (None, "")}
     try:
-        raw = json.dumps(_jsonable(payload), ensure_ascii=False, sort_keys=True, default=repr)
+        body = _jsonable(payload) if not clean else {"payload": _jsonable(payload), "context": clean}
+        raw = json.dumps(body, ensure_ascii=False, sort_keys=True, default=repr)
     except TypeError:
-        raw = repr(payload)
+        raw = repr((payload, clean))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _cache_key(payload: Any) -> str:
+    return cache_key(payload)
 
 
 def _jsonable(value: Any) -> Any:
@@ -483,6 +496,7 @@ async def ainvoke_structured(model, schema, messages: Sequence, limiter) -> tupl
             )
         ]
         try:
+            limiter.schema_repairs = int(getattr(limiter, "schema_repairs", 0) or 0) + 1
             repaired = await limiter.ainvoke(runnable, repair)
             return parse_structured(repaired, schema), repair
         except ValueError:

@@ -120,7 +120,7 @@ def test_low_confidence_merge_is_not_applied():
     assert high["codebook"][next(iter(high["codebook"]))]["definition"] in {"own", "other"}
 
 
-def test_opposite_valence_is_not_merged():
+def test_opposite_valence_does_not_block_a_shared_category():
     book = {
         "praising direct team": {
             "code": "praising direct team",
@@ -150,9 +150,10 @@ def test_opposite_valence_is_not_merged():
         ],
         candidates=[],
     )
-    assert applied["accepted_merges"] == []
-    assert applied["rejected_merges"][0]["reason"] == "opposite_valence"
-    assert len(applied["codebook"]) == 2
+    assert len(applied["accepted_merges"]) == 1
+    assert applied["accepted_merges"][0]["source_valence"] == "negative"
+    assert applied["accepted_merges"][0]["target_valence"] == "positive"
+    assert applied["rejected_merges"] == []
 
 
 def test_recreated_code_reapplies_the_accepted_merge():

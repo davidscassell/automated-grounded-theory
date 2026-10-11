@@ -48,12 +48,17 @@ sys.path.insert(0, str(ROOT))
 
 from automated_grounded_theory.benchmark import (  # noqa: E402
     amap_codes,
+    audit_sample,
     binary_theme_kappa,
+    codes_tagged_in,
     excerpt_label_pairs,
+    excerpt_offset_hits,
     load_bcstats,
     load_fixture_bundle,
     load_muse,
+    quote_and_coverage_rates,
     report_from_mapping,
+    unit_grid_agreement,
 )
 
 
@@ -168,35 +173,78 @@ def run_dataset(dataset: str, model: str, output: Path, limit: int | None) -> di
     documents = bundle["documents"]
     if limit:
         documents = documents[:limit]
-        keep = {item["id"] for item in documents}
-        tags = [item for item in bundle["tags"] if item["document"] in keep]
-    else:
-        tags = bundle["tags"]
+    keep = {item["id"] for item in documents}
+    tags = [item for item in bundle["tags"] if item["document"] in keep]
     question = MUSE_QUESTIONS.get(bundle["dataset"], "What is happening in these documents?")
+    _progress(f"{len(documents)} documents, {len(tags)} in-scope tags")
     result = open_code(documents, _context(question), model=model, output_dir=output / "open_code")
     themes = build_themes(result, _context(question), model=model, output_dir=output / "themes")
+    in_scope = set(codes_tagged_in(tags, keep))
     human = [
         {"code": item["label"], "definition": item.get("definition") or "", "theme": ""}
         for item in bundle["codebook"]
-        if item.get("label")
+        if item.get("label") and item["label"] in in_scope
     ]
     llm = [{"code": item["code"], "definition": item.get("definition") or ""} for item in result.codebook]
-    mappings = run_sync(amap_codes(model, llm, human))
+    mappings = _graded(run_sync(amap_codes(model, llm, human)))
     human_labels, llm_labels = excerpt_label_pairs(tags, result.segments, mappings)
     report = report_from_mapping(
-        bundle["human_codes"],
+        [item["code"] for item in human],
         [item["code"] for item in llm],
         mappings,
         human_labels=human_labels,
         llm_labels=llm_labels,
         stage_seconds=_stage_seconds(result, themes),
     )
+    report["in_scope_human_codes"] = len(human)
+    report["excerpt_offsets"] = excerpt_offset_hits(tags, result.segments, mappings, documents=documents)
+    report["excerpt_offsets"].pop("rows", None)
+    report["quote_and_coverage"] = quote_and_coverage_rates(result.passages, result.segments)
+    units = []
+    by_passage: dict[str, dict] = {}
+    for passage in result.passages:
+        by_passage[str(passage.get("passage_id"))] = {
+            "unit_id": passage.get("passage_id"),
+            "human_codes": [],
+            "llm_codes": [segment.get("code") for segment in result.segments if segment.get("passage_id") == passage.get("passage_id")],
+        }
+    report["unit_agreement"] = unit_grid_agreement(list(by_passage.values()))
+    sample = audit_sample(mappings, fraction=0.2, seed=0)
+    report["audit_sample_size"] = len(sample)
     (output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     (output / "mapping.json").write_text(json.dumps(mappings, indent=2), encoding="utf-8")
+    (output / "audit_sample.json").write_text(json.dumps(sample, indent=2), encoding="utf-8")
     return report
 
 
+def _progress(message: str) -> None:
+    print(message, flush=True)
+
+
+def _graded(mappings: list[dict]) -> list[dict]:
+    graded = []
+    for row in mappings:
+        confidence = float(row.get("confidence") or 0)
+        if row.get("grade"):
+            grade = str(row["grade"])
+        elif confidence >= 0.8:
+            grade = "full"
+        elif confidence >= 0.5:
+            grade = "partial"
+        else:
+            grade = "none"
+        llm_codes = list(row.get("llm_codes") or [])
+        if not llm_codes and row.get("llm_code"):
+            llm_codes = [row["llm_code"]]
+        graded.append({**row, "grade": grade, "llm_codes": llm_codes})
+    return graded
+
+
 def main() -> None:
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     parser = argparse.ArgumentParser(description="Benchmark open coding against human codes.")
     parser.add_argument("--download", action="store_true", help="Download Muse and the BC Stats sample.")
     parser.add_argument("--fixture", type=Path, default=None, help="Score a tiny fixture directory and exit.")
@@ -208,7 +256,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.download:
         download()
-        print(f"Downloaded into {DATA}")
+        _progress(f"Downloaded into {DATA}")
         return
     if args.fixture:
         bundle = load_fixture(args.fixture)
@@ -219,7 +267,7 @@ def main() -> None:
         llm_labels = [row.get("llm_code") or "" for row in bundle["segments"]]
         themes_h = [row.get("theme") or "" for row in bundle["human_codes"] if row.get("theme")]
         themes_m = [row.get("theme") or "" for row in mappings if row.get("theme")]
-        print(json.dumps(report_from_mapping(
+        _progress(json.dumps(report_from_mapping(
             human,
             llm,
             mappings,
@@ -232,8 +280,9 @@ def main() -> None:
     if args.dataset:
         if not args.model:
             parser.error("--dataset requires --model.")
+        _progress(f"Coding {args.dataset} with {args.model}")
         report = run_dataset(args.dataset, args.model, args.output / args.dataset, args.limit or None)
-        print(json.dumps(report, indent=2))
+        _progress(json.dumps(report, indent=2))
         return
     parser.error("Pass --download, --fixture, or --dataset.")
 

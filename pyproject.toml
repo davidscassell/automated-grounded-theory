@@ -1,6 +1,6 @@
 [project]
 name = "automated_grounded_theory"
-version = "0.5.5"
+version = "0.6.0"
 description = "Grounded theory open coding and focused coding with any LangChain chat model."
 readme = "README.md"
 license = "MIT"
@@ -26,6 +26,7 @@ cohere = ["langchain-cohere"]
 huggingface = ["langchain-huggingface"]
 checkpoint = ["langgraph-checkpoint-sqlite"]
 plots = ["matplotlib"]
+viz = ["grandalf"]
 dev = [
     "pytest",
     "langgraph-checkpoint-sqlite",

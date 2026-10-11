@@ -151,6 +151,7 @@ class QuoteAnchor:
     model_quote: str
     spans: tuple[tuple[int, int], ...] = ()
     doc_spans: tuple[tuple[int, int], ...] = ()
+    flags: tuple[str, ...] = ()
 
     @property
     def doc_start(self) -> int | None:
@@ -191,6 +192,8 @@ def anchor_quote(
     document_text: str = "",
     passage_start: int = 0,
     passage_end: int | None = None,
+    prefer_offset: int | None = None,
+    occurrence: int | None = None,
 ) -> QuoteAnchor:
     """Anchor ``quote`` without ever rejecting it.
 
@@ -203,7 +206,7 @@ def anchor_quote(
     model_quote = "" if quote is None else str(quote).strip()
     end_offset = passage_start + len(passage) if passage_end is None else passage_end
     regions: list[tuple[str, str, int | None, int | None]] = [
-        ("passage", passage or "", passage_start, 0),
+        ("passage", passage or "", passage_start, prefer_offset),
     ]
     if prev_text:
         origin = _region_origin(document_text, prev_text, passage_start, before=True)
@@ -217,7 +220,13 @@ def anchor_quote(
     best: QuoteAnchor | None = None
     for source, text, origin, bias in regions:
         allow_fuzzy = best is None or best.status in QUOTE_FLAG_STATUSES
-        hit = _anchor_in(model_quote, text, bias=bias, allow_fuzzy=allow_fuzzy)
+        hit = _anchor_in(
+            model_quote,
+            text,
+            bias=bias,
+            allow_fuzzy=allow_fuzzy,
+            occurrence=occurrence,
+        )
         if hit is None:
             continue
         anchored = _place(hit, source=source, origin=origin, haystack=text, model_quote=model_quote)
@@ -275,6 +284,7 @@ def _place(hit: "_Hit", *, source: str, origin: int | None, haystack: str, model
         model_quote=model_quote,
         spans=hit.spans,
         doc_spans=doc_spans,
+        flags=hit.flags,
     )
 
 
@@ -292,9 +302,17 @@ class _Hit:
     status: str
     similarity: float | None
     spans: tuple[tuple[int, int], ...]
+    flags: tuple[str, ...] = ()
 
 
-def _anchor_in(quote: str, haystack: str, *, bias: int | None, allow_fuzzy: bool) -> _Hit | None:
+def _anchor_in(
+    quote: str,
+    haystack: str,
+    *,
+    bias: int | None,
+    allow_fuzzy: bool,
+    occurrence: int | None = None,
+) -> _Hit | None:
     if not quote or not haystack:
         return None
     parts = _quote_parts(quote)
@@ -305,9 +323,9 @@ def _anchor_in(quote: str, haystack: str, *, bias: int | None, allow_fuzzy: bool
         if multi is not None:
             return multi
     target = parts[0] if len(parts) == 1 else " ".join(parts)
-    exact = _exact_span(target, haystack, bias=bias)
-    if exact is not None and _span_ok(haystack, exact):
-        return _Hit("exact", 1.0, (exact,))
+    exact = _exact_span(target, haystack, bias=bias, occurrence=occurrence)
+    if exact is not None and _span_ok(haystack, exact[0]):
+        return _Hit("exact", 1.0, (exact[0],), exact[1])
     normalized = _normalized_span(target, haystack, bias=bias)
     if normalized is not None and _span_ok(haystack, normalized):
         return _Hit("normalized_match", 1.0, (normalized,))
@@ -361,15 +379,22 @@ def _match_part(part: str, haystack: str, cursor: int) -> tuple[str, tuple[int, 
     window_end = min(len(haystack), cursor + 800 + len(part) + 80)
     region = haystack[cursor:window_end]
     exact = _exact_span(part, region, bias=None)
-    if exact is not None and _span_ok(region, exact):
-        return "exact", (cursor + exact[0], cursor + exact[1])
+    if exact is not None and _span_ok(region, exact[0]):
+        span = exact[0]
+        return "exact", (cursor + span[0], cursor + span[1])
     normalized = _normalized_span(part, region, bias=None)
     if normalized is not None and _span_ok(region, normalized):
         return "normalized_match", (cursor + normalized[0], cursor + normalized[1])
     return None
 
 
-def _exact_span(quote: str, haystack: str, *, bias: int | None) -> tuple[int, int] | None:
+def _exact_span(
+    quote: str,
+    haystack: str,
+    *,
+    bias: int | None,
+    occurrence: int | None = None,
+) -> tuple[tuple[int, int], tuple[str, ...]] | None:
     cleaned = quote.strip()
     if not cleaned:
         return None
@@ -383,7 +408,15 @@ def _exact_span(quote: str, haystack: str, *, bias: int | None) -> tuple[int, in
         start = index + max(1, len(cleaned))
     if not spans:
         return None
-    return _closest(spans, bias)
+    if occurrence is not None:
+        if occurrence < 0 or occurrence >= len(spans):
+            return None
+        return spans[occurrence], ()
+    # A repeated quote is not silently the first hit. Neighborhood bias picks
+    # one; with no neighborhood the span is kept and flagged.
+    if len(spans) > 1 and bias is None:
+        return spans[0], ("ambiguous_span",)
+    return _closest(spans, bias), ()
 
 
 def _normalized_span(quote: str, haystack: str, *, bias: int | None) -> tuple[int, int] | None:
@@ -572,6 +605,9 @@ _TRIVIAL_EXACT = frozenset(
         "nothing",
         "no comment",
         "no comments",
+        "i don't know",
+        "i dont know",
+        "idk",
         "-",
         "--",
         "---",
@@ -605,19 +641,40 @@ def substantive_memo(text: str) -> bool:
     return True
 
 
+_HEX_CODE_ID = re.compile(r"^[0-9a-f]{16}$")
+
+
+def is_code_id_text(label: str) -> bool:
+    """True when a label is a raw 16-character code id, not a human name."""
+    return bool(_HEX_CODE_ID.fullmatch(str(label or "").strip().casefold()))
+
+
 def is_trivial_passage(text: str) -> bool:
     """True when a passage has no incident worth a model call.
 
-    Empty comments, punctuation, and explicit non-answers are skipped.
-    A short but substantive reply such as "yes" is kept.
+    Empty comments, punctuation, and explicit non-answers are excluded.
+    A short but substantive reply such as "yes" is kept. The original row
+    stays in the corpus with :func:`exclusion_reason`.
+    """
+    return exclusion_reason(text) is not None
+
+
+def exclusion_reason(text: str) -> str | None:
+    """Why a row is kept but not sent to the model, or None when it is codable.
+
+    ``N/A`` and ``I don't know`` are exclusions under the default study policy.
+    They can be missingness or a real claim of uncertainty; the reason is stored
+    either way so a later policy can recode them.
     """
     stripped = (text or "").strip()
     if not stripped:
-        return True
+        return "empty"
     folded = re.sub(r"\s+", " ", stripped).casefold()
     if folded in _TRIVIAL_EXACT:
-        return True
-    return re.search(r"[A-Za-z0-9]", stripped) is None
+        return "non_answer"
+    if re.search(r"[A-Za-z0-9]", stripped) is None:
+        return "no_substantive_text"
+    return None
 
 
 _LEAK_STOP = frozenset(

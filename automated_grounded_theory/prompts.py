@@ -41,8 +41,11 @@ Ask of each passage: what is this data a study of, what is actually happening, \
 and what category does this incident indicate?
 
 Code with short gerunds: simple, active, close to the data, usually two to six words. \
-Code the incident, not the topic. Return one code per distinct incident. A passage \
-that both praises and criticizes needs a separate code for each incident.
+Prefer one action and one object. Before you finish a code, ask whether it hides a \
+second idea (who, why, or a consequence). If it does, return another code. Return \
+one code per distinct incident. Spans may overlap. A passage may carry zero codes \
+or several. A passage that both praises and criticizes needs a separate code for \
+each incident.
 
 In-vivo codes: set in_vivo true only when every one of these is true. If one fails, \
 in_vivo is false.
@@ -65,8 +68,12 @@ shows the label or definition should change. Create a new code only when none of
 nearest codes fits. Before action create, set nearest_code to one of those labels, \
 nearest_code_ids to their code_id values, and why_not_nearest to the property this \
 incident has that the nearest code does not. \
-Do not mint a near-duplicate. Set valence to positive, negative, neutral, or mixed. \
-Praise and criticism are opposite stances and must not share a code. Set confidence \
+Do not mint a near-duplicate. nearest_code may be empty when no code exists yet \
+or no listed code is close. Set valence to positive, negative, neutral, or mixed. \
+Valence is context. It does not stop two codes from informing one category, and it \
+is not by itself a reason to merge them. Set uncertainty_flags when the span is \
+ambiguous, the context is thin, two codes compete, or the inference is unsupported. \
+Confidence is a diagnostic, not a probability. Set confidence \
 from 0 to 1 on the action, on in_vivo, and on the memo. Anchors: 0.2 thin or \
 contradictory evidence, 0.5 plausible, 0.8 the quotes support it, 0.95 the quotes \
 show it directly. Write a rationale of one to three sentences for the action, for \
@@ -97,7 +104,8 @@ that the book had no close code), a property or dimension this incident varies, 
 one emerging question the next passage could answer. Do not write a sentence that \
 only says no property was recorded.
 
-If several passages are in the user message, code every one of them."""
+If several passages are in the user message, return one passages item for every \
+passage_id. A missing passage_id is a failed slot, not an empty coding."""
 
 SWEEP_SYSTEM = """You are comparing codes with codes during open coding.
 
@@ -119,8 +127,10 @@ every other duplicate pair you find in this chunk, each with a rationale. Do not
 merge codes that merely share a verb, a topic, or a sensitizing concept. When you \
 merge only when the codes share the same action, the same object, and the same \
 stance. Set same_action, same_object, and same_stance on every merge and rejection. \
-Keep the clearer label as the target and name the other code as the source. Never \
-merge a positive code with a negative code. Record source_valence and target_valence. \
+Keep the clearer label as the target and name the other code as the source. \
+Record source_valence and target_valence. Stance is context, not a merge veto: \
+alias_duplicate only when the concept is the same, record_dimension or keep_distinct \
+when the contrast matters, and do not treat a chain of pairs as one merge. \
 On each accept, set rewritten_label and rewritten_definition from the member quotes, \
 and set quote_fits for each example quote (fits false when a quote should be split \
 back out). Set confidence from 0 to 1. Anchors: 0.2 thin or contradictory, 0.5 \
@@ -313,6 +323,7 @@ def build_coding_messages(
                 next_text=clip(str(passage.get("next_text") or ""), 400),
                 metadata=dict(passage.get("metadata") or {}),
                 nearest_code_ids=[by_label.get(code_key(label), "") for label in labels if code_key(label)],
+                question=str(passage.get("question") or ""),
             )
         )
     notes = [note for note in (feedback or {}).values() if note]
@@ -400,9 +411,10 @@ The open codes already exist. Group them into themes. A theme gathers codes \
 about the same kind of incident. Name the theme, define the incident it gathers, \
 and list a few properties (dimensions that vary inside it) when the codes show any.
 
-Assign every CODE_LABEL to exactly one theme. Copy the label text exactly. Do not \
-invent a code, do not rename a code, and do not drop one to keep the list short. \
-A code that could sit in two themes still goes to the one it fits best.
+Assign every CODE_LABEL to at least one theme. A code may belong to more than one \
+theme when it genuinely informs both. Copy the label text exactly. Do not invent a \
+code, do not rename a code, and do not drop one to keep the list short. \
+max_themes is a presentation budget, not a reason to erase a membership.
 
 Themes are categories of the codes in front of you. The research context is only \
 for understanding those codes. It is not a list of themes to force, and it is not \

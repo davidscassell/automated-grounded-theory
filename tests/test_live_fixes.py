@@ -474,7 +474,7 @@ def test_empty_document_memo_is_omitted():
     assert all("No property" not in item["text"] for item in notes)
 
 
-def test_collapse_blocks_a_dominant_theme():
+def test_theme_share_is_a_presentation_budget():
     themes = []
     for index in range(10):
         themes.append(
@@ -487,10 +487,13 @@ def test_collapse_blocks_a_dominant_theme():
         )
     merged, _mapping, changed = collapse_themes(themes, max_themes=6, max_theme_share=0.30)
     assert changed
-    assert len(merged) > 1
-    assert max(len(theme["codes"]) for theme in merged) <= 30
+    assert max(len(theme["codes"]) for theme in merged) > 30
     total = sum(len(theme["codes"]) for theme in merged)
     assert total == 100
+    from automated_grounded_theory.themes import _dominance_warning
+
+    note = _dominance_warning(merged, 0.30)
+    assert note and "presentation" in note
 
     dissimilar = [
         {"name": word, "definition": word, "properties": [], "codes": [word]}

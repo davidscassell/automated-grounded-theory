@@ -83,6 +83,13 @@ class CodeProposal(_LLMModel):
         default_factory=list,
         description="code_id values of the nearest codes you considered before creating. Empty when reusing.",
     )
+    uncertainty_flags: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional flags: ambiguous_span, insufficient_context, competing_code, unsupported_inference. "
+            "Confidence stays a diagnostic and does not decide the code."
+        ),
+    )
     confidence: float = Field(
         default=1.0,
         ge=0.0,
@@ -448,6 +455,7 @@ class PassageInput(_LLMModel):
     next_text: str = ""
     metadata: dict = Field(default_factory=dict)
     nearest_code_ids: list[str] = Field(default_factory=list)
+    question: str = ""
 
 
 class CodingRequest(_LLMModel):

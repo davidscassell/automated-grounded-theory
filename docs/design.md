@@ -1,0 +1,125 @@
+# automated-grounded-theory — Technical Design (0.6.0)
+
+Repo: https://github.com/davidscassell/automated-grounded-theory
+Status: steps 1 and 2 of the v0.6 plan. Category development, theoretical sampling, and theory integration are not in this release.
+
+The default procedure is Charmaz-informed automated analysis: initial coding against a frozen snapshot, constant comparison with distinct operations, and `build_themes` as a descriptive reporting view. It is not an axial-coding template.
+
+## 1. What this release changes
+
+| Choice in 0.5.4 / 0.5.5 | 0.6.0 |
+| --- | --- |
+| One code decision treated as the whole passage | Several assignments, each with its own evidence span. Spans may overlap. |
+| Paragraph cuts that split answers | `unit="incident"` (default): interviewer question plus the full answer, then ~150–800 character incidents, never mid-sentence, cap ~1200. |
+| Quote mismatch dropped the code | Kept from 0.5.5: `quote_status` is exact, normalized_match, fuzzy_match, possibly_modified, or unanchored. Possibly modified and unanchored are flagged. The code stays. |
+| Opposite valence blocked a merge | Valence is context. `alias_duplicate` is not rejected for stance. `record_dimension` and `keep_distinct` keep the contrast. `link_to_category` can place both under one category label. |
+| One theme per code, 30% share cap | Many-to-many membership. `max_theme_share` and `max_themes` are presentation budgets. Prevalence names its denominator. |
+| Pairwise union-find was transitive | A component of three or more codes is merged only when every pair was judged. Otherwise the extra edge is `non_transitive` and listed under lost-distinction candidates. |
+| Sequential coding node | `Send` workers read snapshot `S_t`. One commit writes `S_t+1`. `batch_size` defaults to 1 and can be set to 4. |
+
+## 2. Stack
+
+- Python ≥ 3.11, LangChain (`init_chat_model("provider:model")` or a `BaseChatModel`), LangGraph (`Send`, checkpointing).
+- Pydantic v2 at model boundaries. One schema-repair retry (`REPAIR THIS OUTPUT`), separate from transport retries.
+- Optional extras: provider SDKs, `checkpoint`, `plots`, `viz` (`grandalf`; `pygraphviz` is optional and not in the extra), `dev`.
+- `draw_mermaid_png` posts to mermaid.ink. It is not an offline renderer.
+
+## 3. Public API
+
+```python
+result = await aopen_code(
+    corpus,
+    context,
+    model="xai:grok-4",          # or a BaseChatModel
+    seed=42,
+    unit="incident",             # default
+    batch_size=1,                # reference; 4 is the comparison setting
+    concurrency=4,               # shared in-flight cap
+    review_mode="document",      # "wave" is opt-in
+    sweep_every=25,
+    pipeline=True,
+    review_below=0.5,
+    min_merge_confidence=0.5,
+    max_merges_per_sweep=12,
+    token_budget=4000,
+)
+themes = await abuild_themes(result, context, model=model, max_themes=12, max_theme_share=0.30)
+report = await aevaluate(result, compare_to=[other])
+run = load_run(output_dir)
+graph = get_graph("open_code")  # or "themes"
+```
+
+`context` guides attention. Keys named `codes` or `codebook` raise `PresetCodesError`.
+
+`max_theme_share` does not block a fold. `abuild_themes` does not develop categories. There is no `arun_study` in this release.
+
+## 4. Records
+
+| Record | What is stored |
+| --- | --- |
+| Document | Stable id, source text hash, metadata, original order. |
+| Incident | Question, exact start/end on the immutable source, `coverage_status`, `exclusion_reason`. |
+| EvidenceSpan | Document id, exact offsets, `quote_status`, code id. Repeated quotes are disambiguated by occurrence or neighborhood and flagged `ambiguous_span` when neither is available. |
+| CodeVersion | Stable `code_id`, `revision`, label, definition, inclusion/exclusion, anchor and contrast span ids, lifecycle. A hex id is never used as a label. |
+| CodingAssignment | Span, code id and revision, snapshot id, rationale, optional `uncertainty_flags`. |
+| Comparison | `alias_duplicate`, `refine_definition`, `split_code`, `link_to_category`, `record_dimension`, `keep_distinct`, `defer`. `relate_categories` is recorded and not executed. |
+
+`coverage_status` is `coded`, `context_only`, `excluded`, `failed`, or `pending`. A missing output slot is `failed`, not an empty coding. `nearest_code_id` is null when the book is empty or no neighbor was named.
+
+Uncertainty flags: `ambiguous_span`, `insufficient_context`, `competing_code`, `unsupported_inference`. Self-rated confidence is diagnostic only.
+
+`metadata["code_versions"]` and `metadata["coverage"]` are materialized on the result. Taguette CSVs are unchanged: no confidence and no `quote_status` column. A future Taguette SQLite project adapter must pin the Taguette version it targets. This release does not include that adapter.
+
+## 5. Graph
+
+`get_graph("open_code")`:
+
+`segment_and_shuffle` → `prepare_round` → `Send("code_worker")` → `commit` → `sweep` → `consolidate` → `export`.
+
+`prepare_round` freezes `snapshot_id`, `definition_revision`, `evidence_revision`, and `policy_version` (`0.6.0`). Workers do not mutate the codebook. The proposal reducer dedupes by proposal id, drops conflicting payloads, sorts, and clears only on `{"__reset__": True}`. `commit` rejects a stale snapshot id, skips proposal ids already committed, and is the only writer of definitions.
+
+`get_graph("themes")` fans chunk workers out with `Send` into `theme_worker`, then joins at `validate`. The reporting graph is separate from category development.
+
+One `CallLimiter` is shared by coding and sweep calls in a run, including retries. Cache keys add snapshot, definition, evidence, and policy versions when those are set. Transport retries and the one schema repair are counted separately (`transport_retries`, `schema_repairs`).
+
+Metrics on `metadata["metrics"]`: duplicates before reconciliation, reconciliation calls and seconds, coding p50/p95, tokens, retries, lost-distinction candidates.
+
+Checkpoint state is serializable (snapshot refs, passages, proposals). Models and the limiter stay on the runtime object.
+
+## 6. Themes and saturation
+
+Themes may share codes. Each theme reports `denominator_passages`, `denominator_documents`, and `denominator_respondents`. A presentation-budget note is a warning, not a rejected fold.
+
+Saturation keeps the pre-alias and post-alias curves (`new_codes_pre_alias`, `new_codes_post_alias`). `judgment` is always null.
+
+## 7. Evaluation and the three-way benchmark
+
+`benchmarks/compare_versions.py --offline` runs the `v0.5.4` git tag (merged PR #4, not a 0.6 commit) against 0.6.0 `batch_size=1` and `batch_size=4` on the fake coder. `--model` and `--corpus` run 0.6.0 live. Do not treat that script as a download of Muse.
+
+Benchmark scoring:
+
+- Human codes are those tagged in the coded documents.
+- Document ids `6` and `6.0` normalize to `6`.
+- Alignment rows carry `grade` `full` / `partial` / `none` and may list several `llm_codes`. `audit_sample` exports 20% for hand review.
+- Excerpt recall uses character-offset overlap (IoU or containment ≥ 0.3).
+- Agreement on a fixed unit grid is per-code present/absent (`unit_grid_agreement`), not single-label kappa.
+- `quote_and_coverage_rates` reports flag rates and uncoded share.
+- `amap_codes` resolves a `provider:model` string through `init_chat_model`.
+- Progress lines are flushed.
+
+## 8. Results so far (live, xAI Grok, 150 comments)
+
+| Version | Time | Final codes | Reuse | Singletons | Notes |
+| --- | --- | --- | --- | --- | --- |
+| v1 | 48.5 min | 132 | 13% | 90% | no merges |
+| v6 (0.5.2) | 7.9 min | 68 | 56% | 29% | first real merges |
+| v7 (0.5.3) | 21.2 min | 52 | 67% | 50% | safer merges; seeds diverge |
+| v8 (0.5.4) | 49.5 min | 71 | 52% | 63% | sweep outputs of 8–12k tokens |
+
+RAND Muse E2 under 0.5.4, as scored: precision 0.60, recall 0.19, F1 0.29 against 78 human codes. In-scope tags on the two coded documents are 23 codes, and much of the gap was the old quote drop plus one-label alignment. That figure is not the paper's codebook-application kappa.
+
+0.6.0 has not been timed on that live corpus in this change.
+
+## 9. Out of scope
+
+Category feedback, focused recoding of earlier negatives, relationship hypotheses, sampling briefs, and a Taguette project-file adapter. See the v0.6 plan steps 3–5.
