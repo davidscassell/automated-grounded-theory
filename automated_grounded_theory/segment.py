@@ -60,14 +60,22 @@ def plan_coding(
     unit: Unit = "paragraph",
     seed: int | None = None,
     parallel_documents: bool = False,
+    review_mode: str = "document",
 ) -> CodingPlan:
     """Segment ``corpus`` and return passages in the order a run would code them.
 
     Does not call a model. ``seed`` is recorded so the order can be repeated.
     When ``seed`` is omitted, one is drawn and returned on the plan.
+
+    ``review_mode='document'`` (the default) shuffles documents and keeps each
+    document's passages in reading order. ``review_mode='wave'`` shuffles
+    passages across documents. That weakens constant comparison, because a
+    later passage in a document can be coded before an earlier one.
     """
     if unit not in UNITS:
         raise ValueError(f"unit must be one of {', '.join(UNITS)}. Got {unit!r}.")
+    if review_mode not in {"document", "wave"}:
+        raise ValueError(f"review_mode must be 'document' or 'wave'. Got {review_mode!r}.")
     if seed is None:
         seed = random.SystemRandom().randrange(0, 2**31)
     documents = load_corpus(corpus)
@@ -107,8 +115,20 @@ def plan_coding(
             parallel=True,
         )
 
-    queue = list(range(len(passages)))
-    rng.shuffle(queue)
+    if review_mode == "document":
+        by_doc: dict[str, list[int]] = {}
+        doc_order: list[str] = []
+        for index, passage in enumerate(passages):
+            doc_id = str(passage.get("doc_id") or "")
+            if doc_id not in by_doc:
+                doc_order.append(doc_id)
+                by_doc[doc_id] = []
+            by_doc[doc_id].append(index)
+        rng.shuffle(doc_order)
+        queue = [index for doc_id in doc_order for index in by_doc[doc_id]]
+    else:
+        queue = list(range(len(passages)))
+        rng.shuffle(queue)
     for order, index in enumerate(queue):
         passages[index]["coding_order"] = order
     _mark_trivial(passages, warnings)

@@ -1,15 +1,16 @@
-"""Score an open-coding run without calling a model.
+"""Score an open-coding run.
 
 ``evaluate_run`` reads a result object or an ``output_dir``. Chen et al.
 coverage, overlap, novelty, and divergence compare two or more codebooks.
-Those four use lexical clusters (token Jaccard at least 0.5) as the
-aggregated code space. The paper's merge step calls a model; this module
-does not, and it does not need an API key.
+By default those four use lexical clusters (token Jaccard at least 0.5).
+Pass ``model`` and the same scores are computed from concurrent same-code
+judgments instead. Without a model, nothing here calls a provider.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import collections
 import difflib
 import json
@@ -19,7 +20,17 @@ import statistics
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from automated_grounded_theory.async_support import (
+    CallLimiter,
+    parse_structured,
+    run_sync,
+    structured_runnable,
+)
+from automated_grounded_theory.backends import resolve_chat_model
+from automated_grounded_theory.prompts import build_judge_messages
 from automated_grounded_theory.retrieval import jaccard
+from automated_grounded_theory.schemas import SameCodeJudgment
+from automated_grounded_theory.clustering import adjusted_rand_index
 from automated_grounded_theory.validation import code_key
 
 _STOP = set(
@@ -43,6 +54,16 @@ def evaluate_run(
     context: str | None = None,
     log_path: str | Path | None = None,
     other_sources: Sequence[Any] | None = None,
+    *,
+    model=None,
+    concurrency: int = 4,
+    max_retries: int = 4,
+    retry_backoff: float = 0.5,
+    retry_max_backoff: float = 8.0,
+    api_key: str | None = None,
+    temperature: float = 0.0,
+    judge_limit: int = 64,
+    llm_seed: int | None = None,
 ) -> dict:
     """Metrics for one run, plus Chen et al. metrics when more codebooks are passed.
 
@@ -52,7 +73,49 @@ def evaluate_run(
     ``log_path`` is optional JSON (one object per line, or a single object) with
     a ``seconds`` field for wall-clock time. ``other_sources`` are further runs
     or directories on the same corpus.
+
+    ``model``, when set, judges near-duplicate codes concurrently. Chen metrics
+    then use those judgments. Omit ``model`` to keep the lexical clusters.
+    This wrapper works inside a running event loop.
     """
+    return run_sync(
+        aevaluate(
+            source,
+            context,
+            log_path,
+            other_sources,
+            model=model,
+            concurrency=concurrency,
+            max_retries=max_retries,
+            retry_backoff=retry_backoff,
+            retry_max_backoff=retry_max_backoff,
+            api_key=api_key,
+            temperature=temperature,
+            judge_limit=judge_limit,
+            llm_seed=llm_seed,
+        )
+    )
+
+
+async def aevaluate(
+    source: Any,
+    context: str | None = None,
+    log_path: str | Path | None = None,
+    other_sources: Sequence[Any] | None = None,
+    *,
+    model=None,
+    concurrency: int = 4,
+    max_retries: int = 4,
+    retry_backoff: float = 0.5,
+    retry_max_backoff: float = 8.0,
+    api_key: str | None = None,
+    temperature: float = 0.0,
+    judge_limit: int = 64,
+    llm_seed: int | None = None,
+) -> dict:
+    """Async form of :func:`evaluate_run`."""
+    if concurrency < 1 or judge_limit < 1 or max_retries < 0:
+        raise ValueError("concurrency and judge_limit must be at least 1, and max_retries at least 0.")
     run = _load_run(source)
     context_text = _context_text(context, run)
     metrics = _score(run, context_text)
@@ -67,14 +130,44 @@ def evaluate_run(
     books = [_codes(run)]
     if other_sources:
         books.extend(_codes(_load_run(item)) for item in other_sources)
+    if other_sources:
+        others = [_load_run(item) for item in other_sources]
+        metrics["adjusted_rand_index"] = round(
+            sum(assignment_ari(run, other) for other in others) / len(others),
+            4,
+        )
+    if model is None:
+        metrics["chen_metrics"] = chen_metrics(books) if len(books) >= 2 else _CHEN_NOTE
+        return metrics
+    coder = resolve_chat_model(model, api_key=api_key, temperature=temperature, llm_seed=llm_seed)
+    limiter = CallLimiter(concurrency, max_retries=max_retries, backoff=retry_backoff, max_backoff=retry_max_backoff)
+    tasks = []
     if len(books) >= 2:
-        metrics["chen_metrics"] = chen_metrics(books)
+        tasks.append(_judge_pairs(coder, books, limiter, judge_limit, same_coder=False))
+    tasks.append(_judge_pairs(coder, books, limiter, judge_limit, same_coder=True))
+    judged = await asyncio.gather(*tasks)
+    cursor = 0
+    if len(books) >= 2:
+        cross, cross_rows = judged[cursor]
+        cursor += 1
+        metrics["chen_metrics"] = chen_metrics(books, links=cross)
     else:
+        cross_rows = []
         metrics["chen_metrics"] = _CHEN_NOTE
+    _within, within_rows = judged[cursor]
+    metrics["llm_judgments"] = {
+        "cross_codebook": cross_rows,
+        "within_codebook": within_rows,
+        "same_cross": sum(1 for row in cross_rows if row["same"]),
+        "same_within": sum(1 for row in within_rows if row["same"]),
+    }
     return metrics
 
 
-def chen_metrics(codebooks: Sequence[Sequence[Mapping[str, Any]] | Mapping[str, Any]]) -> dict:
+def chen_metrics(
+    codebooks: Sequence[Sequence[Mapping[str, Any]] | Mapping[str, Any]],
+    links: Sequence[tuple[str, str]] | None = None,
+) -> dict:
     """Coverage, overlap, novelty, and divergence across codebooks.
 
     Clusters are connected components of codes whose labels (or label plus
@@ -93,7 +186,7 @@ def chen_metrics(codebooks: Sequence[Sequence[Mapping[str, Any]] | Mapping[str, 
     if not entries:
         empty = {"coverage": 0.0, "overlap": 0.0, "novelty": 0.0, "divergence": 0.0, "codes": 0}
         return {
-            "method": "lexical Jaccard >= 0.5 clusters; not the paper's model merge",
+            "method": _chen_method(links),
             "per_coder": [dict(empty) for _ in coders],
             "mean_coverage": 0.0,
             "mean_overlap": 0.0,
@@ -114,10 +207,17 @@ def chen_metrics(codebooks: Sequence[Sequence[Mapping[str, Any]] | Mapping[str, 
         if left_root != right_root:
             parent[right_root] = left_root
 
+    linked = _link_keys(links)
     for left in range(len(entries)):
         for right in range(left + 1, len(entries)):
             left_label, left_definition = entries[left][1], entries[left][2]
             right_label, right_definition = entries[right][1], entries[right][2]
+            if linked is not None:
+                left_key = code_key(left_label)
+                right_key = code_key(right_label)
+                if left_key == right_key or frozenset((left_key, right_key)) in linked:
+                    union(left, right)
+                continue
             score = jaccard(left_label, right_label)
             if score < _CLUSTER_JACCARD:
                 score = jaccard(f"{left_label} {left_definition}", f"{right_label} {right_definition}")
@@ -188,13 +288,122 @@ def chen_metrics(codebooks: Sequence[Sequence[Mapping[str, Any]] | Mapping[str, 
             }
         )
     return {
-        "method": "lexical Jaccard >= 0.5 clusters; not the paper's model merge",
+        "method": _chen_method(links),
         "per_coder": per_coder,
         "mean_coverage": round(statistics.mean(item["coverage"] for item in per_coder), 4),
         "mean_overlap": round(statistics.mean(item["overlap"] for item in per_coder), 4),
         "mean_novelty": round(statistics.mean(item["novelty"] for item in per_coder), 4),
         "mean_divergence": round(statistics.mean(item["divergence"] for item in per_coder), 4),
     }
+
+
+def assignment_ari(left: Mapping[str, Any], right: Mapping[str, Any]) -> float:
+    """Adjusted Rand index of passage→code assignments.
+
+    Passages are paired by ``passage_id``. Several codes on one passage are
+    joined in sorted order so the labeling does not depend on segment order.
+    This is the stability score across seeds. It is not a claim of saturation.
+    """
+    left_labels = _passage_labels(left)
+    right_labels = _passage_labels(right)
+    keys = sorted(set(left_labels) | set(right_labels))
+    if not keys:
+        return 1.0
+    return adjusted_rand_index(
+        [left_labels.get(key, "") for key in keys],
+        [right_labels.get(key, "") for key in keys],
+    )
+
+
+def _passage_labels(run: Mapping[str, Any]) -> dict[str, str]:
+    grouped: dict[str, list[str]] = {}
+    for segment in run.get("segments") or []:
+        passage_id = str(segment.get("passage_id") or "")
+        if not passage_id:
+            continue
+        grouped.setdefault(passage_id, []).append(str(segment.get("code") or ""))
+    return {passage_id: "|".join(sorted(labels)) for passage_id, labels in grouped.items()}
+
+
+def _chen_method(links: Sequence[tuple[str, str]] | None) -> str:
+    if links is None:
+        return "lexical Jaccard >= 0.5 clusters; not the paper's model merge"
+    return "llm same-code judgments, reconciled in pair order"
+
+
+def _link_keys(links: Sequence[tuple[str, str]] | None) -> set[frozenset[str]] | None:
+    if links is None:
+        return None
+    found: set[frozenset[str]] = set()
+    for left, right in links:
+        left_key = code_key(str(left))
+        right_key = code_key(str(right))
+        if left_key and right_key and left_key != right_key:
+            found.add(frozenset((left_key, right_key)))
+    return found
+
+
+def _candidate_pairs(codebooks: Sequence, limit: int, *, same_coder: bool) -> list[tuple[float, dict, dict]]:
+    """Near-duplicate pairs, highest overlap first, so the cap is deterministic."""
+    rows: list[tuple[int, dict]] = []
+    for coder_index, book in enumerate(codebooks):
+        for row in _code_rows(book):
+            rows.append((coder_index, row))
+    found: list[tuple[float, dict, dict]] = []
+    for left in range(len(rows)):
+        for right in range(left + 1, len(rows)):
+            if (rows[left][0] == rows[right][0]) != same_coder:
+                continue
+            left_row, right_row = rows[left][1], rows[right][1]
+            score = jaccard(left_row["code"], right_row["code"])
+            if score < _CLUSTER_JACCARD:
+                score = max(
+                    score,
+                    jaccard(
+                        f"{left_row['code']} {left_row['definition']}",
+                        f"{right_row['code']} {right_row['definition']}",
+                    ),
+                )
+            if score < 0.2:
+                continue
+            found.append((score, left_row, right_row))
+    found.sort(
+        key=lambda item: (
+            -item[0],
+            item[1]["code"].casefold(),
+            item[2]["code"].casefold(),
+            item[1]["definition"].casefold(),
+            item[2]["definition"].casefold(),
+        )
+    )
+    return found[:limit]
+
+
+async def _judge_pairs(model, codebooks, limiter: CallLimiter, limit: int, *, same_coder: bool):
+    pairs = _candidate_pairs(codebooks, limit, same_coder=same_coder)
+    if not pairs:
+        return [], []
+    runnable = structured_runnable(model, SameCodeJudgment)
+    results = await limiter.abatch(
+        runnable,
+        [build_judge_messages(left, right) for _score, left, right in pairs],
+    )
+    links: list[tuple[str, str]] = []
+    rows = []
+    for (_score, left, right), result in zip(pairs, results):
+        payload, _usage = parse_structured(result, SameCodeJudgment)
+        same = bool(payload.get("same"))
+        rows.append(
+            {
+                "left": left["code"],
+                "right": right["code"],
+                "same": same,
+                "rationale": payload.get("rationale") or "",
+            }
+        )
+        if same:
+            links.append((left["code"], right["code"]))
+    return links, rows
 
 
 def main(argv: Sequence[str] | None = None) -> int:

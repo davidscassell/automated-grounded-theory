@@ -53,5 +53,18 @@ def test_seed_is_reproducible_and_file_paths_load(tmp_path: Path):
     other = plan_coding([path], unit="paragraph", seed=2)
     order = [item["passage_id"] for item in sorted(first.passages, key=lambda item: item["coding_order"])]
     assert order == [item["passage_id"] for item in sorted(second.passages, key=lambda item: item["coding_order"])]
-    assert order != [item["passage_id"] for item in sorted(other.passages, key=lambda item: item["coding_order"])]
+    # One document stays in reading order. The seed shuffles documents, not passages.
+    assert order == [item["passage_id"] for item in sorted(other.passages, key=lambda item: item["coding_order"])]
+    assert order == sorted(order)
     assert first.passages[0]["doc_id"] == "interview"
+    docs = [
+        {"id": "ada", "text": "I packed my suitcase."},
+        {"id": "bea", "text": "I was crying at the station."},
+        {"id": "cam", "text": "They hired me on a Friday."},
+    ]
+    seeded = plan_coding(docs, seed=1)
+    again = plan_coding(docs, seed=1)
+    flipped = plan_coding(docs, seed=4)
+    doc_order = [item["doc_id"] for item in sorted(seeded.passages, key=lambda item: item["coding_order"])]
+    assert doc_order == [item["doc_id"] for item in sorted(again.passages, key=lambda item: item["coding_order"])]
+    assert doc_order != [item["doc_id"] for item in sorted(flipped.passages, key=lambda item: item["coding_order"])]

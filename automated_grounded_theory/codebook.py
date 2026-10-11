@@ -27,6 +27,13 @@ _ACTION_ALIASES = {
 }
 
 
+def _code_id(key: str) -> str:
+    """Stable id for a normalized label. The same spelling always hashes the same."""
+    import hashlib
+
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+
+
 def empty_counters() -> dict[str, int]:
     return {"segment": 0, "memo": 0, "highlight": 0, "sweep": 0}
 
@@ -227,6 +234,7 @@ def commit_passage(
             book[key] = {
                 "code": item["code"],
                 "key": key,
+                "code_id": _code_id(key),
                 "definition": item["definition"],
                 "in_vivo": item["in_vivo"],
                 "gerund_ok": item["gerund_ok"],
@@ -439,7 +447,13 @@ def apply_sweep(
         if root_source == root_target:
             rejected.append({**record, "reason": "already_merged"})
             continue
-        parent[root_source] = root_target
+        # The survivor is the lexicographically smaller code id. The model's
+        # source/target direction does not change which label remains, so two
+        # chunks that disagree about direction still produce one merge map.
+        if root_target < root_source:
+            parent[root_source] = root_target
+        else:
+            parent[root_target] = root_source
         accepted.append(record)
 
     book: dict[str, dict] = {}

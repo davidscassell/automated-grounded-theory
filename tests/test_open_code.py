@@ -27,7 +27,17 @@ def test_open_code_merges_and_keeps_verbatim_quotes(tmp_path):
     model = FakeCoder()
     result = _run(model, output_dir=tmp_path, api_key="sk-test-secret")
     assert not result.interrupted
-    assert model.call_count == 4
+    assert model.call_count == 6
+    reviewed = [item["doc_id"] for item in result.passages]
+    blocks = []
+    for doc_id in reviewed:
+        if not blocks or blocks[-1] != doc_id:
+            assert doc_id not in blocks
+            blocks.append(doc_id)
+    assert set(blocks) == {"alex", "blair", "casey", "drew"}
+    assert [item["passage_id"] for item in result.passages] == [
+        item["passage_id"] for item in sorted(result.passages, key=lambda item: item["coding_order"])
+    ]
     quotes = {item["passage_id"]: item["text"] for item in result.passages}
     assert len(result.segments) == 4
     for segment in result.segments:
@@ -186,7 +196,7 @@ def test_embedding_candidates_are_optional():
 
 def test_batching_and_waves_cut_calls():
     batched = FakeCoder()
-    result = _run(batched, batch_size=4, concurrency=1, sweep_every=25)
+    result = _run(batched, batch_size=4, concurrency=1, sweep_every=25, review_mode="wave", pipeline=False)
     assert batched.call_count == 2
     assert len(result.segments) == 4
     assert result.prompt_log[0]["usage"]["total_tokens"] == 18
@@ -200,6 +210,8 @@ def test_batching_and_waves_cut_calls():
         sweep_every=25,
         batch_size=1,
         concurrency=2,
+        review_mode="wave",
+        pipeline=False,
     )
     code_prompts = [item for item in waved_result.prompt_log if item["kind"] == "code_passage"]
     assert len(code_prompts) == 4

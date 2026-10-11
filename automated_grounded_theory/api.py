@@ -10,6 +10,7 @@ from typing import Any, Sequence
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models.chat_models import BaseChatModel
 
+from automated_grounded_theory.async_support import CallLimiter, run_sync
 from automated_grounded_theory.backends import (
     describe_model,
     prompt_cache_supported,
@@ -38,6 +39,7 @@ __all__ = [
     "OpenCodeResult",
     "ResearchContext",
     "StabilityReport",
+    "amulti_seed_stability",
     "aopen_code",
     "compare_runs",
     "multi_seed_stability",
@@ -65,7 +67,7 @@ def open_code(
     concurrency: int = 2,
     top_k_codes: int = 12,
     frequent_codes: int = 8,
-    merge_threshold: float = 0.82,
+    merge_threshold: float = 0.85,
     lexical_merge_threshold: float = 0.5,
     checkpoint_path: str | Path | None = None,
     thread_id: str | None = None,
@@ -84,9 +86,17 @@ def open_code(
     validation_retries: int = 1,
     require_gerund: bool = False,
     candidate_limit: int = 30,
+    review_mode: str = "document",
+    pipeline: bool = True,
+    token_budget: int = 4000,
     prompt_cache: bool | None = None,
     recursion_limit: int | None = None,
     checkpointer: Any = None,
+    sweep_chunk: int = 40,
+    embed_batch_size: int = 64,
+    max_retries: int = 4,
+    retry_backoff: float = 0.5,
+    retry_max_backoff: float = 8.0,
 ) -> OpenCodeResult:
     """Run first-round grounded-theory open coding over ``corpus``.
 
@@ -101,59 +111,76 @@ def open_code(
     sensitizing concepts). It is rejected if it contains preset codes.
 
     The saturation curve is reported and is not a stopping decision.
-    ``batch_size`` passages share one model call. ``concurrency`` calls run
-    together, then the codebook is updated before the next wave. A wave stops
-    at the next sweep. ``parallel_documents`` codes each document against its own codebook and
+    ``batch_size`` passages share one model call. ``concurrency`` is the cap on
+    in-flight model calls. A wave stops at the next sweep, then the codebook is
+    updated. Sweep chunks (candidates, merge confirmation, definition updates)
+    run together under that cap and are reconciled in chunk order.
+    ``parallel_documents`` codes each document against its own codebook and
     merges those codebooks at each sweep. It is off by default because that
     delays constant comparison across documents.
+
+    ``review_mode='document'`` (the default) reads every document in seeded
+    order and every passage of that document in reading order, then updates
+    the codebook. ``review_mode='wave'`` may code passages from several
+    documents in one step. That is faster and weakens constant comparison.
+
+    When ``pipeline`` is true, synthesis of the passages just coded runs while
+    the next document or wave is coded against the pre-merge snapshot. The
+    merge map is applied afterwards, in a fixed order. Rate-limit errors retry
+    with full-jitter backoff and honor ``Retry-After``. This wrapper works
+    inside a running event loop.
     """
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(
-            aopen_code(
-                corpus,
-                context,
-                model=model,
-                seed=seed,
-                sweep_every=sweep_every,
-                sweep_model=sweep_model,
-                unit=unit,
-                embeddings=embeddings,
-                api_key=api_key,
-                embeddings_api_key=embeddings_api_key,
-                temperature=temperature,
-                sweep_temperature=sweep_temperature,
-                parallel_documents=parallel_documents,
-                batch_size=batch_size,
-                concurrency=concurrency,
-                top_k_codes=top_k_codes,
-                frequent_codes=frequent_codes,
-                merge_threshold=merge_threshold,
-                lexical_merge_threshold=lexical_merge_threshold,
-                checkpoint_path=checkpoint_path,
-                thread_id=thread_id,
-                resume=resume,
-                interrupt_before_sweep=interrupt_before_sweep,
-                output_dir=output_dir,
-                prompt_log_path=prompt_log_path,
-                code_retriever=code_retriever,
-                llm_seed=llm_seed,
-                model_kwargs=model_kwargs,
-                sweep_model_kwargs=sweep_model_kwargs,
-                embeddings_kwargs=embeddings_kwargs,
-                long_passage_chars=long_passage_chars,
-                max_codes_per_passage=max_codes_per_passage,
-                neighbor_chars=neighbor_chars,
-                validation_retries=validation_retries,
-                require_gerund=require_gerund,
-                candidate_limit=candidate_limit,
-                prompt_cache=prompt_cache,
-                recursion_limit=recursion_limit,
-                checkpointer=checkpointer,
-            )
+    return run_sync(
+        aopen_code(
+            corpus,
+            context,
+            model=model,
+            seed=seed,
+            sweep_every=sweep_every,
+            sweep_model=sweep_model,
+            unit=unit,
+            embeddings=embeddings,
+            api_key=api_key,
+            embeddings_api_key=embeddings_api_key,
+            temperature=temperature,
+            sweep_temperature=sweep_temperature,
+            parallel_documents=parallel_documents,
+            batch_size=batch_size,
+            concurrency=concurrency,
+            top_k_codes=top_k_codes,
+            frequent_codes=frequent_codes,
+            merge_threshold=merge_threshold,
+            lexical_merge_threshold=lexical_merge_threshold,
+            checkpoint_path=checkpoint_path,
+            thread_id=thread_id,
+            resume=resume,
+            interrupt_before_sweep=interrupt_before_sweep,
+            output_dir=output_dir,
+            prompt_log_path=prompt_log_path,
+            code_retriever=code_retriever,
+            llm_seed=llm_seed,
+            model_kwargs=model_kwargs,
+            sweep_model_kwargs=sweep_model_kwargs,
+            embeddings_kwargs=embeddings_kwargs,
+            long_passage_chars=long_passage_chars,
+            max_codes_per_passage=max_codes_per_passage,
+            neighbor_chars=neighbor_chars,
+            validation_retries=validation_retries,
+            require_gerund=require_gerund,
+            review_mode=review_mode,
+            pipeline=pipeline,
+            token_budget=token_budget,
+            candidate_limit=candidate_limit,
+            prompt_cache=prompt_cache,
+            recursion_limit=recursion_limit,
+            checkpointer=checkpointer,
+            sweep_chunk=sweep_chunk,
+            embed_batch_size=embed_batch_size,
+            max_retries=max_retries,
+            retry_backoff=retry_backoff,
+            retry_max_backoff=retry_max_backoff,
         )
-    raise RuntimeError("open_code() cannot run inside a running event loop. Await aopen_code() instead.")
+    )
 
 
 async def aopen_code(
@@ -175,7 +202,7 @@ async def aopen_code(
     concurrency: int = 2,
     top_k_codes: int = 12,
     frequent_codes: int = 8,
-    merge_threshold: float = 0.82,
+    merge_threshold: float = 0.85,
     lexical_merge_threshold: float = 0.5,
     checkpoint_path: str | Path | None = None,
     thread_id: str | None = None,
@@ -194,9 +221,18 @@ async def aopen_code(
     validation_retries: int = 1,
     require_gerund: bool = False,
     candidate_limit: int = 30,
+    review_mode: str = "document",
+    pipeline: bool = True,
+    token_budget: int = 4000,
     prompt_cache: bool | None = None,
     recursion_limit: int | None = None,
     checkpointer: Any = None,
+    sweep_chunk: int = 40,
+    embed_batch_size: int = 64,
+    max_retries: int = 4,
+    retry_backoff: float = 0.5,
+    retry_max_backoff: float = 8.0,
+    limiter: CallLimiter | None = None,
 ) -> OpenCodeResult:
     """Async form of :func:`open_code`."""
     _validate_params(
@@ -207,6 +243,12 @@ async def aopen_code(
         validation_retries=validation_retries,
         batch_size=batch_size,
         concurrency=concurrency,
+        sweep_chunk=sweep_chunk,
+        embed_batch_size=embed_batch_size,
+        max_retries=max_retries,
+        retry_backoff=retry_backoff,
+        review_mode=review_mode,
+        token_budget=token_budget,
     )
     parsed_context = parse_context(context)
     documents = load_corpus(corpus)
@@ -265,6 +307,9 @@ async def aopen_code(
         parallel_documents=parallel_documents,
         batch_size=batch_size,
         concurrency=concurrency,
+        review_mode=review_mode,
+        pipeline=pipeline,
+        token_budget=token_budget,
         prompt_cache=cache,
         api_key_provided=api_key is not None,
         thread_id=thread_id,
@@ -299,13 +344,25 @@ async def aopen_code(
         long_passage_chars=long_passage_chars,
         validation_retries=validation_retries,
         require_gerund=require_gerund,
+        review_mode=review_mode,
+        pipeline=pipeline,
+        token_budget=token_budget,
         candidate_limit=candidate_limit,
         batch_size=batch_size,
         concurrency=concurrency,
+        sweep_chunk=sweep_chunk,
+        embed_batch_size=embed_batch_size,
         model_name=model_name,
         sweep_model_name=sweep_name,
         prompt_log_path=str(prompt_log_path) if prompt_log_path else None,
         output_dir=str(output_dir) if output_dir else None,
+        limiter=limiter
+        or CallLimiter(
+            concurrency,
+            max_retries=max_retries,
+            backoff=retry_backoff,
+            max_backoff=retry_max_backoff,
+        ),
     )
     limit = recursion_limit if recursion_limit is not None else 250_000
     resumable = checkpoint_path is not None or checkpointer is not None
@@ -400,20 +457,39 @@ def multi_seed_stability(
     seeds: Sequence[int],
     **open_code_kwargs: Any,
 ) -> StabilityReport:
-    """Run :func:`open_code` once per seed and compare the codebooks.
+    """Run open coding once per seed, concurrently, and compare the codebooks.
 
     The report describes label overlap. It does not pick a winning seed.
-    Checkpoint thread ids and output directories are suffixed with the seed
-    so the runs do not overwrite one another.
+    Seeds share one concurrency cap. Results are ordered by the ``seeds`` list,
+    not by which seed finishes first. This wrapper works inside a running event loop.
     """
-    if len(list(seeds)) < 2:
+    return run_sync(amulti_seed_stability(corpus, context, seeds, **open_code_kwargs))
+
+
+async def amulti_seed_stability(
+    corpus: Any,
+    context: ResearchContext | dict | str,
+    seeds: Sequence[int],
+    **open_code_kwargs: Any,
+) -> StabilityReport:
+    """Async form of :func:`multi_seed_stability`."""
+    seed_list = [int(seed) for seed in seeds]
+    if len(seed_list) < 2:
         raise ValueError("multi_seed_stability needs at least two seeds.")
     if "seed" in open_code_kwargs:
         raise ValueError("Pass seeds to multi_seed_stability, not seed=.")
-    runs = []
+    limiter = open_code_kwargs.pop("limiter", None)
+    if limiter is None:
+        limiter = CallLimiter(
+            int(open_code_kwargs.get("concurrency", 2)),
+            max_retries=int(open_code_kwargs.get("max_retries", 4)),
+            backoff=float(open_code_kwargs.get("retry_backoff", 0.5)),
+            max_backoff=float(open_code_kwargs.get("retry_max_backoff", 8.0)),
+        )
     base_thread = open_code_kwargs.get("thread_id")
     base_output = open_code_kwargs.get("output_dir")
-    for seed in seeds:
+
+    async def one(seed: int):
         kwargs = dict(open_code_kwargs)
         if base_thread:
             kwargs["thread_id"] = f"{base_thread}-seed-{seed}"
@@ -421,9 +497,14 @@ def multi_seed_stability(
             kwargs["thread_id"] = f"seed-{seed}"
         if base_output:
             kwargs["output_dir"] = str(Path(base_output) / f"seed-{seed}")
-        runs.append(open_code(corpus, context, seed=int(seed), **kwargs))
+        if kwargs.get("checkpoint_path"):
+            path = Path(kwargs["checkpoint_path"])
+            kwargs["checkpoint_path"] = str(path.with_name(f"{path.stem}-seed-{seed}{path.suffix}"))
+        return await aopen_code(corpus, context, seed=seed, limiter=limiter, **kwargs)
+
+    runs = await asyncio.gather(*(one(seed) for seed in seed_list))
     report = compare_runs(runs)
-    report.runs = runs
+    report.runs = list(runs)
     return report
 
 
@@ -436,6 +517,12 @@ def _validate_params(
     validation_retries: int,
     batch_size: int,
     concurrency: int,
+    sweep_chunk: int,
+    embed_batch_size: int,
+    max_retries: int,
+    retry_backoff: float,
+    review_mode: str,
+    token_budget: int,
 ) -> None:
     if unit not in UNITS:
         raise ValueError(f"unit must be one of {', '.join(UNITS)}. Got {unit!r}.")
@@ -443,6 +530,14 @@ def _validate_params(
         raise ValueError("sweep_every must be at least 1.")
     if batch_size < 1 or concurrency < 1:
         raise ValueError("batch_size and concurrency must be at least 1.")
+    if sweep_chunk < 1 or embed_batch_size < 1:
+        raise ValueError("sweep_chunk and embed_batch_size must be at least 1.")
+    if max_retries < 0 or retry_backoff < 0:
+        raise ValueError("max_retries and retry_backoff must be zero or more.")
+    if review_mode not in {"document", "wave"}:
+        raise ValueError("review_mode must be 'document' or 'wave'.")
+    if token_budget < 1:
+        raise ValueError("token_budget must be at least 1.")
     if top_k_codes < 0 or max_codes_per_passage < 1 or validation_retries < 0:
         raise ValueError("top_k_codes, max_codes_per_passage, and validation_retries are out of range.")
 
@@ -463,6 +558,9 @@ def _metadata(**kwargs: Any) -> dict:
         "parallel_documents": kwargs["parallel_documents"],
         "batch_size": kwargs["batch_size"],
         "concurrency": kwargs["concurrency"],
+        "review_mode": kwargs["review_mode"],
+        "pipeline": kwargs["pipeline"],
+        "token_budget": kwargs["token_budget"],
         "prompt_cache": kwargs["prompt_cache"],
         "api_key_provided": kwargs["api_key_provided"],
         "thread_id": kwargs["thread_id"],

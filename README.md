@@ -1,6 +1,6 @@
 # automated_grounded_theory
 
-**Open coding**, then **focused coding**, in the grounded theory tradition. A chat model reads every passage, in a seeded random order, and builds a codebook as it goes. A second pass every N passages compares codes with codes. The package reports how many new codes each batch added. It does not decide that the data are saturated.
+**Open coding**, then **focused coding**, in the grounded theory tradition (Glaser and Strauss 1967; Glaser 1978, 1992; Strauss and Corbin 1990/1998; Charmaz 2006/2014). By default the model reads every document in a seeded order, and every passage of that document in reading order, comparing each incident with the codebook earned so far. It does not decide that the data are saturated. How each step maps onto those sources is in [docs/methodology.md](docs/methodology.md). A short notebook with the same citations and the Taguette import steps is [docs/open_coding.ipynb](docs/open_coding.ipynb).
 
 `build_themes` is the next round: it groups those open codes into themes. It does not do axial coding, selective coding, or theoretical sampling.
 
@@ -83,9 +83,13 @@ result = open_code(corpus, context, model=coder, seed=7)
 
 A corpus item can be a mapping with `text` or `path`, optional `id` / `name`, and optional `metadata` (department, tenure, and anything else about the respondent). Metadata is copied onto each segment and into `highlights.csv`. It is not a code, and the model is told not to put it in labels or definitions.
 
-`unit` is `paragraph` (default), `sentence`, `line`, or `speaker_turn` (lines like `Name: ...`). Each passage keeps its document id, character offsets, and the neighboring passage. Only the coding order is shuffled. `plan_coding` shows that order without calling a model. Empty passages and non-answers (`n/a`, `none`, punctuation) are kept in the passage list and are not sent to the model.
+`unit` is `paragraph` (default), `sentence`, `line`, or `speaker_turn` (lines like `Name: ...`). Each passage keeps its document id, character offsets, and the neighboring passage. In document mode the seed shuffles documents and leaves passages in reading order. In wave mode the seed shuffles passages. `plan_coding` shows that order without calling a model. Empty passages and non-answers (`n/a`, `none`, punctuation) are kept in the passage list and are not sent to the model.
 
-`batch_size` (default 8) is how many passages share one model call. `concurrency` (default 2) is how many of those calls run together. The codebook is updated after each wave, and a wave stops at the next sweep, so later passages still see codes earned earlier in the seeded order. Raise either number when a run is dominated by call latency. Set both to 1 to code one passage at a time.
+`review_mode` defaults to `document`. Documents are shuffled with the seed. Passages inside a document stay in reading order and are coded with that document's neighbors. The codebook is updated after the document (or after each passage when `batch_size` is 1). `review_mode="wave"` may code passages from several documents in one step against one frozen snapshot. That weakens constant comparison (Glaser and Strauss 1967): a later passage can be coded before an earlier one, and new codes are invisible to the rest of the wave. Use it only when you have accepted that tradeoff. `parallel_documents=True` is a second opt-in that gives each document its own codebook until a sweep. It is off by default.
+
+`batch_size` (default 8, meant to stay in the 5–10 range) is how many passages share one model call. Batches are packed in coding order by an approximate token budget (`token_budget`, characters/4) so the split is a function of the seed, not of which call returns first. `concurrency` (default 2) is the ceiling on in-flight calls. A 429 halves that ceiling and a streak of successes raises it again (AIMD). Retries use full-jitter backoff and honor `Retry-After`. The system prompt and research context stay a stable prefix so a provider can cache them; the codebook snapshot and the passages come after.
+
+`pipeline=True` (the default) runs synthesis of the passages just coded while the next document or wave is coded against the pre-merge snapshot. The merge map is applied when the sweep returns, in chunk order, and the surviving label is the lexicographically smaller code id. Set `pipeline=False` and `batch_size=1` for a fully sequential reading. Async entry points are `aopen_code`, `abuild_themes`, `aevaluate`, and `amulti_seed_stability`. The sync wrappers work inside a running event loop (a notebook) by using a worker thread.
 
 `parallel_documents=True` codes each document on its own codebook and merges them at sweeps. It is off by default, because passages then do not see each other's new codes until the next sweep. `concurrency` caps how many documents are coded in one wave.
 
@@ -113,7 +117,7 @@ A plain check then runs, with no model:
 - a non-gerund label is kept and flagged, unless `require_gerund=True`
 - a new code with no nearest code, or a definition that repeats respondent metadata, is kept and flagged for review
 
-Every `sweep_every` passages (and once at the end) a sweep model may merge codes. The whole codebook is sent, in chunks of 40 when it is larger than that, so later codes are not dropped. Candidate pairs come from embedding cosine when you pass `embeddings`, and from label overlap otherwise. Those pairs are hints. The sweep model may also propose a duplicate pair itself. It can sharpen definitions. It can flag an overloaded code. It does not split one, because that would reassign old segments without rereading them. Accepted renames are applied to earlier segments with a merge map.
+Every `sweep_every` passages (and once at the end) a sweep model may merge codes. The whole codebook is sent, in chunks of 40 when it is larger than that, so later codes are not dropped. Chunks run concurrently and are reconciled by chunk index. When you pass `embeddings`, candidates are cosine similarity of label plus definition (default threshold 0.85) grouped by average-linkage agglomerative clustering. Without embeddings, candidates are label overlap. Those pairs are hints. The sweep model may also propose a duplicate pair itself. It can sharpen definitions. It can flag an overloaded code. It does not split one, because that would reassign old segments without rereading them. Accepted merges become a union-find map whose root is the lexicographically smaller code id, then that map relabels segments. A response cache replays an identical prompt on a rerun. After each document the run also stores a document memo (the incident memos from that reading) and a reflexivity note that the document was read in seeded order.
 
 `result.saturation` is new codes per batch. `result.saturation_report["judgment"]` is always `None`.
 
@@ -130,9 +134,9 @@ Every `sweep_every` passages (and once at the end) a sweep model may merge codes
 - `highlights.csv` — columns `id,document,tag,content`, plus `metadata` (Taguette ignores extra columns)
 - `run_metadata.json` and `prompt_log.json` — model names, seed, parameters, prompts, and token usage when the provider reports it
 
-Taguette's importer looks for a column named `tag`, `name`, or `path`, plus an optional `description`. Other columns are ignored, so `taguette_codebook.csv` imports from Project info → Import codebook. The header matches Taguette's own codebook CSV export. Dots in labels are replaced, because Taguette treats `.` as a parent/child split.
+Taguette's importer (`taguette.import_codebook.list_tags`) looks for a column named `tag`, `name`, or `path`, plus an optional `description`. Other columns are ignored, so `taguette_codebook.csv` imports from Project info → Import codebook. The header matches Taguette's own codebook CSV export. A backslash in a path is the parent/child split (`interesting\places` in Taguette's tests and `.qdc` export). Backslashes inside a label are replaced so they do not add a level. Dots are kept.
 
-Taguette writes REFI-QDA `.qdc` and does not import it. `codebook.qdc` follows that export (`urn:QDA-XML:codebook:1.0`, `Code` with `guid`, `name`, `isCodable`) and adds a `Description` child so other packages can read the definition. `highlights.csv` matches Taguette's highlight export shape. Taguette does not import highlights.
+Taguette writes REFI-QDA `.qdc` and does not import it. `codebook.qdc` follows that export (`urn:QDA-XML:codebook:1.0`, `Code` with `guid`, `name`, `isCodable="true"`, and an empty `Sets`) and adds a `Description` child so other packages can read the definition. `highlights.csv` matches Taguette's highlight export shape (`id`, `document`, `tag`, `content`). Taguette does not import highlights.
 
 Prompt caching: the instructions and research context sit in a stable system prefix. The codebook and the passages stay in the user message, which changes every call. Anthropic also gets an explicit `cache_control` breakpoint. Providers that cache a repeated prefix on their own (including xAI and OpenAI, when that model supports it) see the same stable prefix. Set `prompt_cache=True` or `False` to force the explicit breakpoint on or off.
 
@@ -171,16 +175,17 @@ Each theme keeps up to three representative quotes (`quotes_per_theme`). A quote
 - `themes.md` — definition, properties, prevalence, metadata breakdowns, member codes, quotes, tensions, uncoded passages
 - `themes.csv` — `theme,definition,codes,n_passages,pct_passages,n_documents,pct_documents,n_comments,pct_comments,n_respondents,pct_respondents`
 - `themes.json` — the same records, plus tensions, negative cases, and uncoded passages
-- `taguette_themes.csv` — Taguette codebook, one row per code, tag path `Theme.Code` (dots inside a label are replaced, so the only split is between theme and code)
+- `taguette_themes.csv` — Taguette codebook. One parent row per theme, then one row per code, path `Theme\Code` (backslash, which is what Taguette stores; backslashes inside a label are replaced)
+- `taguette_themes.qdc` — the same paths in REFI-QDA codebook XML
 - `theme_prevalence.png` — horizontal bars for percent of passages and percent of respondents
 
-The chart needs matplotlib (`pip install "automated_grounded_theory[plots]"`). If it is not installed, the other files are still written and `themes.warnings` says the chart was skipped. Taguette imports `taguette_themes.csv` from Project info → Import codebook. It does not import highlights.
+The chart needs matplotlib (`pip install "automated_grounded_theory[plots]"`). If it is not installed, the other files are still written and `themes.warnings` says the chart was skipped. Taguette imports `taguette_themes.csv` from Project info → Import codebook. After import, a code sits under its theme because the path is `Theme\Code` and the theme row is the prefix. Taguette does not import highlights or `.qdc`. Quote checks for each theme run concurrently and do not call the model.
 
 `context` is the same sensitizing context as open coding. A mapping with preset codes raises `PresetCodesError` and does not call the model.
 
 ## Evaluate
 
-`evaluate_run` scores a result or an output directory. It does not call a model.
+`evaluate_run` scores a result or an output directory. With no `model`, it does not call a provider. Pass `model` and near-duplicate pairs are judged concurrently; Chen metrics then use those judgments. `adjusted_rand_index` compares passage→code assignments when `other_sources` is set (seed stability; Hubert and Arabie 1985, as implemented for these labelings). The command-line `agt-evaluate` stays lexical and does not call a model.
 
 ```python
 from automated_grounded_theory import evaluate_run
@@ -190,7 +195,7 @@ metrics = evaluate_run("coding_run", context="context.md", log_path="run.log")
 
 The report includes coverage, codes per passage, verbatim-quote accuracy, gerund and in-vivo rates, label length, singleton share, redundant pairs, the saturation curve and the first batch whose new-code rate is under 10%, merges, memo stats, context-leakage, calls, and tokens per passage.
 
-Pass `other_sources` (more output directories or results on the same corpus) for Chen et al. coverage, overlap, novelty, and divergence. The same scores are in `chen_metrics`. Clustering is lexical Jaccard at 0.5, not the paper's model-based merge, so this stays offline.
+Pass `other_sources` (more output directories or results on the same corpus) for Chen et al. coverage, overlap, novelty, and divergence (arXiv:2411.12142). The same scores are in `chen_metrics`. Without `model`, clustering is lexical Jaccard at 0.5, not the paper's model-based merge, so the default stays offline.
 
 ```bash
 agt-evaluate coding_run context.md run.log --also coding_run/seed-1 coding_run/seed-2
@@ -209,6 +214,18 @@ agt-evaluate coding_run context.md run.log --also coding_run/seed-1 coding_run/s
 
 The checks and the sweep exist because that JMIR tutorial found LLM coding weak on context, organization, and connections. Neighbors stay attached to each passage. Sweeps do the code-to-code comparison. Saturation is reported, not declared (Charmaz).
 
+## Speed
+
+`scripts/benchmark_review_modes.py` runs a fake coder that sleeps 0.05s per call on 6 documents × 4 passages (24 passages), seed 7, `sweep_every=8`. No API key. Numbers below are from that script in this environment.
+
+| Mode | What it does | Seconds | Calls | Passages/s | Codes | Merges | Near-duplicate pairs left |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| sequential | `review_mode="document"`, `pipeline=False`, `batch_size=1`, `concurrency=1` | 1.455 | 27 | 16.50 | 3 | 3 | 0 |
+| document | `review_mode="document"`, background synthesis, `batch_size=4`, `concurrency=4` | 0.389 | 9 | 61.64 | 3 | 3 | 0 |
+| wave | `review_mode="wave"`, background synthesis, `batch_size=4`, `concurrency=4` | 0.177 | 8 | 135.34 | 3 | 1 | 0 |
+
+On this fake coder, exact repeated labels collapse when they are committed, so none of the three left a near-duplicate pair behind. Document mode kept the same final code count as the sequential reading and still ran a merge on each synthesis. Wave mode was the fastest and needed only one merge pass, because passages from different documents shared a snapshot. That speed is the constant-comparison tradeoff described above: later incidents in a document can be coded before earlier ones. Re-run the script after you change the delay or the corpus; do not treat these times as a provider benchmark.
+
 ## Tests
 
 ```bash
@@ -218,7 +235,7 @@ pytest
 
 `pytest` puts the repository root on `pythonpath`, so `tests` imports without an extra install step. The `dev` extra includes `langgraph-checkpoint-sqlite`. If that package is missing, the sqlite resume test is skipped and the in-memory resume test still runs.
 
-Tests use a fake chat model and a four-document corpus in `tests/corpus.py`. Focused-coding tests use a second fake that groups those codes. They do not call a provider.
+Tests use a fake chat model and a four-document corpus in `tests/corpus.py`. Focused-coding tests use a second fake that groups those codes. Async tests cover a running event loop, rate-limit retry, and order-independent reconciliation. If Taguette is installed, `tests/test_taguette_roundtrip.py` imports the CSV through `taguette.import_codebook.list_tags` and checks that `Theme\Code` paths validate. They do not call a provider.
 
 ## License
 

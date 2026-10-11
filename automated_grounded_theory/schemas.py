@@ -166,6 +166,13 @@ class ThemeCoding(_LLMModel):
     negative_cases: list[ThemeNegative] = Field(default_factory=list)
 
 
+class SameCodeJudgment(_LLMModel):
+    """Whether two open codes name the same kind of incident."""
+
+    same: bool = Field(description="True when both codes capture the same incident, not merely the same topic.")
+    rationale: str = Field(default="", description="One short clause. Empty if obvious.")
+
+
 class SweepCoding(_LLMModel):
     """Code-to-code comparison. May propose merges. Does not invent codes."""
 

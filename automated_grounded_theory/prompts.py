@@ -336,16 +336,49 @@ def build_theme_messages(
     n_themes: int | None,
     feedback: str,
     prompt_cache: bool,
+    chunk_index: int = 1,
+    chunk_count: int = 1,
 ) -> list:
-    parts = [
-        format_theme_codebook(codes),
-        "",
-        "Return one theme per group. Every CODE_LABEL appears under exactly one theme.",
-    ]
+    parts = []
+    if chunk_count > 1:
+        parts.extend(
+            [
+                f"This is chunk {chunk_index} of {chunk_count}. "
+                "Assign only the CODE_LABEL lines in this message. Other chunks are reconciled afterwards.",
+                "",
+            ]
+        )
+    parts.extend(
+        [
+            format_theme_codebook(codes),
+            "",
+            "Return one theme per group. Every CODE_LABEL appears under exactly one theme.",
+        ]
+    )
     if feedback:
         parts.extend(["", feedback])
     system = theme_system_text(context, n_themes)
     return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content="\n".join(parts))]
+
+
+JUDGE_SYSTEM = """You compare two open codes from a grounded-theory codebook.
+
+Say whether they name the same kind of incident. Shared wording, a shared verb, \
+or a shared topic is not enough. same is true only when a segment coded with one \
+would still be coded with the other."""
+
+
+def build_judge_messages(left: Mapping[str, Any], right: Mapping[str, Any]) -> list:
+    """One pair. The caller keeps the pair identity; the model only answers same/not."""
+    body = "\n".join(
+        [
+            f"CODE_A: {left.get('code', '')}",
+            f"DEFINITION_A: {left.get('definition', '')}",
+            f"CODE_B: {right.get('code', '')}",
+            f"DEFINITION_B: {right.get('definition', '')}",
+        ]
+    )
+    return [SystemMessage(content=JUDGE_SYSTEM), HumanMessage(content=body)]
 
 
 def validation_feedback(rejections: Sequence[Mapping[str, Any]]) -> str:
