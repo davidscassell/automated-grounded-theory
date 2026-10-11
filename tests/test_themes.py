@@ -186,7 +186,8 @@ def test_prevalence_quotes_breakdowns_and_exports(tmp_path):
     assert packed_row["pct_respondents"] == "50.0"
 
     tags = (tmp_path / "taguette_themes.csv").read_text(encoding="utf-8")
-    assert "Packing to leave.packing bags" in tags
+    assert "Packing to leave\\packing bags" in tags
+    assert (tmp_path / "taguette_themes.qdc").exists()
     saved = json.loads((tmp_path / "themes.json").read_text(encoding="utf-8"))
     assert saved["totals"]["n_codes"] == 3
     try:
@@ -285,7 +286,8 @@ def test_order_tag_path_and_respondent_key():
         item["code"] for item in order_codes(codes, seed=2)
     ]
     assert [item["code"] for item in order_codes(codes, seed=None)] == [f"code {index}" for index in range(7, -1, -1)]
-    assert theme_tag_path("Pay. Benefits", "asking.more") == "Pay· Benefits.asking·more"
+    assert theme_tag_path("Pay. Benefits", "asking.more") == "Pay. Benefits\\asking.more"
+    assert theme_tag_path("Pay\\Benefits", "asking\\more") == "Pay·Benefits\\asking·more"
     metadata = {"respondent_id": "R1", "person": "Alex"}
     assert respondent_of(metadata, "alex", None) == "R1"
     assert respondent_of(metadata, "alex", "person") == "Alex"

@@ -102,10 +102,10 @@ def test_merge_map_relabels_earlier_segments():
         candidates=[{"source": "packing bags", "target": "packing bags up", "score": 0.7}],
         definitions=[{"code": "packing bags up", "definition": "Bagging possessions while leaving."}],
     )
-    assert list(applied["codebook"]) == ["packing bags up"]
-    assert applied["codebook"]["packing bags up"]["frequency"] == 2
-    assert applied["codebook"]["packing bags up"]["definition"] == "Bagging possessions while leaving."
-    assert {item["code"] for item in applied["segments"]} == {"packing bags up"}
+    assert list(applied["codebook"]) == ["packing bags"]
+    assert applied["codebook"]["packing bags"]["frequency"] == 2
+    assert applied["codebook"]["packing bags"]["definition"] == "Bagging possessions while leaving."
+    assert {item["code"] for item in applied["segments"]} == {"packing bags"}
 
 
 def test_sweep_may_propose_a_pair_that_was_not_a_candidate():
@@ -121,7 +121,7 @@ def test_sweep_may_propose_a_pair_that_was_not_a_candidate():
         candidates=[],
     )
     assert len(applied["accepted_merges"]) == 1
-    assert list(applied["codebook"]) == ["starting a new job"]
+    assert list(applied["codebook"]) == ["crying at the station"]
     unknown = apply_sweep(
         codebook,
         segments,
@@ -133,8 +133,9 @@ def test_sweep_may_propose_a_pair_that_was_not_a_candidate():
 
 
 def test_taguette_csv_and_qdc(tmp_path):
-    tag = taguette_tag("leaving.home")
-    assert "." not in tag
+    tag = taguette_tag("leaving\\home")
+    assert "\\" not in tag
+    assert taguette_tag("leaving.home") == "leaving.home"
     result = OpenCodeResult(
         codebook=[
             {
@@ -180,8 +181,9 @@ def test_taguette_csv_and_qdc(tmp_path):
     paths = export_result(result, tmp_path)
     with open(paths["taguette_codebook.csv"], encoding="utf-8", newline="") as handle:
         rows = list(csv.reader(handle))
-    assert rows[0][:2] == ["tag", "description"]
-    assert "." not in rows[1][0]
+    assert rows[0] == ["tag", "description", "number of highlights", "number of documents"]
+    assert "\\" not in rows[1][0]
+    assert "." in rows[1][0]
     root = ET.fromstring(codebook_qdc(result.codebook))
     assert root.tag == f"{{{QDC_NAMESPACE}}}CodeBook"
     description = root.find(f".//{{{QDC_NAMESPACE}}}Description")

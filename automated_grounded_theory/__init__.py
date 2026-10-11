@@ -5,12 +5,13 @@ sensitizes attention and is not a codebook. Themes group those codes afterwards.
 """
 
 from automated_grounded_theory.api import (
+    amulti_seed_stability,
     aopen_code,
     compare_runs,
     multi_seed_stability,
     open_code,
 )
-from automated_grounded_theory.evaluate import chen_metrics, evaluate_run
+from automated_grounded_theory.evaluate import aevaluate, chen_metrics, evaluate_run
 from automated_grounded_theory.context import PresetCodesError, ResearchContext
 from automated_grounded_theory.graph import CodingError
 from automated_grounded_theory.results import OpenCodeResult
@@ -37,6 +38,8 @@ __all__ = [
     "ThemeResult",
     "__version__",
     "abuild_themes",
+    "aevaluate",
+    "amulti_seed_stability",
     "aopen_code",
     "build_themes",
     "chen_metrics",

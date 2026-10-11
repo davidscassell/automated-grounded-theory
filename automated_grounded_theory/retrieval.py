@@ -7,6 +7,7 @@ embeddings, cosine similarity. Pass any object with ``rank()`` as
 
 from __future__ import annotations
 
+import asyncio
 import math
 import re
 from typing import Mapping, Protocol, Sequence
@@ -96,9 +97,77 @@ class EmbeddingCodeRetriever:
         labels = [str(entry.get("code") or "") for entry in codebook]
         vectors = self.embeddings.embed_documents([code_text(entry) for entry in codebook])
         query = self.embeddings.embed_query(passage)
-        scored = [(cosine(query, vector), label) for vector, label in zip(vectors, labels) if label]
-        scored.sort(key=lambda item: (-item[0], item[1].casefold()))
-        return [label for _, label in scored[:k]]
+        return _rank_vectors(labels, vectors, query, k)
+
+    async def arank_many(
+        self,
+        passages: Sequence[str],
+        codebook: Sequence[Mapping],
+        *,
+        k: int,
+        limiter,
+        batch_size: int = 64,
+    ) -> list[list[str]]:
+        """Rank every passage. The codebook is embedded once, in batches."""
+        if k <= 0 or not codebook or not passages:
+            return [[] for _ in passages]
+        labels = [str(entry.get("code") or "") for entry in codebook]
+        vectors = await aembed_texts(
+            self.embeddings,
+            [code_text(entry) for entry in codebook],
+            batch_size=batch_size,
+            limiter=limiter,
+        )
+        queries = await aembed_texts(
+            self.embeddings,
+            list(passages),
+            batch_size=batch_size,
+            limiter=limiter,
+        )
+        return [_rank_vectors(labels, vectors, query, k) for query in queries]
+
+
+def _rank_vectors(labels: Sequence[str], vectors: Sequence[Sequence[float]], query: Sequence[float], k: int) -> list[str]:
+    scored = [(cosine(query, vector), label) for vector, label in zip(vectors, labels) if label]
+    scored.sort(key=lambda item: (-item[0], item[1].casefold()))
+    return [label for _, label in scored[:k]]
+
+
+async def aembed_texts(embeddings, texts: Sequence[str], *, batch_size: int, limiter) -> list[list[float]]:
+    """Embed ``texts`` in batches. Uses ``aembed_documents`` when the object has it.
+
+    Rate-limit errors retry with the limiter's backoff. Other errors propagate.
+    """
+    if not texts:
+        return []
+    size = max(1, int(batch_size))
+    batches = [list(texts[start : start + size]) for start in range(0, len(texts), size)]
+
+    async def one(batch: list[str]) -> list[list[float]]:
+        delay = limiter.backoff
+        async with limiter.embed_semaphore:
+            for attempt in range(limiter.max_retries + 1):
+                try:
+                    embed = getattr(embeddings, "aembed_documents", None)
+                    if embed is None:
+                        return await asyncio.to_thread(embeddings.embed_documents, batch)
+                    return await embed(batch)
+                except Exception as exc:
+                    if attempt >= limiter.max_retries or not _rate_limit(exc):
+                        raise
+                    limiter.rate_limit_retries += 1
+                    await asyncio.sleep(delay)
+                    delay = min(limiter.max_backoff, delay * 2)
+        raise RuntimeError("embedding retry loop exited without a result")
+
+    groups = await asyncio.gather(*(one(batch) for batch in batches))
+    return [vector for group in groups for vector in group]
+
+
+def _rate_limit(exc: BaseException) -> bool:
+    from automated_grounded_theory.async_support import is_rate_limit
+
+    return is_rate_limit(exc)
 
 
 def merge_candidates(
@@ -118,34 +187,56 @@ def merge_candidates(
     entries = [entry for entry in codebook if entry.get("code")]
     if len(entries) < 2:
         return []
-    method = "embedding" if embeddings is not None else "lexical"
+    vectors = None
     if embeddings is not None:
         vectors = embeddings.embed_documents([code_text(entry) for entry in entries])
-        scores = [
-            (cosine(vectors[i], vectors[j]), i, j)
-            for i in range(len(entries))
-            for j in range(i + 1, len(entries))
-        ]
-        threshold = embedding_threshold
-    else:
-        # Labels only. A sharpened definition should not hide two codes
-        # that still name the same incident.
-        scores = [
-            (jaccard(str(entries[i].get("code") or ""), str(entries[j].get("code") or "")), i, j)
-            for i in range(len(entries))
-            for j in range(i + 1, len(entries))
-        ]
-        threshold = lexical_threshold
+    return score_pairs(
+        entries,
+        vectors,
+        embedding_threshold=embedding_threshold,
+        lexical_threshold=lexical_threshold,
+        limit=limit,
+    )
 
+
+def score_pairs(
+    entries: Sequence[Mapping],
+    vectors: Sequence[Sequence[float]] | None,
+    *,
+    embedding_threshold: float = 0.82,
+    lexical_threshold: float = 0.5,
+    limit: int = 30,
+    chunk_indexes: Sequence[int] | None = None,
+) -> list[dict]:
+    """Pair codes that are close enough for a sweep to confirm.
+
+    When ``chunk_indexes`` is set, a pair is kept when at least one side is in
+    that chunk. Labels are compared when ``vectors`` is missing, so a sharpened
+    definition cannot hide two codes that still name the same incident.
+    """
+    if len(entries) < 2:
+        return []
+    method = "embedding" if vectors is not None else "lexical"
+    threshold = embedding_threshold if vectors is not None else lexical_threshold
+    allowed = None if chunk_indexes is None else set(chunk_indexes)
+    scores = []
+    for i in range(len(entries)):
+        for j in range(i + 1, len(entries)):
+            if allowed is not None and i not in allowed and j not in allowed:
+                continue
+            if vectors is not None:
+                score = cosine(vectors[i], vectors[j])
+            else:
+                score = jaccard(str(entries[i].get("code") or ""), str(entries[j].get("code") or ""))
+            scores.append((score, i, j))
     pairs = []
     for score, i, j in scores:
         if score < threshold:
             continue
-        left = str(entries[i]["code"])
-        right = str(entries[j]["code"])
-        if code_key(left) == code_key(right):
+        left = str(entries[i].get("code") or "")
+        right = str(entries[j].get("code") or "")
+        if not left or not right or code_key(left) == code_key(right):
             continue
-        # Prefer the more frequent label as the default target. The model may swap them.
         left_count = int(entries[i].get("frequency") or 0)
         right_count = int(entries[j].get("frequency") or 0)
         if right_count > left_count or (right_count == left_count and right.casefold() < left.casefold()):
@@ -162,6 +253,24 @@ def merge_candidates(
         )
     pairs.sort(key=lambda item: (-item["score"], item["source"].casefold(), item["target"].casefold()))
     return pairs[:limit]
+
+
+def union_candidates(groups: Sequence[Sequence[Mapping]]) -> list[dict]:
+    """Dedupe candidate pairs from concurrent chunks. Highest score wins."""
+    best: dict[frozenset[str], dict] = {}
+    for group in groups:
+        for item in group:
+            source = code_key(str(item.get("source") or ""))
+            target = code_key(str(item.get("target") or ""))
+            if not source or not target or source == target:
+                continue
+            key = frozenset((source, target))
+            current = best.get(key)
+            if current is None or float(item.get("score") or 0) > float(current.get("score") or 0):
+                best[key] = dict(item)
+    pairs = list(best.values())
+    pairs.sort(key=lambda item: (-float(item["score"]), str(item["source"]).casefold(), str(item["target"]).casefold()))
+    return pairs
 
 
 def select_prompt_codes(

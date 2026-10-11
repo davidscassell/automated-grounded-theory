@@ -18,6 +18,12 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
+from automated_grounded_theory.async_support import (
+    CallLimiter,
+    parse_structured,
+    run_sync,
+    structured_runnable,
+)
 from automated_grounded_theory.backends import describe_model, prompt_cache_supported, resolve_chat_model
 from automated_grounded_theory.context import ResearchContext, parse_context
 from automated_grounded_theory.export import _write_csv, _write_json, taguette_tag
@@ -40,6 +46,7 @@ class ThemeGraphState(TypedDict, total=False):
     max_attempts: int
     feedback: str
     proposal: dict | None
+    proposals: dict
     accepted: bool
     assigned: list
     missing: list
@@ -122,11 +129,15 @@ def respondent_of(
 
 
 def theme_tag_path(theme_name: str, code_label: str) -> str:
-    """Taguette hierarchy: one dot between theme and code.
+    """Taguette hierarchy: ``Theme\\Code``.
 
-    Dots inside either label are replaced, because Taguette splits on ``.``.
+    Taguette's tag path uses a backslash between parent and child
+    (see ``interesting\\places`` in its tests and ``.qdc`` export). Backslashes
+    inside either label are replaced so they do not add another level.
     """
-    return f"{taguette_tag(theme_name)}.{taguette_tag(code_label)}"
+    from automated_grounded_theory.export import TAGUETTE_SEPARATOR
+
+    return f"{taguette_tag(theme_name)}{TAGUETTE_SEPARATOR}{taguette_tag(code_label)}"
 
 
 def assign_codes(
@@ -219,6 +230,7 @@ def compute_themes(
     respondent_key: str | None,
     quotes_per_theme: int,
     min_quote_chars: int,
+    with_quotes: bool = True,
 ) -> tuple[list[dict], list[dict], list[dict], list[dict], dict, list[str]]:
     """Prevalence, breakdowns, quotes, tensions, and uncoded passages.
 
@@ -245,6 +257,7 @@ def compute_themes(
             respondent_key=respondent_key,
             quotes_per_theme=quotes_per_theme,
             min_quote_chars=min_quote_chars,
+            with_quotes=with_quotes,
         )
         assigned_keys.update(code_key(label) for label in built["codes"])
         themes.append(built)
@@ -434,6 +447,11 @@ def build_themes(
     min_quote_chars: int = 15,
     validation_retries: int = 1,
     prompt_log_path: str | Path | None = None,
+    concurrency: int = 2,
+    theme_chunk: int = 40,
+    max_retries: int = 4,
+    retry_backoff: float = 0.5,
+    retry_max_backoff: float = 8.0,
 ) -> ThemeResult:
     """Group the codes from ``open_code`` into themes.
 
@@ -441,35 +459,38 @@ def build_themes(
     ``n_themes`` asks for that many themes; leave it unset and the model chooses.
     ``seed`` shuffles the codebook order in the prompt. It does not pick quotes.
 
-    The model assigns each open code to one theme. A check then requires every
-    code to be assigned and every name to exist in the codebook. Counts,
-    breakdowns, quotes, and uncoded passages are computed from the result.
+    The codebook is split into chunks of ``theme_chunk``. Those chunks are
+    proposed concurrently (``concurrency`` caps in-flight calls), then reconciled
+    in chunk order so every open code lands in one theme. Quote checks for each
+    theme also run concurrently. Counts and breakdowns are computed from the
+    segments. This wrapper works inside a running event loop.
     """
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(
-            abuild_themes(
-                open_code_result,
-                context,
-                model=model,
-                n_themes=n_themes,
-                seed=seed,
-                respondent_key=respondent_key,
-                output_dir=output_dir,
-                api_key=api_key,
-                temperature=temperature,
-                llm_seed=llm_seed,
-                model_kwargs=model_kwargs,
-                prompt_cache=prompt_cache,
-                chart=chart,
-                quotes_per_theme=quotes_per_theme,
-                min_quote_chars=min_quote_chars,
-                validation_retries=validation_retries,
-                prompt_log_path=prompt_log_path,
-            )
+    return run_sync(
+        abuild_themes(
+            open_code_result,
+            context,
+            model=model,
+            n_themes=n_themes,
+            seed=seed,
+            respondent_key=respondent_key,
+            output_dir=output_dir,
+            api_key=api_key,
+            temperature=temperature,
+            llm_seed=llm_seed,
+            model_kwargs=model_kwargs,
+            prompt_cache=prompt_cache,
+            chart=chart,
+            quotes_per_theme=quotes_per_theme,
+            min_quote_chars=min_quote_chars,
+            validation_retries=validation_retries,
+            prompt_log_path=prompt_log_path,
+            concurrency=concurrency,
+            theme_chunk=theme_chunk,
+            max_retries=max_retries,
+            retry_backoff=retry_backoff,
+            retry_max_backoff=retry_max_backoff,
         )
-    raise RuntimeError("build_themes() cannot run inside a running event loop. Await abuild_themes() instead.")
+    )
 
 
 async def abuild_themes(
@@ -491,6 +512,12 @@ async def abuild_themes(
     min_quote_chars: int = 15,
     validation_retries: int = 1,
     prompt_log_path: str | Path | None = None,
+    concurrency: int = 2,
+    theme_chunk: int = 40,
+    max_retries: int = 4,
+    retry_backoff: float = 0.5,
+    retry_max_backoff: float = 8.0,
+    limiter: CallLimiter | None = None,
 ) -> ThemeResult:
     """Async form of :func:`build_themes`."""
     _validate_theme_params(
@@ -498,6 +525,9 @@ async def abuild_themes(
         quotes_per_theme=quotes_per_theme,
         min_quote_chars=min_quote_chars,
         validation_retries=validation_retries,
+        concurrency=concurrency,
+        theme_chunk=theme_chunk,
+        max_retries=max_retries,
     )
     research = parse_context(context)
     source = _coerce_result(open_code_result)
@@ -532,20 +562,30 @@ async def abuild_themes(
     )
     model_name = describe_model(coder if not isinstance(model, str) else model)
     cache = prompt_cache_supported(coder, model_name) if prompt_cache is None else prompt_cache
+    if limiter is None:
+        limiter = CallLimiter(
+            concurrency,
+            max_retries=max_retries,
+            backoff=retry_backoff,
+            max_backoff=retry_max_backoff,
+        )
+    chunks = _theme_chunks(codes, theme_chunk)
     graph = _compile_theme_graph(
         coder,
         codes,
+        chunks,
         research,
-        n_themes=n_themes,
+        n_themes=n_themes if len(chunks) == 1 else None,
         prompt_cache=cache,
         model_name=model_name,
+        limiter=limiter,
     )
     final = await graph.ainvoke(
         {
             "attempt": 0,
             "max_attempts": validation_retries + 1,
             "feedback": "",
-            "proposal": None,
+            "proposals": {},
             "accepted": False,
             "assigned": [],
             "missing": [],
@@ -577,6 +617,16 @@ async def abuild_themes(
         respondent_key=respondent_key,
         quotes_per_theme=quotes_per_theme,
         min_quote_chars=min_quote_chars,
+        with_quotes=False,
+    )
+    await _fill_quotes(
+        themes,
+        segments=source.segments,
+        passages=source.passages,
+        respondent_key=respondent_key,
+        quotes_per_theme=quotes_per_theme,
+        min_quote_chars=min_quote_chars,
+        limiter=limiter,
     )
     warnings.extend(extra)
     if n_themes is not None and len(themes) != n_themes:
@@ -603,48 +653,100 @@ async def abuild_themes(
             prompt_cache=cache,
             calls=len(final.get("prompt_log") or []),
             question=research.research_question,
+            concurrency=concurrency,
+            theme_chunk=theme_chunk,
         ),
         warnings=warnings,
     )
     return _finish(themed, output_dir, chart, prompt_log_path)
 
 
+def _theme_chunks(codes: Sequence[Mapping[str, Any]], size: int) -> list[list[dict]]:
+    width = max(1, size)
+    rows = [dict(entry) for entry in codes]
+    if len(rows) <= width:
+        return [rows]
+    return [rows[start : start + width] for start in range(0, len(rows), width)]
+
+
+def reconcile_theme_proposals(parts: Sequence[tuple[int, Mapping[str, Any]]]) -> dict:
+    """Join chunk proposals in chunk-index order. Earlier chunks keep a code."""
+    themes: list = []
+    tensions: list = []
+    negatives: list = []
+    for _index, payload in sorted(parts, key=lambda item: item[0]):
+        themes.extend(payload.get("themes") or [])
+        tensions.extend(payload.get("tensions") or [])
+        negatives.extend(payload.get("negative_cases") or [])
+    return {"themes": themes, "tensions": tensions, "negative_cases": negatives}
+
+
 def _compile_theme_graph(
     model: BaseChatModel,
     codes: Sequence[Mapping[str, Any]],
+    chunks: Sequence[Sequence[Mapping[str, Any]]],
     context: ResearchContext,
     *,
     n_themes: int | None,
     prompt_cache: bool,
     model_name: str,
+    limiter: CallLimiter,
 ):
+    runnable = structured_runnable(model, ThemeCoding)
+
     async def propose(state: ThemeGraphState) -> dict:
-        messages = build_theme_messages(
-            context=context,
-            codes=codes,
-            n_themes=n_themes,
-            feedback=str(state.get("feedback") or ""),
-            prompt_cache=prompt_cache,
-        )
-        payload, usage = await _invoke_theme(model, messages)
+        proposals = dict(state.get("proposals") or {})
+        missing = list(state.get("missing") or [])
+        indexes = _chunks_to_retry(chunks, missing, first=not proposals)
+        message_lists = []
+        for index in indexes:
+            message_lists.append(
+                build_theme_messages(
+                    context=context,
+                    codes=chunks[index],
+                    n_themes=n_themes,
+                    feedback=str(state.get("feedback") or ""),
+                    prompt_cache=prompt_cache,
+                    chunk_index=index + 1,
+                    chunk_count=len(chunks),
+                )
+            )
+        try:
+            results = await limiter.abatch(runnable, message_lists)
+        except Exception as exc:
+            raise ThemeError(f"Focused coding failed: {exc}") from exc
         log = list(state.get("prompt_log") or [])
-        log.append(
-            {
-                "kind": "themes",
-                "model": model_name,
-                "messages": serialize_messages(messages),
-                "output": payload,
-                "usage": usage,
-            }
-        )
-        return {"proposal": payload, "attempt": int(state.get("attempt") or 0) + 1, "prompt_log": log}
+        for index, messages, result in zip(indexes, message_lists, results):
+            try:
+                payload, usage = parse_structured(result, ThemeCoding)
+            except ValueError as exc:
+                raise ThemeError(f"Focused coding failed on chunk {index + 1}: {exc}") from exc
+            proposals[index] = payload
+            log.append(
+                {
+                    "kind": "themes",
+                    "model": model_name,
+                    "chunk_index": index + 1,
+                    "messages": serialize_messages(messages),
+                    "output": payload,
+                    "usage": usage,
+                }
+            )
+        log.sort(key=lambda item: int(item.get("chunk_index") or 0))
+        return {
+            "proposals": proposals,
+            "attempt": int(state.get("attempt") or 0) + 1,
+            "prompt_log": log,
+        }
 
     def validate(state: ThemeGraphState) -> dict:
-        proposal = state.get("proposal") or {}
+        parts = [(int(index), payload) for index, payload in (state.get("proposals") or {}).items()]
+        proposal = reconcile_theme_proposals(parts)
         assigned, report = assign_codes(proposal, codes)
         accepted = not report["missing"]
         return {
             "accepted": accepted,
+            "proposal": proposal,
             "assigned": assigned,
             "missing": report["missing"],
             "unknown": report["unknown"],
@@ -668,32 +770,58 @@ def _compile_theme_graph(
     return builder.compile()
 
 
-async def _invoke_theme(model: BaseChatModel, messages: list) -> tuple[dict, dict]:
-    try:
-        try:
-            structured = model.with_structured_output(ThemeCoding, include_raw=True)
-        except TypeError:
-            structured = model.with_structured_output(ThemeCoding)
-        result = await structured.ainvoke(messages)
-    except Exception as exc:
-        raise ThemeError(f"Focused coding failed: {exc}") from exc
-    if result is None:
-        raise ThemeError("Focused coding returned no structured output.")
-    raw = None
-    if isinstance(result, dict) and "parsed" in result:
-        raw = result.get("raw")
-        parsed = result.get("parsed")
-        if parsed is None:
-            raise ThemeError(f"Focused coding output could not be parsed: {result.get('parsing_error')}")
-    else:
-        parsed = result
-    if hasattr(parsed, "model_dump"):
-        payload = parsed.model_dump()
-    elif isinstance(parsed, dict):
-        payload = ThemeCoding.model_validate(parsed).model_dump()
-    else:
-        raise ThemeError(f"Focused coding returned {type(parsed).__name__}, not ThemeCoding.")
-    return payload, _usage_from(raw)
+def _chunks_to_retry(chunks: Sequence[Sequence[Mapping[str, Any]]], missing: Sequence[str], *, first: bool) -> list[int]:
+    if first or not missing:
+        return list(range(len(chunks)))
+    needed = {code_key(label) for label in missing}
+    chosen = []
+    for index, chunk in enumerate(chunks):
+        keys = {code_key(str(entry.get("code") or "")) for entry in chunk}
+        if keys & needed:
+            chosen.append(index)
+    return chosen or list(range(len(chunks)))
+
+
+async def _fill_quotes(
+    themes: list[dict],
+    *,
+    segments: Sequence[Mapping[str, Any]],
+    passages: Sequence[Mapping[str, Any]],
+    respondent_key: str | None,
+    quotes_per_theme: int,
+    min_quote_chars: int,
+    limiter: CallLimiter,
+) -> None:
+    """Validate representative quotes for every theme at once. Theme order is fixed."""
+    if not themes:
+        return
+    passages_by_id = {str(item.get("passage_id")): item for item in passages if item.get("passage_id")}
+    prepared = []
+    for theme in themes:
+        member_keys = {code_key(label) for label in theme.get("codes") or []}
+        member_segments = [
+            segment
+            for segment in segments
+            if code_key(str(segment.get("code") or "")) in member_keys
+        ]
+        counts = Counter(code_key(str(segment.get("code") or "")) for segment in member_segments)
+        prepared.append((member_segments, counts))
+
+    async def one(index: int) -> list[dict]:
+        member_segments, counts = prepared[index]
+        return await limiter.call(
+            _select_quotes,
+            member_segments,
+            passages_by_id,
+            counts,
+            respondent_key=respondent_key,
+            limit=quotes_per_theme,
+            min_chars=min_quote_chars,
+        )
+
+    chosen = await asyncio.gather(*(one(index) for index in range(len(themes))))
+    for theme, quotes in zip(themes, chosen):
+        theme["quotes"] = quotes
 
 
 def _one_theme(
@@ -706,6 +834,7 @@ def _one_theme(
     respondent_key: str | None,
     quotes_per_theme: int,
     min_quote_chars: int,
+    with_quotes: bool = True,
 ) -> dict:
     member_keys = {code_key(label) for label in theme.get("codes") or []}
     member_segments = [
@@ -767,13 +896,17 @@ def _one_theme(
         "n_respondents": n_respondents,
         "pct_respondents": _pct(n_respondents, totals["n_respondents"]),
         "breakdowns": _breakdowns(passage_ids, passages_by_id),
-        "quotes": _select_quotes(
-            member_segments,
-            passages_by_id,
-            counts,
-            respondent_key=respondent_key,
-            limit=quotes_per_theme,
-            min_chars=min_quote_chars,
+        "quotes": (
+            _select_quotes(
+                member_segments,
+                passages_by_id,
+                counts,
+                respondent_key=respondent_key,
+                limit=quotes_per_theme,
+                min_chars=min_quote_chars,
+            )
+            if with_quotes
+            else []
         ),
     }
 
@@ -1035,23 +1168,47 @@ def _theme_markdown(theme: Mapping[str, Any], min_quote_chars: int) -> list[str]
 
 
 def _write_taguette(place, result: ThemeResult) -> None:
-    """Codebook CSV Taguette can import. ``Theme.Code`` is the parent/child path.
+    """Codebook CSV Taguette can import. Each code is ``Theme\\Code``.
 
-    Taguette does not import highlights, so this file is the codebook only.
+    A parent row for the theme is written first so the prefix exists. Taguette's
+    importer keeps the path string; highlight filtering treats a backslash path
+    as a sub-tag of that prefix. Taguette does not import highlights.
     """
+    from automated_grounded_theory.export import TAGUETTE_SEPARATOR
+
     used: set[str] = set()
     rows = []
     for theme in result.themes:
+        parent = _unique_path(taguette_tag(str(theme.get("name") or "")), used)
+        member_rows = []
+        highlights = 0
+        documents = 0
         for item in theme.get("code_counts") or []:
             path = _unique_path(theme_tag_path(theme["name"], item["code"]), used)
             description = theme.get("definition") or ""
             if item.get("definition"):
                 description = (description + "\n\n" + item["definition"]).strip()
-            rows.append([path, description, item["segments"], item["documents"]])
+            member_rows.append([path, description, item["segments"], item["documents"]])
+            highlights += int(item.get("segments") or 0)
+            documents += int(item.get("documents") or 0)
+        if TAGUETTE_SEPARATOR in parent:
+            parent = parent.replace(TAGUETTE_SEPARATOR, "·")
+        rows.append([parent, theme.get("definition") or "", highlights, documents])
+        rows.extend(member_rows)
     _write_csv(
         place("taguette_themes.csv"),
         ["tag", "description", "number of highlights", "number of documents"],
         rows,
+    )
+    from automated_grounded_theory.export import codebook_qdc
+
+    place("taguette_themes.qdc").write_text(
+        codebook_qdc(
+            [{"code": row[0], "definition": row[1]} for row in rows],
+            origin=f"automated_grounded_theory {__version__}",
+            preserve_separator=True,
+        ),
+        encoding="utf-8",
     )
 
 
@@ -1157,6 +1314,8 @@ def _metadata(**kwargs: Any) -> dict:
         "prompt_cache": kwargs["prompt_cache"],
         "calls": kwargs["calls"],
         "research_question": kwargs["question"],
+        "concurrency": kwargs.get("concurrency"),
+        "theme_chunk": kwargs.get("theme_chunk"),
     }
 
 
@@ -1175,6 +1334,9 @@ def _validate_theme_params(
     quotes_per_theme: int,
     min_quote_chars: int,
     validation_retries: int,
+    concurrency: int,
+    theme_chunk: int,
+    max_retries: int,
 ) -> None:
     if n_themes is not None and n_themes < 1:
         raise ValueError("n_themes must be at least 1, or None to let the model choose.")
@@ -1182,30 +1344,10 @@ def _validate_theme_params(
         raise ValueError("quotes_per_theme must be at least 1.")
     if min_quote_chars < 0:
         raise ValueError("min_quote_chars must be zero or more.")
-    if validation_retries < 0:
-        raise ValueError("validation_retries must be zero or more.")
-
-
-def _usage_from(raw: Any) -> dict[str, int]:
-    meta = getattr(raw, "usage_metadata", None) or {}
-    if not meta and raw is not None:
-        response = getattr(raw, "response_metadata", None) or {}
-        token_usage = response.get("token_usage") or response.get("usage") or {}
-        meta = {
-            "input_tokens": token_usage.get("prompt_tokens") or token_usage.get("input_tokens") or 0,
-            "output_tokens": token_usage.get("completion_tokens") or token_usage.get("output_tokens") or 0,
-            "total_tokens": token_usage.get("total_tokens") or 0,
-        }
-    input_tokens = int(meta.get("input_tokens") or 0)
-    output_tokens = int(meta.get("output_tokens") or 0)
-    total_tokens = int(meta.get("total_tokens") or 0)
-    if total_tokens == 0:
-        total_tokens = input_tokens + output_tokens
-    return {
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "total_tokens": total_tokens,
-    }
+    if validation_retries < 0 or max_retries < 0:
+        raise ValueError("validation_retries and max_retries must be zero or more.")
+    if concurrency < 1 or theme_chunk < 1:
+        raise ValueError("concurrency and theme_chunk must be at least 1.")
 
 
 def _pct(count: int, total: int) -> float:

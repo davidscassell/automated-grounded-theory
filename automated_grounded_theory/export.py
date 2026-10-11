@@ -1,14 +1,15 @@
 """Write a run as CSV, JSON, Markdown, Taguette codebook CSV, and REFI-QDA QDC.
 
-Taguette's codebook importer reads a CSV with a name column called ``tag``,
-``name``, or ``path``, and an optional ``description`` column. Other columns
-are ignored. The CSV written here uses Taguette's own export header
-(``tag``, ``description``, ``number of highlights``, ``number of documents``)
-so the same file imports.
+Taguette's codebook importer (``taguette.import_codebook.list_tags``) reads a
+CSV with a name column called ``tag``, ``name``, or ``path``, and an optional
+``description`` column. Other columns are ignored. The CSV written here uses
+Taguette's own export header (``tag``, ``description``, ``number of highlights``,
+``number of documents``). A backslash in the path is the parent/child split
+(``interesting\\places`` in Taguette's tests). Dots are ordinary characters.
 
 Taguette exports REFI-QDA codebook XML (``.qdc``) and does not import it.
-The QDC file follows that export shape, plus a ``Description`` child from the
-codebook schema, for packages that do import QDC (NVivo, ATLAS.ti, QualCoder).
+The QDC file follows that export (``Code`` with ``guid``, ``name``,
+``isCodable``) plus a ``Description`` child for packages that read one.
 
 ``highlights.csv`` uses Taguette's highlight-export columns (``id``,
 ``document``, ``tag``, ``content``). Taguette does not import highlights.
@@ -31,13 +32,20 @@ QDC_NAMESPACE = "urn:QDA-XML:codebook:1.0"
 _QDC_UUID_NAMESPACE = uuid.UUID("a6e0c1d2-7b34-4f0a-9c11-0b6e2a9d4f18")
 
 
-def taguette_tag(label: str, used: set[str] | None = None) -> str:
-    """Make a label safe as a Taguette tag path.
+# Taguette stores a tag path as one string. A backslash separates a parent from
+# its child (``interesting\places`` in Taguette's own tests and QDC export).
+# The codebook CSV importer (``taguette.import_codebook.list_tags``) keeps that
+# path as written. Dots are ordinary characters.
+TAGUETTE_SEPARATOR = "\\"
 
-    Taguette treats ``.`` as a parent/child separator (``interesting.places``).
-    Dots in emergent labels are replaced so they do not become a hierarchy.
+
+def taguette_tag(label: str, used: set[str] | None = None) -> str:
+    """Make one path component safe for Taguette.
+
+    Backslashes in a label would look like extra hierarchy levels, so they are
+    replaced. The path itself is joined later with :data:`TAGUETTE_SEPARATOR`.
     """
-    cleaned = label.replace(".", "·").replace("\n", " ").replace("\r", " ")
+    cleaned = label.replace("\\", "·").replace("\n", " ").replace("\r", " ")
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     cleaned = cleaned or "untitled-code"
     if used is None:
@@ -74,15 +82,28 @@ def _description(entry: Mapping[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
-def codebook_qdc(codes: list[Mapping[str, Any]], *, origin: str | None = None) -> str:
-    """Serialize a REFI-QDA codebook (``.qdc``)."""
+def codebook_qdc(codes: list[Mapping[str, Any]], *, origin: str | None = None, preserve_separator: bool = False) -> str:
+    """Serialize a REFI-QDA codebook (``.qdc``).
+
+    The shape matches Taguette's export: ``CodeBook`` / ``Codes`` / ``Code``
+    with ``guid``, ``name``, and ``isCodable``, plus an empty ``Sets``. A
+    ``Description`` child carries the definition for tools that read it.
+    Taguette writes ``.qdc`` and does not import it. ``name`` uses a backslash
+    for hierarchy when ``preserve_separator`` is set (``Theme\\Code``).
+    """
     ns = QDC_NAMESPACE
     ET.register_namespace("", ns)
     root = ET.Element(f"{{{ns}}}CodeBook", {"origin": origin or f"automated_grounded_theory {__version__}"})
     codes_el = ET.SubElement(root, f"{{{ns}}}Codes")
     used: set[str] = set()
     for entry in codes:
-        tag = taguette_tag(str(entry.get("code") or ""), used)
+        raw = str(entry.get("code") or "")
+        tag = raw if preserve_separator else taguette_tag(raw, used)
+        if preserve_separator:
+            if tag in used:
+                tag = taguette_tag(tag, used)
+            else:
+                used.add(tag)
         guid = str(uuid.uuid5(_QDC_UUID_NAMESPACE, tag)).upper()
         code_el = ET.SubElement(
             codes_el,
