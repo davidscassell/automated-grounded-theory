@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -13,6 +14,7 @@ class LoadedDocument:
     name: str
     text: str
     source: str
+    metadata: dict = field(default_factory=dict)
 
 
 CorpusItem = str | Path | Mapping[str, Any]
@@ -66,7 +68,7 @@ def load_corpus(corpus: CorpusItem | Sequence[CorpusItem]) -> list[LoadedDocumen
 
     * a string of document text (a string that is an existing file path is read)
     * a :class:`pathlib.Path`
-    * a mapping with ``text`` or ``path`` and optional ``id`` / ``name``
+    * a mapping with ``text`` or ``path``, optional ``id`` / ``name``, and optional ``metadata``
 
     A single string or path is accepted as a one-document corpus.
     """
@@ -84,6 +86,30 @@ def load_corpus(corpus: CorpusItem | Sequence[CorpusItem]) -> list[LoadedDocumen
     if not any(doc.text.strip() for doc in documents):
         raise ValueError("corpus documents are empty.")
     return documents
+
+
+def _plain_metadata(value: Any) -> dict:
+    """Copy document metadata into JSON-like values.
+
+    Respondent attributes stay attached to the document. They are not codes.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError("corpus item metadata must be a mapping.")
+
+    def plain(item: Any) -> Any:
+        if item is None or isinstance(item, (str, int, float, bool)):
+            return item
+        if isinstance(item, Mapping):
+            return {str(key): plain(inner) for key, inner in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [plain(inner) for inner in item]
+        return str(item)
+
+    copied = {str(key): plain(inner) for key, inner in value.items()}
+    # Round-trip so later JSON exports cannot fail on a leftover object.
+    return json.loads(json.dumps(copied))
 
 
 def _load_item(item: CorpusItem, index: int, used: set[str]) -> LoadedDocument:
@@ -116,7 +142,13 @@ def _load_item(item: CorpusItem, index: int, used: set[str]) -> LoadedDocument:
         else:
             raise ValueError(f"Corpus item {index} needs 'text' or 'path'.")
         doc_id = _unique_id(requested, used)
-        return LoadedDocument(doc_id=doc_id, name=name, text=text, source=source)
+        return LoadedDocument(
+            doc_id=doc_id,
+            name=name,
+            text=text,
+            source=source,
+            metadata=_plain_metadata(item.get("metadata")),
+        )
 
     raise TypeError(
         "Each corpus item must be a string, a path, or a mapping with 'text' or 'path'. "

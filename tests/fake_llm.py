@@ -12,6 +12,7 @@ from langchain_core.runnables import RunnableLambda
 
 from automated_grounded_theory.prompts import message_text
 from automated_grounded_theory.schemas import (
+    BatchCoding,
     CodeProposal,
     DefinitionUpdate,
     MergeDecision,
@@ -21,12 +22,12 @@ from automated_grounded_theory.schemas import (
 
 
 def _passage(text: str) -> str:
-    match = re.search(r"<<<PASSAGE\n(.*)\nPASSAGE>>>", text, re.S)
+    match = re.search(r"<<<PASSAGE\n(.*?)\nPASSAGE>>>", text, re.S)
     return match.group(1) if match else ""
 
 
-def _labels(text: str) -> set[str]:
-    return {label.casefold() for label in re.findall(r"^CODE_LABEL: (.+)$", text, re.M)}
+def _labels(text: str) -> list[str]:
+    return re.findall(r"^CODE_LABEL: (.+)$", text, re.M)
 
 
 def _sentence(passage: str, keyword: str) -> str:
@@ -70,32 +71,77 @@ class FakeCoder(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content="{}"))])
 
     def with_structured_output(self, schema, **kwargs):
+        include_raw = bool(kwargs.get("include_raw"))
+
         def _call(messages):
             self.call_count += 1
             text = "\n".join(message_text(message) for message in messages)
-            if getattr(schema, "__name__", "") == "SweepCoding":
-                return self.sweep(text)
-            return self.code(text)
+            name = getattr(schema, "__name__", "")
+            if name == "SweepCoding":
+                parsed = self.sweep(text)
+            elif name == "BatchCoding":
+                parsed = self.batch(text)
+            else:
+                parsed = self.code(text)
+            if not include_raw:
+                return parsed
+            raw = AIMessage(
+                content="{}",
+                usage_metadata={"input_tokens": 12, "output_tokens": 6, "total_tokens": 18},
+            )
+            return {"raw": raw, "parsed": parsed, "parsing_error": None}
 
         return RunnableLambda(_call)
+
+    def batch(self, text: str) -> BatchCoding:
+        blocks = re.findall(r"<<<PASSAGE\n(.*?)\nPASSAGE>>>", text, re.S)
+        ids = re.findall(r"^passage_id: (.+)$", text, re.M)
+        header = text.split("PASSAGE TO CODE", 1)[0]
+        feedback = ""
+        if "VALIDATION FEEDBACK" in text:
+            feedback = text[text.index("VALIDATION FEEDBACK") :]
+        items = []
+        for index, block in enumerate(blocks):
+            passage_id = ids[index] if index < len(ids) else ""
+            one = (
+                header
+                + "\nPASSAGE TO CODE\n"
+                + f"passage_id: {passage_id}\n"
+                + "<<<PASSAGE\n"
+                + block
+                + "\nPASSAGE>>>\n"
+                + feedback
+            )
+            coded = self.code(one)
+            coded.passage_id = passage_id
+            items.append(coded)
+        if not items:
+            coded = self.code(text)
+            items.append(coded)
+        return BatchCoding(passages=items)
 
     def code(self, text: str) -> PassageCoding:
         passage = _passage(text)
         rule = _rule(passage)
         if rule is None:
-            return PassageCoding(what_is_happening="Nothing codable stood out.", codes=[], memo="No incident to code.")
+            return PassageCoding(codes=[], memo="")
         label, quote = rule
-        action = "reuse" if label.casefold() in _labels(text) else "new"
+        known = {item.casefold() for item in _labels(text)}
+        action = "reuse" if label.casefold() in known else "new"
+        others = [item for item in _labels(text) if item.casefold() != label.casefold()]
+        nearest = others[0] if action == "new" and others else ""
+        why = "It names a different incident." if nearest else ""
         return PassageCoding(
-            what_is_happening=quote,
             codes=[
                 CodeProposal(
                     action=action,
                     code=label,
+                    nearest_code=nearest,
+                    why_not_nearest=why,
                     definition=f"Incidents of {label}.",
                     quote=quote,
                     in_vivo=False,
-                    rationale="The incident matches this gerund.",
+                    rationale="Matches this incident.",
                     confidence=0.9,
                 )
             ],
@@ -135,7 +181,6 @@ class FlakyCoder(FakeCoder):
         rule = _rule(passage)
         label = rule[0] if rule else "packing bags"
         return PassageCoding(
-            what_is_happening="A first pass missed the wording.",
             codes=[
                 CodeProposal(
                     action="new",

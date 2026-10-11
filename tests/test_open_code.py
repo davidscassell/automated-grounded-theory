@@ -2,7 +2,10 @@ import json
 
 import pytest
 
-from automated_grounded_theory import open_code
+from automated_grounded_theory import evaluate_run, open_code
+from automated_grounded_theory.evaluate import chen_metrics
+from automated_grounded_theory.graph import iter_sweep_chunks
+from automated_grounded_theory.prompts import CODING_SYSTEM
 from automated_grounded_theory.backends import prompt_cache_supported, resolve_chat_model
 from automated_grounded_theory.context import PresetCodesError
 from automated_grounded_theory.retrieval import EmbeddingCodeRetriever, cosine, merge_candidates
@@ -24,7 +27,7 @@ def test_open_code_merges_and_keeps_verbatim_quotes(tmp_path):
     model = FakeCoder()
     result = _run(model, output_dir=tmp_path, api_key="sk-test-secret")
     assert not result.interrupted
-    assert model.call_count == 6
+    assert model.call_count == 4
     quotes = {item["passage_id"]: item["text"] for item in result.passages}
     assert len(result.segments) == 4
     for segment in result.segments:
@@ -89,6 +92,7 @@ def test_resume_from_memory_and_sqlite(tmp_path):
     assert not finished.interrupted
     assert len(finished.segments) == 4
 
+    pytest.importorskip("langgraph.checkpoint.sqlite")
     checkpoint = tmp_path / "run.sqlite"
     paused = open_code(
         CORPUS,
@@ -178,3 +182,134 @@ def test_embedding_candidates_are_optional():
     assert {pairs[0]["source"], pairs[0]["target"]} == {"packing bags", "packing bags up"}
     ranked = EmbeddingCodeRetriever(_PackingEmbeddings()).rank("I was packing bags", codes, k=1)
     assert ranked == ["packing bags"]
+
+
+def test_batching_and_waves_cut_calls():
+    batched = FakeCoder()
+    result = _run(batched, batch_size=4, concurrency=1, sweep_every=25)
+    assert batched.call_count == 2
+    assert len(result.segments) == 4
+    assert result.prompt_log[0]["usage"]["total_tokens"] == 18
+
+    waved = FakeCoder()
+    waved_result = open_code(
+        CORPUS,
+        CONTEXT,
+        model=waved,
+        seed=7,
+        sweep_every=25,
+        batch_size=1,
+        concurrency=2,
+    )
+    code_prompts = [item for item in waved_result.prompt_log if item["kind"] == "code_passage"]
+    assert len(code_prompts) == 4
+    assert sum("codebook is empty" in json.dumps(item["messages"]) for item in code_prompts) == 2
+    assert len(waved_result.segments) == 4
+
+
+def test_trivial_passages_are_not_sent_to_the_model():
+    model = FakeCoder()
+    result = open_code(
+        ["I spent the morning packing my suitcase.", "n/a", "   "],
+        CONTEXT,
+        model=model,
+        seed=1,
+        sweep_every=25,
+        batch_size=1,
+        concurrency=1,
+    )
+    assert model.call_count == 2
+    assert len(result.segments) == 1
+    assert sum(1 for passage in result.passages if passage.get("skipped")) == 2
+    coded_ids = {segment["passage_id"] for segment in result.segments}
+    assert not any(memo.get("passage_id") not in coded_ids and memo.get("kind") == "passage" for memo in result.memos)
+
+
+def test_document_metadata_reaches_segments_and_taguette(tmp_path):
+    result = open_code(
+        [
+            {
+                "id": "r1",
+                "text": "I spent the morning packing my suitcase.",
+                "metadata": {"department": "cardiology", "tenure_band": "0-1 years"},
+            }
+        ],
+        CONTEXT,
+        model=FakeCoder(),
+        seed=1,
+        sweep_every=25,
+        batch_size=1,
+        concurrency=1,
+        output_dir=tmp_path,
+    )
+    assert result.segments[0]["metadata"]["department"] == "cardiology"
+    highlights = (tmp_path / "highlights.csv").read_text(encoding="utf-8")
+    assert "cardiology" in highlights
+    assert "metadata" in highlights.splitlines()[0]
+
+
+def test_export_survives_callback_objects(tmp_path):
+    class Callback:
+        def __call__(self):
+            return None
+
+    result = _run(FakeCoder(), output_dir=tmp_path)
+    result.metadata = {"model_kwargs": {"callbacks": [Callback()], "note": object()}}
+    from automated_grounded_theory.export import export_result
+
+    export_result(result, tmp_path)
+    assert (tmp_path / "codebook.json").exists()
+    metadata = json.loads((tmp_path / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["model_kwargs"]["callbacks"] == [None]
+    assert (tmp_path / "coded_segments.json").stat().st_mtime <= (tmp_path / "run_metadata.json").stat().st_mtime
+
+
+def test_evaluate_run_and_chen_metrics(tmp_path):
+    result = _run(FakeCoder(), output_dir=tmp_path)
+    log = tmp_path / "run.log"
+    log.write_text(json.dumps({"ok": True, "seconds": 12.5}) + "\n", encoding="utf-8")
+    metrics = evaluate_run(result, log_path=log)
+    assert metrics["coverage_pct"] == 100.0
+    assert metrics["verbatim_quote_pct"] == 100.0
+    assert metrics["segments"] == 4
+    assert metrics["merges_accepted"] >= 1
+    assert metrics["usage_total_tokens"] > 0
+    assert metrics["tokens_per_passage"] > 0
+    assert metrics["wall_clock_s"] == 12.5
+    assert isinstance(metrics["chen_metrics"], str)
+    from_dir = evaluate_run(tmp_path, other_sources=[tmp_path])
+    assert from_dir["chen_metrics"]["mean_overlap"] == 1.0
+    similar = chen_metrics(
+        [
+            [{"code": "packing bags", "definition": "packing luggage"}],
+            [{"code": "packing bags up", "definition": "packing luggage"}],
+        ]
+    )
+    different = chen_metrics(
+        [
+            [{"code": "packing bags", "definition": "packing luggage"}],
+            [{"code": "crying at the station", "definition": "tears while leaving"}],
+        ]
+    )
+    assert similar["mean_overlap"] > different["mean_overlap"]
+    assert different["mean_novelty"] > similar["mean_novelty"]
+    from automated_grounded_theory.evaluate import main
+
+    written = tmp_path / "metrics.json"
+    assert main([str(tmp_path), "-o", str(written)]) == 0
+    assert json.loads(written.read_text(encoding="utf-8"))["segments"] == 4
+
+
+def test_sweep_chunks_cover_every_code():
+    codes = [{"code": f"doing thing {index}", "definition": "x", "frequency": 1} for index in range(100)]
+    chunks = iter_sweep_chunks(codes, 40)
+    assert [len(chunk) for chunk in chunks] == [40, 40, 20]
+    assert {entry["code"] for chunk in chunks for entry in chunk} == {entry["code"] for entry in codes}
+
+
+def test_coding_prompt_requires_comparison_and_in_vivo():
+    folded = CODING_SYSTEM.casefold()
+    assert "nearest_code" in CODING_SYSTEM
+    assert "in_vivo" in folded
+    assert "one code per distinct incident" in folded
+    assert "respondent" in folded

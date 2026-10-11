@@ -197,6 +197,63 @@ def assess_label(label: str, *, in_vivo: bool, passage: str, require_gerund: boo
     return True, reasons, {"code": shown, "key": code_key(shown), "in_vivo": in_vivo_flag, "gerund_ok": has_gerund}
 
 
+_TRIVIAL_EXACT = frozenset(
+    {
+        "n/a",
+        "na",
+        "n.a",
+        "n.a.",
+        "none",
+        "nil",
+        "null",
+        "nothing",
+        "no comment",
+        "no comments",
+        "-",
+        "--",
+        "---",
+        ".",
+        "...",
+        "?",
+    }
+)
+
+
+def is_trivial_passage(text: str) -> bool:
+    """True when a passage has no incident worth a model call.
+
+    Empty comments, punctuation, and explicit non-answers are skipped.
+    A short but substantive reply such as "yes" is kept.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return True
+    folded = re.sub(r"\s+", " ", stripped).casefold()
+    if folded in _TRIVIAL_EXACT:
+        return True
+    return re.search(r"[A-Za-z0-9]", stripped) is None
+
+
+def attribute_leak(text: str, metadata: dict | None) -> list[str]:
+    """Metadata values that appear as whole tokens in ``text``.
+
+    Definitions should name the incident, not the respondent. A hit is a
+    review flag, not a rejected code.
+    """
+    if not text or not metadata:
+        return []
+    folded = text.casefold()
+    hits: list[str] = []
+    for key, value in metadata.items():
+        raw = str(value).strip()
+        if len(raw) < 4:
+            continue
+        pattern = r"(?<![a-z0-9])" + re.escape(raw.casefold()) + r"(?![a-z0-9])"
+        if re.search(pattern, folded):
+            hits.append(str(key))
+    return hits
+
+
 def review_passage_flags(passage_text: str, *, quote: str, long_passage_chars: int, low_confidence: bool, confidence: float) -> list[str]:
     reasons: list[str] = []
     if long_passage_chars and len(passage_text) >= long_passage_chars:

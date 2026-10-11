@@ -156,6 +156,20 @@ def redact(mapping: dict[str, Any] | None) -> dict[str, Any]:
             redacted[key] = "***"
         elif isinstance(value, dict):
             redacted[key] = redact(value)
+        elif isinstance(value, (list, tuple)):
+            redacted[key] = [_redact_value(item) for item in value]
         else:
-            redacted[key] = value
+            redacted[key] = _redact_value(value)
     return redacted
+
+
+def _redact_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return redact(value)
+    if isinstance(value, (list, tuple)):
+        return [_redact_value(item) for item in value]
+    if callable(value):
+        return None
+    return repr(value)

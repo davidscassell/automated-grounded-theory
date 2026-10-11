@@ -11,6 +11,7 @@ from typing import Any, Mapping
 
 from automated_grounded_theory.validation import (
     assess_label,
+    attribute_leak,
     code_key,
     locate_quote,
     review_passage_flags,
@@ -136,6 +137,10 @@ def interpret_coding(
         if action == "new" and not definition:
             definition = str(proposal.get("rationale") or "").strip() or "Definition not yet specified."
             review.append("missing_definition")
+        if action == "new" and known and not str(proposal.get("nearest_code") or "").strip():
+            review.append("missing_nearest_code")
+        if attribute_leak(definition, passage.get("metadata") or {}):
+            review.append("definition_contains_respondent_attribute")
 
         key = fields["key"]
         if key in seen_keys and action == "new":
@@ -156,6 +161,8 @@ def interpret_coding(
                 "in_vivo": fields["in_vivo"],
                 "gerund_ok": fields["gerund_ok"],
                 "rationale": str(proposal.get("rationale") or ""),
+                "nearest_code": str(proposal.get("nearest_code") or "").strip(),
+                "why_not_nearest": str(proposal.get("why_not_nearest") or "").strip(),
                 "confidence": confidence,
                 "needs_review": bool(review),
                 "review_reasons": review,
@@ -169,7 +176,6 @@ def interpret_coding(
         "accepted": accepted,
         "rejections": rejections,
         "memo": str(payload.get("memo") or "").strip(),
-        "what_is_happening": str(payload.get("what_is_happening") or "").strip(),
         "low_confidence": low_confidence,
     }
 
@@ -194,22 +200,20 @@ def commit_passage(
     known_before = set(existing_keys) if existing_keys is not None else set(book)
     new_codes = 0
 
-    what = interpreted.get("what_is_happening") or ""
-    memo_body = interpreted.get("memo") or ""
-    text = "\n\n".join(part for part in (what.strip(), memo_body.strip()) if part).strip()
-    if not text:
-        text = "No analytic memo was returned for this passage."
-    memo_id = _next(counters, "memo", "m")
-    new_memos.append(
-        {
-            "memo_id": memo_id,
-            "kind": "passage",
-            "doc_id": passage.get("doc_id"),
-            "passage_id": passage.get("passage_id"),
-            "sweep_index": None,
-            "text": text,
-        }
-    )
+    memo_body = str(interpreted.get("memo") or "").strip()
+    memo_id = None
+    if memo_body:
+        memo_id = _next(counters, "memo", "m")
+        new_memos.append(
+            {
+                "memo_id": memo_id,
+                "kind": "passage",
+                "doc_id": passage.get("doc_id"),
+                "passage_id": passage.get("passage_id"),
+                "sweep_index": None,
+                "text": memo_body,
+            }
+        )
 
     for item in interpreted.get("accepted") or []:
         key = item["key"]
@@ -272,6 +276,9 @@ def commit_passage(
             "in_vivo": item["in_vivo"],
             "action": item["action"],
             "rationale": item["rationale"],
+            "nearest_code": item.get("nearest_code") or "",
+            "why_not_nearest": item.get("why_not_nearest") or "",
+            "metadata": dict(passage.get("metadata") or {}),
             "confidence": item["confidence"],
             "needs_review": item["needs_review"],
             "review_reasons": list(item["review_reasons"]),
@@ -383,16 +390,6 @@ def union_codebooks(books: list[dict[str, dict]]) -> dict[str, dict]:
     return united
 
 
-def candidate_pair_keys(candidates: list[Mapping[str, Any]]) -> set[frozenset[str]]:
-    pairs: set[frozenset[str]] = set()
-    for item in candidates:
-        source = code_key(str(item.get("source") or ""))
-        target = code_key(str(item.get("target") or ""))
-        if source and target and source != target:
-            pairs.add(frozenset((source, target)))
-    return pairs
-
-
 def apply_sweep(
     codebook: dict[str, dict],
     segments: list[dict],
@@ -403,12 +400,19 @@ def apply_sweep(
     overloaded: list[str] | None = None,
     relation_hints: list[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Confirm candidate merges, sharpen definitions, and relabel segments.
+    """Apply model-proposed merges, sharpen definitions, and relabel segments.
 
-    A merge is applied only when its unordered pair was a candidate. The
-    sweep model confirms; it does not invent pairs.
+    ``candidates`` are hints that were shown to the model. A merge is applied
+    when both labels exist. The model may propose a pair that was not a candidate.
+    Accepted merges record ``from_candidate`` so a later reader can see which
+    pairs the model added on its own.
     """
-    allowed = candidate_pair_keys(candidates)
+    hinted: set[frozenset[str]] = set()
+    for item in candidates:
+        source_key = code_key(str(item.get("source") or ""))
+        target_key = code_key(str(item.get("target") or ""))
+        if source_key and target_key and source_key != target_key:
+            hinted.add(frozenset((source_key, target_key)))
     parent = {key: key for key in codebook}
 
     def find(key: str) -> str:
@@ -422,12 +426,14 @@ def apply_sweep(
     for merge in merges:
         source = code_key(str(merge.get("source") or ""))
         target = code_key(str(merge.get("target") or ""))
-        record = {"source": merge.get("source"), "target": merge.get("target"), "rationale": merge.get("rationale", "")}
+        record = {
+            "source": merge.get("source"),
+            "target": merge.get("target"),
+            "rationale": merge.get("rationale", ""),
+            "from_candidate": frozenset((source, target)) in hinted,
+        }
         if source not in parent or target not in parent or source == target:
             rejected.append({**record, "reason": "unknown_or_same"})
-            continue
-        if frozenset((source, target)) not in allowed:
-            rejected.append({**record, "reason": "not_a_candidate"})
             continue
         root_source, root_target = find(source), find(target)
         if root_source == root_target:

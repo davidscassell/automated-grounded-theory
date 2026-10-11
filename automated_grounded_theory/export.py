@@ -104,8 +104,28 @@ def _write_csv(path: Path, header: list[str], rows: list[list[Any]]) -> None:
         writer.writerows(rows)
 
 
+def _json_ready(value: Any) -> Any:
+    """Drop callables and repr anything else JSON cannot encode.
+
+    Model callbacks are the usual offender. Core files are written before
+    metadata so a metadata value cannot take the codebook down with it.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    if callable(value):
+        return None
+    return repr(value)
+
+
 def _write_json(path: Path, payload: Any) -> None:
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(_json_ready(payload), indent=2, ensure_ascii=False, default=repr) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _examples_cell(entry: Mapping[str, Any]) -> str:
@@ -223,6 +243,8 @@ def export_result(result, directory: str | Path) -> dict[str, str]:
             "needs_review",
             "review_reasons",
             "rationale",
+            "nearest_code",
+            "metadata",
         ],
         [
             [
@@ -241,19 +263,22 @@ def export_result(result, directory: str | Path) -> dict[str, str]:
                 item.get("needs_review"),
                 ";".join(item.get("review_reasons") or []),
                 item.get("rationale"),
+                item.get("nearest_code"),
+                json.dumps(item.get("metadata") or {}, ensure_ascii=False),
             ]
             for item in segments
         ],
     )
     _write_csv(
         place("highlights.csv"),
-        ["id", "document", "tag", "content"],
+        ["id", "document", "tag", "content", "metadata"],
         [
             [
                 item.get("highlight_id"),
                 item.get("doc_name") or item.get("doc_id"),
                 taguette_tag(str(item.get("code") or "")),
                 item.get("quote"),
+                json.dumps(item.get("metadata") or {}, ensure_ascii=False),
             ]
             for item in segments
         ],
@@ -300,10 +325,10 @@ def export_result(result, directory: str | Path) -> dict[str, str]:
             for point in result.saturation
         ],
     )
+    _write_json(place("passages.json"), result.passages)
     _write_json(place("validation_log.json"), result.validation_log)
     _write_json(place("sweep_log.json"), result.sweep_log)
     _write_json(place("prompt_log.json"), result.prompt_log)
-    _write_json(place("passages.json"), result.passages)
     metadata = dict(result.metadata)
     metadata["interrupted"] = result.interrupted
     metadata["saturation_note"] = result.saturation_report.get("note")

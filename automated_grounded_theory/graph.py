@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import threading
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -40,7 +41,7 @@ from automated_grounded_theory.prompts import (
 from automated_grounded_theory.results import result_from_state
 from automated_grounded_theory.retrieval import CodeRetriever, merge_candidates, select_prompt_codes
 from automated_grounded_theory.saturation import saturation_point
-from automated_grounded_theory.schemas import PassageCoding, SweepCoding
+from automated_grounded_theory.schemas import BatchCoding, SweepCoding
 from automated_grounded_theory.segment import plan_coding
 
 logger = logging.getLogger("automated_grounded_theory")
@@ -91,6 +92,9 @@ class RunConfig:
     validation_retries: int = 1
     require_gerund: bool = False
     candidate_limit: int = 30
+    batch_size: int = 8
+    concurrency: int = 2
+    sweep_chunk: int = 40
     model_name: str = ""
     sweep_model_name: str = ""
     prompt_log_path: str | None = None
@@ -110,7 +114,13 @@ class CodingError(RuntimeError):
 def initial_state(documents: list[LoadedDocument], metadata: dict) -> CodingState:
     return {
         "documents": [
-            {"doc_id": doc.doc_id, "name": doc.name, "text": doc.text, "source": doc.source}
+            {
+                "doc_id": doc.doc_id,
+                "name": doc.name,
+                "text": doc.text,
+                "source": doc.source,
+                "metadata": dict(doc.metadata),
+            }
             for doc in documents
         ],
         "passages": [],
@@ -216,13 +226,23 @@ def _segment_node(state: CodingState) -> dict:
             name=item["name"],
             text=item["text"],
             source=item.get("source") or "",
+            metadata=dict(item.get("metadata") or {}),
         )
         for item in state["documents"]
     ]
     # plan_coding loads via load_corpus, which would re-wrap mappings.
     # Documents are already loaded, so call the planner on mappings.
     plan = plan_coding(
-        [{"id": doc.doc_id, "name": doc.name, "text": doc.text, "source": doc.source} for doc in documents],
+        [
+            {
+                "id": doc.doc_id,
+                "name": doc.name,
+                "text": doc.text,
+                "source": doc.source,
+                "metadata": doc.metadata,
+            }
+            for doc in documents
+        ],
         unit=metadata["unit"],
         seed=metadata["seed"],
         parallel_documents=bool(metadata.get("parallel_documents")),
@@ -242,40 +262,73 @@ def _segment_node(state: CodingState) -> dict:
 
 def _code_node(runtime: RunConfig):
     async def code_passage(state: CodingState) -> dict:
-        jobs = _jobs(state)
+        jobs = _wave(state, runtime)
         if not jobs:
             return {"pending": []}
 
-        async def one(doc_id: str | None, index: int) -> dict:
-            passage = state["passages"][index]
+        async def one(doc_id: str | None, indices: list[int]) -> list[dict]:
+            passages = [state["passages"][index] for index in indices]
             book = _book_for(state, doc_id)
-            coding, attempt_errors = await _code_with_retries(runtime, passage, book)
-            return {
-                "passage_index": index,
-                "doc_id": doc_id,
-                "coding": coding,
-                "attempt_errors": attempt_errors,
-            }
+            coded = await _code_batch(runtime, passages, book)
+            rows = []
+            for index in indices:
+                passage = state["passages"][index]
+                coding, attempt_errors = coded[str(passage.get("passage_id"))]
+                rows.append(
+                    {
+                        "passage_index": index,
+                        "doc_id": doc_id,
+                        "coding": coding,
+                        "attempt_errors": attempt_errors,
+                    }
+                )
+            return rows
 
-        pending = list(await asyncio.gather(*(one(doc_id, index) for doc_id, index in jobs)))
-        return {"pending": pending}
+        groups = await asyncio.gather(*(one(doc_id, indices) for doc_id, indices in jobs))
+        return {"pending": [row for group in groups for row in group]}
 
     return code_passage
 
 
-def _jobs(state: CodingState) -> list[tuple[str | None, int]]:
+def _wave(state: CodingState, runtime: RunConfig) -> list[tuple[str | None, list[int]]]:
+    """One wave: up to concurrency batches, each up to batch_size passages.
+
+    The wave stops at the next sweep so the codebook is committed before more
+    passages are coded. Passages inside a wave share the codebook from the
+    start of the wave.
+    """
+    metadata = state.get("metadata") or {}
+    batch_size = max(1, int(metadata.get("batch_size") or runtime.batch_size))
+    concurrency = max(1, int(metadata.get("concurrency") or runtime.concurrency))
+    sweep_every = max(1, int(metadata.get("sweep_every") or 1))
+    since = int(state.get("passages_since_sweep") or 0)
+    room = sweep_every - since
+    if room <= 0:
+        return []
+
     if state.get("parallel"):
-        jobs = []
+        jobs: list[tuple[str | None, list[int]]] = []
+        used = 0
         for doc_id in sorted(state.get("branch_queues") or {}):
-            queue = state["branch_queues"][doc_id]
-            if queue:
-                jobs.append((doc_id, queue[0]))
+            if len(jobs) >= concurrency or used >= room:
+                break
+            queue = list(state["branch_queues"][doc_id])
+            if not queue:
+                continue
+            take = min(batch_size, len(queue), room - used)
+            if take <= 0:
+                break
+            jobs.append((doc_id, queue[:take]))
+            used += take
         return jobs
+
     index = int(state.get("next_index") or 0)
-    queue = state.get("queue") or []
+    queue = list(state.get("queue") or [])
     if index >= len(queue):
         return []
-    return [(None, queue[index])]
+    take = min(room, batch_size * concurrency, len(queue) - index)
+    indices = queue[index : index + take]
+    return [(None, indices[start : start + batch_size]) for start in range(0, len(indices), batch_size)]
 
 
 def _book_for(state: CodingState, doc_id: str | None) -> dict:
@@ -284,51 +337,94 @@ def _book_for(state: CodingState, doc_id: str | None) -> dict:
     return state.get("codebook") or {}
 
 
-async def _code_with_retries(runtime: RunConfig, passage: dict, codebook: dict) -> tuple[dict, list]:
-    feedback = None
-    attempt_errors: list[list[dict]] = []
-    coding: dict = {}
+async def _code_batch(runtime: RunConfig, passages: list[dict], codebook: dict) -> dict[str, tuple[dict, list]]:
+    """Code a batch. Quote failures are retried on their own, not with the batch."""
+    pending = list(passages)
+    feedback: dict[str, str] = {}
+    errors: dict[str, list] = {str(passage.get("passage_id")): [] for passage in passages}
+    done: dict[str, tuple[dict, list]] = {}
     attempts = max(0, runtime.validation_retries) + 1
     for attempt in range(attempts):
-        coding = await _invoke_coding(runtime, passage, codebook, feedback)
-        interpreted = interpret_coding(
-            coding,
-            passage,
-            codebook,
-            max_codes=runtime.max_codes_per_passage,
-            require_gerund=runtime.require_gerund,
-            long_passage_chars=runtime.long_passage_chars,
-        )
-        quote_failures = [item for item in interpreted["rejections"] if item.get("reason") == "quote_not_verbatim"]
-        if not quote_failures or attempt == attempts - 1:
+        if not pending:
             break
-        attempt_errors.append(quote_failures)
-        feedback = validation_feedback(quote_failures)
-    return coding, attempt_errors
+        aligned = await _invoke_coding(runtime, pending, codebook, feedback or None)
+        still_pending = []
+        feedback = {}
+        for passage, coding in zip(pending, aligned):
+            passage_id = str(passage.get("passage_id"))
+            interpreted = interpret_coding(
+                coding,
+                passage,
+                codebook,
+                max_codes=runtime.max_codes_per_passage,
+                require_gerund=runtime.require_gerund,
+                long_passage_chars=runtime.long_passage_chars,
+            )
+            quote_failures = [item for item in interpreted["rejections"] if item.get("reason") == "quote_not_verbatim"]
+            if quote_failures and attempt < attempts - 1:
+                errors[passage_id].append(quote_failures)
+                still_pending.append(passage)
+                feedback[passage_id] = validation_feedback(quote_failures)
+            else:
+                done[passage_id] = (coding, errors[passage_id])
+        pending = still_pending
+    for passage in passages:
+        passage_id = str(passage.get("passage_id"))
+        done.setdefault(passage_id, ({"passage_id": passage_id, "codes": [], "memo": ""}, errors[passage_id]))
+    return done
 
 
-async def _invoke_coding(runtime: RunConfig, passage: dict, codebook: dict, feedback: str | None) -> dict:
-    ranked = runtime.retriever.rank(str(passage.get("text") or ""), list(codebook.values()), k=runtime.top_k_codes)
-    view, omitted = select_prompt_codes(list(codebook.values()), ranked, frequent_limit=runtime.frequent_codes)
+async def _invoke_coding(
+    runtime: RunConfig,
+    passages: list[dict],
+    codebook: dict,
+    feedback: dict[str, str] | None,
+) -> list[dict]:
+    ranked: list[str] = []
+    seen: set[str] = set()
+    entries = list(codebook.values())
+    for passage in passages:
+        for label in runtime.retriever.rank(str(passage.get("text") or ""), entries, k=runtime.top_k_codes):
+            key = label.casefold()
+            if key not in seen:
+                seen.add(key)
+                ranked.append(label)
+    view, omitted = select_prompt_codes(entries, ranked, frequent_limit=runtime.frequent_codes)
     messages = build_coding_messages(
         context=runtime.context,
         codebook_view=view,
         omitted_codes=omitted,
-        passage=passage,
+        passages=passages,
         neighbor_chars=runtime.neighbor_chars,
         feedback=feedback,
         prompt_cache=runtime.prompt_cache,
     )
+    passage_ids = ",".join(str(passage.get("passage_id")) for passage in passages)
     parsed = await _ainvoke_structured(
         runtime.coder,
-        PassageCoding,
+        BatchCoding,
         messages,
         kind="code_passage",
         model_name=runtime.model_name,
-        passage_id=str(passage.get("passage_id")),
+        passage_id=passage_ids,
         runtime=runtime,
     )
-    return parsed
+    return _align_batch(parsed, passages)
+
+
+def _align_batch(payload: dict, passages: list[dict]) -> list[dict]:
+    items = list(payload.get("passages") or [])
+    by_id = {str(item.get("passage_id")): item for item in items if item.get("passage_id")}
+    aligned = []
+    for index, passage in enumerate(passages):
+        passage_id = str(passage.get("passage_id") or "")
+        item = by_id.get(passage_id)
+        if item is None and index < len(items):
+            item = items[index]
+        if item is None:
+            item = {"passage_id": passage_id, "codes": [], "memo": "", "low_confidence": True}
+        aligned.append(item)
+    return aligned
 
 
 def _validate_node(runtime: RunConfig):
@@ -355,8 +451,11 @@ def _validate_node(runtime: RunConfig):
             for book in branch_books.values():
                 global_keys.update(book)
 
-        # Apply in a stable order.
-        pending_sorted = sorted(pending, key=lambda item: (item.get("doc_id") or "", item.get("passage_index") or 0))
+        # Commit in seeded coding order so earlier passages in a wave land first.
+        pending_sorted = sorted(
+            pending,
+            key=lambda item: state["passages"][item["passage_index"]].get("coding_order", item["passage_index"]),
+        )
         for item in pending_sorted:
             passage = state["passages"][item["passage_index"]]
             doc_id = item.get("doc_id")
@@ -408,9 +507,9 @@ def _validate_node(runtime: RunConfig):
                     committed["codebook"],
                     [segment for segment in segments if segment.get("doc_id") == doc_id],
                 )
-                queue = branch_queues.get(doc_id) or []
-                if queue and queue[0] == item["passage_index"]:
-                    branch_queues[doc_id] = queue[1:]
+                branch_queues[doc_id] = [
+                    index for index in (branch_queues.get(doc_id) or []) if index != item["passage_index"]
+                ]
             else:
                 codebook = committed["codebook"]
                 next_index += 1
@@ -498,29 +597,14 @@ def _sweep_node(runtime: RunConfig):
 
         codes = list(codebook.values())
         codes.sort(key=lambda entry: (-int(entry.get("frequency") or 0), str(entry.get("code") or "").casefold()))
-        truncated = codes[:80]
         candidates = merge_candidates(
-            truncated,
+            codes,
             embeddings=runtime.embeddings,
             embedding_threshold=runtime.merge_threshold,
             lexical_threshold=runtime.lexical_merge_threshold,
             limit=runtime.candidate_limit,
         )
-        messages = build_sweep_messages(
-            context=runtime.context,
-            codes=truncated,
-            candidates=candidates,
-            prompt_cache=runtime.prompt_cache,
-        )
-        parsed = await _ainvoke_structured(
-            runtime.sweeper,
-            SweepCoding,
-            messages,
-            kind="sweep",
-            model_name=runtime.sweep_model_name,
-            passage_id=f"sweep-{sweep_index}",
-            runtime=runtime,
-        )
+        parsed, chunk_count = await _sweep_chunks(runtime, codes, candidates, sweep_index)
         prompt_log = _take_prompts(runtime, state)
         applied = apply_sweep(
             codebook,
@@ -578,11 +662,12 @@ def _sweep_node(runtime: RunConfig):
             "merge_map": applied["merge_map"],
             "relation_hints": applied["relation_hints"],
             "overloaded_codes": overloaded,
-            "codes_sent": len(truncated),
+            "codes_sent": len(codes),
+            "chunks": chunk_count,
         }
         branch_books = state.get("branch_codebooks") or {}
         if state.get("parallel"):
-            branch_books = {doc_id: json.loads(json.dumps(applied["codebook"])) for doc_id in branch_books}
+            branch_books = {doc_id: deepcopy(applied["codebook"]) for doc_id in branch_books}
         return _sweep_update(
             state,
             codebook=applied["codebook"],
@@ -635,6 +720,95 @@ def _export_node(runtime: RunConfig):
     return export_node
 
 
+def iter_sweep_chunks(codes: list, limit: int) -> list[list]:
+    """Split a codebook into sweep requests. Every code is sent; none are dropped."""
+    size = max(1, limit)
+    if len(codes) <= size:
+        return [list(codes)]
+    return [list(codes[start : start + size]) for start in range(0, len(codes), size)]
+
+
+async def _sweep_chunks(runtime: RunConfig, codes: list, candidates: list, sweep_index: int) -> tuple[dict, int]:
+    from automated_grounded_theory.validation import code_key
+
+    chunks = iter_sweep_chunks(codes, runtime.sweep_chunk)
+    merges: list = []
+    definitions: list = []
+    overloaded: list = []
+    hints: list = []
+    integrative: list[str] = []
+    reflexive: list[str] = []
+    for index, chunk in enumerate(chunks, start=1):
+        if len(chunks) == 1:
+            chunk_candidates = candidates
+        else:
+            keys = {code_key(str(entry.get("code") or "")) for entry in chunk}
+            chunk_candidates = [
+                item
+                for item in candidates
+                if code_key(str(item.get("source") or "")) in keys or code_key(str(item.get("target") or "")) in keys
+            ]
+        messages = build_sweep_messages(
+            context=runtime.context,
+            codes=chunk,
+            candidates=chunk_candidates,
+            prompt_cache=runtime.prompt_cache,
+            all_codes=codes if len(chunks) > 1 else None,
+            chunk_index=index,
+            chunk_count=len(chunks),
+        )
+        parsed = await _ainvoke_structured(
+            runtime.sweeper,
+            SweepCoding,
+            messages,
+            kind="sweep",
+            model_name=runtime.sweep_model_name,
+            passage_id=f"sweep-{sweep_index}" if len(chunks) == 1 else f"sweep-{sweep_index}-chunk-{index}",
+            runtime=runtime,
+        )
+        merges.extend(parsed.get("merges") or [])
+        definitions.extend(parsed.get("definitions") or [])
+        overloaded.extend(parsed.get("overloaded_codes") or [])
+        hints.extend(parsed.get("relation_hints") or [])
+        if str(parsed.get("integrative_memo") or "").strip():
+            integrative.append(str(parsed["integrative_memo"]).strip())
+        if str(parsed.get("reflexive_memo") or "").strip():
+            reflexive.append(str(parsed["reflexive_memo"]).strip())
+    return (
+        {
+            "merges": merges,
+            "definitions": definitions,
+            "overloaded_codes": overloaded,
+            "relation_hints": hints,
+            "integrative_memo": "\n\n".join(integrative),
+            "reflexive_memo": "\n\n".join(reflexive),
+        },
+        len(chunks),
+    )
+
+
+def _usage_from(raw: Any) -> dict[str, int]:
+    meta = getattr(raw, "usage_metadata", None) or {}
+    if not meta:
+        response = getattr(raw, "response_metadata", None) or {}
+        token_usage = response.get("token_usage") or response.get("usage") or {}
+        meta = {
+            "input_tokens": token_usage.get("prompt_tokens") or token_usage.get("input_tokens") or 0,
+            "output_tokens": token_usage.get("completion_tokens") or token_usage.get("output_tokens") or 0,
+            "total_tokens": token_usage.get("total_tokens") or 0,
+        }
+    input_tokens = int(meta.get("input_tokens") or 0)
+    output_tokens = int(meta.get("output_tokens") or 0)
+    total_tokens = int(meta.get("total_tokens") or 0)
+    if total_tokens == 0:
+        total_tokens = input_tokens + output_tokens
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
 async def _ainvoke_structured(
     model: BaseChatModel,
     schema,
@@ -646,18 +820,25 @@ async def _ainvoke_structured(
     runtime: RunConfig,
 ) -> dict:
     try:
-        structured = model.with_structured_output(schema)
+        try:
+            structured = model.with_structured_output(schema, include_raw=True)
+        except TypeError:
+            structured = model.with_structured_output(schema)
         result = await structured.ainvoke(messages)
     except Exception as exc:
         raise CodingError(f"{kind} failed for {passage_id}: {exc}") from exc
     if result is None:
         raise CodingError(f"{kind} for {passage_id} returned no structured output.")
-    if hasattr(result, "model_dump"):
+    raw = None
+    if hasattr(result, "model_dump") and not isinstance(result, dict):
         payload = result.model_dump()
     elif isinstance(result, dict):
+        raw = result.get("raw")
         parsed = result.get("parsed", result)
         if hasattr(parsed, "model_dump"):
             payload = parsed.model_dump()
+        elif isinstance(parsed, dict) and "passages" in parsed or "merges" in parsed or "codes" in parsed:
+            payload = parsed
         else:
             payload = schema.model_validate(parsed).model_dump()
     else:
@@ -668,6 +849,7 @@ async def _ainvoke_structured(
         "model": model_name,
         "messages": serialize_messages(messages),
         "output": payload,
+        "usage": _usage_from(raw),
     }
     _append_prompt_log(runtime, entry)
     return payload
@@ -683,7 +865,7 @@ def _take_prompts(runtime: RunConfig, state: CodingState) -> list:
 
 def _append_prompt_log(runtime: RunConfig, entry: dict) -> None:
     assert runtime._log_lock is not None
-    line = json.dumps(entry, ensure_ascii=False)
+    line = json.dumps(entry, ensure_ascii=False, default=repr)
     with runtime._log_lock:
         runtime.prompt_records.append(entry)
         if not runtime.prompt_log_path:
