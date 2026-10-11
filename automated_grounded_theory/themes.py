@@ -463,6 +463,7 @@ def build_themes(
     retry_backoff: float = 0.5,
     retry_max_backoff: float = 8.0,
     max_themes: int = 12,
+    max_theme_share: float = 0.30,
     request_timeout: float = 120.0,
     embeddings: Any = None,
 ) -> ThemeResult:
@@ -470,7 +471,9 @@ def build_themes(
 
     ``model`` is a ``provider:model-name`` string or a ``BaseChatModel``.
     ``n_themes`` asks for that many themes. Leave it unset and the model is asked
-    for about 6 to ``max_themes`` (default 12), then near-duplicates are folded.
+    for about 6 to ``max_themes`` (default 12). Near-duplicates are folded only
+    while they stay similar, and not when one theme would hold more than
+    ``max_theme_share`` of the codes (default 0.30).
     ``open_code_result`` may be an :class:`OpenCodeResult` or a directory written
     by ``open_code`` (see :func:`load_run`). ``seed`` shuffles the codebook order
     in the prompt. It does not pick quotes.
@@ -506,6 +509,7 @@ def build_themes(
             retry_backoff=retry_backoff,
             retry_max_backoff=retry_max_backoff,
             max_themes=max_themes,
+            max_theme_share=max_theme_share,
             request_timeout=request_timeout,
             embeddings=embeddings,
         )
@@ -537,6 +541,7 @@ async def abuild_themes(
     retry_backoff: float = 0.5,
     retry_max_backoff: float = 8.0,
     max_themes: int = 12,
+    max_theme_share: float = 0.30,
     request_timeout: float = 120.0,
     embeddings: Any = None,
     limiter: CallLimiter | None = None,
@@ -551,6 +556,7 @@ async def abuild_themes(
         theme_chunk=theme_chunk,
         max_retries=max_retries,
         max_themes=max_themes,
+        max_theme_share=max_theme_share,
     )
     research = parse_context(context)
     source = _coerce_result(open_code_result)
@@ -625,33 +631,23 @@ async def abuild_themes(
     warnings.extend(final.get("chunk_warnings") or [])
     proposal = dict(final.get("proposal") or {})
     assigned = list(final.get("assigned") or [])
-    if not final.get("accepted"):
-        missing = list(final.get("missing") or [])
-        if final.get("timed_out"):
-            warnings.append(
-                "Some theme chunks timed out. Codes the model did not group are in 'Ungrouped incidents'."
-            )
-            themes_raw = list(proposal.get("themes") or [])
-            if missing:
-                themes_raw.append(
-                    {
-                        "name": "Ungrouped incidents",
-                        "definition": "Open codes the model did not group before the deadline.",
-                        "properties": [],
-                        "codes": missing,
-                    }
-                )
-            proposal["themes"] = themes_raw
-            assigned, report = assign_codes(proposal, codes)
-            if report["missing"]:
-                detail = "; ".join(report["missing"])
-                raise ThemeError(f"Focused coding left open codes unassigned: {detail}.")
-        else:
-            detail = "; ".join(missing) if missing else "the model returned no usable themes"
-            retry = ""
-            if validation_retries:
-                retry = " The model was shown the missing labels and still did not cover them."
-            raise ThemeError(f"Focused coding left open codes unassigned: {detail}.{retry}")
+    prompt_log = list(final.get("prompt_log") or [])
+    missing = [] if final.get("accepted") else list(final.get("missing") or [])
+    if missing:
+        assigned, proposal, missing = await _cover_leftovers(
+            coder,
+            assigned,
+            proposal,
+            missing,
+            codes,
+            context=research,
+            limiter=limiter,
+            prompt_cache=cache,
+            model_name=model_name,
+            prompt_log=prompt_log,
+            warnings=warnings,
+            timed_out=bool(final.get("timed_out")),
+        )
     if final.get("unknown"):
         warnings.append("Dropped names that are not open codes: " + "; ".join(final["unknown"]))
     if final.get("duplicates"):
@@ -659,7 +655,6 @@ async def abuild_themes(
             "Some codes were named in more than one theme. The first assignment was kept: "
             + "; ".join(final["duplicates"])
         )
-    prompt_log = list(final.get("prompt_log") or [])
     assigned, proposal = await _fold_near_duplicates(
         assigned,
         proposal,
@@ -668,6 +663,7 @@ async def abuild_themes(
         limiter=limiter,
         max_themes=max_themes,
         cap=n_themes is None,
+        max_theme_share=max_theme_share,
         embeddings=embeddings,
         api_key=api_key,
         request_timeout=request_timeout,
@@ -757,85 +753,27 @@ def collapse_themes(
     vectors: Sequence[Sequence[float]] | None = None,
     near_threshold: float = 0.5,
     cap: bool = True,
+    max_theme_share: float = 0.30,
 ) -> tuple[list[dict], dict[str, str], bool]:
-    """Fold near-duplicate themes, then closest pairs until ``max_themes``.
+    """Fold themes only while they stay similar and none grows past ``max_theme_share``.
 
     Similarity is cosine when ``vectors`` is aligned with ``themes``, otherwise
-    token overlap of the name and definition. The survivor is the theme with
-    more codes, then the lexicographically smaller name. ``cap`` is false when
-    the caller asked for an exact ``n_themes``: near-duplicates still fold, and
-    the list is not forced down to ``max_themes``.
+    token overlap of the name and definition. Pairs below ``near_threshold`` are
+    not folded, including when more than ``max_themes`` themes remain.
+    ``max_themes`` is the prompt target, not a quota this function forces.
+    A fold that would put more than ``max_theme_share`` of the open codes in one
+    theme is skipped. ``cap`` is retained so older callers keep working; it no
+    longer merges dissimilar themes down to ``max_themes``.
     """
+    del cap, max_themes
     rows = [dict(theme) for theme in themes if str(theme.get("name") or "").strip()]
-    count = len(rows)
-    if count == 0:
-        return [], {}, False
-    parent = list(range(count))
-
-    def find(index: int) -> int:
-        while parent[index] != index:
-            parent[index] = parent[parent[index]]
-            index = parent[index]
-        return index
-
-    def union(left: int, right: int) -> None:
-        root_left, root_right = find(left), find(right)
-        if root_left == root_right:
-            return
-        if root_left < root_right:
-            parent[root_right] = root_left
-        else:
-            parent[root_left] = root_right
-
-    def score(left: int, right: int) -> float:
-        if vectors is not None and left < len(vectors) and right < len(vectors):
-            return cosine(vectors[left], vectors[right])
-        return jaccard(_theme_text(rows[left]), _theme_text(rows[right]))
-
-    pairs = [(score(left, right), left, right) for left in range(count) for right in range(left + 1, count)]
-    for value, left, right in sorted(pairs, key=lambda item: (-item[0], item[1], item[2])):
-        if value >= near_threshold:
-            union(left, right)
-
-    def cluster_count() -> int:
-        return len({find(index) for index in range(count)})
-
-    if cap and max_themes >= 1:
-        while cluster_count() > max_themes:
-            best: tuple[tuple[float, int, int], int, int] | None = None
-            roots: dict[int, list[int]] = {}
-            for index in range(count):
-                roots.setdefault(find(index), []).append(index)
-            root_ids = sorted(roots)
-            for offset, root_left in enumerate(root_ids):
-                for root_right in root_ids[offset + 1 :]:
-                    for left in roots[root_left]:
-                        for right in roots[root_right]:
-                            value = score(left, right)
-                            ordered = (left, right) if left < right else (right, left)
-                            key = (-value, ordered[0], ordered[1])
-                            if best is None or key < best[0]:
-                                best = (key, left, right)
-            if best is None:
-                break
-            union(best[1], best[2])
-
-    groups: dict[int, list[int]] = {}
-    for index in range(count):
-        groups.setdefault(find(index), []).append(index)
-
-    merged: list[dict] = []
-    mapping: dict[str, str] = {}
-    changed = False
-    for root in sorted(groups, key=lambda item: min(groups[item])):
-        members = [rows[index] for index in groups[root]]
-        if len(members) > 1:
-            changed = True
-        bundled = _bundle_themes(members)
-        merged.append(bundled)
-        for theme in members:
-            mapping[str(theme.get("name") or "")] = bundled["name"]
-    return merged, mapping, changed
+    groups = _theme_clusters(
+        rows,
+        vectors=vectors,
+        near_threshold=near_threshold,
+        max_theme_share=max_theme_share,
+    )
+    return _themes_from_groups(rows, groups)
 
 
 def apply_theme_merge_plan(
@@ -879,6 +817,121 @@ def apply_theme_merge_plan(
     return rebuilt, rename
 
 
+async def _cover_leftovers(
+    model: BaseChatModel,
+    assigned: list[dict],
+    proposal: dict,
+    missing: list[str],
+    codes: Sequence[Mapping[str, Any]],
+    *,
+    context: ResearchContext,
+    limiter: CallLimiter,
+    prompt_cache: bool,
+    model_name: str,
+    prompt_log: list,
+    warnings: list[str],
+    timed_out: bool,
+) -> tuple[list[dict], dict, list[str]]:
+    """One targeted call for codes the first pass skipped, then a residual theme.
+
+    A handful of leftovers is not a failed run. Codes still missing after that
+    call sit in ``Ungrouped incidents``.
+    """
+    try:
+        payload, usage, messages = await _reassign_leftovers(
+            model,
+            assigned,
+            missing,
+            codes,
+            context=context,
+            limiter=limiter,
+            prompt_cache=prompt_cache,
+        )
+    except Exception as exc:
+        if is_transient(exc):
+            warnings.append(f"Leftover reassignment timed out ({exc}).")
+        else:
+            warnings.append(f"Leftover reassignment failed ({exc}).")
+    else:
+        prompt_log.append(
+            {
+                "kind": "theme_reassign",
+                "model": model_name,
+                "messages": serialize_messages(messages),
+                "output": payload,
+                "usage": usage,
+            }
+        )
+        proposal = dict(proposal)
+        proposal["themes"] = list(proposal.get("themes") or []) + list(payload.get("themes") or [])
+        assigned, report = assign_codes(proposal, codes)
+        missing = list(report["missing"])
+    if not missing:
+        return assigned, proposal, []
+    if timed_out:
+        warnings.append("Some theme chunks timed out before every code was grouped.")
+    warnings.append(
+        "Some open codes were still unassigned after one reassignment call. "
+        "They are in 'Ungrouped incidents'."
+    )
+    proposal = dict(proposal)
+    proposal["themes"] = list(proposal.get("themes") or []) + [
+        {
+            "name": "Ungrouped incidents",
+            "definition": "Open codes the model did not group.",
+            "properties": [],
+            "codes": list(missing),
+        }
+    ]
+    assigned, report = assign_codes(proposal, codes)
+    return assigned, proposal, list(report["missing"])
+
+
+async def _reassign_leftovers(
+    model: BaseChatModel,
+    assigned: Sequence[Mapping[str, Any]],
+    missing: Sequence[str],
+    codes: Sequence[Mapping[str, Any]],
+    *,
+    context: ResearchContext,
+    limiter: CallLimiter,
+    prompt_cache: bool,
+) -> tuple[dict, dict, list]:
+    by_key = {code_key(str(entry.get("code") or "")): entry for entry in codes}
+    lines = [
+        "These open codes were not assigned to a theme. Assign every CODE_LABEL to one theme.",
+        "Prefer an existing THEME_NAME, copied exactly. Copy each CODE_LABEL exactly.",
+        "",
+        "EXISTING THEMES",
+    ]
+    if not assigned:
+        lines.append("(none yet)")
+    for theme in assigned:
+        lines.append(f"THEME_NAME: {theme.get('name') or ''}")
+        definition = str(theme.get("definition") or "").strip()
+        if definition:
+            lines.append(f"DEFINITION: {definition}")
+    lines.extend(["", "LEFTOVER CODES"])
+    for label in missing:
+        entry = by_key.get(code_key(label), {})
+        lines.append(f"CODE_LABEL: {label}")
+        definition = str(entry.get("definition") or "").strip()
+        if definition:
+            lines.append(f"DEFINITION: {definition}")
+        lines.append("")
+    from automated_grounded_theory.prompts import _system_message, render_context
+
+    system = (
+        "You are finishing focused coding. Assign only the leftover open codes. "
+        "Do not drop a CODE_LABEL and do not invent a code.\n\n" + render_context(context)
+    )
+    messages = [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content="\n".join(lines))]
+    runnable = structured_runnable(model, ThemeCoding)
+    result = await limiter.ainvoke(runnable, messages)
+    payload, usage = parse_structured(result, ThemeCoding)
+    return payload, usage, messages
+
+
 async def _fold_near_duplicates(
     assigned: list[dict],
     proposal: dict,
@@ -888,6 +941,7 @@ async def _fold_near_duplicates(
     limiter: CallLimiter,
     max_themes: int,
     cap: bool,
+    max_theme_share: float,
     embeddings: Any,
     api_key: str | None,
     request_timeout: float,
@@ -896,38 +950,43 @@ async def _fold_near_duplicates(
     warnings: list[str],
     prompt_log: list,
 ) -> tuple[list[dict], dict]:
-    """Collapse near-duplicate themes, then ask the model to rename that grouping.
+    """Propose similar folds, ask the model to confirm them, and keep a share cap.
 
-    The model is called only when membership changed. A timeout or an invalid
-    plan keeps the deterministic names.
+    The model is called only when a fold is proposed. A timeout keeps those
+    folds. A plan that separates themes undoes the fold. Dissimilar themes are
+    not merged to reach ``max_themes``.
     """
+    del max_themes, cap
     if not assigned:
         return assigned, proposal
+    rows = [dict(theme) for theme in assigned if str(theme.get("name") or "").strip()]
     vectors = await _theme_vectors(
-        assigned,
+        rows,
         embeddings=embeddings,
         api_key=api_key,
         request_timeout=request_timeout,
         limiter=limiter,
         warnings=warnings,
     )
-    collapsed, mapping, changed = collapse_themes(
-        assigned,
-        max_themes=max_themes,
+    groups = _theme_clusters(
+        rows,
         vectors=vectors,
-        cap=cap,
+        near_threshold=0.5,
+        max_theme_share=max_theme_share,
     )
-    if not changed:
+    if not any(len(group) > 1 for group in groups):
+        note = _dominance_warning(rows, max_theme_share)
+        if note:
+            warnings.append(note)
         return assigned, proposal
-    current = collapsed
     try:
         payload, usage, messages = await _propose_theme_merge(
             coder,
-            current,
+            rows,
+            groups=groups,
             context=context,
             limiter=limiter,
-            max_themes=max_themes,
-            cap=cap,
+            max_theme_share=max_theme_share,
             prompt_cache=prompt_cache,
         )
     except Exception as exc:
@@ -937,6 +996,7 @@ async def _fold_near_duplicates(
             warnings.append(
                 f"Theme merge pass failed ({exc}). Near-duplicate themes kept the wording grouping."
             )
+        current, mapping, _changed = _themes_from_groups(rows, groups)
     else:
         prompt_log.append(
             {
@@ -947,14 +1007,11 @@ async def _fold_near_duplicates(
                 "usage": usage,
             }
         )
-        applied = apply_theme_merge_plan(current, payload, max_themes=max_themes, cap=cap)
-        if applied is None:
-            warnings.append(
-                "Theme merge pass did not cover every theme once. Near-duplicate themes kept the wording grouping."
-            )
-        else:
-            current, rename = applied
-            mapping = {old: rename.get(new, new) for old, new in mapping.items()}
+        confirmed = _groups_from_confirmation(rows, groups, payload, max_theme_share=max_theme_share)
+        current, mapping, _changed = _themes_from_groups(rows, confirmed)
+    note = _dominance_warning(current, max_theme_share)
+    if note:
+        warnings.append(note)
     return current, _remap_theme_names(proposal, mapping)
 
 
@@ -986,43 +1043,88 @@ async def _propose_theme_merge(
     model: BaseChatModel,
     themes: Sequence[Mapping[str, Any]],
     *,
+    groups: Sequence[Sequence[int]],
     context: ResearchContext,
     limiter: CallLimiter,
-    max_themes: int,
-    cap: bool,
+    max_theme_share: float,
     prompt_cache: bool,
 ) -> tuple[dict, dict, list]:
+    """Ask the model to confirm or reject each proposed fold. Does not invent folds."""
     runnable = structured_runnable(model, ThemeMergePlan)
+    ceiling = round(100 * max_theme_share)
     lines = [
-        "These themes overlap. Group them so each incident is named once.",
-        "Every THEME_NAME below must appear in exactly one group's members list. Copy the name exactly.",
-        "Do not drop a theme name and do not invent open codes.",
+        "These folds are proposed because the names and definitions are similar.",
+        "Confirm a fold by putting its THEME_NAME values in the same group's members list.",
+        "Reject a fold by giving each THEME_NAME its own group.",
+        "Do not combine themes that are not in the same proposed fold.",
+        f"Do not build a group with more than {ceiling}% of the open codes.",
+        "Copy each THEME_NAME exactly.",
+        "",
     ]
-    if cap:
-        lines.append(f"Use at most {max_themes} groups.")
-    lines.append("")
-    for theme in themes:
-        lines.append(f"THEME_NAME: {theme.get('name') or ''}")
-        definition = str(theme.get("definition") or "").strip()
-        if definition:
-            lines.append(f"DEFINITION: {definition}")
-        codes = "; ".join(str(label) for label in theme.get("codes") or [])
-        if codes:
-            lines.append(f"CODES: {codes}")
+    shown = 0
+    for indexes in groups:
+        if len(indexes) < 2:
+            continue
+        shown += 1
+        lines.append(f"PROPOSED FOLD {shown}")
+        for index in indexes:
+            theme = themes[index]
+            lines.append(f"THEME_NAME: {theme.get('name') or ''}")
+            definition = str(theme.get("definition") or "").strip()
+            if definition:
+                lines.append(f"DEFINITION: {definition}")
+            codes = "; ".join(str(label) for label in theme.get("codes") or [])
+            if codes:
+                lines.append(f"CODES: {codes}")
         lines.append("")
-    ceiling = f" At most {max_themes} groups." if cap else ""
     from automated_grounded_theory.prompts import _system_message, render_context
 
     system = (
-        "You are reconciling near-duplicate themes after focused coding. "
+        "You are confirming near-duplicate theme folds after focused coding. "
         "Members are theme names, not open codes. "
-        f"Every THEME_NAME appears in exactly one group.{ceiling}\n\n"
+        "Reject a fold when the incidents are different. "
+        f"One theme must not hold more than {ceiling}% of the codes.\n\n"
         + render_context(context)
     )
     messages = [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content="\n".join(lines))]
     result = await limiter.ainvoke(runnable, messages)
     payload, usage = parse_structured(result, ThemeMergePlan)
     return payload, usage, messages
+
+
+def _groups_from_confirmation(
+    rows: Sequence[Mapping[str, Any]],
+    groups: Sequence[Sequence[int]],
+    plan: Mapping[str, Any],
+    *,
+    max_theme_share: float,
+) -> list[list[int]]:
+    """Keep a proposed fold only when the model put those themes in one group."""
+    placement: dict[str, int] = {}
+    for group_id, group in enumerate(plan.get("themes") or []):
+        for label in group.get("members") or []:
+            name = str(label)
+            if name not in placement:
+                placement[name] = group_id
+    sizes, total = _theme_sizes(rows)
+    limit = max_theme_share * total if max_theme_share > 0 else total
+    confirmed: list[list[int]] = []
+    for cluster in groups:
+        if len(cluster) == 1:
+            confirmed.append(list(cluster))
+            continue
+        buckets: dict[Any, list[int]] = {}
+        for index in cluster:
+            name = str(rows[index].get("name") or "")
+            key = placement.get(name, ("alone", index))
+            buckets.setdefault(key, []).append(index)
+        for indexes in buckets.values():
+            if sum(sizes[index] for index in indexes) > limit + 1e-9:
+                confirmed.extend([[index] for index in indexes])
+            else:
+                confirmed.append(list(indexes))
+    confirmed.sort(key=lambda indexes: min(indexes))
+    return confirmed
 
 
 def _remap_theme_names(proposal: Mapping[str, Any], mapping: Mapping[str, str]) -> dict:
@@ -1042,6 +1144,105 @@ def _remap_theme_names(proposal: Mapping[str, Any], mapping: Mapping[str, str]) 
             copy["theme"] = renamed(copy["theme"])
         negatives.append(copy)
     return {**dict(proposal), "tensions": tensions, "negative_cases": negatives}
+
+
+def _theme_clusters(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    vectors: Sequence[Sequence[float]] | None,
+    near_threshold: float,
+    max_theme_share: float,
+) -> list[list[int]]:
+    """Greedy clusters. Stop below the threshold. Never build a dominant theme."""
+    count = len(rows)
+    if count == 0:
+        return []
+    sizes, total = _theme_sizes(rows)
+    parent = list(range(count))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        root_left, root_right = find(left), find(right)
+        if root_left == root_right:
+            return
+        if root_left < root_right:
+            parent[root_right] = root_left
+            sizes[root_left] += sizes[root_right]
+        else:
+            parent[root_left] = root_right
+            sizes[root_right] += sizes[root_left]
+
+    def score(left: int, right: int) -> float:
+        if vectors is not None and left < len(vectors) and right < len(vectors):
+            return cosine(vectors[left], vectors[right])
+        return jaccard(_theme_text(rows[left]), _theme_text(rows[right]))
+
+    pairs = [(score(left, right), left, right) for left in range(count) for right in range(left + 1, count)]
+    limit = max_theme_share * total if max_theme_share > 0 else total
+    for value, left, right in sorted(pairs, key=lambda item: (-item[0], item[1], item[2])):
+        if value < near_threshold:
+            break
+        root_left, root_right = find(left), find(right)
+        if root_left == root_right:
+            continue
+        if sizes[root_left] + sizes[root_right] > limit + 1e-9:
+            continue
+        union(left, right)
+
+    groups: dict[int, list[int]] = {}
+    for index in range(count):
+        groups.setdefault(find(index), []).append(index)
+    return [groups[root] for root in sorted(groups, key=lambda item: min(groups[item]))]
+
+
+def _theme_sizes(rows: Sequence[Mapping[str, Any]]) -> tuple[list[int], int]:
+    counts = [len(list(row.get("codes") or [])) for row in rows]
+    total = sum(counts)
+    if total <= 0:
+        return [1] * len(rows), len(rows)
+    return counts, total
+
+
+def _themes_from_groups(
+    rows: Sequence[Mapping[str, Any]],
+    groups: Sequence[Sequence[int]],
+) -> tuple[list[dict], dict[str, str], bool]:
+    merged: list[dict] = []
+    mapping: dict[str, str] = {}
+    changed = False
+    for indexes in groups:
+        members = [rows[index] for index in indexes]
+        if len(members) > 1:
+            changed = True
+        bundled = _bundle_themes(members)
+        merged.append(bundled)
+        for theme in members:
+            mapping[str(theme.get("name") or "")] = bundled["name"]
+    return merged, mapping, changed
+
+
+def _dominance_warning(themes: Sequence[Mapping[str, Any]], max_theme_share: float) -> str | None:
+    """Warn when one theme holds more than the share limit on a real codebook."""
+    counts = [len(list(theme.get("codes") or [])) for theme in themes]
+    total = sum(counts)
+    if total < 8 or not themes:
+        return None
+    worst_index = max(range(len(themes)), key=lambda index: (counts[index], str(themes[index].get("name") or "")))
+    count = counts[worst_index]
+    if count <= max_theme_share * total + 1e-9:
+        return None
+    name = themes[worst_index].get("name") or "theme"
+    pct = round(100 * count / total, 1)
+    ceiling = round(100 * max_theme_share)
+    return (
+        f"Theme {name!r} holds {count} of {total} open codes ({pct}%), "
+        f"above the {ceiling}% share limit. Folds that would concentrate more codes were blocked."
+    )
 
 
 def _theme_text(theme: Mapping[str, Any]) -> str:
@@ -1766,11 +1967,14 @@ def _validate_theme_params(
     theme_chunk: int,
     max_retries: int,
     max_themes: int,
+    max_theme_share: float,
 ) -> None:
     if n_themes is not None and n_themes < 1:
         raise ValueError("n_themes must be at least 1, or None to let the model choose.")
     if max_themes < 1:
         raise ValueError("max_themes must be at least 1.")
+    if not 0 < max_theme_share <= 1:
+        raise ValueError("max_theme_share must be greater than 0 and at most 1.")
     if quotes_per_theme < 1:
         raise ValueError("quotes_per_theme must be at least 1.")
     if min_quote_chars < 0:

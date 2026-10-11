@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from automated_grounded_theory import ThemeError, build_themes, open_code
+from automated_grounded_theory import build_themes, open_code
 from automated_grounded_theory.context import PresetCodesError, parse_context
 from automated_grounded_theory.prompts import build_theme_messages
 from automated_grounded_theory.results import OpenCodeResult
@@ -216,11 +216,14 @@ def test_retry_assigns_the_code_the_first_call_dropped():
     assert sorted(labels) == ["crying at the station", "packing bags", "starting a new job"]
 
 
-def test_still_missing_after_retry_raises():
+def test_still_missing_after_retry_is_ungrouped():
     model = FakeThemer(drop_last="always")
-    with pytest.raises(ThemeError, match="packing bags|crying at the station|starting a new job"):
-        build_themes(_result(), CONTEXT, model=model, seed=1)
-    assert model.call_count == 2
+    result = build_themes(_result(), CONTEXT, model=model, seed=1, chart=False)
+    assert model.call_count == 3
+    labels = [code for theme in result.themes for code in theme["codes"]]
+    assert sorted(labels) == ["crying at the station", "packing bags", "starting a new job"]
+    assert any(theme["name"] == "Ungrouped incidents" for theme in result.themes)
+    assert any("Ungrouped incidents" in warning for warning in result.warnings)
 
 
 def test_unknown_code_is_dropped_and_not_required():

@@ -26,7 +26,7 @@ from automated_grounded_theory.graph import _append_reading_notes
 from automated_grounded_theory.prompts import CODING_SYSTEM, message_text
 from automated_grounded_theory.results import OpenCodeResult
 from automated_grounded_theory.schemas import ThemeCoding, ThemeProposal
-from automated_grounded_theory.themes import ThemeError, build_themes, collapse_themes
+from automated_grounded_theory.themes import build_themes, collapse_themes
 from automated_grounded_theory.validation import code_key, substantive_memo
 from tests.corpus import CONTEXT, CORPUS
 from tests.fake_llm import FakeCoder
@@ -314,18 +314,21 @@ def test_theme_timeout_becomes_ungrouped_incidents():
     ]
 
 
-def test_theme_validation_failure_still_raises():
+def test_leftovers_are_ungrouped_instead_of_raising():
     model = FakeThemer(drop_last="always")
-    with pytest.raises(ThemeError):
-        build_themes(
-            _result(),
-            CONTEXT,
-            model=model,
-            chart=False,
-            validation_retries=0,
-            max_retries=0,
-            retry_backoff=0,
-        )
+    result = build_themes(
+        _result(),
+        CONTEXT,
+        model=model,
+        chart=False,
+        validation_retries=0,
+        max_retries=0,
+        retry_backoff=0,
+    )
+    assert model.call_count == 2
+    assert any(theme["name"] == "Ungrouped incidents" for theme in result.themes)
+    labels = [code for theme in result.themes for code in theme["codes"]]
+    assert sorted(labels) == ["crying at the station", "packing bags", "starting a new job"]
 
 
 def test_collapse_caps_themes_and_merges_near_duplicates():
@@ -368,9 +371,9 @@ def test_collapse_caps_themes_and_merges_near_duplicates():
     kept = next(theme for theme in merged if theme["name"] == survivor)
     assert sorted(kept["codes"]) == ["code a", "code b"]
 
-    capped, _, capped_changed = collapse_themes(themes, max_themes=12, cap=True)
-    assert capped_changed
-    assert len(capped) <= 12
+    not_forced, _, not_forced_changed = collapse_themes(themes, max_themes=6, cap=True)
+    assert not_forced_changed
+    assert len(not_forced) == 13
 
     uncapped, _, also_changed = collapse_themes(themes, max_themes=12, cap=False)
     assert also_changed
@@ -384,6 +387,7 @@ def test_collapse_caps_themes_and_merges_near_duplicates():
         max_themes=12,
         vectors=[[1.0, 0.0], [1.0, 0.0]],
         cap=False,
+        max_theme_share=1.0,
     )
     assert embed_changed
     assert embed_map["alpha"] == embed_map["bravo"]
@@ -401,6 +405,7 @@ def test_merge_timeout_keeps_deterministic_grouping():
         max_retries=0,
         retry_backoff=0,
         retry_max_backoff=0,
+        max_theme_share=1.0,
     )
     assert model.call_count == 2
     assert "ThemeMergePlan" in model.seen
@@ -422,7 +427,11 @@ def test_in_vivo_prompt_requires_a_vivid_phrase():
     assert "Pay. Pay. Pay." in CODING_SYSTEM
     assert "feels like a number" in CODING_SYSTEM
     assert "staying for the team" in CODING_SYSTEM
-    assert "in_vivo" in CODING_SYSTEM
+    assert "set in_vivo true only when every one of these is true" in CODING_SYSTEM
+    assert "participant's language" in CODING_SYSTEM
+    assert "50 to 120" in CODING_SYSTEM
+    assert "emerging question" in CODING_SYSTEM
+    assert "Prefer reuse" in CODING_SYSTEM
 
 
 def test_empty_document_memo_is_omitted():
@@ -450,3 +459,178 @@ def test_empty_document_memo_is_omitted():
     )
     assert [item["kind"] for item in notes] == ["reflexive"]
     assert all("No property" not in item["text"] for item in notes)
+
+
+def test_collapse_blocks_a_dominant_theme():
+    themes = []
+    for index in range(10):
+        themes.append(
+            {
+                "name": f"Valuing workplace item {index}",
+                "definition": "People value workplace features such as pay tools and the building.",
+                "properties": [],
+                "codes": [f"c{index}-{slot}" for slot in range(10)],
+            }
+        )
+    merged, _mapping, changed = collapse_themes(themes, max_themes=6, max_theme_share=0.30)
+    assert changed
+    assert len(merged) > 1
+    assert max(len(theme["codes"]) for theme in merged) <= 30
+    total = sum(len(theme["codes"]) for theme in merged)
+    assert total == 100
+
+    dissimilar = [
+        {"name": word, "definition": word, "properties": [], "codes": [word]}
+        for word in ("apple", "bridge", "comet", "drum", "eagle", "forest", "glacier", "harbor")
+    ]
+    kept, _, dissimilar_changed = collapse_themes(dissimilar, max_themes=3, cap=True)
+    assert not dissimilar_changed
+    assert len(kept) == 8
+
+
+def test_sweep_decisions_match_offered_pairs_only():
+    candidates = [
+        {"pair_id": f"p{index:04d}", "source": f"left {index}", "target": f"right {index}"}
+        for index in range(12)
+    ]
+    extras = [
+        {"pair_id": f"extra-{index}", "source": f"noise {index}", "target": f"other {index}", "rationale": "no"}
+        for index in range(200)
+    ]
+    rejections = [
+        {"pair_id": "p0001", "source": "left 1", "target": "right 1", "rationale": "different incidents"},
+        {"pair_id": "p0002", "source": "right 9", "target": "left 9", "rationale": "labels swapped against the id"},
+        *extras,
+    ]
+    applied = {
+        "accepted_merges": [
+            {"source": "left 0", "target": "right 0", "from_candidate": True, "rationale": "same"},
+        ],
+        "rejected_merges": [],
+    }
+    finalize_candidate_decisions(applied, candidates, rejections=rejections)
+    assert len(applied["candidate_decisions"]) == 12
+    assert len(applied["ignored_decisions"]) == 201
+    reasons = {item["pair_id"]: item["reason"] for item in applied["candidate_decisions"]}
+    assert reasons["p0000"] == "accepted"
+    assert reasons["p0001"] == "model_rejected"
+    assert reasons["p0002"] == "model_omitted"
+    assert sum(item["decision"] == "accept" for item in applied["candidate_decisions"]) == 1
+    assert sum(item["decision"] == "reject" for item in applied["candidate_decisions"]) == 11
+
+
+def test_run_sync_does_not_chain_a_missing_event_loop():
+    import traceback
+
+    from automated_grounded_theory.async_support import run_sync
+
+    async def boom():
+        raise ValueError("leftover codes")
+
+    with pytest.raises(ValueError, match="leftover codes") as caught:
+        run_sync(boom())
+    text = "".join(traceback.format_exception(caught.value))
+    assert "no running event loop" not in text
+    assert caught.value.__cause__ is None
+
+
+def test_code_reuse_pct_counts_later_uses_only():
+    from automated_grounded_theory.evaluate import _score
+
+    metrics = _score(
+        {
+            "codebook": [
+                {"code": "packing bags", "frequency": 2, "in_vivo": False},
+                {"code": "starting a new job", "frequency": 1, "in_vivo": False},
+            ],
+            "segments": [
+                {"segment_id": "s1", "code": "packing bags"},
+                {"segment_id": "s2", "code": "packing bags"},
+                {"segment_id": "s3", "code": "starting a new job"},
+            ],
+            "passages": [],
+            "memos": [],
+            "sweep_log": [],
+            "prompt_log": [],
+            "saturation": [],
+        },
+        "",
+    )
+    assert metrics["code_reuse_pct"] == 33.3
+    assert "Prefer reuse" in metrics["code_reuse_target"]
+
+
+def test_embedding_failure_falls_back_to_lexical_candidates():
+    from langchain_core.embeddings import Embeddings
+
+    class BoomEmbeddings(Embeddings):
+        def embed_documents(self, texts):
+            raise TimeoutError("deadline exceeded")
+
+        def embed_query(self, text):
+            raise TimeoutError("deadline exceeded")
+
+    result = open_code(
+        CORPUS,
+        CONTEXT,
+        model=FakeCoder(),
+        embeddings=BoomEmbeddings(),
+        seed=7,
+        sweep_every=25,
+        pipeline=False,
+        batch_size=1,
+        concurrency=1,
+        max_retries=0,
+        retry_backoff=0,
+        retry_max_backoff=0,
+    )
+    assert result.codebook
+    blob = " ".join(result.warnings)
+    assert "label overlap" in blob
+
+
+def test_rejected_fold_stays_split():
+    from automated_grounded_theory.schemas import ThemeGroup, ThemeMergePlan
+
+    class RejectFolds(MergeTimeout):
+        def with_structured_output(self, schema, **kwargs):
+            parent = super().with_structured_output(schema, **kwargs)
+            schema_name = getattr(schema, "__name__", "")
+            include_raw = bool(kwargs.get("include_raw"))
+
+            def _call(messages):
+                if schema_name != "ThemeMergePlan":
+                    return parent.invoke(messages)
+                self.call_count += 1
+                self.seen.append(schema_name)
+                text = "\n".join(message_text(message) for message in messages)
+                names = re.findall(r"^THEME_NAME: (.+)$", text, re.M)
+                coding = ThemeMergePlan(
+                    themes=[ThemeGroup(name=name, members=[name], definition="") for name in names]
+                )
+                if not include_raw:
+                    return coding
+                raw = AIMessage(
+                    content="{}",
+                    usage_metadata={"input_tokens": 4, "output_tokens": 4, "total_tokens": 8},
+                )
+                return {"raw": raw, "parsed": coding, "parsing_error": None}
+
+            return RunnableLambda(_call)
+
+    model = RejectFolds()
+    result = build_themes(
+        _result(),
+        CONTEXT,
+        model=model,
+        chart=False,
+        validation_retries=0,
+        max_retries=0,
+        retry_backoff=0,
+        retry_max_backoff=0,
+        max_theme_share=1.0,
+    )
+    assert "ThemeMergePlan" in model.seen
+    grouped = {theme["name"]: theme["codes"] for theme in result.themes}
+    assert any(codes == ["packing bags"] for codes in grouped.values())
+    assert any(codes == ["crying at the station"] for codes in grouped.values())

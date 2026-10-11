@@ -434,21 +434,30 @@ def apply_sweep(
 
     accepted: list[dict] = []
     rejected: list[dict] = []
+    ignored: list[dict] = []
     for merge in merges:
         source = code_key(str(merge.get("source") or ""))
         target = code_key(str(merge.get("target") or ""))
+        offered = frozenset((source, target)) in hinted if source and target else False
         record = {
             "source": merge.get("source"),
             "target": merge.get("target"),
+            "pair_id": merge.get("pair_id") or "",
             "rationale": merge.get("rationale", ""),
-            "from_candidate": frozenset((source, target)) in hinted,
+            "from_candidate": offered,
         }
         if source not in parent or target not in parent or source == target:
-            rejected.append({**record, "reason": "unknown_or_same"})
+            if offered:
+                rejected.append({**record, "reason": "unknown_or_same"})
+            else:
+                ignored.append({**record, "reason": "not_offered"})
             continue
         root_source, root_target = find(source), find(target)
         if root_source == root_target:
-            rejected.append({**record, "reason": "already_merged"})
+            if offered:
+                rejected.append({**record, "reason": "already_merged"})
+            else:
+                ignored.append({**record, "reason": "not_offered"})
             continue
         # The survivor is the lexicographically smaller code id. The model's
         # source/target direction does not change which label remains, so two
@@ -545,6 +554,7 @@ def apply_sweep(
         "segments": new_segments,
         "accepted_merges": accepted,
         "rejected_merges": rejected,
+        "ignored_decisions": ignored,
         "merge_map": display_map,
         "relation_hints": hints_applied,
     }
@@ -564,41 +574,72 @@ def finalize_candidate_decisions(
     rejections: Sequence[Mapping[str, Any]] | None = None,
     skipped: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Log an accept or a reject for every candidate.
+    """Log exactly one decision for each offered candidate pair.
 
-    A pair the model never mentions is a rejection with reason ``model_omitted``.
-    A pair whose sweep chunk timed out is ``chunk_skipped``. Neither is dropped.
+    A pair the model never mentions is ``model_omitted``. A pair whose sweep
+    chunk timed out is ``chunk_skipped``. A decision whose pair_id or labels
+    are not in the candidate list is stored on ``ignored_decisions`` and is
+    not counted as a candidate decision.
     """
-    decided: set[frozenset[str]] = set()
-    for item in list(applied.get("accepted_merges") or []) + list(applied.get("rejected_merges") or []):
-        pair = _pair_key(item.get("source"), item.get("target"))
-        if pair:
-            decided.add(pair)
-    hinted: set[frozenset[str]] = set()
+    hinted: dict[frozenset[str], dict] = {}
+    by_id: dict[str, frozenset[str]] = {}
     for item in candidates:
         pair = _pair_key(item.get("source"), item.get("target"))
-        if pair:
-            hinted.add(pair)
+        if pair is None or pair in hinted:
+            continue
+        hinted[pair] = dict(item)
+        pair_id = str(item.get("pair_id") or "").strip()
+        if pair_id and pair_id not in by_id:
+            by_id[pair_id] = pair
+    for item in skipped or []:
+        pair = _pair_key(item.get("source"), item.get("target"))
+        if pair is None or pair in hinted:
+            continue
+        hinted[pair] = dict(item)
+        pair_id = str(item.get("pair_id") or "").strip()
+        if pair_id and pair_id not in by_id:
+            by_id[pair_id] = pair
 
-    def add(source: Any, target: Any, *, reason: str, rationale: str) -> None:
-        pair = _pair_key(source, target)
-        if pair is None or pair in decided:
+    decided: set[frozenset[str]] = set()
+    for item in list(applied.get("accepted_merges") or []) + list(applied.get("rejected_merges") or []):
+        pair = _offered_pair(item, hinted, by_id)
+        if pair:
+            decided.add(pair)
+
+    ignored = list(applied.get("ignored_decisions") or [])
+
+    def add(item: Mapping[str, Any], *, reason: str, rationale: str) -> None:
+        pair = _offered_pair(item, hinted, by_id)
+        if pair is None:
+            ignored.append(
+                {
+                    "source": item.get("source"),
+                    "target": item.get("target"),
+                    "pair_id": item.get("pair_id") or "",
+                    "rationale": rationale,
+                    "from_candidate": False,
+                    "reason": "not_offered",
+                }
+            )
+            return
+        if pair in decided:
             return
         decided.add(pair)
+        offered = hinted[pair]
         applied.setdefault("rejected_merges", []).append(
             {
-                "source": source,
-                "target": target,
+                "source": offered.get("source"),
+                "target": offered.get("target"),
+                "pair_id": offered.get("pair_id") or "",
                 "rationale": rationale,
-                "from_candidate": pair in hinted,
+                "from_candidate": True,
                 "reason": reason,
             }
         )
 
     for item in rejections or []:
         add(
-            item.get("source"),
-            item.get("target"),
+            item,
             reason="model_rejected",
             rationale=str(item.get("rationale") or ""),
         )
@@ -608,8 +649,7 @@ def finalize_candidate_decisions(
     )
     for item in skipped_rows:
         add(
-            item.get("source"),
-            item.get("target"),
+            item,
             reason="chunk_skipped",
             rationale=str(item.get("rationale") or "This sweep chunk hit a deadline and was skipped."),
         )
@@ -621,12 +661,61 @@ def finalize_candidate_decisions(
     omitted.sort(key=lambda item: (str(item.get("source") or "").casefold(), str(item.get("target") or "").casefold()))
     for item in omitted:
         add(
-            item.get("source"),
-            item.get("target"),
+            item,
             reason="model_omitted",
             rationale="The model did not accept or reject this candidate.",
         )
+    applied["ignored_decisions"] = ignored
+    applied["candidate_decisions"] = _candidate_decision_rows(applied, hinted)
     return applied
+
+
+def _offered_pair(
+    item: Mapping[str, Any],
+    hinted: Mapping[frozenset[str], Mapping[str, Any]],
+    by_id: Mapping[str, frozenset[str]],
+) -> frozenset[str] | None:
+    """The candidate this decision names, or None when it was not offered."""
+    pair = _pair_key(item.get("source"), item.get("target"))
+    pair_id = str(item.get("pair_id") or "").strip()
+    if pair_id:
+        expected = by_id.get(pair_id)
+        if expected is None:
+            return None
+        if pair is not None and pair != expected:
+            return None
+        return expected
+    if pair in hinted:
+        return pair
+    return None
+
+
+def _candidate_decision_rows(applied: Mapping[str, Any], hinted: Mapping[frozenset[str], Mapping[str, Any]]) -> list[dict]:
+    """One row per offered pair, in candidate order."""
+    rows = []
+    for pair, offered in hinted.items():
+        decision = "reject"
+        reason = "model_omitted"
+        for item in applied.get("accepted_merges") or []:
+            if _pair_key(item.get("source"), item.get("target")) == pair:
+                decision = "accept"
+                reason = "accepted"
+                break
+        else:
+            for item in applied.get("rejected_merges") or []:
+                if _pair_key(item.get("source"), item.get("target")) == pair:
+                    reason = str(item.get("reason") or "model_rejected")
+                    break
+        rows.append(
+            {
+                "pair_id": offered.get("pair_id") or "",
+                "source": offered.get("source"),
+                "target": offered.get("target"),
+                "decision": decision,
+                "reason": reason,
+            }
+        )
+    return rows
 
 
 def codebook_list(codebook: Mapping[str, Mapping[str, Any]]) -> list[dict]:

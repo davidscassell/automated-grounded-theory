@@ -20,7 +20,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
-from automated_grounded_theory.async_support import parse_structured, structured_runnable
+from automated_grounded_theory.async_support import is_transient, parse_structured, structured_runnable
 from automated_grounded_theory.batching import pack_indices
 from automated_grounded_theory.clustering import cluster_pairs
 from automated_grounded_theory.codebook import (
@@ -45,6 +45,7 @@ from automated_grounded_theory.results import result_from_state
 from automated_grounded_theory.retrieval import (
     CodeRetriever,
     EmbeddingCodeRetriever,
+    LexicalCodeRetriever,
     aembed_texts,
     code_text,
     score_pairs,
@@ -117,6 +118,7 @@ class RunConfig:
     output_dir: str | None = None
     limiter: Any = None
     prompt_records: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
     _log_lock: threading.Lock | None = None
 
     def __post_init__(self) -> None:
@@ -442,13 +444,25 @@ async def _invoke_coding(
     seen: set[str] = set()
     entries = list(codebook.values())
     if isinstance(runtime.retriever, EmbeddingCodeRetriever):
-        per_passage = await runtime.retriever.arank_many(
-            [str(passage.get("text") or "") for passage in passages],
-            entries,
-            k=runtime.top_k_codes,
-            limiter=runtime.limiter,
-            batch_size=runtime.embed_batch_size,
-        )
+        try:
+            per_passage = await runtime.retriever.arank_many(
+                [str(passage.get("text") or "") for passage in passages],
+                entries,
+                k=runtime.top_k_codes,
+                limiter=runtime.limiter,
+                batch_size=runtime.embed_batch_size,
+            )
+        except Exception as exc:
+            if not is_transient(exc):
+                raise
+            runtime.notes.append(
+                f"Code retrieval embeddings failed ({exc}). Nearest codes used label overlap instead."
+            )
+            lexical = LexicalCodeRetriever()
+            per_passage = [
+                lexical.rank(str(passage.get("text") or ""), entries, k=runtime.top_k_codes)
+                for passage in passages
+            ]
     else:
         per_passage = [
             runtime.retriever.rank(str(passage.get("text") or ""), entries, k=runtime.top_k_codes)
@@ -469,6 +483,7 @@ async def _invoke_coding(
         neighbor_chars=runtime.neighbor_chars,
         feedback=feedback,
         prompt_cache=runtime.prompt_cache,
+        nearest=per_passage,
     )
     passage_ids = ",".join(str(passage.get("passage_id")) for passage in passages)
     parsed = await _ainvoke_structured(
@@ -589,6 +604,8 @@ def _validate_node(runtime: RunConfig):
             passages_coded += 1
 
         _append_reading_notes(memos, counters, pending_sorted, state)
+        notes = list(runtime.notes)
+        runtime.notes.clear()
 
         if state.get("parallel"):
             codebook = union_codebooks(list(branch_books.values()))
@@ -609,6 +626,7 @@ def _validate_node(runtime: RunConfig):
             "passages_since_sweep": passages_since,
             "passages_coded": passages_coded,
             "pending": [],
+            "warnings": list(state.get("warnings") or []) + notes,
         }
 
     runtime._commit = validate_passage
@@ -770,7 +788,13 @@ def _sweep_node(runtime: RunConfig):
             rejections=list(parsed.get("rejections") or []),
             skipped=list(parsed.get("skipped_candidates") or []),
         )
-        warnings = list(state.get("warnings") or []) + list(parsed.get("warnings") or [])
+        warnings = list(state.get("warnings") or []) + list(parsed.get("warnings") or []) + list(runtime.notes)
+        runtime.notes.clear()
+        ignored = list(applied.get("ignored_decisions") or [])
+        if ignored:
+            warnings.append(
+                f"Ignored {len(ignored)} sweep decisions that were not offered candidate pairs."
+            )
         for merge in applied["accepted_merges"]:
             logger.info("merged code %s into %s", merge.get("source"), merge.get("target"))
         integrative = str(parsed.get("integrative_memo") or "").strip()
@@ -815,6 +839,8 @@ def _sweep_node(runtime: RunConfig):
             "candidates": candidates,
             "accepted_merges": applied["accepted_merges"],
             "rejected_merges": applied["rejected_merges"],
+            "ignored_decisions": list(applied.get("ignored_decisions") or []),
+            "candidate_decisions": list(applied.get("candidate_decisions") or []),
             "merge_map": applied["merge_map"],
             "relation_hints": applied["relation_hints"],
             "overloaded_codes": overloaded,
@@ -1007,13 +1033,22 @@ async def _sweep_chunks(runtime: RunConfig, codes: list, sweep_index: int) -> tu
     chunks = iter_sweep_chunks(codes, runtime.sweep_chunk)
     positions = {id(entry): index for index, entry in enumerate(codes)}
     vectors = None
+    embed_note = ""
     if runtime.embeddings is not None:
-        vectors = await aembed_texts(
-            runtime.embeddings,
-            [code_text(entry) for entry in codes],
-            batch_size=runtime.embed_batch_size,
-            limiter=runtime.limiter,
-        )
+        try:
+            vectors = await aembed_texts(
+                runtime.embeddings,
+                [code_text(entry) for entry in codes],
+                batch_size=runtime.embed_batch_size,
+                limiter=runtime.limiter,
+            )
+        except Exception as exc:
+            if not is_transient(exc):
+                raise
+            vectors = None
+            embed_note = (
+                f"Sweep embeddings failed ({exc}). Merge candidates used label overlap instead."
+            )
 
     async def detect(chunk: list) -> list:
         indexes = [positions[id(entry)] for entry in chunk]
@@ -1056,11 +1091,12 @@ async def _sweep_chunks(runtime: RunConfig, codes: list, sweep_index: int) -> tu
             )
         return union_candidates([lexical_or_cosine, extra])
 
-    from automated_grounded_theory.async_support import is_transient
-
     per_chunk_candidates = await asyncio.gather(*(detect(chunk) for chunk in chunks))
+    for chunk_number, group in enumerate(per_chunk_candidates, start=1):
+        for pair_number, item in enumerate(group, start=1):
+            item["pair_id"] = f"s{sweep_index}c{chunk_number}p{pair_number:04d}"
     candidates = union_candidates(per_chunk_candidates)
-    warnings: list[str] = []
+    warnings: list[str] = [embed_note] if embed_note else []
     skipped_candidates: list[dict] = []
 
     async def confirm(index: int, chunk: list) -> tuple[int, dict, str | None]:

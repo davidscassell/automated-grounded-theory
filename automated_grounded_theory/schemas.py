@@ -33,13 +33,16 @@ class CodeProposal(_LLMModel):
     nearest_code: str = Field(
         default="",
         description=(
-            "Required before action new when the codebook is not empty: "
-            "the closest listed label. Empty when reusing or when the book is empty."
+            "Required before action new when any nearest code was listed: copy one of those labels. "
+            "Empty when reusing, refining, or when the book is empty."
         ),
     )
     why_not_nearest: str = Field(
         default="",
-        description="One short clause: why nearest_code does not cover this incident. Empty unless action is new.",
+        description=(
+            "Required with nearest_code: the property this incident has that the nearest code does not cover. "
+            "Empty unless action is new."
+        ),
     )
     refined_label: str | None = Field(
         default=None,
@@ -83,8 +86,8 @@ class PassageCoding(_LLMModel):
     memo: str = Field(
         default="",
         description=(
-            "Empty unless this passage adds a property, dimension, condition, "
-            "consequence, or comparison with a named code. Do not restate the passage."
+            "Empty, or about 50 to 120 words with a comparison to a named code, "
+            "a property or dimension, and one emerging question. Do not restate the passage."
         ),
     )
     low_confidence: bool = Field(
@@ -94,6 +97,7 @@ class PassageCoding(_LLMModel):
 
 
 class MergeDecision(_LLMModel):
+    pair_id: str = Field(default="", description="pair_id from the candidate list. Empty only for an extra merge.")
     source: str = Field(description="Code to fold into the target. This label is retired.")
     target: str = Field(description="Code that remains. Prefer the clearer, more specific gerund.")
     rationale: str = ""
@@ -102,6 +106,7 @@ class MergeDecision(_LLMModel):
 class MergeRejection(_LLMModel):
     """A candidate pair that should stay as two codes."""
 
+    pair_id: str = Field(default="", description="pair_id from the candidate list. Do not invent one.")
     source: str = Field(description="One label from a candidate pair. Copy it exactly.")
     target: str = Field(description="The other label from that candidate pair. Copy it exactly.")
     rationale: str = Field(default="", description="Why these are different incidents.")

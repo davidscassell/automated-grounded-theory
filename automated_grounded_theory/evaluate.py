@@ -470,11 +470,22 @@ def _score(run: Mapping[str, Any], context_text: str) -> dict:
             100 * sum(int(entry.get("frequency") or 0) == 1 for entry in codebook) / len(codebook),
             1,
         )
+        metrics["code_reuse_pct"] = _code_reuse_pct(segments)
+        metrics["code_reuse_target"] = (
+            "Share of segments that reuse a code already applied earlier. "
+            "Prefer reuse or refinement over a new singleton. "
+            "Nearest existing codes are listed in the coding prompt for that comparison."
+        )
     else:
         metrics["gerund_first_word_pct"] = None
         metrics["in_vivo_pct"] = None
         metrics["mean_label_words"] = None
         metrics["singleton_codes_pct"] = None
+        metrics["code_reuse_pct"] = None
+        metrics["code_reuse_target"] = (
+            "Share of segments that reuse a code already applied earlier. "
+            "Prefer reuse or refinement over a new singleton."
+        )
     pairs = _redundant_pairs(codebook)
     metrics["redundant_pairs_count"] = len(pairs)
     metrics["redundant_pairs_top"] = pairs[:15]
@@ -567,6 +578,34 @@ def _leakage(labels: Sequence[str], context_text: str) -> float | None:
         words = tokens(label)[1:]
         ratios.append(sum(word in context_words for word in words) / max(1, len(words)))
     return round(100 * sum(ratio >= 0.5 for ratio in ratios) / len(ratios), 1)
+
+
+def _code_reuse_pct(segments: Sequence[Mapping[str, Any]]) -> float | None:
+    """Percent of segments whose code was already used on an earlier segment."""
+    if not segments:
+        return None
+    ordered = sorted(
+        segments,
+        key=lambda item: (
+            int(item.get("coding_order") or 0),
+            str(item.get("segment_id") or ""),
+        ),
+    )
+    seen: set[str] = set()
+    reused = 0
+    counted = 0
+    for segment in ordered:
+        key = code_key(str(segment.get("code") or ""))
+        if not key:
+            continue
+        counted += 1
+        if key in seen:
+            reused += 1
+        else:
+            seen.add(key)
+    if not counted:
+        return None
+    return round(100 * reused / counted, 1)
 
 
 def _saturation_points(payload: Any) -> list[dict]:

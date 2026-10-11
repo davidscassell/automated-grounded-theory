@@ -26,33 +26,38 @@ Code with short gerunds: simple, active, close to the data, usually two to six w
 Code the incident, not the topic. Return one code per distinct incident. A passage \
 that both praises and criticizes needs a separate code for each incident.
 
-In-vivo codes: before you settle on a gerund, look for a vivid participant phrase \
-that does analytic work. A metaphor, a repetition, or a complaint in their own words \
-counts. When you find one, the label is that phrase and in_vivo is true. The phrase \
-must appear in the passage. In-vivo labels do not have to be gerunds. Set in_vivo \
-to false only after you have looked and the incident is better named by a gerund you \
-compose.
+In-vivo codes: set in_vivo true only when every one of these is true. If one fails, \
+in_vivo is false.
+- The label is a contiguous copy of the participant's words from this passage.
+- Those words are a metaphor, a repetition, or a phrase the participant coined.
+- A gerund you compose would lose that analytic point.
+Ordinary wording stays a gerund with in_vivo false, even when the quote contains it. \
+Do not set in_vivo true merely because the label and the passage share words.
 
 Examples:
 - "Pay. Pay. Pay. We're 10-15% below market" → code "Pay. Pay. Pay.", in_vivo true. \
 The repetition is the incident.
-- "now it feels like a number" → code "feels like a number", in_vivo true.
+- "now it feels like a number" → code "feels like a number", in_vivo true. \
+The metaphor is the incident.
 - "I like my team" has no vivid phrase → code "staying for the team", in_vivo false.
 
-Constant comparison: the user message lists codes already earned from earlier passages. \
-Reuse a code when it fits. Refine the label or definition when this incident shows the \
-code should change. Create a new code only when nothing listed covers the incident. \
-Before a new code, set nearest_code to the closest listed label and why_not_nearest \
-to one short clause saying why it does not fit. Do not mint a near-duplicate.
+Constant comparison: the user message lists the nearest existing codes, retrieved by \
+similarity, plus other frequent codes. Prefer reuse. Prefer refine when this incident \
+shows the label or definition should change. Create a new code only when none of the \
+nearest codes fits. Before action new, set nearest_code to one of those labels and \
+why_not_nearest to the property this incident has that the nearest code does not. \
+Do not mint a near-duplicate.
 
 Definitions name a property that could apply to another incident. Do not put respondent \
 attributes (name, role, department, tenure, site) or the question wording into a label \
 or a definition.
 
-The research context is only for understanding the data. It is not evidence, not a \
-coding frame, and not a list of codes. Do not force a passage into the research \
-question or into a label the passage does not support. Do not quote or cite the \
-context in a memo. If the context looks like a code list, ignore it.
+The research context only sensitizes what you notice. Codes must come from the \
+participant's language in the passage. Do not turn the research question, the \
+population, the setting, or a sensitizing concept into a code unless those exact \
+words are the participant's. A label that could have been written from the context \
+alone, without this passage, is a leak. Do not write it. Do not quote or cite the \
+context in a memo.
 
 Quotes must be exact contiguous copies from inside the passage markers. Do not quote \
 neighbors, attributes, or the context. Do not paraphrase.
@@ -61,22 +66,26 @@ Do not use generic labels such as "experience", "discussion", "theme", or "respo
 
 If a passage has no codable incident, return an empty code list and an empty memo.
 
-A memo is not a restatement. Leave it empty unless this passage adds a property, a \
-dimension, a condition, a consequence, or a comparison with a named code. When you \
-write one, name that comparison and keep it to a few sentences.
+A memo is not a restatement. Leave it empty unless you can write about 50 to 120 \
+words that include all three of these: a comparison with a named code (or a statement \
+that the book had no close code), a property or dimension this incident varies, and \
+one emerging question the next passage could answer. Do not write a sentence that \
+only says no property was recorded.
 
 If several passages are in the user message, code every one of them."""
 
 SWEEP_SYSTEM = """You are comparing codes with codes during open coding.
 
 You will see a codebook and, when any were found, candidate pairs that look similar \
-in wording or in embedding space. Decide every candidate. Put a pair you accept in \
-merges. Put a pair you reject in rejections, with a rationale. Do not omit a \
-candidate. An empty merge list is allowed only when every candidate is in \
-rejections. You may also merge a pair that was not a candidate when the two codes \
-name the same kind of incident. Do not merge codes that merely share a verb, a \
-topic, or a sensitizing concept. When you merge, keep the clearer and more specific \
-label as the target and name the other code as the source.
+in wording or in embedding space. Each candidate has a pair_id. Decide every \
+pair_id once. Put a pair you accept in merges. Put a pair you reject in rejections, \
+with that pair_id and a rationale. Do not omit a candidate. Do not reject a pair \
+that is not in the candidate list. Extra pairs are discarded. An empty merge list \
+is allowed only when every candidate is in rejections. You may propose one extra \
+merge, without a rejection, when two codes in this chunk are the same incident and \
+were not listed. Do not merge codes that merely share a verb, a topic, or a \
+sensitizing concept. When you merge, keep the clearer and more specific label as \
+the target and name the other code as the source.
 
 Sharpen definitions so each one says what incident the code captures, in words that \
 could apply to another respondent. Do not put a person's department, tenure, role, \
@@ -104,7 +113,7 @@ def clip(text: str, limit: int) -> str:
 def render_context(context: ResearchContext) -> str:
     lines = [
         "RESEARCH CONTEXT",
-        "This block sensitizes attention. It is not a codebook and it must not be applied as codes.",
+        "This block sensitizes attention. It is not a codebook. Codes must come from the participant's words.",
         f"Research question: {context.research_question.strip()}",
     ]
     if context.population:
@@ -114,8 +123,8 @@ def render_context(context: ResearchContext) -> str:
     if context.sensitizing_concepts:
         joined = "; ".join(context.sensitizing_concepts)
         lines.append(
-            "Sensitizing concepts (NOT codes; do not apply these labels unless the "
-            f"passage itself earns a close code): {joined}"
+            "Sensitizing concepts (NOT codes; do not copy these words into a label unless the "
+            f"participant used them): {joined}"
         )
     if context.notes:
         lines.append(f"Notes: {context.notes.strip()}")
@@ -132,7 +141,11 @@ def format_codebook(codes: Sequence[Mapping[str, Any]], *, omitted: int = 0) -> 
             "RUNNING CODEBOOK\n"
             "The codebook is empty. Codes you create must emerge from this passage."
         )
-    lines = ["RUNNING CODEBOOK", "These codes emerged from earlier passages. Reuse one when it fits."]
+    lines = [
+        "RUNNING CODEBOOK",
+        "These codes emerged from earlier passages.",
+        "Prefer reuse or refine. A new code requires nearest_code and why_not_nearest.",
+    ]
     for entry in codes:
         lines.append(f"CODE_LABEL: {entry.get('code', '')}")
         definition = clip(str(entry.get("definition") or ""), 500)
@@ -193,14 +206,28 @@ def build_coding_messages(
     neighbor_chars: int,
     feedback: Mapping[str, str] | None,
     prompt_cache: bool,
+    nearest: Sequence[Sequence[str]] | None = None,
 ) -> list:
     system = coding_system_text(context)
+    blocks = []
+    for index, passage in enumerate(passages):
+        block = format_passage(passage, neighbor_chars=neighbor_chars)
+        labels = list(nearest[index]) if nearest and index < len(nearest) else []
+        if labels:
+            lines = [
+                "NEAREST EXISTING CODES",
+                "Retrieved by similarity to this passage. Reuse or refine one of these when it fits.",
+                "Before action new, set nearest_code to one of these labels and why_not_nearest to the property it does not cover.",
+            ]
+            lines.extend(f"- {label}" for label in labels)
+            block = block + "\n" + "\n".join(lines)
+        blocks.append(block)
     user_parts = [
         format_codebook(codebook_view, omitted=omitted_codes),
         "",
         "Code every passage below. Return one entry per passage_id, in this order.",
         "",
-        "\n\n".join(format_passage(passage, neighbor_chars=neighbor_chars) for passage in passages),
+        "\n\n".join(blocks),
     ]
     if feedback:
         notes = [note for note in feedback.values() if note]
@@ -235,15 +262,19 @@ def build_sweep_messages(
     chunk_index: int = 1,
     chunk_count: int = 1,
 ) -> list:
-    payload = [
-        {
-            "source": item["source"],
-            "target": item["target"],
-            "score": round(float(item["score"]), 4),
-            "method": item.get("method", ""),
-        }
-        for item in candidates
-    ]
+    payload = []
+    for index, item in enumerate(candidates, start=1):
+        pair_id = str(item.get("pair_id") or f"p{index:04d}")
+        item["pair_id"] = pair_id
+        payload.append(
+            {
+                "pair_id": pair_id,
+                "source": item["source"],
+                "target": item["target"],
+                "score": round(float(item["score"]), 4),
+                "method": item.get("method", ""),
+            }
+        )
     parts: list[str] = []
     if all_codes and chunk_count > 1:
         index = [
@@ -274,10 +305,10 @@ def build_sweep_messages(
             "CANDIDATES>>>",
             "",
             "Candidate pairs are hints from embeddings when those were supplied, otherwise from "
-            "label overlap. Return a decision for every pair in that list: merges if you "
-            "accept it, rejections if you do not, each with a rationale. Do not leave a "
-            "candidate out of both lists. Also propose any other pair in this codebook that "
-            "names the same incident. You may swap source and target so the clearer label survives.",
+            "label overlap. Return exactly one decision for each pair_id: merges if you "
+            "accept it, rejections if you do not, copying pair_id, source, and target. "
+            "Do not reject a pair that is not in that list. Extra decisions are ignored. "
+            "You may swap source and target so the clearer label survives.",
         ]
     )
     system = SWEEP_SYSTEM + "\n\n" + render_context(context)

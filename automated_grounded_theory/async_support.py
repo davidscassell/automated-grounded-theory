@@ -414,7 +414,11 @@ def run_sync(coro):
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(coro)
+        try:
+            return asyncio.run(coro)
+        except BaseException as exc:
+            # get_running_loop() just failed. Do not chain that as the cause.
+            raise exc from None
 
     outcome: dict[str, Any] = {}
 
@@ -428,5 +432,5 @@ def run_sync(coro):
     thread.start()
     thread.join()
     if "error" in outcome:
-        raise outcome["error"]
+        raise outcome["error"] from None
     return outcome["value"]
