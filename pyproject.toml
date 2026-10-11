@@ -1,0 +1,45 @@
+[project]
+name = "automated_grounded_theory"
+version = "0.1.0"
+description = "First-round grounded theory open coding with any LangChain chat model."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain>=1.0,<2",
+    "langchain-core>=0.3",
+    "langgraph>=1.0,<2",
+    "pydantic>=2",
+]
+
+[project.optional-dependencies]
+xai = ["langchain-xai"]
+openai = ["langchain-openai"]
+anthropic = ["langchain-anthropic"]
+google = ["langchain-google-genai"]
+mistral = ["langchain-mistralai"]
+groq = ["langchain-groq"]
+ollama = ["langchain-ollama"]
+azure = ["langchain-openai"]
+aws = ["langchain-aws"]
+cohere = ["langchain-cohere"]
+huggingface = ["langchain-huggingface"]
+checkpoint = ["langgraph-checkpoint-sqlite"]
+dev = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/davidscassell/automated-grounded-theory"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["automated_grounded_theory*"]
+
+[tool.setuptools.package-data]
+automated_grounded_theory = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
