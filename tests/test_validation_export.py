@@ -98,7 +98,15 @@ def test_merge_map_relabels_earlier_segments():
     applied = apply_sweep(
         codebook,
         segments,
-        merges=[{"source": "packing bags", "target": "packing bags up", "rationale": "same incident"}],
+        merges=[{
+            "source": "packing bags",
+            "target": "packing bags up",
+            "rationale": "same incident",
+            "same_action": True,
+            "same_object": True,
+            "contrast_checked": True,
+            "material_contrast": False,
+        }],
         candidates=[{"source": "packing bags", "target": "packing bags up", "score": 0.7}],
         definitions=[{"code": "packing bags up", "definition": "Bagging possessions while leaving."}],
     )
@@ -108,7 +116,15 @@ def test_merge_map_relabels_earlier_segments():
     sharpened = apply_sweep(
         codebook,
         segments,
-        merges=[{"source": "packing bags", "target": "packing bags up", "rationale": "same incident"}],
+        merges=[{
+            "source": "packing bags",
+            "target": "packing bags up",
+            "rationale": "same incident",
+            "same_action": True,
+            "same_object": True,
+            "contrast_checked": True,
+            "material_contrast": False,
+        }],
         candidates=[{"source": "packing bags", "target": "packing bags up", "score": 0.7}],
         definitions=[{"code": "packing bags", "definition": "Bagging possessions while leaving."}],
     )
@@ -128,8 +144,9 @@ def test_sweep_may_propose_a_pair_that_was_not_a_candidate():
         merges=[{"source": "crying at the station", "target": "starting a new job", "rationale": "same incident"}],
         candidates=[],
     )
-    assert len(applied["accepted_merges"]) == 1
-    assert list(applied["codebook"]) == ["crying at the station"]
+    assert applied["accepted_merges"] == []
+    assert applied["rejected_merges"][0]["reason"] == "aspects_differ"
+    assert set(applied["codebook"]) == {"crying at the station", "starting a new job"}
     unknown = apply_sweep(
         codebook,
         segments,

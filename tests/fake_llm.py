@@ -238,6 +238,13 @@ class FakeCoder(BaseChatModel):
                         rationale="These packing labels name the same incident of bagging possessions before leaving.",
                         rewritten_definition="Bagging and boxing possessions while leaving a place.",
                         confidence=0.9,
+                        same_action=True,
+                        same_object=True,
+                        same_stance=True,
+                        contrast_checked=True,
+                        material_contrast=False,
+                        evidence_same=True,
+                        comparison_op="alias_duplicate",
                     )
                 )
         return SweepCoding(

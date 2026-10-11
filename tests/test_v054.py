@@ -24,7 +24,6 @@ from automated_grounded_theory.benchmark import (
     theme_agreement,
 )
 from automated_grounded_theory.codebook import (
-    apply_post_merge,
     apply_sweep,
     frozen_pair_keys,
     remember_pair_decisions,
@@ -148,12 +147,15 @@ def test_rejected_pair_stays_decided_until_the_definition_changes():
                 "same_action": True,
                 "same_object": True,
                 "same_stance": True,
+                "contrast_checked": True,
+                "material_contrast": False,
             }
         ],
         candidates=[],
         frozen_pairs=set(),
     )
-    assert len(merged["accepted_merges"]) == 1
+    assert merged["accepted_merges"] == []
+    assert merged["rejected_merges"][0]["reason"] == "aspects_differ"
 
 
 def test_quote_that_does_not_fit_is_split_back():
@@ -190,20 +192,11 @@ def test_quote_that_does_not_fit_is_split_back():
         ],
         candidates=[],
     )
-    assert applied["accepted_merges"][0]["source_valence"] == "negative"
-    assert applied["accepted_merges"][0]["target_valence"] == "negative"
-    book2, rows, ops, stats = apply_post_merge(
-        applied["codebook"],
-        applied["segments"],
-        applied["accepted_merges"],
-        book,
-        segments,
-    )
-    assert stats["quotes_split"] == 1
-    assert any(row["quote"] == "The rollout had no training." and row["code"] == ROLLOUT for row in rows)
-    assert "criticizing training gaps" in book2
-    assert any(op["op"] == "split_quote" and op["rationale"] for op in ops)
-    assert not any(item.get("reason") == "definition_not_survivor" for item in applied["review"])
+    assert applied["accepted_merges"] == []
+    assert applied["rejected_merges"][0]["reason"] == "mixed_evidence"
+    assert applied["rejected_merges"][0]["source_valence"] == "negative"
+    assert applied["rejected_merges"][0]["target_valence"] == "negative"
+    assert set(applied["codebook"]) == {ROLLOUT, PROMO}
 
 
 def test_trivial_merge_skips_the_model_and_the_cap_defers():
@@ -217,24 +210,36 @@ def test_trivial_merge_skips_the_model_and_the_cap_defers():
     assert merges[0]["confidence"] == 0.95
     assert "near-duplicates" in merges[0]["rationale"]
 
-    labels = ["alpha one", "bravo two", "charlie three", "delta four"]
+    labels = [
+        "recording the alpha delay",
+        "recording an alpha delay",
+        "recording one alpha delay",
+        "recording our alpha delay",
+    ]
     book = {label: _entry(label, label, "neutral") for label in labels}
     segments = [_seg(label, label) for label in labels]
+    flags = {
+        "same_action": True,
+        "same_object": True,
+        "contrast_checked": True,
+        "material_contrast": False,
+        "evidence_same": True,
+    }
     applied = apply_sweep(
         book,
         segments,
         merges=[
-            {"source": "bravo two", "target": "alpha one", "confidence": 0.99, "rationale": "highest"},
-            {"source": "charlie three", "target": "alpha one", "confidence": 0.7, "rationale": "lower"},
-            {"source": "delta four", "target": "alpha one", "confidence": 0.6, "rationale": "lowest"},
+            {"source": "recording an alpha delay", "target": "recording the alpha delay", "confidence": 0.99, "rationale": "highest", **flags},
+            {"source": "recording one alpha delay", "target": "recording the alpha delay", "confidence": 0.7, "rationale": "lower", **flags},
+            {"source": "recording our alpha delay", "target": "recording the alpha delay", "confidence": 0.6, "rationale": "lowest", **flags},
         ],
         candidates=[],
         max_merges_per_sweep=1,
     )
     assert len(applied["accepted_merges"]) == 1
     assert {applied["accepted_merges"][0]["source"], applied["accepted_merges"][0]["target"]} == {
-        "alpha one",
-        "bravo two",
+        "recording the alpha delay",
+        "recording an alpha delay",
     }
     assert sum(item["reason"] == "merge_cap" for item in applied["review"]) == 2
     assert not any(item.get("reason") == "merge_cap" for item in applied["rejected_merges"])
@@ -269,12 +274,13 @@ def test_rubric_agreement_can_hold_a_confident_merge():
                 "source": ROLLOUT,
                 "target": PROMO,
                 "confidence": 0.9,
-                "rationale": "The model did not set the rubric, so its own confidence stands.",
+                "rationale": "The model did not set the rubric, so the pair stays two codes.",
             }
         ],
         candidates=[],
     )
-    assert len(applied["accepted_merges"]) == 1
+    assert applied["accepted_merges"] == []
+    assert applied["rejected_merges"][0]["reason"] == "aspects_differ"
 
 
 def test_run_sync_does_not_chain_a_closed_loop_under_no_running_loop():

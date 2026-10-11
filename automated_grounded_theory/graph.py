@@ -522,9 +522,21 @@ def _commit_node(runtime: RunConfig):
                 }
             )
         metrics = dict(state.get("metrics") or {})
-        metrics["duplicates_before_reconciliation"] = int(metrics.get("duplicates_before_reconciliation") or 0) + int(
+        metrics["exact_proposal_collisions"] = int(metrics.get("exact_proposal_collisions") or 0) + int(
             buffer.get("duplicates") or 0
         )
+        rounds = list(metrics.get("rounds") or [])
+        rounds.append(
+            {
+                "snapshot_id": str(state.get("snapshot_id") or ""),
+                "passage_ids": [
+                    str(state["passages"][item["passage_index"]].get("passage_id") or "") for item in fresh
+                ],
+                "doc_ids": [str(item.get("doc_id") or state["passages"][item["passage_index"]].get("doc_id") or "") for item in fresh],
+                "size": len(fresh),
+            }
+        )
+        metrics["rounds"] = rounds
         metrics["reconciliation_calls"] = int(metrics.get("reconciliation_calls") or 0) + 1
         metrics["reconciliation_seconds"] = round(
             float(metrics.get("reconciliation_seconds") or 0) + time.perf_counter() - started,
@@ -672,16 +684,28 @@ def _wave(
     if index >= len(queue):
         return []
     if review_mode == "document":
-        # Stay inside one document. ``batch_size`` 1 commits after every passage,
-        # so the next passage is compared with codes just earned. A larger batch
-        # codes several passages of this document against one frozen snapshot.
+        # A long document stays together so its passages share one snapshot.
+        # A survey with one incident per respondent does not fill ``batch_size``
+        # inside that document, so the round continues into the next documents,
+        # in seeded order, until ``batch_size`` passages are taken. One commit
+        # reconciles that round.
         doc_id = state["passages"][queue[index]].get("doc_id")
-        cap = min(room, batch_size * concurrency)
-        indices = []
+        doc_rest = 0
         for passage_index in queue[index:]:
             if state["passages"][passage_index].get("doc_id") != doc_id:
                 break
+            doc_rest += 1
+        if doc_rest >= batch_size:
+            cap = min(room, batch_size * concurrency)
+            stay = True
+        else:
+            cap = min(room, batch_size)
+            stay = False
+        indices = []
+        for passage_index in queue[index:]:
             if len(indices) >= cap:
+                break
+            if stay and state["passages"][passage_index].get("doc_id") != doc_id:
                 break
             indices.append(passage_index)
     else:
@@ -1019,6 +1043,7 @@ def _validate_node(runtime: RunConfig):
                 passage,
                 interpreted,
                 existing_keys=global_keys,
+                origin_snapshot_id=str(state.get("snapshot_id") or ""),
             )
             segments = committed["segments"]
             memos = committed["memos"]
@@ -1220,7 +1245,9 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
             )
 
         code_task = None
-        if runtime.pipeline and _remaining(state):
+        # Overlap needs a free slot. At concurrency 1 the coding task takes the
+        # only slot and the sweep waits with nothing of its own in flight.
+        if runtime.pipeline and _remaining(state) and int(runtime.concurrency) > 1:
             jobs = _wave(state, runtime, upcoming=True)
             if jobs:
                 code_task = asyncio.create_task(_pending_rows(runtime, state, jobs))
@@ -1348,6 +1375,12 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
                 applied.setdefault("ops", []).extend(more_ops)
                 quote_stats["quotes_checked"] += extra["quotes_checked"]
                 quote_stats["quotes_split"] += extra["quotes_split"]
+                quote_stats["merges_later_split"] = int(quote_stats.get("merges_later_split") or 0) + int(
+                    extra.get("merges_later_split") or 0
+                )
+                quote_stats["split_merges"] = list(quote_stats.get("split_merges") or []) + list(
+                    extra.get("split_merges") or []
+                )
         extras["rewrites"] = time.perf_counter() - rewrite_started
         finalize_candidate_decisions(
             applied,
@@ -1464,11 +1497,25 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
             review=review,
             pair_decisions=pair_decisions,
         )
-        update["lost_distinction_candidates"] = list(state.get("lost_distinction_candidates") or []) + list(
+        from automated_grounded_theory.codebook import mark_later_splits
+        from automated_grounded_theory.records import accumulate_duplicate_rounds, duplicate_pair_count, same_round_duplicates
+
+        audit = list(state.get("lost_distinction_candidates") or []) + list(
             applied.get("lost_distinction_candidates") or []
         )
+        split_merges = list(quote_stats.get("split_merges") or [])
+        mark_later_splits(audit, split_merges)
+        update["lost_distinction_candidates"] = audit
+        judgments = list(applied.get("accepted_merges") or []) + list(applied.get("rejected_merges") or []) + list(proposed)
+        pairs = same_round_duplicates(pre_merge_book, judgments)
         metrics = dict(state.get("metrics") or {})
-        metrics["lost_distinction_candidates"] = len(update["lost_distinction_candidates"])
+        rounds = accumulate_duplicate_rounds(list(metrics.get("duplicate_rounds") or []), pairs)
+        metrics["duplicate_rounds"] = rounds
+        metrics["duplicates_before_reconciliation"] = duplicate_pair_count(rounds)
+        metrics["lost_distinction_candidates"] = len(audit)
+        metrics["merges_later_split"] = int(metrics.get("merges_later_split") or 0) + int(
+            quote_stats.get("merges_later_split") or 0
+        )
         update["metrics"] = metrics
         if overlap_state is not None:
             coded_before = int(state.get("passages_since_sweep") or 0)
@@ -1523,11 +1570,14 @@ def _sweep_update(
 
 def _export_node(runtime: RunConfig):
     def export_node(state: CodingState) -> dict:
+        metrics = dict(state.get("metrics") or {})
+        metrics["activity"] = runtime.limiter.activity_report()
+        state = {**state, "metrics": metrics}
         provisional = result_from_state(state, interrupted=False, thread_id=str(state.get("metadata", {}).get("thread_id") or ""), resumable=False)
         paths: dict[str, str] = {}
         if runtime.output_dir:
             paths = export_result(provisional, runtime.output_dir)
-        return {"export_paths": paths, "finished": True}
+        return {"export_paths": paths, "finished": True, "metrics": metrics}
 
     return export_node
 

@@ -6,6 +6,7 @@ double-count applications.
 
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 from typing import Any, Mapping, Sequence
 
@@ -234,9 +235,136 @@ def trivial_merges(codes: Sequence[Mapping[str, Any]], frozen: set[frozenset[str
                     "same_stance": True,
                     "trivial": True,
                     "action": "accept",
+                    "contrast_checked": True,
+                    "material_contrast": False,
+                    "evidence_same": True,
+                    "comparison_op": "alias_duplicate",
                 }
             )
     return merges
+
+
+_ASPECT_STOP = {
+    "a",
+    "an",
+    "the",
+    "of",
+    "to",
+    "for",
+    "and",
+    "or",
+    "in",
+    "on",
+    "with",
+    "after",
+    "before",
+    "from",
+    "without",
+    "that",
+    "this",
+    "into",
+    "over",
+    "under",
+    "than",
+    "then",
+}
+_ASPECT_MODIFIERS = {
+    "better",
+    "more",
+    "less",
+    "higher",
+    "lower",
+    "small",
+    "large",
+    "very",
+    "really",
+    "up",
+    "any",
+    "much",
+    "many",
+}
+
+
+def aspect_tokens(text: str) -> set[str]:
+    """Content words of a label or definition, without light verbs or modifiers."""
+    tokens = set()
+    for token in re.findall(r"[a-z0-9]+(?:\.[a-z0-9]+)?", str(text or "").casefold()):
+        if token in _ASPECT_STOP or token in _ASPECT_MODIFIERS or len(token) < 2:
+            continue
+        if token.endswith("ing") and len(token) > 5:
+            continue
+        tokens.add(token)
+    return tokens
+
+
+def aspects_differ(left: str, right: str) -> bool:
+    """True when each label names an object or aspect the other does not.
+
+    A longer label that only adds detail to the same words does not differ.
+    Sharing one platform name is not enough when each side still has its own object.
+    """
+    left_tokens = aspect_tokens(left)
+    right_tokens = aspect_tokens(right)
+    if not left_tokens or not right_tokens:
+        return False
+    if left_tokens <= right_tokens or right_tokens <= left_tokens:
+        return False
+    return bool(left_tokens - right_tokens) and bool(right_tokens - left_tokens)
+
+
+def _definitions_differ(left_label: str, left_def: str, right_label: str, right_def: str) -> bool:
+    """True when two long concept statements share no content word.
+
+    The statement is the label plus the definition. A later sharpening can
+    drop the object from one definition while the label still names it, and
+    that paraphrase is not a difference. Short definitions are not compared.
+    """
+    left_definition = str(left_def or "").strip()
+    right_definition = str(right_def or "").strip()
+    if len(left_definition.split()) < 4 or len(right_definition.split()) < 4:
+        return False
+    left_text = f"{left_label} {left_definition}".strip()
+    right_text = f"{right_label} {right_definition}".strip()
+    if jaccard(left_text, right_text) >= 0.15:
+        return False
+    return not (aspect_tokens(left_text) & aspect_tokens(right_text))
+
+
+def classify_comparison(merge: Mapping[str, Any], codebook: Mapping[str, Mapping[str, Any]]) -> tuple[str, str]:
+    """Decide whether an alias is the same concept in the definitions and the quotes.
+
+    ``alias_duplicate`` requires the same action, the same object, a contrast
+    check that found no material difference, and evidence that is not mixed.
+    Anything else stays ``keep_distinct``, ``defer``, or the operation the
+    model already named. Valence is not part of this gate.
+    """
+    named = str(merge.get("comparison_op") or merge.get("op") or "").strip()
+    if named in {"keep_distinct", "defer", "link_to_category", "record_dimension", "split_code", "refine_definition"}:
+        return named, named
+    if merge.get("trivial"):
+        return "alias_duplicate", "trivial_pair"
+    fits = list(merge.get("quote_fits") or [])
+    if any(isinstance(item, Mapping) and item.get("fits") is False for item in fits):
+        return "defer", "mixed_evidence"
+    if merge.get("evidence_same") is False:
+        return "defer", "mixed_evidence"
+    source = str(merge.get("source") or "")
+    target = str(merge.get("target") or "")
+    if aspects_differ(source, target):
+        return "keep_distinct", "aspects_differ"
+    source_def = str((codebook.get(code_key(source)) or {}).get("definition") or "")
+    target_def = str((codebook.get(code_key(target)) or {}).get("definition") or "")
+    if _definitions_differ(source, source_def, target, target_def):
+        return "keep_distinct", "definitions_differ"
+    if merge.get("same_action") is False or merge.get("same_object") is False:
+        return "keep_distinct", "different_action_or_object"
+    if merge.get("same_action") is not True or merge.get("same_object") is not True:
+        return "keep_distinct", "concept_not_shown"
+    if merge.get("contrast_checked") is not True:
+        return "defer", "contrast_unchecked"
+    if merge.get("material_contrast") is True:
+        return "defer", "material_contrast"
+    return "alias_duplicate", "same_concept"
 
 
 def _pair_still_current(
@@ -303,9 +431,16 @@ def replay_accepted_pairs(
                 "target": codebook[right].get("code") or right,
                 "source_id": str(codebook[left].get("code_id") or ""),
                 "target_id": str(codebook[right].get("code_id") or ""),
-                "rationale": str(row.get("reason") or ""),
+                "rationale": str(row.get("rationale") or row.get("reason") or ""),
                 "confidence": bounded_unit(row.get("confidence"), 1.0),
                 "pair_id": "",
+                "same_action": row.get("same_action", True),
+                "same_object": row.get("same_object", True),
+                "same_stance": row.get("same_stance"),
+                "contrast_checked": row.get("contrast_checked", True),
+                "material_contrast": row.get("material_contrast", False),
+                "evidence_same": row.get("evidence_same", True),
+                "comparison_op": "alias_duplicate",
             }
         )
     return merges
@@ -349,6 +484,12 @@ def remember_pair_decisions(
             "source_valence": str(row.get("source_valence") or codebook[source].get("valence") or ""),
             "target_valence": str(row.get("target_valence") or codebook[target].get("valence") or ""),
             "definitions": current_defs,
+            "same_action": row.get("same_action"),
+            "same_object": row.get("same_object"),
+            "same_stance": row.get("same_stance"),
+            "contrast_checked": row.get("contrast_checked"),
+            "material_contrast": row.get("material_contrast"),
+            "evidence_same": row.get("evidence_same"),
         }
     return [stored[key] for key in sorted(stored)]
 
@@ -736,6 +877,7 @@ def commit_passage(
     interpreted: Mapping[str, Any],
     *,
     existing_keys: set[str] | None = None,
+    origin_snapshot_id: str = "",
 ) -> dict[str, Any]:
     """Append segments for accepted codes. ``existing_keys`` tracks globally new labels."""
     book = deepcopy(codebook)
@@ -791,6 +933,7 @@ def commit_passage(
                 "contrast_span_ids": [],
                 "category_links": [],
                 "first_seen": passage.get("passage_id"),
+                "origin_snapshot_id": str(origin_snapshot_id or ""),
                 "history": [
                     {
                         "event": "created",
@@ -987,6 +1130,57 @@ def union_codebooks(books: list[dict[str, dict]]) -> dict[str, dict]:
     return united
 
 
+def _audit_alias(record: Mapping[str, Any], codebook: Mapping[str, Mapping[str, Any]], segments: Sequence[Mapping[str, Any]]) -> dict:
+    """One accepted alias, with both definitions and a few member quotes."""
+    source = code_key(str(record.get("source") or ""))
+    target = code_key(str(record.get("target") or ""))
+
+    def quotes(key: str) -> list[str]:
+        found = []
+        for segment in segments:
+            seg_key = segment.get("code_key") or code_key(str(segment.get("code") or ""))
+            quote = str(segment.get("quote") or "").strip()
+            if seg_key == key and quote:
+                found.append(quote)
+        return found[:3]
+
+    return {
+        "kind": "accepted_alias",
+        "source": record.get("source"),
+        "target": record.get("target"),
+        "source_definition": str((codebook.get(source) or {}).get("definition") or ""),
+        "target_definition": str((codebook.get(target) or {}).get("definition") or ""),
+        "source_quotes": quotes(source),
+        "target_quotes": quotes(target),
+        "rationale": str(record.get("rationale") or ""),
+        "comparison_op": "alias_duplicate",
+        "later_split": False,
+    }
+
+
+def mark_later_splits(candidates: list[dict], split_merges: Sequence[Mapping[str, Any]]) -> int:
+    """Mark accepted aliases that a later split pulled apart. Returns how many."""
+    if not split_merges:
+        return 0
+    keys = set()
+    for item in split_merges:
+        left = code_key(str(item.get("source") or ""))
+        right = code_key(str(item.get("target") or ""))
+        if left and right:
+            keys.add(frozenset((left, right)))
+    count = 0
+    for row in candidates:
+        if row.get("kind") != "accepted_alias" or row.get("later_split"):
+            continue
+        pair = frozenset(
+            (code_key(str(row.get("source") or "")), code_key(str(row.get("target") or "")))
+        )
+        if pair in keys:
+            row["later_split"] = True
+            count += 1
+    return count
+
+
 def apply_post_merge(
     codebook: dict[str, dict],
     segments: list[dict],
@@ -1011,6 +1205,7 @@ def apply_post_merge(
     ops: list[dict] = []
     checked = 0
     split = 0
+    split_merges: list[dict] = []
     for merge in accepted:
         source = code_key(str(merge.get("source") or ""))
         target = code_key(str(merge.get("target") or ""))
@@ -1046,6 +1241,7 @@ def apply_post_merge(
                     rationale=rationale or definition,
                 )
             )
+        moved_any = False
         for check in merge.get("quote_fits") or []:
             checked += 1
             fits = check.get("fits", True)
@@ -1094,6 +1290,7 @@ def apply_post_merge(
             if not moved:
                 continue
             split += 1
+            moved_any = True
             ops.append(
                 _op(
                     op="split_quote",
@@ -1104,8 +1301,15 @@ def apply_post_merge(
                     rationale=str(check.get("rationale") or ""),
                 )
             )
+        if moved_any:
+            split_merges.append({"source": merge.get("source"), "target": merge.get("target")})
     book = sync_counts(book, rows)
-    return book, rows, ops, {"quotes_checked": checked, "quotes_split": split}
+    return book, rows, ops, {
+        "quotes_checked": checked,
+        "quotes_split": split,
+        "merges_later_split": len(split_merges),
+        "split_merges": split_merges,
+    }
 
 
 def apply_sweep(
@@ -1238,6 +1442,32 @@ def apply_sweep(
             else:
                 ignored.append({**record, "reason": "not_offered"})
             continue
+        for flag in (
+            "same_action",
+            "same_object",
+            "same_stance",
+            "contrast_checked",
+            "material_contrast",
+            "evidence_same",
+            "quote_fits",
+        ):
+            if flag in merge:
+                record[flag] = merge.get(flag)
+        decision, gate_reason = classify_comparison(merge, codebook)
+        record["comparison_op"] = decision
+        if decision != "alias_duplicate":
+            rejected.append({**record, "reason": gate_reason, "decision": decision})
+            ops.append(
+                _op(
+                    op=decision,
+                    status="deferred" if decision == "defer" else "applied",
+                    confidence=confidence,
+                    ids={"source_id": record["source_id"], "target_id": record["target_id"], "pair_id": record["pair_id"]},
+                    reason=gate_reason,
+                    rationale=record["rationale"],
+                )
+            )
+            continue
         eligible.append((record, source, target))
 
     eligible.sort(key=lambda item: (-float(item[0].get("confidence") or 0), str(item[0].get("source") or ""), str(item[0].get("target") or "")))
@@ -1270,7 +1500,15 @@ def apply_sweep(
         group = set(components.get(root_source) or {root_source}) | set(components.get(root_target) or {root_target})
         if not component_aliases_are_direct(group, eligible_pairs):
             rejected.append({**record, "reason": "non_transitive", "comparison_op": "alias_duplicate"})
-            lost.append({"codes": sorted(group), "edge": [source, target], "reason": "non_transitive"})
+            lost.append(
+                {
+                    "kind": "non_transitive",
+                    "codes": sorted(group),
+                    "edge": [source, target],
+                    "reason": "non_transitive",
+                    "rationale": record.get("rationale") or "",
+                }
+            )
             ops.append(
                 _op(
                     op="alias_duplicate",
@@ -1294,6 +1532,7 @@ def apply_sweep(
         components.pop(retired_root, None)
         record = {**record, "decision": "accept", "comparison_op": "alias_duplicate"}
         accepted.append(record)
+        lost.append(_audit_alias(record, codebook, segments))
         applied_count += 1
         ops.append(
             _op(

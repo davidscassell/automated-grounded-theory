@@ -1,7 +1,7 @@
-# automated-grounded-theory — Technical Design (0.6.0)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
-Status: steps 1 and 2 of the v0.6 plan. Category development, theoretical sampling, and theory integration are not in this release.
+Status: steps 1 and 2 of the v0.6 plan. Category development, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
 
 The default procedure is Charmaz-informed automated analysis: initial coding against a frozen snapshot, constant comparison with distinct operations, and `build_themes` as a descriptive reporting view. It is not an axial-coding template.
 
@@ -21,7 +21,7 @@ The default procedure is Charmaz-informed automated analysis: initial coding aga
 
 - Python ≥ 3.11, LangChain (`init_chat_model("provider:model")` or a `BaseChatModel`), LangGraph (`Send`, checkpointing).
 - Pydantic v2 at model boundaries. One schema-repair retry (`REPAIR THIS OUTPUT`), separate from transport retries.
-- Optional extras: provider SDKs, `checkpoint`, `plots`, `viz` (`grandalf`; `pygraphviz` is optional and not in the extra), `dev`.
+- Optional extras: provider SDKs, `checkpoint`, `plots`, `viz` (`grandalf`; `pygraphviz` is optional and not in the extra), `taguette` (`taguette>=1.5`, for a caller who imports Taguette itself), `dev`. The `taguette` extra does not add a SQLite project adapter.
 - `draw_mermaid_png` posts to mermaid.ink. It is not an offline renderer.
 
 ## 3. Public API
@@ -76,13 +76,13 @@ Uncertainty flags: `ambiguous_span`, `insufficient_context`, `competing_code`, `
 
 `segment_and_shuffle` → `prepare_round` → `Send("code_worker")` → `commit` → `sweep` → `consolidate` → `export`.
 
-`prepare_round` freezes `snapshot_id`, `definition_revision`, `evidence_revision`, and `policy_version` (`0.6.0`). Workers do not mutate the codebook. The proposal reducer dedupes by proposal id, drops conflicting payloads, sorts, and clears only on `{"__reset__": True}`. `commit` rejects a stale snapshot id, skips proposal ids already committed, and is the only writer of definitions.
+`prepare_round` freezes `snapshot_id`, `definition_revision`, `evidence_revision`, and `policy_version` (`0.6.1`). Workers do not mutate the codebook. The proposal reducer dedupes by proposal id, drops conflicting payloads, sorts, and clears only on `{"__reset__": True}`. `commit` rejects a stale snapshot id, skips proposal ids already committed, and is the only writer of definitions.
 
 `get_graph("themes")` fans chunk workers out with `Send` into `theme_worker`, then joins at `validate`. The reporting graph is separate from category development.
 
 One `CallLimiter` is shared by coding and sweep calls in a run, including retries. Cache keys add snapshot, definition, evidence, and policy versions when those are set. Transport retries and the one schema repair are counted separately (`transport_retries`, `schema_repairs`).
 
-Metrics on `metadata["metrics"]`: duplicates before reconciliation, reconciliation calls and seconds, coding p50/p95, tokens, retries, lost-distinction candidates.
+Metrics on `metadata["metrics"]`: duplicates before reconciliation, reconciliation calls and seconds, coding p50/p95, tokens, retries, lost-distinction candidates, `merges_later_split`, and `activity` (in-flight events and idle gaps of at least 0.05 seconds). `duplicate_rounds.json` and `lost_distinction_candidates.json` are written next to the codebook.
 
 Checkpoint state is serializable (snapshot refs, passages, proposals). Models and the limiter stay on the runtime object.
 
@@ -94,7 +94,7 @@ Saturation keeps the pre-alias and post-alias curves (`new_codes_pre_alias`, `ne
 
 ## 7. Evaluation and the three-way benchmark
 
-`benchmarks/compare_versions.py --offline` runs the `v0.5.4` git tag (merged PR #4, not a 0.6 commit) against 0.6.0 `batch_size=1` and `batch_size=4` on the fake coder. `--model` and `--corpus` run 0.6.0 live. Do not treat that script as a download of Muse.
+`benchmarks/compare_versions.py --offline` runs the `v0.5.4` git tag (merged PR #4, not a 0.6 commit) in a detached worktree against the current package at `batch_size=1` and `batch_size=4` on the fake coder. `--model`, `--corpus`, and `--context` (a JSON object or a markdown notes file) run the current package live and pass the research context through. `--log-dir` appends every chat-model call to `calls.jsonl`. A tag older than 0.6 keeps that tag's shipped defaults. Do not treat that script as a download of Muse.
 
 Benchmark scoring:
 
@@ -118,8 +118,18 @@ Benchmark scoring:
 
 RAND Muse E2 under 0.5.4, as scored: precision 0.60, recall 0.19, F1 0.29 against 78 human codes. In-scope tags on the two coded documents are 23 codes, and much of the gap was the old quote drop plus one-label alignment. That figure is not the paper's codebook-application kappa.
 
-0.6.0 has not been timed on that live corpus in this change.
+0.6.0 has not been timed on that live corpus in this change. A later live three-way run of 0.6.0 (v0.5.4, batch 1, batch 4) is what 0.6.1 answers. 0.6.1 itself has not been live-timed.
 
-## 9. Out of scope
+## 9. Corrections in 0.6.1
+
+- `duplicates_before_reconciliation` counts proposals born in the same snapshot that a later comparison aliases or judges as the same concept (`same_action` and `same_object`). It does not count identical labels. Exact proposal-id collisions stay in `exact_proposal_collisions`. Each round's pairs are in `duplicate_rounds.json`.
+- Every accepted alias is exported with both definitions, up to three quotes from each side, and the rationale (`kind: accepted_alias` in `lost_distinction_candidates.json`). `merges_later_split` counts aliases a later quote split pulled apart.
+- The shared limiter releases its slot before a retry sleep. `Retry-After` cannot exceed `max_backoff`. Pipeline overlap does not start a coding task when `concurrency` is 1, so a sweep is not stuck behind its own overlap. The run metadata includes the in-flight timeline.
+- In document mode, a document that still has at least `batch_size` passages stays inside that document (up to `batch_size * concurrency` workers, one commit). A shorter document, such as one comment per respondent, continues into the next documents until the round holds `batch_size` passages. Reconciliation runs once per round. `batch_size` still defaults to 1.
+- `run_sync` reuses one background event loop and does not close HTTP clients the caller still holds. `build_themes` can follow `open_code` on the same model instance.
+- `alias_duplicate` requires the same action, the same object, a contrast check, no material contrast, and evidence that is not mixed. Labels that each name an object or aspect the other lacks stay `keep_distinct` (`aspects_differ`), including when they share a platform name. Mixed `quote_fits` or `evidence_same` false is `defer`. A missing rubric is `keep_distinct`. Valence is still not a reason to alias or to refuse. A trivial near-duplicate with the same stance still aliases without a model call.
+- `presentation_themes` folds reporting themes that share a content word. Analytic membership is unchanged. There is no theme quota. The prevalence chart uses that reporting view. `presentation_themes.json` is the list.
+
+## 10. Out of scope
 
 Category feedback, focused recoding of earlier negatives, relationship hypotheses, sampling briefs, and a Taguette project-file adapter. See the v0.6 plan steps 3–5.

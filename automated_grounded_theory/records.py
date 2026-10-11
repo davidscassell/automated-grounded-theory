@@ -11,7 +11,7 @@ import json
 from itertools import combinations
 from typing import Any, Mapping, Sequence
 
-POLICY_VERSION = "0.6.0"
+POLICY_VERSION = "0.6.1"
 
 COMPARISON_OPS = (
     "alias_duplicate",
@@ -181,6 +181,82 @@ def select_committable(
             continue
         fresh.append(dict(item))
     return fresh, stale, skipped
+
+
+def _judged_same_concept(item: Mapping[str, Any]) -> bool:
+    """True when a sweep accepted an alias or said the pair is one concept."""
+    if str(item.get("comparison_op") or "") == "alias_duplicate" and str(item.get("decision") or "") == "accept":
+        return True
+    return item.get("same_action") is True and item.get("same_object") is True
+
+
+def same_round_duplicates(
+    codebook: Mapping[str, Mapping[str, Any]],
+    judgments: Sequence[Mapping[str, Any]],
+) -> list[dict]:
+    """Pairs from one snapshot that an alias or a same-concept judgment later joins.
+
+    Label identity is not enough. Two proposals count when they were created
+    against the same frozen snapshot and a later comparison says they are one
+    concept, including when that comparison is then kept distinct.
+    """
+    from automated_grounded_theory.validation import code_key
+
+    found: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for item in judgments:
+        if not _judged_same_concept(item):
+            continue
+        source = code_key(str(item.get("source") or ""))
+        target = code_key(str(item.get("target") or ""))
+        if not source or not target or source == target:
+            continue
+        left = codebook.get(source) or {}
+        right = codebook.get(target) or {}
+        snapshot = str(left.get("origin_snapshot_id") or "")
+        if not snapshot or snapshot != str(right.get("origin_snapshot_id") or ""):
+            continue
+        key = tuple(sorted((source, target)))
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(
+            {
+                "snapshot_id": snapshot,
+                "source": str(left.get("code") or item.get("source") or source),
+                "target": str(right.get("code") or item.get("target") or target),
+                "judgment": "alias_duplicate"
+                if str(item.get("decision") or "") == "accept"
+                else "same_concept",
+                "rationale": str(item.get("rationale") or ""),
+            }
+        )
+    return found
+
+
+def accumulate_duplicate_rounds(existing: Sequence[Mapping[str, Any]], pairs: Sequence[Mapping[str, Any]]) -> list[dict]:
+    """Group same-round duplicate pairs by snapshot. A pair is stored once."""
+    grouped: dict[str, dict] = {}
+    for row in existing:
+        snapshot = str(row.get("snapshot_id") or "")
+        if not snapshot:
+            continue
+        grouped[snapshot] = {"snapshot_id": snapshot, "pairs": [dict(item) for item in row.get("pairs") or []]}
+    for pair in pairs:
+        snapshot = str(pair.get("snapshot_id") or "")
+        if not snapshot:
+            continue
+        bucket = grouped.setdefault(snapshot, {"snapshot_id": snapshot, "pairs": []})
+        known = {tuple(sorted((str(item.get("source")), str(item.get("target"))))) for item in bucket["pairs"]}
+        key = tuple(sorted((str(pair.get("source")), str(pair.get("target")))))
+        if key in known:
+            continue
+        bucket["pairs"].append(dict(pair))
+    return [grouped[key] for key in sorted(grouped)]
+
+
+def duplicate_pair_count(rounds: Sequence[Mapping[str, Any]]) -> int:
+    return sum(len(row.get("pairs") or []) for row in rounds)
 
 
 def component_aliases_are_direct(members: Sequence[str], accepted_pairs: set[frozenset[str]]) -> bool:

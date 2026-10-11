@@ -182,7 +182,26 @@ class MergeDecision(_LLMModel):
     )
     quote_fits: list["QuoteFit"] = Field(
         default_factory=list,
-        description="One row per member quote. fits false means the quote should be split back out.",
+        description="One row per member quote. fits false means the evidence is mixed and the pair must not be aliased.",
+    )
+    comparison_op: str = Field(
+        default="",
+        description=(
+            "alias_duplicate only when definition and evidence name one concept. "
+            "Otherwise keep_distinct, link_to_category, record_dimension, or defer."
+        ),
+    )
+    contrast_checked: bool = Field(
+        default=False,
+        description="True only after comparing both definitions and their quotes for a different object or aspect.",
+    )
+    material_contrast: bool = Field(
+        default=False,
+        description="True when that contrast is a real difference. Do not alias when this is true.",
+    )
+    evidence_same: bool | None = Field(
+        default=None,
+        description="True when the quotes support one concept. False when the evidence is mixed.",
     )
 
 

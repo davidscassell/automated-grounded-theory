@@ -734,7 +734,17 @@ def test_model_proposed_merge_is_logged():
             },
         },
         [],
-        merges=[{"source": "paying more", "target": "asking for pay", "rationale": "Same pay incident."}],
+        merges=[{
+            "source": "paying more",
+            "target": "asking for pay",
+            "rationale": "Same pay incident.",
+            "same_action": True,
+            "same_object": True,
+            "same_stance": True,
+            "contrast_checked": True,
+            "material_contrast": False,
+            "evidence_same": True,
+        }],
         candidates=[],
     )
     finalize_candidate_decisions(applied, candidates=[])
@@ -746,7 +756,7 @@ def test_model_proposed_merge_is_logged():
             "decision": "accept",
             "reason": "model_proposed",
             "rationale": "Same pay incident.",
-            "confidence": 1.0,
+            "confidence": 0.95,
         }
     ]
 

@@ -402,6 +402,8 @@ def export_themes(result: ThemeResult, output_dir: str | Path, *, chart: bool = 
         "metadata": result.metadata,
     }
     _write_json(place("themes.json"), payload)
+    shown = list((result.metadata or {}).get("presentation_themes") or result.themes)
+    _write_json(place("presentation_themes.json"), shown)
     place("themes.md").write_text(themes_markdown(result), encoding="utf-8")
     _write_csv(
         place("themes.csv"),
@@ -448,7 +450,11 @@ def export_themes(result: ThemeResult, output_dir: str | Path, *, chart: bool = 
                 "Install the plots extra to draw it."
             )
         else:
-            _write_chart(place("theme_prevalence.png"), result.themes, plt)
+            _write_chart(
+                place("theme_prevalence.png"),
+                list((result.metadata or {}).get("presentation_themes") or result.themes),
+                plt,
+            )
     result.export_paths.update(paths)
     return paths
 
@@ -743,6 +749,7 @@ async def abuild_themes(
                 theme_chunk=theme_chunk,
             ),
             "duplicate_decisions": duplicate_decisions,
+            "presentation_themes": presentation_themes(themes),
             "stage_seconds": {"themes": round(time.perf_counter() - started, 4)},
         },
         warnings=warnings,
@@ -768,6 +775,106 @@ def reconcile_theme_proposals(parts: Sequence[tuple[int, Mapping[str, Any]]]) ->
         tensions.extend(payload.get("tensions") or [])
         negatives.extend(payload.get("negative_cases") or [])
     return {"themes": themes, "tensions": tensions, "negative_cases": negatives}
+
+
+def presentation_themes(themes: Sequence[Mapping[str, Any]]) -> list[dict]:
+    """Fold themes that share a content word. This is a reporting view only.
+
+    Analytic membership is unchanged. There is no theme quota and no share cap.
+    A theme that does not share a content word with another stays as it is.
+    """
+    rows = [dict(theme) for theme in themes if str(theme.get("name") or "").strip()]
+    if not rows:
+        return []
+    parent = list(range(len(rows)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        root_left, root_right = find(left), find(right)
+        if root_left == root_right:
+            return
+        if root_left < root_right:
+            parent[root_right] = root_left
+        else:
+            parent[root_left] = root_right
+
+    tokens = [_presentation_tokens(str(theme.get("name") or "")) for theme in rows]
+    for left in range(len(rows)):
+        for right in range(left + 1, len(rows)):
+            if tokens[left] and tokens[right] and tokens[left] & tokens[right]:
+                union(left, right)
+    groups: dict[int, list[int]] = {}
+    for index in range(len(rows)):
+        groups.setdefault(find(index), []).append(index)
+    folded = []
+    for indexes in (groups[key] for key in sorted(groups, key=lambda item: min(groups[item]))):
+        members = [rows[index] for index in indexes]
+        bundled = _bundle_themes(members)
+        bundled.update(_presentation_prevalence(members))
+        bundled["folded_from"] = [str(theme.get("name") or "") for theme in members]
+        bundled["presentation"] = True
+        folded.append(bundled)
+    return folded
+
+
+def _presentation_prevalence(members: Sequence[Mapping[str, Any]]) -> dict:
+    """Counts and shares for a reporting theme. A single theme keeps its own."""
+    keys = (
+        "n_passages",
+        "pct_passages",
+        "n_documents",
+        "pct_documents",
+        "n_comments",
+        "pct_comments",
+        "n_respondents",
+        "pct_respondents",
+        "denominator_passages",
+        "denominator_documents",
+        "denominator_respondents",
+        "membership",
+        "breakdowns",
+        "quotes",
+        "code_counts",
+    )
+    if len(members) == 1:
+        return {key: members[0][key] for key in keys if key in members[0]}
+    folded: dict = {}
+    for count_key, pct_key, denom_key in (
+        ("n_passages", "pct_passages", "denominator_passages"),
+        ("n_documents", "pct_documents", "denominator_documents"),
+        ("n_comments", "pct_comments", "denominator_documents"),
+        ("n_respondents", "pct_respondents", "denominator_respondents"),
+    ):
+        if not any(count_key in theme for theme in members):
+            continue
+        total = sum(int(theme.get(count_key) or 0) for theme in members)
+        folded[count_key] = total
+        denom = next((theme.get(denom_key) for theme in members if theme.get(denom_key)), None)
+        if denom:
+            folded[denom_key] = denom
+            folded[pct_key] = round(100.0 * total / int(denom), 1)
+        elif any(pct_key in theme for theme in members):
+            folded[pct_key] = round(sum(float(theme.get(pct_key) or 0) for theme in members), 1)
+    return folded
+
+
+def _presentation_tokens(name: str) -> set[str]:
+    import re
+
+    stop = {"a", "an", "the", "of", "to", "for", "and", "or", "in", "on", "with", "from"}
+    tokens = set()
+    for token in re.findall(r"[a-z0-9]+", name.casefold()):
+        if token in stop or len(token) < 3 or (token.endswith("ing") and len(token) > 5):
+            continue
+        if token.endswith("s") and len(token) > 4:
+            token = token[:-1]
+        tokens.add(token)
+    return tokens
 
 
 def collapse_themes(

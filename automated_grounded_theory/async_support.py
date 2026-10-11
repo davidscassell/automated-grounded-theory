@@ -17,6 +17,7 @@ import hashlib
 import json
 import random
 import threading
+import time
 from typing import Any, Callable, Sequence
 
 class CallLimiter:
@@ -70,6 +71,8 @@ class CallLimiter:
         self.cache_hits = 0
         self.cache_context: dict = {}
         self.schema_repairs = 0
+        self.timeline: list[dict] = []
+        self._timeline_origin: float | None = None
 
     async def ainvoke(self, runnable, payload):
         """``await runnable.ainvoke(payload)`` under the AIMD cap, with rate-limit retries."""
@@ -196,15 +199,56 @@ class CallLimiter:
         self.timeout_retries += count
         self._success_streak = 0
 
+    def _mark(self, kind: str, **extra: Any) -> None:
+        now = time.perf_counter()
+        if self._timeline_origin is None:
+            self._timeline_origin = now
+        self.timeline.append(
+            {
+                "t": round(now - self._timeline_origin, 4),
+                "kind": kind,
+                "in_flight": self._in_flight,
+                **extra,
+            }
+        )
+
+    def activity_report(self) -> dict:
+        """In-flight events and the gaps where nothing was calling the model."""
+        gaps = []
+        idle_at = None
+        for event in self.timeline:
+            kind = event.get("kind")
+            if kind == "idle":
+                idle_at = float(event.get("t") or 0)
+            elif kind == "call_start" and idle_at is not None:
+                seconds = round(float(event.get("t") or 0) - idle_at, 4)
+                if seconds >= 0.05:
+                    gaps.append({"start": idle_at, "end": event.get("t"), "seconds": seconds})
+                idle_at = None
+            elif kind == "call_start":
+                idle_at = None
+        idle_seconds = round(sum(float(item["seconds"]) for item in gaps), 4)
+        return {
+            "events": list(self.timeline),
+            "idle_gaps": gaps,
+            "idle_seconds": idle_seconds,
+            "max_idle_seconds": round(max((float(item["seconds"]) for item in gaps), default=0.0), 4),
+            "max_in_flight": self.max_in_flight,
+        }
+
     async def _invoke(self, runnable, payload):
         """One model call, cut off at ``request_timeout`` seconds.
 
         A timeout of 0 or less waits for the provider. The default is 120.
         """
-        call = runnable.ainvoke(payload)
-        if self.request_timeout and self.request_timeout > 0:
-            return await asyncio.wait_for(call, self.request_timeout)
-        return await call
+        self._mark("call_start")
+        try:
+            call = runnable.ainvoke(payload)
+            if self.request_timeout and self.request_timeout > 0:
+                return await asyncio.wait_for(call, self.request_timeout)
+            return await call
+        finally:
+            self._mark("call_end")
 
     async def _gather(self, runnable, batch: Sequence[Any]) -> list[Any]:
         """Run a batch with one deadline per call and the current concurrency cap."""
@@ -217,10 +261,15 @@ class CallLimiter:
         return list(await asyncio.gather(*(one(payload) for payload in batch), return_exceptions=True))
 
     def _wait(self, attempt: int, exc: BaseException | None) -> float:
+        """Backoff for one retry. ``Retry-After`` cannot exceed ``max_backoff``.
+
+        An uncapped provider delay held the only slot for many minutes while
+        no model call was in flight.
+        """
+        cap = min(self.max_backoff, self.backoff * (2**attempt)) if self.backoff else self.max_backoff
         retry_after = _retry_after(exc)
         if retry_after is not None:
-            return retry_after
-        cap = min(self.max_backoff, self.backoff * (2**attempt))
+            return min(max(0.0, retry_after), max(0.0, self.max_backoff))
         if cap <= 0:
             return 0.0
         return random.uniform(0.0, cap)
@@ -233,7 +282,15 @@ class CallLimiter:
                 if attempt >= self.max_retries or not is_transient(exc):
                     raise
                 self._note_transient(exc)
-                await asyncio.sleep(self._wait(attempt, exc))
+                wait = self._wait(attempt, exc)
+                # Release the slot before sleeping so a sweep or another
+                # passage can use it. The slot is taken again for the retry.
+                await self._release_async()
+                try:
+                    self._mark("idle_sleep", seconds=round(wait, 4))
+                    await asyncio.sleep(wait)
+                finally:
+                    await self._acquire()
         raise RuntimeError("retry loop exited without a result")
 
     def _enter(self) -> None:
@@ -243,6 +300,9 @@ class CallLimiter:
 
     def _leave(self) -> None:
         self._in_flight -= 1
+        if self._in_flight <= 0:
+            self._in_flight = 0
+            self._mark("idle")
 
 
 def cache_key(payload: Any, **context: Any) -> str:
@@ -573,11 +633,29 @@ async def _close_async_http_clients() -> None:
         await asyncio.gather(*extra, return_exceptions=True)
 
 
-async def _run_and_close(coro):
-    try:
-        return await coro
-    finally:
-        await _close_async_http_clients()
+_LOOP_LOCK = threading.Lock()
+_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def _package_loop() -> asyncio.AbstractEventLoop:
+    """One loop for every sync entry point, so a shared client keeps its loop."""
+    global _LOOP
+    with _LOOP_LOCK:
+        if _LOOP is not None and not _LOOP.is_closed():
+            return _LOOP
+        loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def _spin() -> None:
+            asyncio.set_event_loop(loop)
+            ready.set()
+            loop.run_forever()
+
+        thread = threading.Thread(target=_spin, name="agt-loop", daemon=True)
+        thread.start()
+        ready.wait()
+        _LOOP = loop
+        return loop
 
 
 def _loop_is_running() -> bool:
@@ -596,28 +674,20 @@ def _loop_is_running() -> bool:
 def run_sync(coro):
     """Run ``coro`` to completion, including inside a running event loop.
 
-    With no running loop this is :func:`asyncio.run`. With a running loop (a
-    Jupyter cell, or a test that already started one) the coroutine runs on a
-    worker thread so the caller's loop is left alone.
+    Every sync call shares one background loop. A chat model created during
+    ``open_code`` stays bound to that loop, so ``build_themes`` can reuse the
+    same instance. Shared httpx clients are not closed here: closing them
+    made the next call raise ``Event loop is closed``.
     """
-    wrapped = _run_and_close(coro)
-    if not _loop_is_running():
-        try:
-            return asyncio.run(wrapped)
-        except BaseException as exc:
-            raise exc from None
-
-    outcome: dict[str, Any] = {}
-
-    def _worker() -> None:
-        try:
-            outcome["value"] = asyncio.run(wrapped)
-        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller thread
-            outcome["error"] = exc
-
-    thread = threading.Thread(target=_worker, name="agt-sync")
-    thread.start()
-    thread.join()
-    if "error" in outcome:
-        raise outcome["error"] from None
-    return outcome["value"]
+    loop = _package_loop()
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is loop:
+        raise RuntimeError("run_sync cannot wait on the package event loop from inside it.")
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    try:
+        return future.result()
+    except BaseException as exc:
+        raise exc from None

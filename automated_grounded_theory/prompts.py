@@ -124,16 +124,22 @@ Each hint has a pair_id. Decide every hinted pair_id once. Put a hint you accept
 in merges. Put a hint you reject in rejections, with that pair_id and a rationale. \
 Do not omit a hinted pair. Do not reject a pair that was not hinted. Also propose \
 every other duplicate pair you find in this chunk, each with a rationale. Do not \
-merge codes that merely share a verb, a topic, or a sensitizing concept. When you \
-merge only when the codes share the same action, the same object, and the same \
-stance. Set same_action, same_object, and same_stance on every merge and rejection. \
-Keep the clearer label as the target and name the other code as the source. \
-Record source_valence and target_valence. Stance is context, not a merge veto: \
-alias_duplicate only when the concept is the same, record_dimension or keep_distinct \
-when the contrast matters, and do not treat a chain of pairs as one merge. \
-On each accept, set rewritten_label and rewritten_definition from the member quotes, \
-and set quote_fits for each example quote (fits false when a quote should be split \
-back out). Set confidence from 0 to 1. Anchors: 0.2 thin or contradictory, 0.5 \
+merge codes that merely share a verb, a topic, a platform name, or a sensitizing \
+concept. alias_duplicate only when the definitions name the same concept and the \
+quotes show that same concept. Set same_action and same_object true only then. \
+Before alias_duplicate, set contrast_checked true and material_contrast false: \
+you compared both definitions and their quotes and found no different object or \
+aspect. If the objects or aspects differ, set comparison_op to keep_distinct. \
+If the quotes disagree, set evidence_same false and comparison_op to defer. \
+If they belong in one category but are not one code, set comparison_op to \
+link_to_category. Set same_action, same_object, and same_stance on every merge \
+and rejection. Keep the clearer label as the target and name the other code as \
+the source. Record source_valence and target_valence. Stance is context, not a \
+merge veto, and it is not by itself a reason to alias. Do not treat a chain of \
+pairs as one merge. On each accept, set rewritten_label and rewritten_definition \
+from the member quotes, and set quote_fits for each example quote (fits false \
+means the evidence is mixed, so do not alias). Set confidence from 0 to 1. \
+Anchors: 0.2 thin or contradictory, 0.5 \
 plausible, 0.8 the quotes support it, 0.95 the quotes show it directly. Write a \
 rationale of one to three sentences on every merge, rejection, and definition.
 

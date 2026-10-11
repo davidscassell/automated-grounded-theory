@@ -1,6 +1,6 @@
 # automated_grounded_theory
 
-**Open coding**, then **focused coding**, in the grounded theory tradition (Glaser and Strauss 1967; Glaser 1978, 1992; Strauss and Corbin 1990/1998; Charmaz 2006/2014). By default the model reads every document in a seeded order, and every passage of that document in reading order, comparing each incident with the codebook earned so far. It does not decide that the data are saturated. How each step maps onto those sources is in [docs/methodology.md](docs/methodology.md). The 0.6.0 design, with the parameter names the code actually uses, is in [docs/design.md](docs/design.md). A short notebook with the same citations and the Taguette import steps is [docs/open_coding.ipynb](docs/open_coding.ipynb). A full walkthrough on a fictional employee survey, including an offline mode that needs no API key, is [examples/demo.ipynb](examples/demo.ipynb). The notebook writes its outputs to a temporary directory.
+**Open coding**, then **focused coding**, in the grounded theory tradition (Glaser and Strauss 1967; Glaser 1978, 1992; Strauss and Corbin 1990/1998; Charmaz 2006/2014). By default the model reads every document in a seeded order, and every passage of that document in reading order, comparing each incident with the codebook earned so far. It does not decide that the data are saturated. How each step maps onto those sources is in [docs/methodology.md](docs/methodology.md). The 0.6 design, including the 0.6.1 corrections, is in [docs/design.md](docs/design.md). A short notebook with the same citations and the Taguette import steps is [docs/open_coding.ipynb](docs/open_coding.ipynb). A full walkthrough on a fictional employee survey, including an offline mode that needs no API key, is [examples/demo.ipynb](examples/demo.ipynb). The notebook writes its outputs to a temporary directory.
 
 `build_themes` is the next round: it groups those open codes into themes. It does not do axial coding, selective coding, or theoretical sampling.
 
@@ -28,6 +28,7 @@ Coding uses a LangChain chat model. Install the extra for the provider you actua
 | `checkpoint` | SQLite resume (`langgraph-checkpoint-sqlite`) |
 | `plots` | Theme prevalence chart (`matplotlib`) |
 | `viz` | Graph drawing (`grandalf`). Optional `pygraphviz` needs a Graphviz install and is not in the extra. |
+| `taguette` | The Taguette package (`taguette>=1.5`) for a caller who imports it. This package still does not write a Taguette SQLite project. |
 
 ```bash
 pip install "automated_grounded_theory[xai]"
@@ -90,9 +91,9 @@ A corpus item can be a mapping with `text` or `path`, optional `id` / `name`, an
 
 `review_mode` defaults to `document`. Documents are shuffled with the seed. Passages inside a document stay in reading order and are coded with that document's neighbors. The codebook is updated after the document (or after each passage when `batch_size` is 1). `review_mode="wave"` may code passages from several documents in one step against one frozen snapshot. That weakens constant comparison (Glaser and Strauss 1967): a later passage can be coded before an earlier one, and new codes are invisible to the rest of the wave. Use it only when you have accepted that tradeoff. `parallel_documents=True` is a second opt-in that gives each document its own codebook until a sweep. It is off by default.
 
-`batch_size` defaults to 1, the reference condition. `4` is the next setting to compare; do not start at 8. Passages in a batch share one frozen snapshot. `concurrency` (default 4) caps in-flight calls on one shared limiter. A 429 halves that ceiling. Transport retries use full jitter and `Retry-After`. Schema repair (`REPAIR THIS OUTPUT`) is a separate single attempt and is not a transport retry. Cache keys include the snapshot id, definition revision, evidence revision, and policy version.
+`batch_size` defaults to 1, the reference condition. `4` is the next setting to compare; do not start at 8. A document that still has at least `batch_size` passages stays inside that document. A shorter document, such as one survey comment, continues into the next documents until the round holds `batch_size` passages. The round shares one frozen snapshot and reconciles once. `concurrency` (default 4) caps in-flight calls on one shared limiter. A 429 halves that ceiling. Transport retries use full jitter. `Retry-After` cannot exceed `max_backoff`, and the slot is released during the wait. Schema repair (`REPAIR THIS OUTPUT`) is a separate single attempt and is not a transport retry. Cache keys include the snapshot id, definition revision, evidence revision, and policy version. Run metadata includes an in-flight timeline (`metrics.activity`).
 
-`pipeline=True` (the default) runs synthesis of the passages just coded while the next document or wave is coded against the pre-merge snapshot. The merge map is applied when the sweep returns, in chunk order, and the surviving label is the lexicographically smaller code id. Set `pipeline=False` and `batch_size=1` for a fully sequential reading. Async entry points are `aopen_code`, `abuild_themes`, `aevaluate`, and `amulti_seed_stability`. The sync wrappers work inside a running event loop (a notebook) by using a worker thread.
+`pipeline=True` (the default) runs synthesis of the passages just coded while the next document or wave is coded against the pre-merge snapshot. The merge map is applied when the sweep returns, in chunk order, and the surviving label is the lexicographically smaller code id. Set `pipeline=False` and `batch_size=1` for a fully sequential reading. Async entry points are `aopen_code`, `abuild_themes`, `aevaluate`, and `amulti_seed_stability`. The sync wrappers reuse one background event loop and do not close HTTP clients the model still holds, so `build_themes` can follow `open_code` on the same model. Inside a notebook they still run on that loop rather than the notebook's.
 
 `parallel_documents=True` codes each document on its own codebook and merges them at sweeps. It is off by default, because passages then do not see each other's new codes until the next sweep. `concurrency` caps how many documents are coded in one wave.
 
@@ -227,13 +228,13 @@ The checks and the sweep exist because that JMIR tutorial found LLM coding weak 
 
 ## Speed
 
-`scripts/benchmark_review_modes.py` runs a fake coder that sleeps 0.05s per call on 6 documents × 4 passages (24 passages), seed 7, `sweep_every=8`. No API key. Numbers below are from that script in this environment.
+`scripts/benchmark_review_modes.py` runs a fake coder that sleeps 0.05s per call on 6 documents × 4 passages (24 passages), seed 7, `sweep_every=8`, `unit="paragraph"`. No API key. Measured on 0.6.0. 0.6.1 was not remeasured.
 
 | Mode | What it does | Seconds | Calls | Passages/s | Codes | Merges | Near-duplicate pairs left |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| sequential | `review_mode="document"`, `pipeline=False`, `batch_size=1`, `concurrency=1` | 1.588 | 28 | 15.11 | 3 | 3 | 0 |
-| document | `review_mode="document"`, background synthesis, `batch_size=4`, `concurrency=4` | 0.525 | 10 | 45.73 | 3 | 3 | 0 |
-| wave | `review_mode="wave"`, background synthesis, `batch_size=4`, `concurrency=4` | 0.315 | 9 | 76.19 | 3 | 1 | 0 |
+| sequential | `review_mode="document"`, `pipeline=False`, `batch_size=1`, `concurrency=1` | 1.690 | 28 | 14.20 | 3 | 3 | 0 |
+| document | `review_mode="document"`, background synthesis, `batch_size=4`, `concurrency=4` | 0.543 | 10 | 44.18 | 3 | 3 | 0 |
+| wave | `review_mode="wave"`, background synthesis, `batch_size=4`, `concurrency=4` | 0.307 | 9 | 78.20 | 3 | 1 | 0 |
 
 On this fake coder, exact repeated labels collapse when they are committed, so none of the three left a near-duplicate pair behind. Document mode kept the same final code count as the sequential reading and still ran a merge on each synthesis. Wave mode was the fastest and needed only one merge pass, because passages from different documents shared a snapshot. That speed is the constant-comparison tradeoff described above: later incidents in a document can be coded before earlier ones. Re-run the script after you change the delay or the corpus; do not treat these times as a provider benchmark.
 

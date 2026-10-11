@@ -172,6 +172,7 @@ def result_from_state(
     metrics["input_tokens"] = input_tokens
     metrics["output_tokens"] = output_tokens
     metadata["metrics"] = metrics
+    metadata["lost_distinction_audit"] = list(state.get("lost_distinction_candidates") or [])
     metadata["policy_version"] = state.get("policy_version") or metadata.get("policy_version")
     records = materialize_records(
         documents=list(state.get("documents") or []),

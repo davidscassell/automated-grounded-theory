@@ -30,7 +30,7 @@ from tests.fake_llm import FakeCoder
 
 
 def test_version_and_batch_size_default():
-    assert __version__ == "0.6.0"
+    assert __version__ == "0.6.1"
     assert inspect.signature(open_code).parameters["batch_size"].default == 1
     assert inspect.signature(aopen_code).parameters["batch_size"].default == 1
     assert RunConfig.__dataclass_fields__["batch_size"].default == 1
@@ -188,7 +188,7 @@ def test_nontransitive_alias_is_not_applied():
     def entry(label):
         return {"code": label, "key": label, "definition": label, "valence": "neutral", "history": []}
 
-    labels = ["alpha one", "bravo two", "charlie three"]
+    labels = ["recording the alpha delay", "recording an alpha delay", "recording that alpha delay"]
     book = {label: entry(label) for label in labels}
     segments = [
         {"code": label, "code_key": label, "quote": label, "passage_id": label, "doc_id": "d"} for label in labels
@@ -197,8 +197,26 @@ def test_nontransitive_alias_is_not_applied():
         book,
         segments,
         merges=[
-            {"source": "bravo two", "target": "alpha one", "confidence": 0.9, "rationale": "pair"},
-            {"source": "charlie three", "target": "bravo two", "confidence": 0.9, "rationale": "chain"},
+            {
+                "source": "recording an alpha delay",
+                "target": "recording the alpha delay",
+                "confidence": 0.9,
+                "rationale": "pair",
+                "same_action": True,
+                "same_object": True,
+                "contrast_checked": True,
+                "material_contrast": False,
+            },
+            {
+                "source": "recording that alpha delay",
+                "target": "recording an alpha delay",
+                "confidence": 0.9,
+                "rationale": "chain",
+                "same_action": True,
+                "same_object": True,
+                "contrast_checked": True,
+                "material_contrast": False,
+            },
         ],
         candidates=[],
         max_merges_per_sweep=10,
