@@ -37,6 +37,46 @@ def _segment(label: str, quote: str) -> dict:
     }
 
 
+def test_two_incidents_and_attribute_leak():
+    from automated_grounded_theory.codebook import interpret_coding
+
+    passage = {
+        "text": "The team is great. Upper management is another story.",
+        "start_offset": 0,
+        "metadata": {"department": "cardiology"},
+    }
+    coding = {
+        "codes": [
+            {
+                "action": "new",
+                "code": "praising the team",
+                "definition": "Praise for the immediate team.",
+                "quote": "The team is great.",
+                "confidence": 0.9,
+            },
+            {
+                "action": "new",
+                "code": "criticizing management",
+                "definition": "Criticism of management from cardiology.",
+                "quote": "Upper management is another story.",
+                "confidence": 0.8,
+            },
+        ],
+        "memo": "",
+    }
+    interpreted = interpret_coding(
+        coding,
+        passage,
+        {},
+        max_codes=6,
+        require_gerund=False,
+        long_passage_chars=2000,
+    )
+    assert [item["code"] for item in interpreted["accepted"]] == ["praising the team", "criticizing management"]
+    leaked = interpreted["accepted"][1]["review_reasons"]
+    assert "definition_contains_respondent_attribute" in leaked
+
+
 def test_quote_must_be_in_the_passage():
     passage = "I packed my suitcase."
     assert locate_quote("I packed my suitcase.", passage) == (0, len(passage))
@@ -68,7 +108,7 @@ def test_merge_map_relabels_earlier_segments():
     assert {item["code"] for item in applied["segments"]} == {"packing bags up"}
 
 
-def test_merge_outside_candidates_is_dropped():
+def test_sweep_may_propose_a_pair_that_was_not_a_candidate():
     codebook = {"crying at the station": _entry("crying at the station"), "starting a new job": _entry("starting a new job")}
     segments = [
         _segment("crying at the station", "I was crying."),
@@ -77,11 +117,19 @@ def test_merge_outside_candidates_is_dropped():
     applied = apply_sweep(
         codebook,
         segments,
-        merges=[{"source": "crying at the station", "target": "starting a new job"}],
+        merges=[{"source": "crying at the station", "target": "starting a new job", "rationale": "same incident"}],
         candidates=[],
     )
-    assert applied["accepted_merges"] == []
-    assert len(applied["codebook"]) == 2
+    assert len(applied["accepted_merges"]) == 1
+    assert list(applied["codebook"]) == ["starting a new job"]
+    unknown = apply_sweep(
+        codebook,
+        segments,
+        merges=[{"source": "not a code", "target": "starting a new job"}],
+        candidates=[],
+    )
+    assert unknown["accepted_merges"] == []
+    assert len(unknown["codebook"]) == 2
 
 
 def test_taguette_csv_and_qdc(tmp_path):

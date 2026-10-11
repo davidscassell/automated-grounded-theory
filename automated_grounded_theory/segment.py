@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from automated_grounded_theory.corpus import LoadedDocument, load_corpus, normalize_newlines
+from automated_grounded_theory.validation import is_trivial_passage
 
 Unit = Literal["paragraph", "sentence", "line", "speaker_turn"]
 UNITS: tuple[str, ...] = ("paragraph", "sentence", "line", "speaker_turn")
@@ -76,7 +77,7 @@ def plan_coding(
         pieces, piece_warnings = segment_document(document, unit=unit)
         warnings.extend(piece_warnings)
         if not pieces:
-            warnings.append(f"{document.doc_id}: no passages produced; document skipped")
+            pieces = [_empty_passage(document, unit)]
         passages.extend(pieces)
     if not passages:
         warnings.append("No passages were produced from the corpus.")
@@ -96,12 +97,13 @@ def plan_coding(
         queue = [0] * len(passages)
         for index, passage in enumerate(passages):
             queue[passage["coding_order"]] = index
+        _mark_trivial(passages, warnings)
         return CodingPlan(
             passages=passages,
             seed=seed,
             warnings=warnings,
-            queue=queue,
-            branch_queues=branch_queues,
+            queue=_live(passages, queue),
+            branch_queues={doc_id: _live(passages, indices) for doc_id, indices in branch_queues.items()},
             parallel=True,
         )
 
@@ -109,11 +111,12 @@ def plan_coding(
     rng.shuffle(queue)
     for order, index in enumerate(queue):
         passages[index]["coding_order"] = order
+    _mark_trivial(passages, warnings)
     return CodingPlan(
         passages=passages,
         seed=seed,
         warnings=warnings,
-        queue=queue,
+        queue=_live(passages, queue),
         branch_queues={},
         parallel=False,
     )
@@ -160,9 +163,45 @@ def segment_document(document: LoadedDocument, *, unit: Unit) -> tuple[list[dict
                 "next_text": next_text,
                 "unit": unit,
                 "coding_order": position,
+                "metadata": dict(document.metadata),
+                "skipped": False,
             }
         )
     return passages, warnings
+
+
+def _empty_passage(document: LoadedDocument, unit: str) -> dict:
+    """Keep a blank document in the passage list without sending it to a model."""
+    return {
+        "passage_id": f"{document.doc_id}-p0000",
+        "doc_id": document.doc_id,
+        "doc_name": document.name,
+        "source": document.source,
+        "position": 0,
+        "text": document.text,
+        "start_offset": 0,
+        "end_offset": len(document.text),
+        "prev_text": "",
+        "next_text": "",
+        "unit": unit,
+        "coding_order": 0,
+        "metadata": dict(document.metadata),
+        "skipped": True,
+    }
+
+
+def _mark_trivial(passages: list[dict], warnings: list[str]) -> None:
+    skipped = 0
+    for passage in passages:
+        passage["skipped"] = is_trivial_passage(passage.get("text") or "")
+        skipped += int(passage["skipped"])
+    if skipped:
+        noun = "passage" if skipped == 1 else "passages"
+        warnings.append(f"Skipped {skipped} empty or trivial {noun} before the model was called.")
+
+
+def _live(passages: list[dict], indices: list[int]) -> list[int]:
+    return [index for index in indices if not passages[index].get("skipped")]
 
 
 def _assign_parallel_order(passages: list[dict], branch_queues: dict[str, list[int]]) -> None:

@@ -7,6 +7,7 @@ passage change and stay in the user message.
 
 from __future__ import annotations
 
+import json
 from typing import Any, Mapping, Sequence
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -18,59 +19,69 @@ CODING_SYSTEM = """You are doing first-round open coding in the grounded theory 
 This is initial coding only, incident by incident. You are not writing themes, \
 axial coding, selective coding, or a theory.
 
-Ask of the passage:
-- What is this data a study of?
-- What category does this incident indicate?
-- What is actually happening here?
+Ask of each passage: what is this data a study of, what is actually happening, \
+and what category does this incident indicate?
 
-Code with short gerunds: labels should be simple, active, and close to the data, \
-usually two to six words, naming an action or process. Code the incident, not the topic.
+Code with short gerunds: simple, active, close to the data, usually two to six words. \
+Code the incident, not the topic. Return one code per distinct incident. A passage \
+that both praises and criticizes needs a separate code for each incident.
 
-In-vivo codes: when a participant's own phrase does analytic work, you may use that \
-phrase as the label and set in_vivo to true. The phrase must appear in the passage. \
-In-vivo labels do not have to be gerunds.
+In-vivo codes: when a vivid participant phrase does analytic work, use that phrase as \
+the label and set in_vivo to true. The phrase must appear in the passage. In-vivo \
+labels do not have to be gerunds.
 
 Constant comparison: the user message lists codes already earned from earlier passages. \
-For each incident, reuse a code when it fits, refine the label or definition when this \
-incident shows the code should change, or create a new code when nothing listed covers \
-the incident. Do not mint a near-duplicate of a code you can see.
+Reuse a code when it fits. Refine the label or definition when this incident shows the \
+code should change. Create a new code only when nothing listed covers the incident. \
+Before a new code, set nearest_code to the closest listed label and why_not_nearest \
+to one short clause saying why it does not fit. Do not mint a near-duplicate.
 
-The research context sensitizes attention. It is not a coding frame and it is not a \
-list of codes. Do not force the passage into the research question, into a paradigm \
-of conditions, strategies, and consequences, or into any label the passage itself does \
-not support. If the context looks like a code list, ignore it.
+Definitions name a property that could apply to another incident. Do not put respondent \
+attributes (name, role, department, tenure, site) or the question wording into a label \
+or a definition.
 
-Quotes must be exact, contiguous copies of the passage between the passage markers. \
-Do not quote the neighboring context. Do not paraphrase the quote. Do not invent text.
+The research context is only for understanding the data. It is not evidence, not a \
+coding frame, and not a list of codes. Do not force a passage into the research \
+question or into a label the passage does not support. Do not quote or cite the \
+context in a memo. If the context looks like a code list, ignore it.
+
+Quotes must be exact contiguous copies from inside the passage markers. Do not quote \
+neighbors, attributes, or the context. Do not paraphrase.
 
 Do not use generic labels such as "experience", "discussion", "theme", or "response".
 
-If nothing in the passage is codable, return an empty code list and say so in the memo.
+If a passage has no codable incident, return an empty code list and an empty memo.
 
-The memo is a brief analytic note: what the incident suggests, a comparison with the \
-codebook, a property you noticed, a question. It is not a summary of the passage."""
+A memo is not a restatement. Leave it empty unless this passage adds a property, a \
+dimension, a condition, a consequence, or a comparison with a named code. When you \
+write one, name that comparison and keep it to a few sentences.
+
+If several passages are in the user message, code every one of them."""
 
 SWEEP_SYSTEM = """You are comparing codes with codes during open coding.
 
-You will see a codebook and candidate pairs that look similar in wording or in \
-embedding space. Confirm a merge only when two codes name the same kind of incident. \
-Do not merge codes that merely share a verb, a topic, or a sensitizing concept. \
-When you merge, keep the clearer and more specific label as the target and name the \
-other code as the source.
+You will see a codebook and, when any were found, candidate pairs that look similar \
+in wording or in embedding space. Candidates are hints, not a limit. Propose a merge \
+whenever two codes name the same kind of incident, including pairs that are not in \
+the candidate list. Do not merge codes that merely share a verb, a topic, or a \
+sensitizing concept. When you merge, keep the clearer and more specific label as \
+the target and name the other code as the source.
 
-Sharpen definitions so each one says what incident the code captures and, when the \
-examples support it, what distinguishes it from a nearby code. Stay with the examples. \
-Do not import a theoretical framework the examples have not earned.
+Sharpen definitions so each one says what incident the code captures, in words that \
+could apply to another respondent. Do not put a person's department, tenure, role, \
+name, or the question text into a definition. Stay with the examples. Do not import \
+a framework the examples have not earned.
 
-You may flag a code as overloaded when the examples are doing more than one analytic \
-job. Do not split it. Splitting would reassign earlier segments without rereading them. \
+You may flag a code as overloaded when the examples do more than one analytic job. \
+Do not split it. Splitting would reassign earlier segments without rereading them. \
 Flagging is a note for the researcher.
 
 Relation hints are optional notes for a later round. They are not axial coding. \
 Record a link only when the examples make it obvious, and phrase it as a hint.
 
-Do not create new codes. Do not invent examples. Do not merge a pair that is not in \
-the candidate list."""
+Do not create new codes. Do not invent examples. If this request is one chunk of a \
+larger codebook, you may merge a code in the chunk with a code that appears only in \
+the full label index. Use the labels exactly as written."""
 
 
 def clip(text: str, limit: int) -> str:
@@ -141,14 +152,24 @@ def format_passage(passage: Mapping[str, Any], *, neighbor_chars: int) -> str:
         f"doc_name: {passage.get('doc_name', '')}",
         f"passage_id: {passage.get('passage_id', '')}",
         f"position: {passage.get('position', '')}",
-        "Previous context (do not quote):",
-        prev_text or "(none)",
-        "<<<PASSAGE",
-        str(passage.get("text") or ""),
-        "PASSAGE>>>",
-        "Following context (do not quote):",
-        next_text or "(none)",
     ]
+    metadata = passage.get("metadata") or {}
+    if metadata:
+        lines.append(
+            "Respondent attributes (context for you only; do not copy these into codes, "
+            f"definitions, quotes, or memos): {json.dumps(metadata, ensure_ascii=False)}"
+        )
+    lines.extend(
+        [
+            "Previous context (do not quote):",
+            prev_text or "(none)",
+            "<<<PASSAGE",
+            str(passage.get("text") or ""),
+            "PASSAGE>>>",
+            "Following context (do not quote):",
+            next_text or "(none)",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -157,19 +178,23 @@ def build_coding_messages(
     context: ResearchContext,
     codebook_view: Sequence[Mapping[str, Any]],
     omitted_codes: int,
-    passage: Mapping[str, Any],
+    passages: Sequence[Mapping[str, Any]],
     neighbor_chars: int,
-    feedback: str | None,
+    feedback: Mapping[str, str] | None,
     prompt_cache: bool,
 ) -> list:
     system = coding_system_text(context)
     user_parts = [
         format_codebook(codebook_view, omitted=omitted_codes),
         "",
-        format_passage(passage, neighbor_chars=neighbor_chars),
+        "Code every passage below. Return one entry per passage_id, in this order.",
+        "",
+        "\n\n".join(format_passage(passage, neighbor_chars=neighbor_chars) for passage in passages),
     ]
     if feedback:
-        user_parts.extend(["", "VALIDATION FEEDBACK", feedback])
+        notes = [note for note in feedback.values() if note]
+        if notes:
+            user_parts.extend(["", "VALIDATION FEEDBACK", "\n\n".join(notes)])
     return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content="\n".join(user_parts))]
 
 
@@ -195,9 +220,10 @@ def build_sweep_messages(
     codes: Sequence[Mapping[str, Any]],
     candidates: Sequence[Mapping[str, Any]],
     prompt_cache: bool,
+    all_codes: Sequence[Mapping[str, Any]] | None = None,
+    chunk_index: int = 1,
+    chunk_count: int = 1,
 ) -> list:
-    import json
-
     payload = [
         {
             "source": item["source"],
@@ -207,22 +233,43 @@ def build_sweep_messages(
         }
         for item in candidates
     ]
-    user = "\n".join(
+    parts: list[str] = []
+    if all_codes and chunk_count > 1:
+        index = [
+            {
+                "code": item.get("code", ""),
+                "definition": clip(str(item.get("definition") or ""), 160),
+                "count": item.get("frequency", 0),
+            }
+            for item in all_codes
+        ]
+        parts.extend(
+            [
+                f"This is chunk {chunk_index} of {chunk_count}. "
+                "The detailed codebook below is only this chunk. "
+                "The full label index lists every code. Propose merges using those exact labels.",
+                "",
+                "FULL LABEL INDEX",
+                json.dumps(index, ensure_ascii=False),
+                "",
+            ]
+        )
+    parts.extend(
         [
-            render_context(context),
-            "",
             format_sweep_codebook(codes),
             "",
             "<<<CANDIDATES",
             json.dumps(payload, indent=2),
             "CANDIDATES>>>",
             "",
-            "Confirm a merge only for a pair listed in the candidate JSON. "
-            "You may swap source and target so the clearer label survives. "
-            "Return an empty merge list when the candidates are merely similar words.",
+            "Candidate pairs are hints from embeddings when those were supplied, otherwise from "
+            "label overlap. Also propose any other pair in this codebook that names the same "
+            "incident. You may swap source and target so the clearer label survives. "
+            "Return an empty merge list when the codes are merely similar words.",
         ]
     )
-    return [_system_message(SWEEP_SYSTEM, prompt_cache=prompt_cache), HumanMessage(content=user)]
+    system = SWEEP_SYSTEM + "\n\n" + render_context(context)
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content="\n".join(parts))]
 
 
 def validation_feedback(rejections: Sequence[Mapping[str, Any]]) -> str:

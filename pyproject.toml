@@ -1,6 +1,6 @@
 [project]
 name = "automated_grounded_theory"
-version = "0.1.0"
+version = "0.2.0"
 description = "First-round grounded theory open coding with any LangChain chat model."
 readme = "README.md"
 license = "MIT"
@@ -25,7 +25,10 @@ aws = ["langchain-aws"]
 cohere = ["langchain-cohere"]
 huggingface = ["langchain-huggingface"]
 checkpoint = ["langgraph-checkpoint-sqlite"]
-dev = ["pytest"]
+dev = ["pytest", "langgraph-checkpoint-sqlite"]
+
+[project.scripts]
+agt-evaluate = "automated_grounded_theory.evaluate:main"
 
 [project.urls]
 Homepage = "https://github.com/davidscassell/automated-grounded-theory"
@@ -43,3 +46,4 @@ automated_grounded_theory = ["py.typed"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+pythonpath = ["."]

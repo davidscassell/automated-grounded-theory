@@ -10,6 +10,7 @@ from automated_grounded_theory.api import (
     multi_seed_stability,
     open_code,
 )
+from automated_grounded_theory.evaluate import chen_metrics, evaluate_run
 from automated_grounded_theory.context import PresetCodesError, ResearchContext
 from automated_grounded_theory.graph import CodingError
 from automated_grounded_theory.results import OpenCodeResult
@@ -33,7 +34,9 @@ __all__ = [
     "StabilityReport",
     "__version__",
     "aopen_code",
+    "chen_metrics",
     "compare_runs",
+    "evaluate_run",
     "multi_seed_stability",
     "open_code",
     "plan_coding",

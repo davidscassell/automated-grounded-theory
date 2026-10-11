@@ -21,15 +21,25 @@ class CodeProposal(_LLMModel):
     action: Literal["reuse", "refine", "new"] = Field(
         description=(
             "reuse an existing code, refine its label or definition, "
-            "or mint a new code because nothing in the codebook fits"
+            "or mint a new code only when nothing listed fits"
         )
     )
     code: str = Field(
         description=(
-            "For reuse or refine, the existing code label. For new, a short "
-            "gerund phrase close to this incident (or the participant's own "
-            "words when in_vivo is true)."
+            "Existing label for reuse or refine. For new, a short gerund "
+            "(or the participant's own words when in_vivo is true)."
         )
+    )
+    nearest_code: str = Field(
+        default="",
+        description=(
+            "Required before action new when the codebook is not empty: "
+            "the closest listed label. Empty when reusing or when the book is empty."
+        ),
+    )
+    why_not_nearest: str = Field(
+        default="",
+        description="One short clause: why nearest_code does not cover this incident. Empty unless action is new.",
     )
     refined_label: str | None = Field(
         default=None,
@@ -44,11 +54,11 @@ class CodeProposal(_LLMModel):
     )
     in_vivo: bool = Field(
         default=False,
-        description="True only when the label is the participant's own phrase and that phrase is in the passage.",
+        description="True when the label is a vivid participant phrase copied from the passage.",
     )
     rationale: str = Field(
         default="",
-        description="Why this code fits this incident, including how it compares with the codebook.",
+        description="At most 12 words on why this code fits. Not a summary of the passage.",
     )
     confidence: float = Field(
         default=1.0,
@@ -59,16 +69,19 @@ class CodeProposal(_LLMModel):
 
 
 class PassageCoding(_LLMModel):
-    """Open coding of a single passage."""
+    """Open coding of one passage. One code per distinct incident."""
 
-    what_is_happening: str = Field(
-        default="",
-        description="One sentence: what is actually happening in this passage.",
+    passage_id: str = Field(default="", description="The passage_id from the prompt. Copy it exactly.")
+    codes: list[CodeProposal] = Field(
+        default_factory=list,
+        description="One code per distinct incident. Empty when nothing is codable.",
     )
-    codes: list[CodeProposal] = Field(default_factory=list)
     memo: str = Field(
         default="",
-        description="Brief analytic memo: comparisons, properties, questions. Not a summary of the passage.",
+        description=(
+            "Empty unless this passage adds a property, dimension, condition, "
+            "consequence, or comparison with a named code. Do not restate the passage."
+        ),
     )
     low_confidence: bool = Field(
         default=False,
@@ -96,15 +109,27 @@ class RelationHint(_LLMModel):
     note: str = ""
 
 
-class SweepCoding(_LLMModel):
-    """Code-to-code comparison. Confirms merges; does not invent codes."""
+class BatchCoding(_LLMModel):
+    """Open coding for every passage in one request."""
 
-    merges: list[MergeDecision] = Field(default_factory=list)
+    passages: list[PassageCoding] = Field(default_factory=list)
+
+
+class SweepCoding(_LLMModel):
+    """Code-to-code comparison. May propose merges. Does not invent codes."""
+
+    merges: list[MergeDecision] = Field(
+        default_factory=list,
+        description="Pairs that name the same incident. Candidates are hints; other pairs are allowed.",
+    )
     definitions: list[DefinitionUpdate] = Field(default_factory=list)
     overloaded_codes: list[str] = Field(
         default_factory=list,
         description="Codes that seem to cover more than one kind of incident. Do not split them here.",
     )
     relation_hints: list[RelationHint] = Field(default_factory=list)
-    integrative_memo: str = ""
+    integrative_memo: str = Field(
+        default="",
+        description="A few sentences on properties or comparisons. Empty if the sweep changed nothing analytic.",
+    )
     reflexive_memo: str = ""

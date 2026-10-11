@@ -61,6 +61,8 @@ def open_code(
     temperature: float = 0.0,
     sweep_temperature: float | None = None,
     parallel_documents: bool = False,
+    batch_size: int = 8,
+    concurrency: int = 2,
     top_k_codes: int = 12,
     frequent_codes: int = 8,
     merge_threshold: float = 0.82,
@@ -99,7 +101,9 @@ def open_code(
     sensitizing concepts). It is rejected if it contains preset codes.
 
     The saturation curve is reported and is not a stopping decision.
-    ``parallel_documents`` codes each document against its own codebook and
+    ``batch_size`` passages share one model call. ``concurrency`` calls run
+    together, then the codebook is updated before the next wave. A wave stops
+    at the next sweep. ``parallel_documents`` codes each document against its own codebook and
     merges those codebooks at each sweep. It is off by default because that
     delays constant comparison across documents.
     """
@@ -121,6 +125,8 @@ def open_code(
                 temperature=temperature,
                 sweep_temperature=sweep_temperature,
                 parallel_documents=parallel_documents,
+                batch_size=batch_size,
+                concurrency=concurrency,
                 top_k_codes=top_k_codes,
                 frequent_codes=frequent_codes,
                 merge_threshold=merge_threshold,
@@ -165,6 +171,8 @@ async def aopen_code(
     temperature: float = 0.0,
     sweep_temperature: float | None = None,
     parallel_documents: bool = False,
+    batch_size: int = 8,
+    concurrency: int = 2,
     top_k_codes: int = 12,
     frequent_codes: int = 8,
     merge_threshold: float = 0.82,
@@ -197,6 +205,8 @@ async def aopen_code(
         top_k_codes=top_k_codes,
         max_codes_per_passage=max_codes_per_passage,
         validation_retries=validation_retries,
+        batch_size=batch_size,
+        concurrency=concurrency,
     )
     parsed_context = parse_context(context)
     documents = load_corpus(corpus)
@@ -253,6 +263,8 @@ async def aopen_code(
         temperature=temperature,
         sweep_temperature=temperature if sweep_temperature is None else sweep_temperature,
         parallel_documents=parallel_documents,
+        batch_size=batch_size,
+        concurrency=concurrency,
         prompt_cache=cache,
         api_key_provided=api_key is not None,
         thread_id=thread_id,
@@ -288,6 +300,8 @@ async def aopen_code(
         validation_retries=validation_retries,
         require_gerund=require_gerund,
         candidate_limit=candidate_limit,
+        batch_size=batch_size,
+        concurrency=concurrency,
         model_name=model_name,
         sweep_model_name=sweep_name,
         prompt_log_path=str(prompt_log_path) if prompt_log_path else None,
@@ -413,11 +427,22 @@ def multi_seed_stability(
     return report
 
 
-def _validate_params(*, unit: str, sweep_every: int, top_k_codes: int, max_codes_per_passage: int, validation_retries: int) -> None:
+def _validate_params(
+    *,
+    unit: str,
+    sweep_every: int,
+    top_k_codes: int,
+    max_codes_per_passage: int,
+    validation_retries: int,
+    batch_size: int,
+    concurrency: int,
+) -> None:
     if unit not in UNITS:
         raise ValueError(f"unit must be one of {', '.join(UNITS)}. Got {unit!r}.")
     if sweep_every < 1:
         raise ValueError("sweep_every must be at least 1.")
+    if batch_size < 1 or concurrency < 1:
+        raise ValueError("batch_size and concurrency must be at least 1.")
     if top_k_codes < 0 or max_codes_per_passage < 1 or validation_retries < 0:
         raise ValueError("top_k_codes, max_codes_per_passage, and validation_retries are out of range.")
 
@@ -436,6 +461,8 @@ def _metadata(**kwargs: Any) -> dict:
         "temperature": kwargs["temperature"],
         "sweep_temperature": kwargs["sweep_temperature"],
         "parallel_documents": kwargs["parallel_documents"],
+        "batch_size": kwargs["batch_size"],
+        "concurrency": kwargs["concurrency"],
         "prompt_cache": kwargs["prompt_cache"],
         "api_key_provided": kwargs["api_key_provided"],
         "thread_id": kwargs["thread_id"],
@@ -455,6 +482,8 @@ def _metadata(**kwargs: Any) -> dict:
             "require_gerund": kwargs["require_gerund"],
             "retriever": kwargs["retriever"],
             "parallel_documents": kwargs["parallel_documents"],
+            "batch_size": kwargs["batch_size"],
+            "concurrency": kwargs["concurrency"],
         },
         "context": {
             "research_question": context.research_question,
