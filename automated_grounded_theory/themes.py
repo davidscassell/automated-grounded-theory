@@ -197,6 +197,8 @@ def assign_codes(
                 "definition": str(raw.get("definition") or "").strip(),
                 "properties": _clean_list(raw.get("properties")),
                 "codes": codes,
+                "rationale": str(raw.get("rationale") or "").strip()
+                or "These codes gather the same kind of incident.",
                 "confidence": confidence,
             }
         )
@@ -561,6 +563,9 @@ async def abuild_themes(
     limiter: CallLimiter | None = None,
 ) -> ThemeResult:
     """Async form of :func:`build_themes`."""
+    import time
+
+    started = time.perf_counter()
     _validate_theme_params(
         n_themes=n_themes,
         quotes_per_theme=quotes_per_theme,
@@ -737,6 +742,7 @@ async def abuild_themes(
                 theme_chunk=theme_chunk,
             ),
             "duplicate_decisions": duplicate_decisions,
+            "stage_seconds": {"themes": round(time.perf_counter() - started, 4)},
         },
         warnings=warnings,
     )
@@ -1155,7 +1161,7 @@ def _theme_duplicate_decisions(
                 "target": right,
                 "decision": "accept" if kept else "reject",
                 "reason": "hint_accepted" if kept else "model_rejected",
-                "rationale": rationale_for.get(pair, ""),
+                "rationale": rationale_for.get(pair, "") or "These themes were compared as one incident or as two.",
                 "confidence": confidence_for.get(pair, 1.0),
             }
         )
@@ -1167,7 +1173,7 @@ def _theme_duplicate_decisions(
                 "target": right,
                 "decision": "accept",
                 "reason": "model_proposed",
-                "rationale": rationale_for.get(pair, ""),
+                "rationale": rationale_for.get(pair, "") or "These themes were compared as one incident or as two.",
                 "confidence": confidence_for.get(pair, 1.0),
             }
         )
@@ -1589,6 +1595,7 @@ def _one_theme(
         "n_respondents": n_respondents,
         "pct_respondents": _pct(n_respondents, totals["n_respondents"]),
         "confidence": bounded_unit(theme.get("confidence"), 1.0),
+        "rationale": str(theme.get("rationale") or "").strip() or "These codes gather the same kind of incident.",
         "breakdowns": _breakdowns(passage_ids, passages_by_id),
         "quotes": (
             _select_quotes(
@@ -1711,7 +1718,14 @@ def _tensions(
         if not names or not (note or quote):
             continue
         kept.append(
-            {"themes": names, "note": note, "quote": quote, "passage_id": passage_id, "confidence": confidence}
+            {
+                "themes": names,
+                "note": note,
+                "quote": quote,
+                "passage_id": passage_id,
+                "confidence": confidence,
+                "rationale": str(raw.get("rationale") or note),
+            }
         )
     if dropped:
         warnings.append(

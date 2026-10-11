@@ -713,9 +713,9 @@ def test_orthogonal_embeddings_do_not_block_a_lexical_merge():
     )
     packing = [entry for entry in result.codebook if "packing" in entry["code"]]
     assert len(packing) == 1
-    assert result.sweep_log
-    assert result.sweep_log[-1]["candidates"]
-    assert result.sweep_log[-1]["candidate_method"] == "lexical+embedding"
+    with_candidates = [item for item in result.sweep_log if item.get("candidates")]
+    assert with_candidates
+    assert with_candidates[0]["candidate_method"] == "lexical+embedding"
 
 
 def test_model_proposed_merge_is_logged():

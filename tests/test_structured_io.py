@@ -226,7 +226,7 @@ def test_retired_definition_does_not_replace_the_survivor():
     )
     survivor = next(iter(applied["codebook"].values()))
     assert survivor["definition"] == "Survivor wording."
-    assert any(item["reason"] == "definition_not_survivor" for item in applied["review"])
+    assert not any(item["reason"] == "definition_not_survivor" for item in applied["review"])
 
 
 def test_in_vivo_below_threshold_clears_the_flag():

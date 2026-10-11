@@ -89,6 +89,8 @@ def open_code(
     review_mode: str = "document",
     review_below: float = 0.5,
     min_merge_confidence: float = 0.5,
+    max_merges_per_sweep: int = 12,
+    check_model: BaseChatModel | str | None = None,
     pipeline: bool = True,
     token_budget: int = 4000,
     prompt_cache: bool | None = None,
@@ -183,6 +185,8 @@ def open_code(
             review_mode=review_mode,
             review_below=review_below,
             min_merge_confidence=min_merge_confidence,
+            max_merges_per_sweep=max_merges_per_sweep,
+            check_model=check_model,
             pipeline=pipeline,
             token_budget=token_budget,
             candidate_limit=candidate_limit,
@@ -240,6 +244,8 @@ async def aopen_code(
     review_mode: str = "document",
     review_below: float = 0.5,
     min_merge_confidence: float = 0.5,
+    max_merges_per_sweep: int = 12,
+    check_model: BaseChatModel | str | None = None,
     pipeline: bool = True,
     token_budget: int = 4000,
     prompt_cache: bool | None = None,
@@ -272,6 +278,8 @@ async def aopen_code(
         min_merge_confidence=min_merge_confidence,
         request_timeout=request_timeout,
     )
+    if max_merges_per_sweep < 1:
+        raise ValueError("max_merges_per_sweep must be at least 1.")
     parsed_context = parse_context(context)
     documents = load_corpus(corpus)
     coder = resolve_chat_model(
@@ -295,6 +303,17 @@ async def aopen_code(
             model_kwargs=sweep_model_kwargs,
             timeout=request_timeout,
         )
+    checker = None
+    checker_name = ""
+    if check_model is not None and not (isinstance(check_model, str) and not str(check_model).strip()):
+        checker = resolve_chat_model(
+            check_model,
+            api_key=api_key,
+            temperature=0.0,
+            llm_seed=llm_seed,
+            timeout=request_timeout,
+        )
+        checker_name = describe_model(check_model if isinstance(check_model, str) else checker)
     embed_key = api_key if embeddings_api_key is None else embeddings_api_key
     embedding_model = resolve_embeddings(
         embeddings,
@@ -340,6 +359,8 @@ async def aopen_code(
         review_mode=review_mode,
         review_below=review_below,
         min_merge_confidence=min_merge_confidence,
+        max_merges_per_sweep=max_merges_per_sweep,
+        check_model=checker_name,
         pipeline=pipeline,
         token_budget=token_budget,
         prompt_cache=cache,
@@ -379,6 +400,8 @@ async def aopen_code(
         review_mode=review_mode,
         review_below=review_below,
         min_merge_confidence=min_merge_confidence,
+        max_merges_per_sweep=max_merges_per_sweep,
+        check_model=checker,
         pipeline=pipeline,
         token_budget=token_budget,
         candidate_limit=candidate_limit,
@@ -604,6 +627,8 @@ def _metadata(**kwargs: Any) -> dict:
         "review_mode": kwargs["review_mode"],
         "review_below": kwargs.get("review_below", 0.5),
         "min_merge_confidence": kwargs.get("min_merge_confidence", 0.5),
+        "max_merges_per_sweep": kwargs.get("max_merges_per_sweep", 12),
+        "check_model": kwargs.get("check_model") or "",
         "pipeline": kwargs["pipeline"],
         "token_budget": kwargs["token_budget"],
         "prompt_cache": kwargs["prompt_cache"],

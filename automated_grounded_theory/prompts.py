@@ -67,7 +67,10 @@ nearest_code_ids to their code_id values, and why_not_nearest to the property th
 incident has that the nearest code does not. \
 Do not mint a near-duplicate. Set valence to positive, negative, neutral, or mixed. \
 Praise and criticism are opposite stances and must not share a code. Set confidence \
-from 0 to 1 on the action, on in_vivo, and on the memo.
+from 0 to 1 on the action, on in_vivo, and on the memo. Anchors: 0.2 thin or \
+contradictory evidence, 0.5 plausible, 0.8 the quotes support it, 0.95 the quotes \
+show it directly. Write a rationale of one to three sentences for the action, for \
+in_vivo, and for the memo.
 
 Definitions name a property that could apply to another incident. Do not put respondent \
 attributes (name, role, department, tenure, site) or the question wording into a label \
@@ -113,10 +116,15 @@ in merges. Put a hint you reject in rejections, with that pair_id and a rational
 Do not omit a hinted pair. Do not reject a pair that was not hinted. Also propose \
 every other duplicate pair you find in this chunk, each with a rationale. Do not \
 merge codes that merely share a verb, a topic, or a sensitizing concept. When you \
-merge, keep the clearer and more specific label as the target and name the other \
-code as the source. Never merge a positive code with a negative code. The survivor \
-keeps its own label and its own definition. Do not paste one code's definition onto \
-another. Set confidence from 0 to 1 on every merge, rejection, and definition update.
+merge only when the codes share the same action, the same object, and the same \
+stance. Set same_action, same_object, and same_stance on every merge and rejection. \
+Keep the clearer label as the target and name the other code as the source. Never \
+merge a positive code with a negative code. Record source_valence and target_valence. \
+On each accept, set rewritten_label and rewritten_definition from the member quotes, \
+and set quote_fits for each example quote (fits false when a quote should be split \
+back out). Set confidence from 0 to 1. Anchors: 0.2 thin or contradictory, 0.5 \
+plausible, 0.8 the quotes support it, 0.95 the quotes show it directly. Write a \
+rationale of one to three sentences on every merge, rejection, and definition.
 
 Sharpen definitions so each one says what incident the code captures, in words that \
 could apply to another respondent. Do not put a person's department, tenure, role, \
@@ -345,6 +353,7 @@ def build_sweep_messages(
     all_codes: Sequence[Mapping[str, Any]] | None = None,
     chunk_index: int = 1,
     chunk_count: int = 1,
+    consolidation: bool = False,
 ) -> list:
     by_label = {code_key(str(entry.get("code") or "")): stable_code_id(entry) for entry in list(codes) + list(all_codes or [])}
     hints = []
@@ -364,10 +373,18 @@ def build_sweep_messages(
                 method=str(item.get("method") or ""),
             )
         )
+    note = (
+        "Merge only when same action, same object, and same stance all hold. "
+        "Rewrite the survivor label and definition from the member quotes in this same response."
+    )
+    if consolidation:
+        note += " This is the final consolidation pass over the full codebook, in sorted order."
+    if not hints:
+        note += " No similarity hints. Read every code and propose duplicates yourself."
     request = SweepRequest(
         chunk_index=chunk_index,
         chunk_count=chunk_count,
-        note="" if hints else "No similarity hints. Read every code and propose duplicates yourself.",
+        note=note,
         codes=[code_input(entry) for entry in codes],
         label_index=[code_input(entry) for entry in (all_codes or [])] if chunk_count > 1 else [],
         hints=hints,
@@ -663,6 +680,98 @@ def _system_message(text: str, *, prompt_cache: bool) -> SystemMessage:
             }
         ]
     )
+
+
+def build_leak_messages(*, context: ResearchContext, labels: Sequence[Mapping[str, Any]], prompt_cache: bool) -> list:
+    """Cheap check: does a label restate the research context?"""
+    payload = {
+        "note": (
+            "leaks is true when the label could have been written from the research context alone. "
+            "If leaks is true, set reworded_label from the participant's words. "
+            "Set confidence with anchors 0.2, 0.5, 0.8, 0.95 and a one to three sentence rationale."
+        ),
+        "labels": [
+            {"code_id": str(item.get("code_id") or ""), "label": str(item.get("code") or item.get("label") or "")}
+            for item in labels
+        ],
+    }
+    system = (
+        "You check code labels for context leakage. "
+        "A leak restates the research question, population, setting, or a sensitizing concept. "
+        "A grounded label uses the participant's words. "
+        "Set confidence and a rationale on every check.\n\n" + render_context(context)
+    )
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=json.dumps(payload, indent=2))]
+
+
+def build_quote_fit_messages(*, context: ResearchContext, codes: Sequence[Mapping[str, Any]], prompt_cache: bool) -> list:
+    """Cheap check: which quotes do not fit a rewritten code."""
+    payload = {
+        "note": (
+            "For each quote, fits is false when it is a different incident from the label and definition. "
+            "Set split_to to the better label when you know one. "
+            "Set confidence with anchors 0.2, 0.5, 0.8, 0.95 and a one to three sentence rationale."
+        ),
+        "codes": [
+            {
+                "code_id": str(item.get("code_id") or ""),
+                "label": str(item.get("label") or ""),
+                "quotes": list(item.get("quotes") or []),
+            }
+            for item in codes
+        ],
+    }
+    system = (
+        "You check whether each quote still fits its code after a merge. "
+        "Split a quote out only when it names a different action, object, or stance. "
+        "Set confidence and a rationale on every check.\n\n" + render_context(context)
+    )
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=json.dumps(payload, indent=2))]
+
+
+MAPPING_SYSTEM = """You compare one coder's labels with another coder's labels.
+
+The human codes are the reference. For each LLM code, copy the human code that \
+names the same incident, or leave human_code empty when no human code does. Do \
+not invent a human code. Do not map on a shared topic alone: the action, the \
+object, and the stance have to match. Set confidence from 0 to 1. Anchors: 0.2 \
+thin or contradictory, 0.5 plausible, 0.8 the definitions support it, 0.95 the \
+labels show the same incident directly. Write a rationale of one to three \
+sentences on every row. Set theme only when the human code list names one."""
+
+
+def build_code_match_messages(
+    *,
+    llm_codes: Sequence[Mapping[str, Any]],
+    human_codes: Sequence[Mapping[str, Any]],
+    prompt_cache: bool = False,
+) -> list:
+    """Stable system prefix. The two code lists stay in the user JSON."""
+    payload = {
+        "note": (
+            "Map each llm_code onto one human_code, or leave human_code empty when the LLM code is novel. "
+            "Copy labels exactly."
+        ),
+        "human_codes": [
+            {
+                "code": str(item.get("code") or item.get("label") or ""),
+                "definition": str(item.get("definition") or ""),
+                "theme": str(item.get("theme") or ""),
+            }
+            for item in human_codes
+        ],
+        "llm_codes": [
+            {
+                "code": str(item.get("code") or item.get("label") or item or ""),
+                "definition": str(item.get("definition") or "") if isinstance(item, Mapping) else "",
+            }
+            for item in llm_codes
+        ],
+    }
+    return [
+        _system_message(MAPPING_SYSTEM, prompt_cache=prompt_cache),
+        HumanMessage(content=json.dumps(payload, indent=2)),
+    ]
 
 
 def message_text(message: Any) -> str:

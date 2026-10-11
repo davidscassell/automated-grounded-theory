@@ -15,6 +15,13 @@ class _LLMModel(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
+CONFIDENCE_HELP = (
+    "Confidence from 0 to 1. Anchors: 0.2 thin or contradictory evidence, "
+    "0.5 plausible, 0.8 the quotes support it, 0.95 the quotes show it directly."
+)
+RATIONALE_HELP = "One to three sentences explaining this decision. Do not leave this empty."
+
+
 class CodeProposal(_LLMModel):
     """One incident coded against the running codebook."""
 
@@ -63,10 +70,7 @@ class CodeProposal(_LLMModel):
             "phrase before leaving this false. False when the label is a gerund you composed."
         ),
     )
-    rationale: str = Field(
-        default="",
-        description="At most 12 words on why this code fits. Not a summary of the passage.",
-    )
+    rationale: str = Field(default="", description=RATIONALE_HELP)
     code_id: str = Field(
         default="",
         description="code_id of an existing code for reuse or refine. Empty when creating.",
@@ -79,13 +83,17 @@ class CodeProposal(_LLMModel):
         default=1.0,
         ge=0.0,
         le=1.0,
-        description="Confidence in this reuse, refine, or create action.",
+        description=CONFIDENCE_HELP + " This score is for the reuse, refine, or create action.",
     )
     in_vivo_confidence: float = Field(
         default=1.0,
         ge=0.0,
         le=1.0,
-        description="Confidence that the in_vivo flag is correct for this quote.",
+        description=CONFIDENCE_HELP + " This score is for the in_vivo flag.",
+    )
+    in_vivo_rationale: str = Field(
+        default="",
+        description="One to three sentences on why the in_vivo flag is true or false.",
     )
     valence: Literal["positive", "negative", "neutral", "mixed"] = Field(
         default="neutral",
@@ -115,7 +123,7 @@ class PassageCoding(_LLMModel):
         default=1.0,
         ge=0.0,
         le=1.0,
-        description="Confidence in the memo. Use 1 when the memo is empty.",
+        description=CONFIDENCE_HELP + " Use 0.95 when the memo is empty.",
     )
     low_confidence: bool = Field(
         default=False,
@@ -137,15 +145,33 @@ class MergeDecision(_LLMModel):
     )
     source: str = Field(description="Label to fold into the target. This label is retired.")
     target: str = Field(description="Label that remains. Prefer the clearer, more specific gerund.")
-    rationale: str = Field(
-        default="",
-        description="Why these codes name the same incident. Required on every merge.",
+    rationale: str = Field(default="", description=RATIONALE_HELP)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0, description=CONFIDENCE_HELP)
+    same_action: bool | None = Field(
+        default=None,
+        description="True when both codes name the same action (for example criticizing, or praising).",
     )
-    confidence: float = Field(
-        default=1.0,
-        ge=0.0,
-        le=1.0,
-        description="Confidence that these codes should merge.",
+    same_object: bool | None = Field(
+        default=None,
+        description="True when both codes are about the same object (for example rollout training, not promotion).",
+    )
+    same_stance: bool | None = Field(
+        default=None,
+        description="True when both codes take the same stance. Never true for positive paired with negative.",
+    )
+    source_valence: str = Field(default="", description="positive, negative, neutral, or mixed for the source code.")
+    target_valence: str = Field(default="", description="positive, negative, neutral, or mixed for the target code.")
+    rewritten_label: str = Field(
+        default="",
+        description="Label for the survivor, written from the member quotes. Empty to keep the survivor label.",
+    )
+    rewritten_definition: str = Field(
+        default="",
+        description="Definition for the survivor, written from the member quotes. Empty to keep the survivor definition.",
+    )
+    quote_fits: list["QuoteFit"] = Field(
+        default_factory=list,
+        description="One row per member quote. fits false means the quote should be split back out.",
     )
 
 
@@ -158,25 +184,21 @@ class MergeRejection(_LLMModel):
     target_id: str = Field(default="", description="code_id of the other hinted code.")
     source: str = Field(description="One label from a candidate pair. Copy it exactly.")
     target: str = Field(description="The other label from that candidate pair. Copy it exactly.")
-    rationale: str = Field(default="", description="Why these are different incidents.")
-    confidence: float = Field(
-        default=1.0,
-        ge=0.0,
-        le=1.0,
-        description="Confidence that these codes should stay separate.",
-    )
+    rationale: str = Field(default="", description=RATIONALE_HELP)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0, description=CONFIDENCE_HELP)
+    same_action: bool | None = None
+    same_object: bool | None = None
+    same_stance: bool | None = None
+    source_valence: str = ""
+    target_valence: str = ""
 
 
 class DefinitionUpdate(_LLMModel):
     code_id: str = Field(default="", description="code_id of the code whose definition changes.")
     code: str = Field(default="", description="Label of that code. Copy it exactly.")
     definition: str = ""
-    confidence: float = Field(
-        default=1.0,
-        ge=0.0,
-        le=1.0,
-        description="Confidence in this definition refinement.",
-    )
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0, description=CONFIDENCE_HELP)
+    rationale: str = Field(default="", description=RATIONALE_HELP)
 
 
 class MergeCheck(_LLMModel):
@@ -190,13 +212,11 @@ class MergeCheck(_LLMModel):
     action: Literal["accept", "reject"] = Field(
         description="accept only when both codes name the same incident and the same stance."
     )
-    rationale: str = Field(default="", description="Why this merge should stand or fail.")
-    confidence: float = Field(
-        default=1.0,
-        ge=0.0,
-        le=1.0,
-        description="Confidence in this accept or reject of the proposed merge.",
-    )
+    rationale: str = Field(default="", description=RATIONALE_HELP)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0, description=CONFIDENCE_HELP)
+    same_action: bool | None = None
+    same_object: bool | None = None
+    same_stance: bool | None = None
 
 
 class MergeCheckBatch(_LLMModel):
@@ -205,21 +225,54 @@ class MergeCheckBatch(_LLMModel):
     checks: list[MergeCheck] = Field(default_factory=list)
 
 
+class QuoteFit(_LLMModel):
+    """Whether one member quote still belongs under the rewritten code."""
+
+    code_id: str = Field(default="", description="code_id of the code this quote is currently under.")
+    quote: str = Field(default="", description="The quote, copied exactly.")
+    fits: bool = Field(default=True, description="False when this quote is a different incident from the rewritten code.")
+    split_to: str = Field(
+        default="",
+        description="Label to move the quote back to when fits is false. Empty to restore its previous code.",
+    )
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0, description=CONFIDENCE_HELP)
+    rationale: str = Field(default="", description=RATIONALE_HELP)
+
+
+class QuoteFitBatch(_LLMModel):
+    checks: list[QuoteFit] = Field(default_factory=list)
+
+
+class LeakCheck(_LLMModel):
+    """Whether a label mostly restates the research context."""
+
+    code_id: str = ""
+    label: str = ""
+    leaks: bool = True
+    reworded_label: str = Field(
+        default="",
+        description="A participant-grounded label when leaks is true. Empty when the label is already grounded.",
+    )
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0, description=CONFIDENCE_HELP)
+    rationale: str = Field(default="", description=RATIONALE_HELP)
+
+
+class LeakCheckBatch(_LLMModel):
+    checks: list[LeakCheck] = Field(default_factory=list)
+
+
 class DefinitionRewrite(_LLMModel):
-    """A survivor definition rewritten from the quotes now gathered under that code."""
+    """A survivor label and definition rewritten from the quotes now gathered under that code."""
 
     code_id: str = Field(default="", description="code_id of the surviving code. Copy it from the input.")
-    code: str = Field(default="", description="Label of the surviving code. Copy it exactly. Do not rename it.")
+    code: str = Field(default="", description="Current label. Copy it, or replace it with rewritten_label.")
+    rewritten_label: str = Field(default="", description="Label written from the member quotes. Empty to keep code.")
     definition: str = Field(
         default="",
-        description="What incident the surviving code captures, written from the quotes. Not another code's definition.",
+        description="What incident the surviving code captures, written from the quotes.",
     )
-    confidence: float = Field(
-        default=1.0,
-        ge=0.0,
-        le=1.0,
-        description="Confidence in this definition rewritten from the merged quotes.",
-    )
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0, description=CONFIDENCE_HELP)
+    rationale: str = Field(default="", description=RATIONALE_HELP)
 
 
 class DefinitionRewriteBatch(_LLMModel):
@@ -259,12 +312,8 @@ class ThemeProposal(_LLMModel):
         default_factory=list,
         description="Open-code labels in this theme. Copy each label exactly. Every code belongs to one theme.",
     )
-    confidence: float = Field(
-        default=1.0,
-        ge=0.0,
-        le=1.0,
-        description="Confidence in this theme and in assigning these codes to it.",
-    )
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0, description=CONFIDENCE_HELP)
+    rationale: str = Field(default="", description=RATIONALE_HELP)
 
 
 class ThemeTension(_LLMModel):
@@ -283,12 +332,8 @@ class ThemeTension(_LLMModel):
         default="",
         description="passage_id of that example when the input shows one. Otherwise empty.",
     )
-    confidence: float = Field(
-        default=1.0,
-        ge=0.0,
-        le=1.0,
-        description="Confidence that this tension is in the data.",
-    )
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0, description=CONFIDENCE_HELP)
+    rationale: str = Field(default="", description=RATIONALE_HELP)
 
 
 class ThemeNegative(_LLMModel):
@@ -323,7 +368,7 @@ class ThemeGroup(_LLMModel):
         default=1.0,
         ge=0.0,
         le=1.0,
-        description="Confidence that these themes are duplicates, or 1 when the theme stands alone.",
+        description=CONFIDENCE_HELP + " For a theme that stands alone, use 0.95.",
     )
 
 
@@ -523,3 +568,25 @@ class RewriteRequest(_LLMModel):
 
     note: str = ""
     codes: list[RewriteCodeInput] = Field(default_factory=list)
+
+
+class CodeMatch(_LLMModel):
+    """One LLM code judged against the human codebook."""
+
+    llm_code: str = Field(description="An LLM code label, copied exactly.")
+    human_code: str = Field(
+        default="",
+        description="The human code that names the same incident. Empty when the LLM code is novel.",
+    )
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0, description=CONFIDENCE_HELP)
+    rationale: str = Field(default="", description=RATIONALE_HELP)
+    theme: str = Field(default="", description="Human theme name when the human code sits under one. Empty otherwise.")
+
+
+class CodeMatchBatch(_LLMModel):
+    """A mapping from LLM codes to human codes."""
+
+    matches: list[CodeMatch] = Field(default_factory=list)
+
+
+MergeDecision.model_rebuild()

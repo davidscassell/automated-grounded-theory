@@ -151,6 +151,11 @@ def result_from_state(
 ) -> OpenCodeResult:
     points = list(state.get("saturation") or [])
     passages = sorted(state.get("passages") or [], key=lambda item: item.get("coding_order", 0))
+    metadata = dict(state.get("metadata") or {})
+    if state.get("stage_seconds"):
+        metadata["stage_seconds"] = {
+            key: round(float(value), 4) for key, value in dict(state.get("stage_seconds") or {}).items()
+        }
     return OpenCodeResult(
         codebook=codebook_list(state.get("codebook") or {}),
         segments=list(state.get("segments") or []),
@@ -161,7 +166,7 @@ def result_from_state(
         validation_log=list(state.get("validation_log") or []),
         sweep_log=list(state.get("sweep_log") or []),
         prompt_log=list(state.get("prompt_log") or []),
-        metadata=dict(state.get("metadata") or {}),
+        metadata=metadata,
         warnings=list(state.get("warnings") or []),
         ops=list(state.get("ops") or []),
         review=list(state.get("review") or []),

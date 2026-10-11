@@ -116,6 +116,9 @@ async def aevaluate(
     """Async form of :func:`evaluate_run`."""
     if concurrency < 1 or judge_limit < 1 or max_retries < 0:
         raise ValueError("concurrency and judge_limit must be at least 1, and max_retries at least 0.")
+    import time
+
+    started = time.perf_counter()
     run = _load_run(source)
     context_text = _context_text(context, run)
     metrics = _score(run, context_text)
@@ -138,6 +141,7 @@ async def aevaluate(
         )
     if model is None:
         metrics["chen_metrics"] = chen_metrics(books) if len(books) >= 2 else _CHEN_NOTE
+        metrics.setdefault("stage_seconds", {})["eval"] = round(time.perf_counter() - started, 4)
         return metrics
     coder = resolve_chat_model(model, api_key=api_key, temperature=temperature, llm_seed=llm_seed)
     limiter = CallLimiter(concurrency, max_retries=max_retries, backoff=retry_backoff, max_backoff=retry_max_backoff)
@@ -161,6 +165,7 @@ async def aevaluate(
         "same_cross": sum(1 for row in cross_rows if row["same"]),
         "same_within": sum(1 for row in within_rows if row["same"]),
     }
+    metrics.setdefault("stage_seconds", {})["eval"] = round(time.perf_counter() - started, 4)
     return metrics
 
 
@@ -532,6 +537,8 @@ def _score(run: Mapping[str, Any], context_text: str) -> dict:
     metrics["confidence"] = _confidence_distribution(segment_confidence, review_below)
     metrics["confidence_merges"] = _confidence_distribution(_confidence_values(merge_confidence), review_below)
     metrics["review_below"] = review_below
+    metrics["consistency"] = _consistency(run)
+    metrics["definition_not_survivor"] = metrics["consistency"]["definition_not_survivor"]
     metrics["sweeps"] = len(sweeps)
     metrics["merge_candidates"] = sum(len(item.get("candidates") or []) for item in sweeps)
     metrics["merges_accepted"] = sum(len(item.get("accepted_merges") or []) for item in sweeps)
@@ -578,6 +585,24 @@ def _confidence_values(values) -> list[float]:
         if number == number:
             scores.append(number)
     return scores
+
+
+def _consistency(run: Mapping[str, Any]) -> dict:
+    """Post-merge consistency: retired-code definitions should not pile up on the review list."""
+    review = list(run.get("review") or [])
+    checked = 0
+    split = 0
+    for sweep in run.get("sweep_log") or []:
+        review.extend(sweep.get("review") or [])
+        checked += int(sweep.get("quotes_checked") or 0)
+        split += int(sweep.get("quotes_split") or 0)
+    survivor = sum(1 for item in review if str(item.get("reason") or "") == "definition_not_survivor")
+    return {
+        "definition_not_survivor": survivor,
+        "quotes_checked": checked,
+        "quotes_split": split,
+        "quote_fit_rate": round(1.0 - (split / checked), 4) if checked else None,
+    }
 
 
 def _confidence_distribution(values: Sequence[float], review_below: float) -> dict | None:

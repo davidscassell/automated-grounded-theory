@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +24,8 @@ from typing_extensions import TypedDict
 from automated_grounded_theory.async_support import ainvoke_structured, is_transient
 from automated_grounded_theory.batching import pack_indices
 from automated_grounded_theory.codebook import (
+    agreement_confidence,
+    apply_post_merge,
     apply_sweep,
     commit_passage,
     empty_counters,
@@ -30,6 +33,7 @@ from automated_grounded_theory.codebook import (
     interpret_coding,
     remember_pair_decisions,
     replay_accepted_pairs,
+    trivial_merges,
     union_codebooks,
 )
 from automated_grounded_theory.context import ResearchContext
@@ -56,9 +60,16 @@ from automated_grounded_theory.retrieval import (
     hint_pairs,
     select_prompt_codes,
 )
-from automated_grounded_theory.validation import code_key, context_term_set
+from automated_grounded_theory.validation import code_key, context_term_set, label_restates_context
 from automated_grounded_theory.saturation import saturation_point
-from automated_grounded_theory.schemas import BatchCoding, DefinitionRewriteBatch, MergeCheckBatch, SweepCoding
+from automated_grounded_theory.schemas import (
+    BatchCoding,
+    DefinitionRewriteBatch,
+    LeakCheckBatch,
+    MergeCheckBatch,
+    QuoteFitBatch,
+    SweepCoding,
+)
 from automated_grounded_theory.segment import plan_coding
 
 logger = logging.getLogger("automated_grounded_theory")
@@ -92,6 +103,8 @@ class CodingState(TypedDict, total=False):
     ops: list[dict]
     review: list[dict]
     pair_decisions: list[dict]
+    consolidated: bool
+    stage_seconds: dict
 
 
 @dataclass
@@ -119,6 +132,8 @@ class RunConfig:
     review_mode: str = "document"
     review_below: float = 0.5
     min_merge_confidence: float = 0.5
+    max_merges_per_sweep: int = 12
+    check_model: Any = None
     pipeline: bool = True
     token_budget: int = 4000
     model_name: str = ""
@@ -181,6 +196,8 @@ def initial_state(documents: list[LoadedDocument], metadata: dict) -> CodingStat
         "ops": [],
         "review": [],
         "pair_decisions": [],
+        "consolidated": False,
+        "stage_seconds": {},
     }
 
 
@@ -191,6 +208,7 @@ def build_graph(runtime: RunConfig):
     builder.add_node("code_passage", _code_node(runtime))
     builder.add_node("validate_passage", _validate_node(runtime))
     builder.add_node("sweep", _sweep_node(runtime))
+    builder.add_node("consolidate", _sweep_node(runtime, consolidation=True))
     builder.add_node("export", _export_node(runtime))
     builder.add_edge(START, "segment_and_shuffle")
     builder.add_conditional_edges(
@@ -207,8 +225,9 @@ def build_graph(runtime: RunConfig):
     builder.add_conditional_edges(
         "sweep",
         _route_after_sweep,
-        {"code_passage": "code_passage", "export": "export"},
+        {"code_passage": "code_passage", "consolidate": "consolidate", "export": "export"},
     )
+    builder.add_edge("consolidate", "export")
     builder.add_edge("export", END)
     return builder
 
@@ -250,6 +269,8 @@ def _route_after_validate(state: CodingState) -> str:
 def _route_after_sweep(state: CodingState) -> str:
     if _remaining(state):
         return "code_passage"
+    if not state.get("consolidated") and len(state.get("codebook") or {}) >= 2:
+        return "consolidate"
     return "export"
 
 
@@ -298,12 +319,17 @@ def _segment_node(state: CodingState) -> dict:
 
 def _code_node(runtime: RunConfig):
     async def code_passage(state: CodingState) -> dict:
+        started = time.perf_counter()
         jobs = _wave(state, runtime)
         if not jobs:
-            return {"pending": []}
-
-        rows = await _pending_rows(runtime, state, jobs)
-        return {"pending": rows}
+            update: dict = {"pending": []}
+        else:
+            rows = await _pending_rows(runtime, state, jobs)
+            update = {"pending": rows}
+        timing = dict(state.get("stage_seconds") or {})
+        timing["coding"] = round(float(timing.get("coding") or 0) + time.perf_counter() - started, 4)
+        update["stage_seconds"] = timing
+        return update
 
     return code_passage
 
@@ -450,6 +476,8 @@ async def _code_batch(runtime: RunConfig, passages: list[dict], codebook: dict) 
             else:
                 done[passage_id] = (coding, errors[passage_id])
         pending = still_pending
+    if runtime.check_model is not None:
+        await _annotate_leaks(runtime, done)
     for passage in passages:
         passage_id = str(passage.get("passage_id"))
         done.setdefault(passage_id, ({"passage_id": passage_id, "codes": [], "memo": ""}, errors[passage_id]))
@@ -726,8 +754,21 @@ def _resync(codebook: dict, segments: list[dict]) -> dict:
     return sync_counts(codebook, segments)
 
 
-def _sweep_node(runtime: RunConfig):
+def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
     async def sweep(state: CodingState) -> dict:
+        started = time.perf_counter()
+        extras = {"rewrites": 0.0}
+
+        def finish(update: dict) -> dict:
+            timing = dict(state.get("stage_seconds") or {})
+            elapsed = time.perf_counter() - started
+            timing["sweeps"] = round(float(timing.get("sweeps") or 0) + elapsed, 4)
+            timing["rewrites"] = round(float(timing.get("rewrites") or 0) + extras["rewrites"], 4)
+            if consolidation:
+                timing["consolidation"] = round(float(timing.get("consolidation") or 0) + elapsed, 4)
+            update["stage_seconds"] = timing
+            update["consolidated"] = True if consolidation else bool(state.get("consolidated"))
+            return update
         codebook = dict(state.get("codebook") or {})
         if state.get("parallel") and state.get("branch_codebooks"):
             codebook = union_codebooks(list(state["branch_codebooks"].values()))
@@ -773,17 +814,19 @@ def _sweep_node(runtime: RunConfig):
                     "text": "Sweep skipped: the codebook is empty.",
                 }
             )
-            return _sweep_update(
-                state,
-                codebook=codebook,
-                segments=segments,
-                memos=memos,
-                counters=counters,
-                saturation=list(state.get("saturation") or []) + [_point(codebook)],
-                sweep_log=sweep_log
-                + [{"sweep_index": sweep_index, "candidates": [], "accepted_merges": [], "rejected_merges": []}],
-                prompt_log=_take_prompts(runtime, state),
-                warnings=list(state.get("warnings") or []),
+            return finish(
+                _sweep_update(
+                    state,
+                    codebook=codebook,
+                    segments=segments,
+                    memos=memos,
+                    counters=counters,
+                    saturation=list(state.get("saturation") or []) + [_point(codebook)],
+                    sweep_log=sweep_log
+                    + [{"sweep_index": sweep_index, "candidates": [], "accepted_merges": [], "rejected_merges": []}],
+                    prompt_log=_take_prompts(runtime, state),
+                    warnings=list(state.get("warnings") or []),
+                )
             )
 
         code_task = None
@@ -794,7 +837,9 @@ def _sweep_node(runtime: RunConfig):
         codes = comparison_order(list(codebook.values()))
         frozen = frozen_pair_keys(list(state.get("pair_decisions") or []), codebook)
         try:
-            parsed, candidates, chunk_count = await _sweep_chunks(runtime, codes, sweep_index, frozen=frozen)
+            parsed, candidates, chunk_count = await _sweep_chunks(
+                runtime, codes, sweep_index, frozen=frozen, consolidation=consolidation
+            )
             overlap_pending: list = []
             if code_task is not None:
                 overlap_pending = await code_task
@@ -822,8 +867,29 @@ def _sweep_node(runtime: RunConfig):
             frozenset((code_key(str(item.get("source") or "")), code_key(str(item.get("target") or ""))))
             for item in replay
         }
+        def _stamp(merge) -> dict:
+            row = dict(merge)
+            agreed = agreement_confidence(row)
+            row["model_confidence"] = row.get("confidence", 1.0)
+            if agreed is not None:
+                row["agreement_confidence"] = agreed
+            elif row.get("agreement_confidence") is None:
+                row["agreement_confidence"] = row["model_confidence"]
+            source_key = code_key(str(row.get("source") or ""))
+            target_key = code_key(str(row.get("target") or ""))
+            if not row.get("source_valence"):
+                row["source_valence"] = str(codebook.get(source_key, {}).get("valence") or "")
+            if not row.get("target_valence"):
+                row["target_valence"] = str(codebook.get(target_key, {}).get("valence") or "")
+            if not str(row.get("rationale") or "").strip():
+                row["rationale"] = (
+                    "The sweep judged this pair with the same-action, same-object, same-stance rubric."
+                )
+            return row
+
         proposed = []
         already = []
+        seen_pairs: set[frozenset[str]] = set()
         for merge in parsed.get("merges") or []:
             pair = frozenset(
                 (code_key(str(merge.get("source") or "")), code_key(str(merge.get("target") or "")))
@@ -831,20 +897,31 @@ def _sweep_node(runtime: RunConfig):
             if pair in replay_pairs:
                 continue
             if pair in frozen:
-                already.append({**dict(merge), "reason": "already_decided", "confidence": merge.get("confidence", 1.0)})
+                already.append(
+                    {
+                        **dict(merge),
+                        "reason": "already_decided",
+                        "decision": "reject",
+                        "confidence": merge.get("confidence", 1.0),
+                        "rationale": merge.get("rationale")
+                        or "This pair was already decided in this run, and neither definition has changed in substance.",
+                    }
+                )
             else:
-                proposed.append(merge)
-        verified, verify_rejected = await _verify_proposed_merges(
-            runtime,
-            codebook,
-            proposed,
-            sweep_index,
-        )
-        verify_rejected = list(already) + list(verify_rejected)
+                proposed.append(_stamp(merge))
+                seen_pairs.add(pair)
+        for merge in trivial_merges(list(codebook.values()), frozen):
+            pair = frozenset((code_key(str(merge.get("source") or "")), code_key(str(merge.get("target") or ""))))
+            if pair in seen_pairs or pair in replay_pairs:
+                continue
+            proposed.append(merge)
+            seen_pairs.add(pair)
+        pre_segments = list(segments)
+        rewrite_started = time.perf_counter()
         applied = apply_sweep(
             codebook,
             segments,
-            merges=list(verified) + replay,
+            merges=list(proposed) + [_stamp(item) for item in replay],
             candidates=candidates,
             definitions=list(parsed.get("definitions") or []),
             overloaded=list(parsed.get("overloaded_codes") or []),
@@ -852,20 +929,36 @@ def _sweep_node(runtime: RunConfig):
             min_merge_confidence=runtime.min_merge_confidence,
             review_below=runtime.review_below,
             frozen_pairs=frozen - replay_pairs,
+            max_merges_per_sweep=runtime.max_merges_per_sweep,
         )
-        applied["rejected_merges"] = list(verify_rejected) + list(applied.get("rejected_merges") or [])
-        if applied["accepted_merges"]:
-            rewritten, rewrite_ops = await _rewrite_survivor_definitions(
-                runtime,
-                applied["codebook"],
-                applied["segments"],
-                applied["accepted_merges"],
-                pre_merge_book,
-                sweep_index,
-            )
-            applied["codebook"] = rewritten
-            applied.setdefault("ops", []).extend(rewrite_ops)
-            applied.setdefault("review", []).extend(op for op in rewrite_ops if op.get("status") == "review")
+        applied["rejected_merges"] = list(already) + list(applied.get("rejected_merges") or [])
+        book, rows, post_ops, quote_stats = apply_post_merge(
+            applied["codebook"],
+            applied["segments"],
+            applied["accepted_merges"],
+            pre_merge_book,
+            pre_segments,
+        )
+        applied["codebook"] = book
+        applied["segments"] = rows
+        applied.setdefault("ops", []).extend(post_ops)
+        applied.setdefault("review", []).extend(op for op in post_ops if op.get("status") == "review")
+        if runtime.check_model is not None and applied["accepted_merges"] and quote_stats["quotes_checked"] == 0:
+            checked = await _check_quotes(runtime, applied["codebook"], applied["segments"], applied["accepted_merges"], sweep_index)
+            if checked:
+                book, rows, more_ops, extra = apply_post_merge(
+                    applied["codebook"],
+                    applied["segments"],
+                    checked,
+                    pre_merge_book,
+                    pre_segments,
+                )
+                applied["codebook"] = book
+                applied["segments"] = rows
+                applied.setdefault("ops", []).extend(more_ops)
+                quote_stats["quotes_checked"] += extra["quotes_checked"]
+                quote_stats["quotes_split"] += extra["quotes_split"]
+        extras["rewrites"] = time.perf_counter() - rewrite_started
         finalize_candidate_decisions(
             applied,
             candidates,
@@ -936,12 +1029,15 @@ def _sweep_node(runtime: RunConfig):
             "codes_sent": len(codes),
             "chunks": chunk_count,
             "review": list(applied.get("review") or []),
+            "consolidation": consolidation,
+            "quotes_checked": quote_stats["quotes_checked"],
+            "quotes_split": quote_stats["quotes_split"],
         }
         decision_rows = []
         for item in applied["accepted_merges"]:
             decision_rows.append({**item, "decision": "accept"})
         for item in applied["rejected_merges"]:
-            if item.get("reason") in {"unknown_or_same", "unknown_definition", "not_offered"}:
+            if item.get("reason") in {"unknown_or_same", "unknown_definition", "not_offered", "already_decided", "merge_cap"}:
                 continue
             decision_rows.append({**item, "decision": "reject"})
         pair_decisions = remember_pair_decisions(
@@ -990,7 +1086,7 @@ def _sweep_node(runtime: RunConfig):
             update["new_codes_since_sweep"] = int(overlap_state["new_codes_since_sweep"]) - new_before
             if not state.get("parallel"):
                 update["branch_codebooks"] = overlap_state["branch_codebooks"]
-        return update
+        return finish(update)
 
     return sweep
 
@@ -1164,6 +1260,83 @@ def _quotes_for(segments: list, key: str, limit: int = 6) -> list[str]:
         if len(quotes) >= limit:
             break
     return quotes
+
+
+async def _annotate_leaks(runtime: RunConfig, done: dict) -> None:
+    """Ask ``check_model`` whether flagged labels really restate the context."""
+    if runtime.check_model is None:
+        return
+    from automated_grounded_theory.prompts import build_leak_messages
+
+    labels = []
+    for coding, _errors in done.values():
+        for proposal in coding.get("codes") or []:
+            label = str(proposal.get("code") or "")
+            if label and label_restates_context(label, context_term_set(runtime.context)):
+                labels.append(proposal)
+    if not labels:
+        return
+    messages = build_leak_messages(context=runtime.context, labels=labels, prompt_cache=runtime.prompt_cache)
+    payload = await _ainvoke_structured(
+        runtime.check_model,
+        LeakCheckBatch,
+        messages,
+        kind="context_leak",
+        model_name="check",
+        passage_id="context-leak",
+        runtime=runtime,
+    )
+    by_label = {str(item.get("label") or "").casefold(): item for item in payload.get("checks") or []}
+    for proposal in labels:
+        check = by_label.get(str(proposal.get("code") or "").casefold())
+        if not check:
+            continue
+        proposal["context_leak_rationale"] = check.get("rationale") or ""
+        if not check.get("leaks", True):
+            proposal["context_leak_cleared"] = True
+        elif check.get("reworded_label"):
+            proposal["context_leak_reword"] = check.get("reworded_label")
+
+
+async def _check_quotes(runtime: RunConfig, codebook: dict, segments: list, accepted: list, sweep_index: int) -> list:
+    """Optional cheap model: which member quotes do not fit the merged code."""
+    from automated_grounded_theory.prompts import build_quote_fit_messages
+
+    rows = []
+    for merge in accepted:
+        source = code_key(str(merge.get("source") or ""))
+        target = code_key(str(merge.get("target") or ""))
+        survivor = source if source in codebook else target if target in codebook else ""
+        if not survivor:
+            continue
+        quotes = _quotes_for(segments, survivor)
+        if not quotes:
+            continue
+        rows.append({"code_id": codebook[survivor].get("code_id") or "", "label": codebook[survivor].get("code"), "quotes": quotes, "merge": merge})
+    if not rows:
+        return []
+    messages = build_quote_fit_messages(context=runtime.context, codes=rows, prompt_cache=runtime.prompt_cache)
+    payload = await _ainvoke_structured(
+        runtime.check_model,
+        QuoteFitBatch,
+        messages,
+        kind="quote_fit",
+        model_name="check",
+        passage_id=f"sweep-{sweep_index}-quotes",
+        runtime=runtime,
+    )
+    fits_by_code: dict[str, list] = {}
+    for check in payload.get("checks") or []:
+        fits_by_code.setdefault(str(check.get("code_id") or ""), []).append(check)
+    stamped = []
+    for row in rows:
+        fits = fits_by_code.get(str(row["code_id"]) or "")
+        if not fits:
+            continue
+        merge = dict(row["merge"])
+        merge["quote_fits"] = fits
+        stamped.append(merge)
+    return stamped
 
 
 async def _verify_proposed_merges(
@@ -1340,6 +1513,7 @@ async def _sweep_chunks(
     sweep_index: int,
     *,
     frozen: set[frozenset[str]] | None = None,
+    consolidation: bool = False,
 ) -> tuple[dict, list, int]:
     """Detect candidates, confirm merges, and refine definitions per chunk, concurrently.
 
@@ -1419,6 +1593,7 @@ async def _sweep_chunks(
             all_codes=codes if len(chunks) > 1 else None,
             chunk_index=index,
             chunk_count=len(chunks),
+            consolidation=consolidation,
         )
         try:
             payload = await _ainvoke_structured(

@@ -531,6 +531,32 @@ async def _close_async_http_clients() -> None:
             continue
     if closers:
         await asyncio.gather(*closers, return_exceptions=True)
+    import gc
+
+    gc.collect()
+    extra = []
+    for obj in gc.get_objects():
+        try:
+            cls = type(obj)
+            module = getattr(cls, "__module__", "")
+            name = getattr(cls, "__name__", "")
+        except Exception:
+            continue
+        if not isinstance(module, str) or not isinstance(name, str):
+            continue
+        if "httpx" not in module and "aiohttp" not in module and "httpcore" not in module:
+            continue
+        if "Client" not in name and "Session" not in name:
+            continue
+        close = getattr(obj, "aclose", None)
+        if not callable(close) or getattr(obj, "is_closed", False):
+            continue
+        try:
+            extra.append(close())
+        except Exception:
+            continue
+    if extra:
+        await asyncio.gather(*extra, return_exceptions=True)
 
 
 async def _run_and_close(coro):
@@ -538,6 +564,19 @@ async def _run_and_close(coro):
         return await coro
     finally:
         await _close_async_http_clients()
+
+
+def _loop_is_running() -> bool:
+    """True when this thread already has a running loop.
+
+    The check is finished before any new loop starts, so a later
+    ``Event loop is closed`` is not chained under ``no running event loop``.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
 
 
 def run_sync(coro):
@@ -548,13 +587,10 @@ def run_sync(coro):
     worker thread so the caller's loop is left alone.
     """
     wrapped = _run_and_close(coro)
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
+    if not _loop_is_running():
         try:
             return asyncio.run(wrapped)
         except BaseException as exc:
-            # get_running_loop() just failed. Do not chain that as the cause.
             raise exc from None
 
     outcome: dict[str, Any] = {}

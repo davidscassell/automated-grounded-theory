@@ -231,7 +231,15 @@ class FakeCoder(BaseChatModel):
             if "packing" in source.casefold() and "packing" in target.casefold():
                 if "up" in source.casefold() and "up" not in target.casefold():
                     source, target = target, source
-                merges.append(MergeDecision(source=source, target=target, rationale="Same packing incident."))
+                merges.append(
+                    MergeDecision(
+                        source=source,
+                        target=target,
+                        rationale="These packing labels name the same incident of bagging possessions before leaving.",
+                        rewritten_definition="Bagging and boxing possessions while leaving a place.",
+                        confidence=0.9,
+                    )
+                )
         return SweepCoding(
             merges=merges,
             definitions=[

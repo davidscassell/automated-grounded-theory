@@ -1,0 +1,23 @@
+[
+  {
+    "llm_code": "wanting better pay",
+    "human_code": "wanting better pay",
+    "confidence": 0.95,
+    "rationale": "Both codes name pay that is below what the work is worth.",
+    "theme": "Pay and benefits"
+  },
+  {
+    "llm_code": "having a manager who listens",
+    "human_code": "having a manager who listens",
+    "confidence": 0.8,
+    "rationale": "Both codes name a manager who hears the person out.",
+    "theme": "Leadership"
+  },
+  {
+    "llm_code": "naming a small perk",
+    "human_code": "",
+    "confidence": 0.2,
+    "rationale": "No human code covers a small perk, so this code is novel.",
+    "theme": "Perks"
+  }
+]
