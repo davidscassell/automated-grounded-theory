@@ -103,7 +103,9 @@ def test_reconcile_sweep_is_order_independent():
     backward = reconcile_sweep_parts([early, late])
     assert forward == backward
     assert forward["merges"] == [early["merges"][0]]
-    assert forward["definitions"] == [{"code": "alpha", "definition": "a longer definition wins"}]
+    assert forward["definitions"] == [
+        {"code": "alpha", "code_id": "", "definition": "a longer definition wins", "confidence": 1.0}
+    ]
 
 
 def test_reconcile_themes_keeps_the_earlier_chunk():

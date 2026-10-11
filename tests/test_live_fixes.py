@@ -74,7 +74,16 @@ class MergeTimeout(BaseChatModel):
             if schema_name == "ThemeMergePlan":
                 raise TimeoutError("deadline exceeded")
             text = "\n".join(message_text(message) for message in messages)
-            labels = re.findall(r"^CODE_LABEL: (.+)$", text, re.M)
+            from automated_grounded_theory.prompts import extract_payload
+
+            payload = extract_payload(text)
+            labels = [
+                str(item.get("label") or item.get("code") or "")
+                for item in (payload.get("codes") or [])
+                if item.get("label") or item.get("code")
+            ]
+            if not labels:
+                labels = re.findall(r"^CODE_LABEL: (.+)$", text, re.M)
             features: list[str] = []
             relationships: list[str] = []
             other: list[str] = []
@@ -608,7 +617,15 @@ def test_rejected_fold_stays_split():
                 self.call_count += 1
                 self.seen.append(schema_name)
                 text = "\n".join(message_text(message) for message in messages)
-                names = re.findall(r"^THEME_NAME: (.+)$", text, re.M)
+                from automated_grounded_theory.prompts import extract_payload
+
+                names = [
+                    str(item.get("name") or "")
+                    for item in (extract_payload(text).get("themes") or [])
+                    if item.get("name")
+                ]
+                if not names:
+                    names = re.findall(r"^THEME_NAME: (.+)$", text, re.M)
                 coding = ThemeMergePlan(
                     themes=[ThemeGroup(name=name, members=[name], definition="") for name in names]
                 )
@@ -726,6 +743,7 @@ def test_model_proposed_merge_is_logged():
             "decision": "accept",
             "reason": "model_proposed",
             "rationale": "Same pay incident.",
+            "confidence": 1.0,
         }
     ]
 
@@ -758,4 +776,4 @@ def test_sweep_with_no_hints_still_reviews_the_codebook():
     assert len(result.codebook) == 2
     assert any("no similarity hints" in warning for warning in result.warnings)
     assert any(item["kind"] == "sweep" for item in result.prompt_log)
-    assert "Read every CODE_LABEL" in json.dumps(result.prompt_log)
+    assert "Read every code" in json.dumps(result.prompt_log)

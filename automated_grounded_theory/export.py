@@ -206,6 +206,9 @@ def export_result(result, directory: str | Path) -> dict[str, str]:
             "examples",
             "first_seen",
             "flagged_overloaded",
+            "valence",
+            "confidence_mean",
+            "confidence_min",
         ],
         [
             [
@@ -218,6 +221,9 @@ def export_result(result, directory: str | Path) -> dict[str, str]:
                 _examples_cell(entry),
                 entry.get("first_seen"),
                 entry.get("flagged_overloaded"),
+                entry.get("valence") or "",
+                entry.get("confidence_mean"),
+                entry.get("confidence_min"),
             ]
             for entry in codes
         ],
@@ -260,7 +266,10 @@ def export_result(result, directory: str | Path) -> dict[str, str]:
             "doc_end",
             "in_vivo",
             "action",
+            "code_id",
             "confidence",
+            "in_vivo_confidence",
+            "valence",
             "needs_review",
             "review_reasons",
             "rationale",
@@ -280,7 +289,10 @@ def export_result(result, directory: str | Path) -> dict[str, str]:
                 item.get("doc_end"),
                 item.get("in_vivo"),
                 item.get("action"),
+                item.get("code_id"),
                 item.get("confidence"),
+                item.get("in_vivo_confidence"),
+                item.get("valence"),
                 item.get("needs_review"),
                 ";".join(item.get("review_reasons") or []),
                 item.get("rationale"),
@@ -333,6 +345,11 @@ def export_result(result, directory: str | Path) -> dict[str, str]:
             "new_codes_per_passage",
             "cumulative_passages",
             "cumulative_codes",
+            "new_codes_pre_merge",
+            "new_codes_post_merge",
+            "new_codes_per_passage_post_merge",
+            "cumulative_codes_pre_merge",
+            "cumulative_codes_post_merge",
         ],
         [
             [
@@ -342,6 +359,11 @@ def export_result(result, directory: str | Path) -> dict[str, str]:
                 point.get("new_codes_per_passage"),
                 point.get("cumulative_passages"),
                 point.get("cumulative_codes"),
+                point.get("new_codes_pre_merge", point.get("new_codes")),
+                point.get("new_codes_post_merge", point.get("new_codes")),
+                point.get("new_codes_per_passage_post_merge", point.get("new_codes_per_passage")),
+                point.get("cumulative_codes_pre_merge", point.get("cumulative_codes")),
+                point.get("cumulative_codes_post_merge", point.get("cumulative_codes")),
             ]
             for point in result.saturation
         ],
@@ -349,6 +371,8 @@ def export_result(result, directory: str | Path) -> dict[str, str]:
     _write_json(place("passages.json"), result.passages)
     _write_json(place("validation_log.json"), result.validation_log)
     _write_json(place("sweep_log.json"), result.sweep_log)
+    _write_json(place("ops.json"), list(getattr(result, "ops", []) or []))
+    _write_json(place("review.json"), list(getattr(result, "review", []) or []))
     _write_json(place("prompt_log.json"), result.prompt_log)
     metadata = dict(result.metadata)
     metadata["interrupted"] = result.interrupted

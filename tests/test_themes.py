@@ -179,6 +179,7 @@ def test_prevalence_quotes_breakdowns_and_exports(tmp_path):
         "pct_comments",
         "n_respondents",
         "pct_respondents",
+        "confidence",
     ]
     packed_row = next(row for row in rows if row["theme"] == "Packing to leave")
     assert packed_row["codes"] == "packing bags"

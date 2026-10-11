@@ -34,6 +34,8 @@ class OpenCodeResult:
     interrupted: bool = False
     thread_id: str = ""
     resumable: bool = False
+    ops: list[dict] = field(default_factory=list)
+    review: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -52,6 +54,8 @@ class OpenCodeResult:
             "interrupted": self.interrupted,
             "thread_id": self.thread_id,
             "resumable": self.resumable,
+            "ops": self.ops,
+            "review": self.review,
         }
 
     @classmethod
@@ -97,6 +101,8 @@ class OpenCodeResult:
                 "prompt_log": read("prompt_log.json", []),
                 "metadata": read("run_metadata.json", {}),
                 "warnings": [],
+                "ops": read("ops.json", []),
+                "review": read("review.json", []),
             }
         )
 
@@ -125,6 +131,8 @@ class OpenCodeResult:
             interrupted=bool(payload.get("interrupted") or False),
             thread_id=str(payload.get("thread_id") or ""),
             resumable=bool(payload.get("resumable") or False),
+            ops=list(payload.get("ops") or []),
+            review=list(payload.get("review") or []),
         )
 
 
@@ -155,6 +163,8 @@ def result_from_state(
         prompt_log=list(state.get("prompt_log") or []),
         metadata=dict(state.get("metadata") or {}),
         warnings=list(state.get("warnings") or []),
+        ops=list(state.get("ops") or []),
+        review=list(state.get("review") or []),
         export_paths=dict(export_paths or state.get("export_paths") or {}),
         interrupted=interrupted,
         thread_id=thread_id,

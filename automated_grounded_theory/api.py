@@ -87,6 +87,8 @@ def open_code(
     require_gerund: bool = False,
     candidate_limit: int = 30,
     review_mode: str = "document",
+    review_below: float = 0.5,
+    min_merge_confidence: float = 0.5,
     pipeline: bool = True,
     token_budget: int = 4000,
     prompt_cache: bool | None = None,
@@ -179,6 +181,8 @@ def open_code(
             validation_retries=validation_retries,
             require_gerund=require_gerund,
             review_mode=review_mode,
+            review_below=review_below,
+            min_merge_confidence=min_merge_confidence,
             pipeline=pipeline,
             token_budget=token_budget,
             candidate_limit=candidate_limit,
@@ -234,6 +238,8 @@ async def aopen_code(
     require_gerund: bool = False,
     candidate_limit: int = 30,
     review_mode: str = "document",
+    review_below: float = 0.5,
+    min_merge_confidence: float = 0.5,
     pipeline: bool = True,
     token_budget: int = 4000,
     prompt_cache: bool | None = None,
@@ -262,6 +268,8 @@ async def aopen_code(
         retry_backoff=retry_backoff,
         review_mode=review_mode,
         token_budget=token_budget,
+        review_below=review_below,
+        min_merge_confidence=min_merge_confidence,
         request_timeout=request_timeout,
     )
     parsed_context = parse_context(context)
@@ -330,6 +338,8 @@ async def aopen_code(
         batch_size=batch_size,
         concurrency=concurrency,
         review_mode=review_mode,
+        review_below=review_below,
+        min_merge_confidence=min_merge_confidence,
         pipeline=pipeline,
         token_budget=token_budget,
         prompt_cache=cache,
@@ -367,6 +377,8 @@ async def aopen_code(
         validation_retries=validation_retries,
         require_gerund=require_gerund,
         review_mode=review_mode,
+        review_below=review_below,
+        min_merge_confidence=min_merge_confidence,
         pipeline=pipeline,
         token_budget=token_budget,
         candidate_limit=candidate_limit,
@@ -548,6 +560,8 @@ def _validate_params(
     review_mode: str,
     token_budget: int,
     request_timeout: float,
+    review_below: float = 0.5,
+    min_merge_confidence: float = 0.5,
 ) -> None:
     if unit not in UNITS:
         raise ValueError(f"unit must be one of {', '.join(UNITS)}. Got {unit!r}.")
@@ -563,6 +577,8 @@ def _validate_params(
         raise ValueError("request_timeout must be zero or more. Zero waits with no per-call deadline.")
     if review_mode not in {"document", "wave"}:
         raise ValueError("review_mode must be 'document' or 'wave'.")
+    if not 0 <= review_below <= 1 or not 0 <= min_merge_confidence <= 1:
+        raise ValueError("review_below and min_merge_confidence must be between 0 and 1.")
     if token_budget < 1:
         raise ValueError("token_budget must be at least 1.")
     if top_k_codes < 0 or max_codes_per_passage < 1 or validation_retries < 0:
@@ -586,6 +602,8 @@ def _metadata(**kwargs: Any) -> dict:
         "batch_size": kwargs["batch_size"],
         "concurrency": kwargs["concurrency"],
         "review_mode": kwargs["review_mode"],
+        "review_below": kwargs.get("review_below", 0.5),
+        "min_merge_confidence": kwargs.get("min_merge_confidence", 0.5),
         "pipeline": kwargs["pipeline"],
         "token_budget": kwargs["token_budget"],
         "prompt_cache": kwargs["prompt_cache"],
@@ -600,6 +618,8 @@ def _metadata(**kwargs: Any) -> dict:
             "frequent_codes": kwargs["frequent_codes"],
             "merge_threshold": kwargs["merge_threshold"],
             "lexical_merge_threshold": kwargs["lexical_merge_threshold"],
+            "review_below": kwargs.get("review_below", 0.5),
+            "min_merge_confidence": kwargs.get("min_merge_confidence", 0.5),
             "long_passage_chars": kwargs["long_passage_chars"],
             "max_codes_per_passage": kwargs["max_codes_per_passage"],
             "neighbor_chars": kwargs["neighbor_chars"],

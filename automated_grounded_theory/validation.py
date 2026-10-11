@@ -257,6 +257,57 @@ def is_trivial_passage(text: str) -> bool:
     return re.search(r"[A-Za-z0-9]", stripped) is None
 
 
+_LEAK_STOP = frozenset(
+    "a an the of and or to in on for with by as is are be from that this their its "
+    "do you we should any other how what when where who whom whose".split()
+)
+
+
+def context_term_set(context: Any) -> set[str]:
+    """Content words from the research context. Labels should not be these words restated."""
+    if isinstance(context, str):
+        parts = [context]
+    else:
+        parts = [
+            str(getattr(context, "research_question", "") or ""),
+            str(getattr(context, "population", "") or ""),
+            str(getattr(context, "setting", "") or ""),
+            str(getattr(context, "notes", "") or ""),
+            " ".join(str(item) for item in (getattr(context, "sensitizing_concepts", []) or [])),
+        ]
+    words = re.findall(r"[a-z]+", " ".join(parts).lower())
+    return {word for word in words if word not in _LEAK_STOP and len(word) > 2}
+
+
+def label_restates_context(label: str, terms: set[str]) -> bool:
+    """True when most of the label's content words are already in the research context.
+
+    The leading gerund is ignored. A label such as ``leaving home`` against a
+    sensitizing concept of the same words is a restatement. ``packing bags``
+    against that context is not.
+    """
+    if not terms or not label:
+        return False
+    words = re.findall(r"[a-z]+", label.lower())
+    if words and words[0].endswith("ing") and len(words) > 1:
+        words = words[1:]
+    content = [word for word in words if word not in _LEAK_STOP and len(word) > 2]
+    if not content:
+        return False
+    return sum(word in terms for word in content) / len(content) >= 0.5
+
+
+def bounded_unit(value: Any, default: float = 1.0) -> float:
+    """Clamp a model confidence to ``[0, 1]``. Unreadable values use ``default``."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number:
+        return default
+    return min(1.0, max(0.0, number))
+
+
 def attribute_leak(text: str, metadata: dict | None) -> list[str]:
     """Metadata values that appear as whole tokens in ``text``.
 

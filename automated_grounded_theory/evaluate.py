@@ -499,6 +499,39 @@ def _score(run: Mapping[str, Any], context_text: str) -> dict:
         if point.get("new_codes_per_passage") is not None and float(point["new_codes_per_passage"]) < 0.10
     ]
     metrics["batch_new_rate_below_10pct"] = below[0] if below else None
+    below_post = [
+        point.get("batch")
+        for point in saturation
+        if point.get("new_codes_per_passage_post_merge") is not None
+        and float(point["new_codes_per_passage_post_merge"]) < 0.10
+    ]
+    metrics["batch_post_merge_rate_below_10pct"] = below_post[0] if below_post else None
+    metrics["saturation_post_merge"] = [
+        (
+            point.get("batch"),
+            point.get("new_codes_post_merge"),
+            point.get("new_codes_per_passage_post_merge"),
+        )
+        for point in saturation
+    ]
+    review_below = 0.5
+    metadata = run.get("metadata") or {}
+    params = metadata.get("params") if isinstance(metadata, Mapping) else None
+    if isinstance(params, Mapping) and params.get("review_below") is not None:
+        review_below = float(params["review_below"])
+    elif isinstance(metadata, Mapping) and metadata.get("review_below") is not None:
+        review_below = float(metadata["review_below"])
+    segment_confidence = _confidence_values(segment.get("confidence") for segment in segments)
+    merge_confidence = []
+    for sweep in sweeps:
+        for row in list(sweep.get("accepted_merges") or []) + list(sweep.get("rejected_merges") or []) + list(
+            sweep.get("candidate_decisions") or []
+        ):
+            if row.get("confidence") is not None:
+                merge_confidence.append(row.get("confidence"))
+    metrics["confidence"] = _confidence_distribution(segment_confidence, review_below)
+    metrics["confidence_merges"] = _confidence_distribution(_confidence_values(merge_confidence), review_below)
+    metrics["review_below"] = review_below
     metrics["sweeps"] = len(sweeps)
     metrics["merge_candidates"] = sum(len(item.get("candidates") or []) for item in sweeps)
     metrics["merges_accepted"] = sum(len(item.get("accepted_merges") or []) for item in sweeps)
@@ -533,6 +566,33 @@ def _score(run: Mapping[str, Any], context_text: str) -> dict:
         metrics["tokens_per_passage"] = metrics["prompt_tokens_est_per_passage"]
         metrics["tokens_note"] = "estimate: prompt chars/4; prompt_log usage was zero"
     return metrics
+
+
+def _confidence_values(values) -> list[float]:
+    scores = []
+    for value in values:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if number == number:
+            scores.append(number)
+    return scores
+
+
+def _confidence_distribution(values: Sequence[float], review_below: float) -> dict | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    middle = ordered[(len(ordered) - 1) // 2]
+    return {
+        "n": len(values),
+        "mean": round(statistics.mean(values), 4),
+        "min": min(values),
+        "max": max(values),
+        "p50": middle,
+        "below_review": sum(value < review_below for value in values),
+    }
 
 
 def _redundant_pairs(codebook: Sequence[Mapping[str, Any]]) -> list[list]:

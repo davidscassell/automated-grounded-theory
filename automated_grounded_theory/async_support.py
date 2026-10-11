@@ -376,15 +376,67 @@ def usage_from_message(raw: Any) -> dict[str, int]:
 
 
 def structured_runnable(model, schema):
-    """Prefer ``include_raw`` so token usage can be recorded. Fall back if unsupported."""
-    try:
-        return model.with_structured_output(schema, include_raw=True)
-    except TypeError:
-        return model.with_structured_output(schema)
+    """Prefer strict JSON schema, then looser structured output, always with raw usage when possible."""
+    attempts = (
+        {"method": "json_schema", "strict": True, "include_raw": True},
+        {"method": "json_schema", "include_raw": True},
+        {"method": "function_calling", "include_raw": True},
+        {"include_raw": True},
+        {},
+    )
+    last_error: TypeError | None = None
+    for kwargs in attempts:
+        try:
+            return model.with_structured_output(schema, **kwargs)
+        except TypeError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    return model.with_structured_output(schema)
+
+
+def _raw_text(raw: Any) -> str:
+    if raw is None:
+        return ""
+    content = getattr(raw, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                parts.append(str(block.get("text") or ""))
+        return "\n".join(parts)
+    if isinstance(raw, str):
+        return raw
+    return ""
+
+
+def _model_from_text(text: str, schema):
+    decoder = json.JSONDecoder()
+    start = 0
+    while True:
+        index = text.find("{", start)
+        if index < 0:
+            raise ValueError(f"{schema.__name__} output could not be parsed.")
+        try:
+            obj, _end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            start = index + 1
+            continue
+        if isinstance(obj, dict):
+            return schema.model_validate(obj)
+        start = index + 1
 
 
 def parse_structured(result, schema) -> tuple[dict, dict]:
-    """Normalize ``ainvoke`` / ``abatch`` output to ``(payload, usage)``."""
+    """Normalize ``ainvoke`` / ``abatch`` output to ``(payload, usage)``.
+
+    When the provider returns ``parsed=None``, the raw message is validated
+    against ``schema`` once before this raises.
+    """
     if result is None:
         raise ValueError(f"{schema.__name__} returned no structured output.")
     raw = None
@@ -392,7 +444,11 @@ def parse_structured(result, schema) -> tuple[dict, dict]:
         raw = result.get("raw")
         parsed = result.get("parsed")
         if parsed is None:
-            raise ValueError(f"{schema.__name__} output could not be parsed: {result.get('parsing_error')}")
+            try:
+                parsed = _model_from_text(_raw_text(raw), schema)
+            except ValueError as exc:
+                detail = result.get("parsing_error") or exc
+                raise ValueError(f"{schema.__name__} output could not be parsed: {detail}") from exc
     else:
         parsed = result
     if hasattr(parsed, "model_dump"):
@@ -404,6 +460,86 @@ def parse_structured(result, schema) -> tuple[dict, dict]:
     return payload, usage_from_message(raw)
 
 
+async def ainvoke_structured(model, schema, messages: Sequence, limiter) -> tuple[tuple[dict, dict], list]:
+    """Invoke ``schema`` once, then repair a single malformed output.
+
+    The follow-up user message starts with ``REPAIR THIS OUTPUT``. The second
+    failure raises the first parse error. Returns ``((payload, usage), messages)``.
+    """
+    from langchain_core.messages import HumanMessage
+
+    runnable = structured_runnable(model, schema)
+    result = await limiter.ainvoke(runnable, list(messages))
+    try:
+        return parse_structured(result, schema), list(messages)
+    except ValueError as first:
+        repair = list(messages) + [
+            HumanMessage(
+                content=(
+                    "REPAIR THIS OUTPUT\n"
+                    f"The previous output was not valid {schema.__name__}: {first}\n"
+                    "Return only the structured object."
+                )
+            )
+        ]
+        try:
+            repaired = await limiter.ainvoke(runnable, repair)
+            return parse_structured(repaired, schema), repair
+        except ValueError:
+            raise first from None
+
+
+async def _close_async_http_clients() -> None:
+    """Close httpx and aiohttp clients bound to this loop before the loop shuts down.
+
+    A client left open is closed from ``__del__`` after ``asyncio.run`` finishes,
+    which raises ``RuntimeError: Event loop is closed``.
+    """
+    import gc
+
+    running = asyncio.get_running_loop()
+    closers = []
+    seen: set[int] = set()
+    for obj in gc.get_objects():
+        marker = id(obj)
+        if marker in seen:
+            continue
+        try:
+            cls = type(obj)
+            module = getattr(cls, "__module__", "")
+            name = getattr(cls, "__name__", "")
+        except Exception:
+            continue
+        if not isinstance(module, str) or not isinstance(name, str):
+            continue
+        root = module.split(".", 1)[0]
+        if root not in {"httpx", "aiohttp"} or name not in {"AsyncClient", "ClientSession"}:
+            continue
+        if getattr(obj, "is_closed", False):
+            seen.add(marker)
+            continue
+        bound = getattr(obj, "_loop", None)
+        if bound is not None and bound is not running:
+            continue
+        close = getattr(obj, "aclose", None)
+        if not callable(close):
+            continue
+        seen.add(marker)
+        try:
+            closers.append(close())
+        except Exception:
+            continue
+    if closers:
+        await asyncio.gather(*closers, return_exceptions=True)
+
+
+async def _run_and_close(coro):
+    try:
+        return await coro
+    finally:
+        await _close_async_http_clients()
+
+
 def run_sync(coro):
     """Run ``coro`` to completion, including inside a running event loop.
 
@@ -411,11 +547,12 @@ def run_sync(coro):
     Jupyter cell, or a test that already started one) the coroutine runs on a
     worker thread so the caller's loop is left alone.
     """
+    wrapped = _run_and_close(coro)
     try:
         asyncio.get_running_loop()
     except RuntimeError:
         try:
-            return asyncio.run(coro)
+            return asyncio.run(wrapped)
         except BaseException as exc:
             # get_running_loop() just failed. Do not chain that as the cause.
             raise exc from None
@@ -424,7 +561,7 @@ def run_sync(coro):
 
     def _worker() -> None:
         try:
-            outcome["value"] = asyncio.run(coro)
+            outcome["value"] = asyncio.run(wrapped)
         except BaseException as exc:  # noqa: BLE001 - re-raised on the caller thread
             outcome["error"] = exc
 

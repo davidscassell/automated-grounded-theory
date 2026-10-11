@@ -13,6 +13,24 @@ from typing import Any, Mapping, Sequence
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from automated_grounded_theory.context import ResearchContext
+from automated_grounded_theory.schemas import (
+    CodeInput,
+    CodingRequest,
+    HintGroupInput,
+    HintInput,
+    JudgeRequest,
+    LeftoverRequest,
+    MergeCheckRequest,
+    MergePairInput,
+    PassageInput,
+    RewriteCodeInput,
+    RewriteRequest,
+    SweepRequest,
+    ThemeInput,
+    ThemeRequest,
+    ThemeReviewRequest,
+)
+from automated_grounded_theory.validation import code_key
 
 CODING_SYSTEM = """You are doing first-round open coding in the grounded theory tradition.
 
@@ -44,9 +62,12 @@ The metaphor is the incident.
 Constant comparison: the user message lists the nearest existing codes, retrieved by \
 similarity, plus other frequent codes. Prefer reuse. Prefer refine when this incident \
 shows the label or definition should change. Create a new code only when none of the \
-nearest codes fits. Before action new, set nearest_code to one of those labels and \
-why_not_nearest to the property this incident has that the nearest code does not. \
-Do not mint a near-duplicate.
+nearest codes fits. Before action create, set nearest_code to one of those labels, \
+nearest_code_ids to their code_id values, and why_not_nearest to the property this \
+incident has that the nearest code does not. \
+Do not mint a near-duplicate. Set valence to positive, negative, neutral, or mixed. \
+Praise and criticism are opposite stances and must not share a code. Set confidence \
+from 0 to 1 on the action, on in_vivo, and on the memo.
 
 Definitions name a property that could apply to another incident. Do not put respondent \
 attributes (name, role, department, tenure, site) or the question wording into a label \
@@ -93,7 +114,9 @@ Do not omit a hinted pair. Do not reject a pair that was not hinted. Also propos
 every other duplicate pair you find in this chunk, each with a rationale. Do not \
 merge codes that merely share a verb, a topic, or a sensitizing concept. When you \
 merge, keep the clearer and more specific label as the target and name the other \
-code as the source.
+code as the source. Never merge a positive code with a negative code. The survivor \
+keeps its own label and its own definition. Do not paste one code's definition onto \
+another. Set confidence from 0 to 1 on every merge, rejection, and definition update.
 
 Sharpen definitions so each one says what incident the code captures, in words that \
 could apply to another respondent. Do not put a person's department, tenure, role, \
@@ -205,6 +228,55 @@ def format_passage(passage: Mapping[str, Any], *, neighbor_chars: int) -> str:
     return "\n".join(lines)
 
 
+def stable_code_id(entry: Mapping[str, Any]) -> str:
+    """The pipeline id for a codebook row. Never invent a different id for the same label."""
+    existing = str(entry.get("code_id") or "").strip()
+    if existing:
+        return existing
+    from automated_grounded_theory.codebook import _code_id
+
+    key = code_key(str(entry.get("key") or entry.get("code") or entry.get("label") or ""))
+    return _code_id(key) if key else ""
+
+
+def code_input(entry: Mapping[str, Any]) -> CodeInput:
+    examples = []
+    for item in (entry.get("examples") or [])[:2]:
+        quote = clip(str(item.get("quote") or ""), 240)
+        if not quote:
+            continue
+        examples.append({"quote": quote, "passage_id": str(item.get("passage_id") or "")})
+    return CodeInput(
+        code_id=stable_code_id(entry),
+        label=str(entry.get("code") or entry.get("label") or ""),
+        definition=clip(str(entry.get("definition") or ""), 500),
+        frequency=int(entry.get("frequency") or 0),
+        example=examples[0]["quote"] if examples else "",
+        examples=examples,
+        valence=str(entry.get("valence") or ""),
+    )
+
+
+def extract_payload(text: str) -> dict:
+    """The typed JSON object in a user message, or an empty dict."""
+    decoder = json.JSONDecoder()
+    start = 0
+    while True:
+        index = text.find("{", start)
+        if index < 0:
+            return {}
+        try:
+            obj, _end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            start = index + 1
+            continue
+        if isinstance(obj, dict) and any(
+            key in obj for key in ("passages", "codebook", "codes", "hints", "themes", "left", "pairs")
+        ):
+            return obj
+        start = index + 1
+
+
 def build_coding_messages(
     *,
     context: ResearchContext,
@@ -216,32 +288,36 @@ def build_coding_messages(
     prompt_cache: bool,
     nearest: Sequence[Sequence[str]] | None = None,
 ) -> list:
-    system = coding_system_text(context)
-    blocks = []
+    del neighbor_chars
+    by_label = {code_key(str(entry.get("code") or "")): stable_code_id(entry) for entry in codebook_view}
+    passage_rows = []
     for index, passage in enumerate(passages):
-        block = format_passage(passage, neighbor_chars=neighbor_chars)
         labels = list(nearest[index]) if nearest and index < len(nearest) else []
-        if labels:
-            lines = [
-                "NEAREST EXISTING CODES",
-                "Retrieved by similarity to this passage. Reuse or refine one of these when it fits.",
-                "Before action new, set nearest_code to one of these labels and why_not_nearest to the property it does not cover.",
-            ]
-            lines.extend(f"- {label}" for label in labels)
-            block = block + "\n" + "\n".join(lines)
-        blocks.append(block)
-    user_parts = [
-        format_codebook(codebook_view, omitted=omitted_codes),
-        "",
-        "Code every passage below. Return one entry per passage_id, in this order.",
-        "",
-        "\n\n".join(blocks),
+        passage_rows.append(
+            PassageInput(
+                passage_id=str(passage.get("passage_id") or ""),
+                doc_id=str(passage.get("doc_id") or ""),
+                doc_name=str(passage.get("doc_name") or ""),
+                position=str(passage.get("position") or ""),
+                text=str(passage.get("text") or ""),
+                prev_text=clip(str(passage.get("prev_text") or ""), 400),
+                next_text=clip(str(passage.get("next_text") or ""), 400),
+                metadata=dict(passage.get("metadata") or {}),
+                nearest_code_ids=[by_label.get(code_key(label), "") for label in labels if code_key(label)],
+            )
+        )
+    notes = [note for note in (feedback or {}).values() if note]
+    request = CodingRequest(
+        note="" if codebook_view else "The codebook is empty. Codes you create must emerge from this passage.",
+        omitted_codes=omitted_codes,
+        codebook=[code_input(entry) for entry in codebook_view],
+        passages=passage_rows,
+        feedback=notes,
+    )
+    return [
+        _system_message(coding_system_text(context), prompt_cache=prompt_cache),
+        HumanMessage(content=request.model_dump_json(indent=2)),
     ]
-    if feedback:
-        notes = [note for note in feedback.values() if note]
-        if notes:
-            user_parts.extend(["", "VALIDATION FEEDBACK", "\n\n".join(notes)])
-    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content="\n".join(user_parts))]
 
 
 def format_sweep_codebook(codes: Sequence[Mapping[str, Any]]) -> str:
@@ -270,60 +346,34 @@ def build_sweep_messages(
     chunk_index: int = 1,
     chunk_count: int = 1,
 ) -> list:
-    payload = []
+    by_label = {code_key(str(entry.get("code") or "")): stable_code_id(entry) for entry in list(codes) + list(all_codes or [])}
+    hints = []
     for index, item in enumerate(candidates, start=1):
         pair_id = str(item.get("pair_id") or f"p{index:04d}")
         item["pair_id"] = pair_id
-        payload.append(
-            {
-                "pair_id": pair_id,
-                "source": item["source"],
-                "target": item["target"],
-                "score": round(float(item["score"]), 4),
-                "method": item.get("method", ""),
-            }
+        source = str(item.get("source") or "")
+        target = str(item.get("target") or "")
+        hints.append(
+            HintInput(
+                pair_id=pair_id,
+                source_id=str(item.get("source_id") or by_label.get(code_key(source), "")),
+                target_id=str(item.get("target_id") or by_label.get(code_key(target), "")),
+                source=source,
+                target=target,
+                score=round(float(item.get("score") or 0), 4),
+                method=str(item.get("method") or ""),
+            )
         )
-    parts: list[str] = []
-    if all_codes and chunk_count > 1:
-        index = [
-            {
-                "code": item.get("code", ""),
-                "definition": clip(str(item.get("definition") or ""), 160),
-                "count": item.get("frequency", 0),
-            }
-            for item in all_codes
-        ]
-        parts.extend(
-            [
-                f"This is chunk {chunk_index} of {chunk_count}. "
-                "The detailed codebook below is only this chunk. "
-                "The full label index lists every code. Propose merges using those exact labels.",
-                "",
-                "FULL LABEL INDEX",
-                json.dumps(index, ensure_ascii=False),
-                "",
-            ]
-        )
-    parts.extend(
-        [
-            format_sweep_codebook(codes),
-            "",
-            "<<<CANDIDATES",
-            json.dumps(payload, indent=2),
-            "CANDIDATES>>>",
-            "",
-            "Read every CODE_LABEL above and propose duplicate or near-duplicate pairs yourself. "
-            "Each merge needs a rationale naming the shared incident. "
-            "The candidate list is optional hints (token overlap, plus embeddings only when "
-            "those were supplied). Decide every pair_id once: merges if you accept the hint, "
-            "rejections if you do not, copying pair_id, source, and target. "
-            "Do not reject a pair that is not in that list. "
-            "Do propose extra merges for duplicates the hints missed. "
-            "You may swap source and target so the clearer label survives.",
-        ]
+    request = SweepRequest(
+        chunk_index=chunk_index,
+        chunk_count=chunk_count,
+        note="" if hints else "No similarity hints. Read every code and propose duplicates yourself.",
+        codes=[code_input(entry) for entry in codes],
+        label_index=[code_input(entry) for entry in (all_codes or [])] if chunk_count > 1 else [],
+        hints=hints,
     )
     system = SWEEP_SYSTEM + "\n\n" + render_context(context)
-    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content="\n".join(parts))]
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=request.model_dump_json(indent=2))]
 
 
 THEME_SYSTEM = """You are doing focused coding, the round after open coding (Charmaz).
@@ -402,26 +452,15 @@ def build_theme_messages(
     chunk_count: int = 1,
     max_themes: int = 12,
 ) -> list:
-    parts = []
-    if chunk_count > 1:
-        parts.extend(
-            [
-                f"This is chunk {chunk_index} of {chunk_count}. "
-                "Assign only the CODE_LABEL lines in this message. Other chunks are reconciled afterwards.",
-                "",
-            ]
-        )
-    parts.extend(
-        [
-            format_theme_codebook(codes),
-            "",
-            "Return one theme per group. Every CODE_LABEL appears under exactly one theme.",
-        ]
+    request = ThemeRequest(
+        chunk_index=chunk_index,
+        chunk_count=chunk_count,
+        note="Assign every code_id to exactly one theme. Copy labels exactly.",
+        codes=[code_input(entry) for entry in codes],
+        feedback=feedback,
     )
-    if feedback:
-        parts.extend(["", feedback])
     system = theme_system_text(context, n_themes, max_themes)
-    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content="\n".join(parts))]
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=request.model_dump_json(indent=2))]
 
 
 JUDGE_SYSTEM = """You compare two open codes from a grounded-theory codebook.
@@ -433,15 +472,165 @@ would still be coded with the other."""
 
 def build_judge_messages(left: Mapping[str, Any], right: Mapping[str, Any]) -> list:
     """One pair. The caller keeps the pair identity; the model only answers same/not."""
-    body = "\n".join(
-        [
-            f"CODE_A: {left.get('code', '')}",
-            f"DEFINITION_A: {left.get('definition', '')}",
-            f"CODE_B: {right.get('code', '')}",
-            f"DEFINITION_B: {right.get('definition', '')}",
-        ]
+    request = JudgeRequest(left=code_input(left), right=code_input(right))
+    return [SystemMessage(content=JUDGE_SYSTEM), HumanMessage(content=request.model_dump_json(indent=2))]
+
+
+def build_theme_review_messages(
+    *,
+    context: ResearchContext,
+    themes: Sequence[Mapping[str, Any]],
+    groups: Sequence[Sequence[int]],
+    max_theme_share: float,
+    prompt_cache: bool,
+) -> list:
+    """Alphabetical themes plus optional hint groups, as typed JSON."""
+    rows = [
+        ThemeInput(
+            theme_id=f"t{index:04d}",
+            name=str(theme.get("name") or ""),
+            definition=str(theme.get("definition") or ""),
+            codes=[str(label) for label in theme.get("codes") or []],
+        )
+        for index, theme in enumerate(themes)
+    ]
+    hints = []
+    for number, indexes in enumerate(groups, start=1):
+        if len(indexes) < 2:
+            continue
+        hints.append(
+            HintGroupInput(
+                hint_id=f"h{number:04d}",
+                theme_ids=[rows[index].theme_id for index in indexes],
+                names=[rows[index].name for index in indexes],
+            )
+        )
+    ceiling = round(100 * max_theme_share)
+    request = ThemeReviewRequest(
+        note=(
+            "Read every theme. Put duplicates in one group with a rationale and a confidence. "
+            f"Do not build a group with more than {ceiling}% of the open codes. "
+            + ("No similarity hints." if not hints else "Hints are optional.")
+        ),
+        themes=rows,
+        hints=hints,
     )
-    return [SystemMessage(content=JUDGE_SYSTEM), HumanMessage(content=body)]
+    from automated_grounded_theory.prompts import render_context as _render
+
+    system = (
+        "You are comparing themes with themes after focused coding. "
+        "Members are theme names, not open codes. "
+        "Propose a group when two themes gather the same kind of incident, and say why in rationale. "
+        "Set confidence on every group. "
+        "Hints are optional. Embeddings are not required. "
+        f"One theme must not hold more than {ceiling}% of the codes.\n\n" + _render(context)
+    )
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=request.model_dump_json(indent=2))]
+
+
+def build_leftover_messages(
+    *,
+    context: ResearchContext,
+    themes: Sequence[Mapping[str, Any]],
+    codes: Sequence[Mapping[str, Any]],
+    prompt_cache: bool,
+) -> list:
+    request = LeftoverRequest(
+        note="Assign every leftover code_id to one existing theme, or propose a theme that holds only those codes.",
+        themes=[
+            ThemeInput(
+                theme_id=f"t{index:04d}",
+                name=str(theme.get("name") or ""),
+                definition=str(theme.get("definition") or ""),
+                codes=[str(label) for label in theme.get("codes") or []],
+            )
+            for index, theme in enumerate(themes)
+        ],
+        codes=[code_input(entry) for entry in codes],
+    )
+    system = (
+        "You are finishing focused coding. Assign only the leftover open codes. "
+        "Do not invent a code_id.\n\n" + render_context(context)
+    )
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=request.model_dump_json(indent=2))]
+
+
+def build_merge_check_messages(
+    *,
+    context: ResearchContext,
+    codebook: Mapping[str, Mapping[str, Any]],
+    merges: Sequence[Mapping[str, Any]],
+    prompt_cache: bool,
+) -> list:
+    """Second structured look at proposed merges. Opposite stances are already removed."""
+    by_key = {code_key(str(entry.get("key") or entry.get("code") or "")): entry for entry in codebook.values()}
+    pairs = []
+    for merge in merges:
+        source_key = code_key(str(merge.get("source") or ""))
+        target_key = code_key(str(merge.get("target") or ""))
+        source = by_key.get(source_key, {})
+        target = by_key.get(target_key, {})
+        pairs.append(
+            MergePairInput(
+                pair_id=str(merge.get("pair_id") or ""),
+                source_id=str(source.get("code_id") or merge.get("source_id") or ""),
+                target_id=str(target.get("code_id") or merge.get("target_id") or ""),
+                source=str(source.get("code") or merge.get("source") or ""),
+                target=str(target.get("code") or merge.get("target") or ""),
+                source_definition=str(source.get("definition") or ""),
+                target_definition=str(target.get("definition") or ""),
+                source_valence=str(source.get("valence") or ""),
+                target_valence=str(target.get("valence") or ""),
+                source_quotes=[str(item.get("quote") or "") for item in (source.get("examples") or [])[:3] if item.get("quote")],
+                target_quotes=[str(item.get("quote") or "") for item in (target.get("examples") or [])[:3] if item.get("quote")],
+            )
+        )
+    request = MergeCheckRequest(
+        note=(
+            "Accept a pair only when both codes name the same incident and the same stance. "
+            "Reject praise merged with criticism. Set confidence from 0 to 1."
+        ),
+        pairs=pairs,
+    )
+    system = (
+        "You are verifying proposed code merges. "
+        "Accept only when the quotes show the same incident and the same stance. "
+        "Never accept a positive code merged with a negative code. "
+        "Set confidence on every check.\n\n" + render_context(context)
+    )
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=request.model_dump_json(indent=2))]
+
+
+def build_rewrite_messages(
+    *,
+    context: ResearchContext,
+    codes: Sequence[Mapping[str, Any]],
+    prompt_cache: bool,
+) -> list:
+    """Ask for a survivor definition written from the quotes now under that code."""
+    request = RewriteRequest(
+        note=(
+            "Each code survived a merge and kept its own label. "
+            "Rewrite the definition from the quotes. Do not reuse a retired code's definition. "
+            "Do not change the label. Set confidence from 0 to 1."
+        ),
+        codes=[
+            RewriteCodeInput(
+                code_id=str(entry.get("code_id") or ""),
+                label=str(entry.get("code") or entry.get("label") or ""),
+                definition=str(entry.get("definition") or ""),
+                retired_labels=[str(label) for label in (entry.get("retired_labels") or [])],
+                quotes=[str(quote) for quote in (entry.get("quotes") or [])],
+            )
+            for entry in codes
+        ],
+    )
+    system = (
+        "You are rewriting a code definition after a merge. "
+        "The label stays. The definition must fit the quotes listed for that code, "
+        "not the definition of a code that was retired.\n\n" + render_context(context)
+    )
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=request.model_dump_json(indent=2))]
 
 
 def validation_feedback(rejections: Sequence[Mapping[str, Any]]) -> str:
@@ -453,6 +642,11 @@ def validation_feedback(rejections: Sequence[Mapping[str, Any]]) -> str:
         lines.append(
             f"- code {item.get('code', '')!r}: {item.get('reason', 'rejected')} "
             f"(quote_not_verbatim means the quote was not found in the passage)"
+        )
+    if any(item.get("reason") == "context_restatement" for item in rejections):
+        lines.append(
+            "A rejected label mostly restates the research context. "
+            "Reword it from the participant's words in the passage."
         )
     return "\n".join(lines)
 

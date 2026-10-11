@@ -27,7 +27,7 @@ def test_open_code_merges_and_keeps_verbatim_quotes(tmp_path):
     model = FakeCoder()
     result = _run(model, output_dir=tmp_path, api_key="sk-test-secret")
     assert not result.interrupted
-    assert model.call_count == 6
+    assert model.call_count == 8
     reviewed = [item["doc_id"] for item in result.passages]
     blocks = []
     for doc_id in reviewed:
@@ -197,7 +197,7 @@ def test_embedding_candidates_are_optional():
 def test_batching_and_waves_cut_calls():
     batched = FakeCoder()
     result = _run(batched, batch_size=4, concurrency=1, sweep_every=25, review_mode="wave", pipeline=False)
-    assert batched.call_count == 2
+    assert batched.call_count == 4
     assert len(result.segments) == 4
     assert result.prompt_log[0]["usage"]["total_tokens"] == 18
 

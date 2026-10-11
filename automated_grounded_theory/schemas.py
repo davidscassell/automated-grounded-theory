@@ -67,11 +67,32 @@ class CodeProposal(_LLMModel):
         default="",
         description="At most 12 words on why this code fits. Not a summary of the passage.",
     )
+    code_id: str = Field(
+        default="",
+        description="code_id of an existing code for reuse or refine. Empty when creating.",
+    )
+    nearest_code_ids: list[str] = Field(
+        default_factory=list,
+        description="code_id values of the nearest codes you considered before creating. Empty when reusing.",
+    )
     confidence: float = Field(
         default=1.0,
         ge=0.0,
         le=1.0,
-        description="0 to 1. Lower this when the incident is ambiguous or the passage is thin.",
+        description="Confidence in this reuse, refine, or create action.",
+    )
+    in_vivo_confidence: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Confidence that the in_vivo flag is correct for this quote.",
+    )
+    valence: Literal["positive", "negative", "neutral", "mixed"] = Field(
+        default="neutral",
+        description=(
+            "Stance of this incident. positive and negative are opposites and must not share a code. "
+            "mixed is both in one incident. neutral is neither."
+        ),
     )
 
 
@@ -90,6 +111,12 @@ class PassageCoding(_LLMModel):
             "a property or dimension, and one emerging question. Do not restate the passage."
         ),
     )
+    memo_confidence: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Confidence in the memo. Use 1 when the memo is empty.",
+    )
     low_confidence: bool = Field(
         default=False,
         description="True when this passage should be read again by a human coder.",
@@ -97,30 +124,106 @@ class PassageCoding(_LLMModel):
 
 
 class MergeDecision(_LLMModel):
+    action: Literal["accept"] = Field(default="accept", description="Accept this merge.")
     pair_id: str = Field(
         default="",
         description="pair_id copied from a hint. Empty when you found the duplicate yourself.",
     )
-    source: str = Field(description="Code to fold into the target. This label is retired.")
-    target: str = Field(description="Code that remains. Prefer the clearer, more specific gerund.")
+    source_id: str = Field(default="", description="code_id of the code to retire.")
+    target_id: str = Field(default="", description="code_id of the code that remains.")
+    canonical_id: str = Field(
+        default="",
+        description="code_id that should survive. Empty to let the pipeline choose the stable id.",
+    )
+    source: str = Field(description="Label to fold into the target. This label is retired.")
+    target: str = Field(description="Label that remains. Prefer the clearer, more specific gerund.")
     rationale: str = Field(
         default="",
         description="Why these codes name the same incident. Required on every merge.",
+    )
+    confidence: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Confidence that these codes should merge.",
     )
 
 
 class MergeRejection(_LLMModel):
     """A candidate pair that should stay as two codes."""
 
+    action: Literal["reject"] = Field(default="reject", description="Reject this merge.")
     pair_id: str = Field(default="", description="pair_id from the candidate list. Do not invent one.")
+    source_id: str = Field(default="", description="code_id of one hinted code.")
+    target_id: str = Field(default="", description="code_id of the other hinted code.")
     source: str = Field(description="One label from a candidate pair. Copy it exactly.")
     target: str = Field(description="The other label from that candidate pair. Copy it exactly.")
     rationale: str = Field(default="", description="Why these are different incidents.")
+    confidence: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Confidence that these codes should stay separate.",
+    )
 
 
 class DefinitionUpdate(_LLMModel):
-    code: str
-    definition: str
+    code_id: str = Field(default="", description="code_id of the code whose definition changes.")
+    code: str = Field(default="", description="Label of that code. Copy it exactly.")
+    definition: str = ""
+    confidence: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Confidence in this definition refinement.",
+    )
+
+
+class MergeCheck(_LLMModel):
+    """Second look at one proposed merge. This confirms or rejects the proposal."""
+
+    pair_id: str = Field(default="", description="pair_id from the proposal. Empty if the proposal had none.")
+    source_id: str = Field(default="", description="code_id of one code. Copy it from the proposal.")
+    target_id: str = Field(default="", description="code_id of the other code. Copy it from the proposal.")
+    source: str = Field(default="", description="Label of one code. Copy it exactly.")
+    target: str = Field(default="", description="Label of the other code. Copy it exactly.")
+    action: Literal["accept", "reject"] = Field(
+        description="accept only when both codes name the same incident and the same stance."
+    )
+    rationale: str = Field(default="", description="Why this merge should stand or fail.")
+    confidence: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Confidence in this accept or reject of the proposed merge.",
+    )
+
+
+class MergeCheckBatch(_LLMModel):
+    """One verification for every proposed merge in the request."""
+
+    checks: list[MergeCheck] = Field(default_factory=list)
+
+
+class DefinitionRewrite(_LLMModel):
+    """A survivor definition rewritten from the quotes now gathered under that code."""
+
+    code_id: str = Field(default="", description="code_id of the surviving code. Copy it from the input.")
+    code: str = Field(default="", description="Label of the surviving code. Copy it exactly. Do not rename it.")
+    definition: str = Field(
+        default="",
+        description="What incident the surviving code captures, written from the quotes. Not another code's definition.",
+    )
+    confidence: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Confidence in this definition rewritten from the merged quotes.",
+    )
+
+
+class DefinitionRewriteBatch(_LLMModel):
+    rewrites: list[DefinitionRewrite] = Field(default_factory=list)
 
 
 class RelationHint(_LLMModel):
@@ -147,9 +250,20 @@ class ThemeProposal(_LLMModel):
         default_factory=list,
         description="A few dimensions that vary inside the theme. Empty if none stand out.",
     )
+    theme_id: str = Field(default="", description="Leave empty. The pipeline assigns a stable theme id.")
+    code_ids: list[str] = Field(
+        default_factory=list,
+        description="code_id of each open code in this theme. Copy ids from the input.",
+    )
     codes: list[str] = Field(
         default_factory=list,
-        description="Open-code labels in this theme. Copy each CODE_LABEL exactly. Every code belongs to one theme.",
+        description="Open-code labels in this theme. Copy each label exactly. Every code belongs to one theme.",
+    )
+    confidence: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Confidence in this theme and in assigning these codes to it.",
     )
 
 
@@ -167,7 +281,13 @@ class ThemeTension(_LLMModel):
     )
     passage_id: str = Field(
         default="",
-        description="passage_id of that example when the prompt shows one. Otherwise empty.",
+        description="passage_id of that example when the input shows one. Otherwise empty.",
+    )
+    confidence: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Confidence that this tension is in the data.",
     )
 
 
@@ -186,10 +306,24 @@ class ThemeGroup(_LLMModel):
 
     name: str
     definition: str = ""
+    member_ids: list[str] = Field(
+        default_factory=list,
+        description="theme_id of each theme in this group. Copy ids from the input.",
+    )
+    canonical_id: str = Field(
+        default="",
+        description="theme_id that should survive when members are duplicates. Empty to keep the pipeline's survivor.",
+    )
     members: list[str] = Field(default_factory=list)
     rationale: str = Field(
         default="",
         description="Why these themes are the same incident, when members lists more than one theme. Empty for a theme that stands alone.",
+    )
+    confidence: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Confidence that these themes are duplicates, or 1 when the theme stands alone.",
     )
 
 
@@ -239,3 +373,153 @@ class SweepCoding(_LLMModel):
         description="A few sentences on properties or comparisons. Empty if the sweep changed nothing analytic.",
     )
     reflexive_memo: str = ""
+
+
+class CodeInput(_LLMModel):
+    """One codebook row sent to the model. Ids are assigned by the pipeline."""
+
+    code_id: str
+    label: str
+    definition: str = ""
+    frequency: int = 0
+    example: str = ""
+    examples: list[dict] = Field(default_factory=list)
+    valence: str = ""
+
+
+class PassageInput(_LLMModel):
+    """One passage sent to the model."""
+
+    passage_id: str
+    doc_id: str = ""
+    doc_name: str = ""
+    position: str = ""
+    text: str = ""
+    prev_text: str = ""
+    next_text: str = ""
+    metadata: dict = Field(default_factory=dict)
+    nearest_code_ids: list[str] = Field(default_factory=list)
+
+
+class CodingRequest(_LLMModel):
+    """Typed input for passage coding."""
+
+    note: str = ""
+    omitted_codes: int = 0
+    codebook: list[CodeInput] = Field(default_factory=list)
+    passages: list[PassageInput] = Field(default_factory=list)
+    feedback: list[str] = Field(default_factory=list)
+
+
+class HintInput(_LLMModel):
+    """One optional similarity hint. The model may ignore it."""
+
+    pair_id: str
+    source_id: str = ""
+    target_id: str = ""
+    source: str
+    target: str
+    score: float = 0.0
+    method: str = ""
+
+
+class SweepRequest(_LLMModel):
+    """Typed input for a sweep chunk."""
+
+    chunk_index: int = 1
+    chunk_count: int = 1
+    note: str = ""
+    codes: list[CodeInput] = Field(default_factory=list)
+    label_index: list[CodeInput] = Field(default_factory=list)
+    hints: list[HintInput] = Field(default_factory=list)
+
+
+class ThemeRequest(_LLMModel):
+    """Typed input for focused coding."""
+
+    chunk_index: int = 1
+    chunk_count: int = 1
+    note: str = ""
+    codes: list[CodeInput] = Field(default_factory=list)
+    feedback: str = ""
+
+
+class ThemeInput(_LLMModel):
+    """One theme sent back for duplicate review or leftover assignment."""
+
+    theme_id: str
+    name: str
+    definition: str = ""
+    code_ids: list[str] = Field(default_factory=list)
+    codes: list[str] = Field(default_factory=list)
+
+
+class HintGroupInput(_LLMModel):
+    """Themes that look similar. The model may reject the group."""
+
+    hint_id: str
+    theme_ids: list[str] = Field(default_factory=list)
+    names: list[str] = Field(default_factory=list)
+
+
+class ThemeReviewRequest(_LLMModel):
+    """Typed input for duplicate-theme decisions."""
+
+    note: str = ""
+    themes: list[ThemeInput] = Field(default_factory=list)
+    hints: list[HintGroupInput] = Field(default_factory=list)
+
+
+class LeftoverRequest(_LLMModel):
+    """Typed input for codes the first assignment missed."""
+
+    note: str = ""
+    themes: list[ThemeInput] = Field(default_factory=list)
+    codes: list[CodeInput] = Field(default_factory=list)
+
+
+class JudgeRequest(_LLMModel):
+    """Typed input for a same-incident judgment."""
+
+    left: CodeInput
+    right: CodeInput
+
+
+class MergePairInput(_LLMModel):
+    """One proposed merge sent for a second look."""
+
+    pair_id: str = ""
+    source_id: str = ""
+    target_id: str = ""
+    source: str
+    target: str
+    source_definition: str = ""
+    target_definition: str = ""
+    source_valence: str = ""
+    target_valence: str = ""
+    source_quotes: list[str] = Field(default_factory=list)
+    target_quotes: list[str] = Field(default_factory=list)
+
+
+class MergeCheckRequest(_LLMModel):
+    """Typed input for the merge verification step."""
+
+    note: str = ""
+    pairs: list[MergePairInput] = Field(default_factory=list)
+
+
+class RewriteCodeInput(_LLMModel):
+    """A surviving code whose definition should be rewritten from its quotes."""
+
+    code_id: str
+    label: str
+    definition: str = ""
+    retired_labels: list[str] = Field(default_factory=list)
+    quotes: list[str] = Field(default_factory=list)
+
+
+class RewriteRequest(_LLMModel):
+    """Typed input for post-merge definition rewrites."""
+
+    note: str = ""
+    codes: list[RewriteCodeInput] = Field(default_factory=list)

@@ -15,16 +15,14 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import HumanMessage
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
 from automated_grounded_theory.async_support import (
     CallLimiter,
+    ainvoke_structured,
     is_transient,
-    parse_structured,
     run_sync,
-    structured_runnable,
 )
 from automated_grounded_theory.backends import (
     describe_model,
@@ -34,10 +32,16 @@ from automated_grounded_theory.backends import (
 )
 from automated_grounded_theory.context import ResearchContext, parse_context
 from automated_grounded_theory.export import _write_csv, _write_json, taguette_tag
-from automated_grounded_theory.prompts import build_theme_messages, serialize_messages
+from automated_grounded_theory.prompts import (
+    build_leftover_messages,
+    build_theme_messages,
+    build_theme_review_messages,
+    serialize_messages,
+)
 from automated_grounded_theory.results import OpenCodeResult
 from automated_grounded_theory.retrieval import aembed_texts, comparison_order, cosine, jaccard
 from automated_grounded_theory.schemas import ThemeCoding, ThemeMergePlan
+from automated_grounded_theory.validation import bounded_unit
 from automated_grounded_theory.validation import code_key, display_label, locate_quote
 from automated_grounded_theory.version import __version__
 
@@ -153,6 +157,8 @@ def theme_tag_path(theme_name: str, code_label: str) -> str:
 def assign_codes(
     proposal: Mapping[str, Any],
     codebook: Sequence[Mapping[str, Any]],
+    *,
+    review_below: float = 0.5,
 ) -> tuple[list[dict], dict[str, list[str]]]:
     """Keep the first assignment of each real code. Drop unknown names.
 
@@ -169,6 +175,9 @@ def assign_codes(
     duplicates: list[str] = []
     raw_themes: list[dict] = []
     for raw in proposal.get("themes") or []:
+        confidence = bounded_unit(raw.get("confidence"), 1.0)
+        if confidence < review_below:
+            continue
         name = display_label(str(raw.get("name") or ""))
         codes: list[str] = []
         for label in raw.get("codes") or []:
@@ -188,6 +197,7 @@ def assign_codes(
                 "definition": str(raw.get("definition") or "").strip(),
                 "properties": _clean_list(raw.get("properties")),
                 "codes": codes,
+                "confidence": confidence,
             }
         )
     merged: list[dict] = []
@@ -404,6 +414,7 @@ def export_themes(result: ThemeResult, output_dir: str | Path, *, chart: bool = 
             "pct_comments",
             "n_respondents",
             "pct_respondents",
+            "confidence",
         ],
         [
             [
@@ -418,6 +429,7 @@ def export_themes(result: ThemeResult, output_dir: str | Path, *, chart: bool = 
                 theme["pct_comments"],
                 theme["n_respondents"],
                 theme["pct_respondents"],
+                theme.get("confidence", 1.0),
             ]
             for theme in result.themes
         ],
@@ -903,37 +915,14 @@ async def _reassign_leftovers(
     prompt_cache: bool,
 ) -> tuple[dict, dict, list]:
     by_key = {code_key(str(entry.get("code") or "")): entry for entry in codes}
-    lines = [
-        "These open codes were not assigned to a theme. Assign every CODE_LABEL to one theme.",
-        "Prefer an existing THEME_NAME, copied exactly. Copy each CODE_LABEL exactly.",
-        "",
-        "EXISTING THEMES",
-    ]
-    if not assigned:
-        lines.append("(none yet)")
-    for theme in assigned:
-        lines.append(f"THEME_NAME: {theme.get('name') or ''}")
-        definition = str(theme.get("definition") or "").strip()
-        if definition:
-            lines.append(f"DEFINITION: {definition}")
-    lines.extend(["", "LEFTOVER CODES"])
-    for label in missing:
-        entry = by_key.get(code_key(label), {})
-        lines.append(f"CODE_LABEL: {label}")
-        definition = str(entry.get("definition") or "").strip()
-        if definition:
-            lines.append(f"DEFINITION: {definition}")
-        lines.append("")
-    from automated_grounded_theory.prompts import _system_message, render_context
-
-    system = (
-        "You are finishing focused coding. Assign only the leftover open codes. "
-        "Do not drop a CODE_LABEL and do not invent a code.\n\n" + render_context(context)
+    leftover_codes = [by_key.get(code_key(label), {"code": label}) for label in missing]
+    messages = build_leftover_messages(
+        context=context,
+        themes=assigned,
+        codes=leftover_codes,
+        prompt_cache=prompt_cache,
     )
-    messages = [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content="\n".join(lines))]
-    runnable = structured_runnable(model, ThemeCoding)
-    result = await limiter.ainvoke(runnable, messages)
-    payload, usage = parse_structured(result, ThemeCoding)
+    (payload, usage), messages = await ainvoke_structured(model, ThemeCoding, messages, limiter)
     return payload, usage, messages
 
 
@@ -947,6 +936,7 @@ async def _fold_near_duplicates(
     max_themes: int,
     cap: bool,
     max_theme_share: float,
+    min_merge_confidence: float = 0.5,
     embeddings: Any,
     api_key: str | None,
     request_timeout: float,
@@ -1019,7 +1009,13 @@ async def _fold_near_duplicates(
                 "usage": usage,
             }
         )
-        confirmed = _groups_from_confirmation(rows, groups, payload, max_theme_share=max_theme_share)
+        confirmed = _groups_from_confirmation(
+            rows,
+            groups,
+            payload,
+            max_theme_share=max_theme_share,
+            min_merge_confidence=min_merge_confidence,
+        )
         current, mapping, _changed = _themes_from_groups(rows, confirmed)
         decisions = _theme_duplicate_decisions(rows, groups, confirmed, payload)
     note = _dominance_warning(current, max_theme_share)
@@ -1063,53 +1059,14 @@ async def _propose_theme_merge(
     prompt_cache: bool,
 ) -> tuple[dict, dict, list]:
     """Ask the model to confirm or reject each proposed fold. Does not invent folds."""
-    runnable = structured_runnable(model, ThemeMergePlan)
-    ceiling = round(100 * max_theme_share)
-    lines = [
-        "THEMES TO REVIEW",
-        "These themes are in alphabetical order. Read every one.",
-        "Put themes that gather the same incident in one group, and give that group a rationale.",
-        "Leave a distinct theme in its own group.",
-        "Copy each THEME_NAME exactly. Every name appears in exactly one group.",
-        f"Do not build a group with more than {ceiling}% of the open codes.",
-        "Similarity hints are optional. You may fold themes that were not hinted, and you may reject a hint.",
-        "",
-    ]
-    for theme in themes:
-        lines.append(f"THEME_NAME: {theme.get('name') or ''}")
-        definition = str(theme.get("definition") or "").strip()
-        if definition:
-            lines.append(f"DEFINITION: {definition}")
-        codes = "; ".join(str(label) for label in theme.get("codes") or [])
-        if codes:
-            lines.append(f"CODES: {codes}")
-        lines.append("")
-    shown = 0
-    for indexes in groups:
-        if len(indexes) < 2:
-            continue
-        shown += 1
-        lines.append(f"HINT FOLD {shown}")
-        for index in indexes:
-            lines.append(f"HINT_NAME: {themes[index].get('name') or ''}")
-        lines.append("")
-    if shown == 0:
-        lines.append("No similarity hints. Propose duplicate themes yourself, or leave each theme alone.")
-        lines.append("")
-    from automated_grounded_theory.prompts import _system_message, render_context
-
-    system = (
-        "You are comparing themes with themes after focused coding. "
-        "Members are theme names, not open codes. "
-        "Propose a group when two themes gather the same kind of incident, and say why in rationale. "
-        "Hints from token overlap or embeddings are optional. Embeddings are not required. "
-        "Reject a hint when the incidents are different. "
-        f"One theme must not hold more than {ceiling}% of the codes.\n\n"
-        + render_context(context)
+    messages = build_theme_review_messages(
+        context=context,
+        themes=themes,
+        groups=groups,
+        max_theme_share=max_theme_share,
+        prompt_cache=prompt_cache,
     )
-    messages = [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content="\n".join(lines))]
-    result = await limiter.ainvoke(runnable, messages)
-    payload, usage = parse_structured(result, ThemeMergePlan)
+    (payload, usage), messages = await ainvoke_structured(model, ThemeMergePlan, messages, limiter)
     return payload, usage, messages
 
 
@@ -1119,6 +1076,7 @@ def _groups_from_confirmation(
     plan: Mapping[str, Any],
     *,
     max_theme_share: float,
+    min_merge_confidence: float = 0.5,
 ) -> list[list[int]]:
     """Apply the model's theme groups. A group over the share cap is split.
 
@@ -1140,6 +1098,10 @@ def _groups_from_confirmation(
             placed.add(index)
             indexes.append(index)
         if not indexes:
+            continue
+        confidence = bounded_unit(group.get("confidence"), 1.0)
+        if len(indexes) > 1 and confidence < min_merge_confidence:
+            confirmed.extend([[index] for index in indexes])
             continue
         if sum(sizes[index] for index in indexes) > limit + 1e-9:
             confirmed.extend([[index] for index in indexes])
@@ -1171,13 +1133,16 @@ def _theme_duplicate_decisions(
 ) -> list[dict]:
     """One logged decision for every hinted pair and every model-proposed pair."""
     rationale_for: dict[frozenset[str], str] = {}
+    confidence_for: dict[frozenset[str], float] = {}
     for group in plan.get("themes") or []:
         members = [str(label) for label in group.get("members") or [] if str(label)]
         rationale = str(group.get("rationale") or "")
+        confidence = bounded_unit(group.get("confidence"), 1.0)
         for left_at, left in enumerate(members):
             for right in members[left_at + 1 :]:
                 if left != right:
                     rationale_for.setdefault(frozenset((left, right)), rationale)
+                    confidence_for.setdefault(frozenset((left, right)), confidence)
     hinted_pairs = _pair_names(rows, hinted)
     applied_pairs = _pair_names(rows, applied)
     decisions = []
@@ -1191,6 +1156,7 @@ def _theme_duplicate_decisions(
                 "decision": "accept" if kept else "reject",
                 "reason": "hint_accepted" if kept else "model_rejected",
                 "rationale": rationale_for.get(pair, ""),
+                "confidence": confidence_for.get(pair, 1.0),
             }
         )
     for pair in sorted(applied_pairs - hinted_pairs, key=lambda item: tuple(sorted(item, key=str.casefold))):
@@ -1202,6 +1168,7 @@ def _theme_duplicate_decisions(
                 "decision": "accept",
                 "reason": "model_proposed",
                 "rationale": rationale_for.get(pair, ""),
+                "confidence": confidence_for.get(pair, 1.0),
             }
         )
     return decisions
@@ -1376,11 +1343,13 @@ def _bundle_themes(
     kept_definition = definition if definition is not None else str(survivor.get("definition") or "").strip()
     if not kept_definition:
         kept_definition = max((str(theme.get("definition") or "").strip() for theme in members), key=len, default="")
+    confidences = [bounded_unit(theme.get("confidence"), 1.0) for theme in members]
     return {
         "name": name or str(survivor.get("name") or ""),
         "definition": kept_definition,
         "properties": properties,
         "codes": codes,
+        "confidence": min(confidences) if confidences else 1.0,
     }
 
 
@@ -1396,8 +1365,6 @@ def _compile_theme_graph(
     model_name: str,
     limiter: CallLimiter,
 ):
-    runnable = structured_runnable(model, ThemeCoding)
-
     async def propose(state: ThemeGraphState) -> dict:
         proposals = dict(state.get("proposals") or {})
         missing = list(state.get("missing") or [])
@@ -1417,16 +1384,16 @@ def _compile_theme_graph(
                 max_themes=max_themes,
             )
             try:
-                result = await limiter.ainvoke(runnable, messages)
+                (payload, usage), used_messages = await ainvoke_structured(model, ThemeCoding, messages, limiter)
             except Exception as exc:
                 if is_transient(exc):
-                    return index, messages, None, exc
+                    return index, messages, None, None, exc
                 raise ThemeError(f"Focused coding failed on chunk {index + 1}: {exc}") from exc
-            return index, messages, result, None
+            return index, used_messages, payload, usage, None
 
         outcomes = sorted(await asyncio.gather(*(one(index) for index in indexes)), key=lambda item: item[0])
         log = list(state.get("prompt_log") or [])
-        for index, messages, result, exc in outcomes:
+        for index, messages, payload, usage, exc in outcomes:
             if exc is not None:
                 timed_out = True
                 chunk_warnings.append(
@@ -1445,10 +1412,6 @@ def _compile_theme_graph(
                     }
                 )
                 continue
-            try:
-                payload, usage = parse_structured(result, ThemeCoding)
-            except ValueError as exc:
-                raise ThemeError(f"Focused coding failed on chunk {index + 1}: {exc}") from exc
             proposals[index] = payload
             log.append(
                 {
@@ -1625,6 +1588,7 @@ def _one_theme(
         "pct_comments": _pct(n_documents, totals["n_documents"]),
         "n_respondents": n_respondents,
         "pct_respondents": _pct(n_respondents, totals["n_respondents"]),
+        "confidence": bounded_unit(theme.get("confidence"), 1.0),
         "breakdowns": _breakdowns(passage_ids, passages_by_id),
         "quotes": (
             _select_quotes(
@@ -1737,13 +1701,18 @@ def _tensions(
             key = code_key(str(label))
             if key in known and known[key] not in names:
                 names.append(known[key])
+        confidence = bounded_unit(raw.get("confidence"), 1.0)
+        if confidence < 0.5:
+            continue
         note = str(raw.get("note") or "").strip()
         quote, passage_id = _verified_optional_quote(raw, passages_by_id)
         if raw.get("quote") and not quote:
             dropped += 1
         if not names or not (note or quote):
             continue
-        kept.append({"themes": names, "note": note, "quote": quote, "passage_id": passage_id})
+        kept.append(
+            {"themes": names, "note": note, "quote": quote, "passage_id": passage_id, "confidence": confidence}
+        )
     if dropped:
         warnings.append(
             f"{dropped} tension quote(s) were dropped because they were not verbatim substrings of a passage."

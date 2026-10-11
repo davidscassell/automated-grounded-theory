@@ -104,7 +104,15 @@ def test_merge_map_relabels_earlier_segments():
     )
     assert list(applied["codebook"]) == ["packing bags"]
     assert applied["codebook"]["packing bags"]["frequency"] == 2
-    assert applied["codebook"]["packing bags"]["definition"] == "Bagging possessions while leaving."
+    assert applied["codebook"]["packing bags"]["definition"] == "packing bags"
+    sharpened = apply_sweep(
+        codebook,
+        segments,
+        merges=[{"source": "packing bags", "target": "packing bags up", "rationale": "same incident"}],
+        candidates=[{"source": "packing bags", "target": "packing bags up", "score": 0.7}],
+        definitions=[{"code": "packing bags", "definition": "Bagging possessions while leaving."}],
+    )
+    assert sharpened["codebook"]["packing bags"]["definition"] == "Bagging possessions while leaving."
     assert {item["code"] for item in applied["segments"]} == {"packing bags"}
 
 

@@ -20,13 +20,16 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
-from automated_grounded_theory.async_support import is_transient, parse_structured, structured_runnable
+from automated_grounded_theory.async_support import ainvoke_structured, is_transient
 from automated_grounded_theory.batching import pack_indices
 from automated_grounded_theory.codebook import (
     apply_sweep,
     commit_passage,
     empty_counters,
+    frozen_pair_keys,
     interpret_coding,
+    remember_pair_decisions,
+    replay_accepted_pairs,
     union_codebooks,
 )
 from automated_grounded_theory.context import ResearchContext
@@ -36,6 +39,8 @@ from automated_grounded_theory.prompts import (
     CODING_SYSTEM,
     SWEEP_SYSTEM,
     build_coding_messages,
+    build_merge_check_messages,
+    build_rewrite_messages,
     build_sweep_messages,
     serialize_messages,
     validation_feedback,
@@ -51,9 +56,9 @@ from automated_grounded_theory.retrieval import (
     hint_pairs,
     select_prompt_codes,
 )
-from automated_grounded_theory.validation import code_key
+from automated_grounded_theory.validation import code_key, context_term_set
 from automated_grounded_theory.saturation import saturation_point
-from automated_grounded_theory.schemas import BatchCoding, SweepCoding
+from automated_grounded_theory.schemas import BatchCoding, DefinitionRewriteBatch, MergeCheckBatch, SweepCoding
 from automated_grounded_theory.segment import plan_coding
 
 logger = logging.getLogger("automated_grounded_theory")
@@ -84,6 +89,9 @@ class CodingState(TypedDict, total=False):
     warnings: list[str]
     export_paths: dict[str, str]
     finished: bool
+    ops: list[dict]
+    review: list[dict]
+    pair_decisions: list[dict]
 
 
 @dataclass
@@ -109,6 +117,8 @@ class RunConfig:
     sweep_chunk: int = 20
     embed_batch_size: int = 64
     review_mode: str = "document"
+    review_below: float = 0.5
+    min_merge_confidence: float = 0.5
     pipeline: bool = True
     token_budget: int = 4000
     model_name: str = ""
@@ -168,6 +178,9 @@ def initial_state(documents: list[LoadedDocument], metadata: dict) -> CodingStat
         "warnings": [],
         "export_paths": {},
         "finished": False,
+        "ops": [],
+        "review": [],
+        "pair_decisions": [],
     }
 
 
@@ -418,12 +431,22 @@ async def _code_batch(runtime: RunConfig, passages: list[dict], codebook: dict) 
                 max_codes=runtime.max_codes_per_passage,
                 require_gerund=runtime.require_gerund,
                 long_passage_chars=runtime.long_passage_chars,
+                review_below=runtime.review_below,
+                context_terms=context_term_set(runtime.context),
             )
-            quote_failures = [item for item in interpreted["rejections"] if item.get("reason") == "quote_not_verbatim"]
-            if quote_failures and attempt < attempts - 1:
-                errors[passage_id].append(quote_failures)
+            quote_failures = [
+                item for item in interpreted["rejections"] if item.get("reason") == "quote_not_verbatim"
+            ]
+            restated = [
+                {"code": item.get("code"), "reason": "context_restatement", "quote": item.get("quote")}
+                for item in interpreted["accepted"]
+                if "context_restatement" in (item.get("review_reasons") or [])
+            ]
+            retryable = quote_failures + restated
+            if retryable and attempt < attempts - 1:
+                errors[passage_id].append(retryable)
                 still_pending.append(passage)
-                feedback[passage_id] = validation_feedback(quote_failures)
+                feedback[passage_id] = validation_feedback(retryable)
             else:
                 done[passage_id] = (coding, errors[passage_id])
         pending = still_pending
@@ -524,6 +547,8 @@ def _validate_node(runtime: RunConfig):
         highlights = dict(state.get("highlight_ids") or {})
         counters = dict(state.get("counters") or empty_counters())
         validation_log = list(state.get("validation_log") or [])
+        ops = list(state.get("ops") or [])
+        review = list(state.get("review") or [])
         prompt_log = _take_prompts(runtime, state) if take_prompts else list(state.get("prompt_log") or [])
         branch_queues = {key: list(value) for key, value in (state.get("branch_queues") or {}).items()}
         branch_books = {key: dict(value) for key, value in (state.get("branch_codebooks") or {}).items()}
@@ -553,6 +578,8 @@ def _validate_node(runtime: RunConfig):
                 max_codes=runtime.max_codes_per_passage,
                 require_gerund=runtime.require_gerund,
                 long_passage_chars=runtime.long_passage_chars,
+                review_below=runtime.review_below,
+                context_terms=context_term_set(runtime.context),
             )
             for earlier in item.get("attempt_errors") or []:
                 validation_log.append(
@@ -586,6 +613,8 @@ def _validate_node(runtime: RunConfig):
             memos = committed["memos"]
             highlights = committed["highlight_ids"]
             counters = committed["counters"]
+            ops.extend(committed.get("ops") or [])
+            review.extend(item for item in (committed.get("ops") or []) if item.get("status") == "review")
             new_codes += committed["new_codes"]
             global_keys.update(committed["codebook"])
             if state.get("parallel") and doc_id:
@@ -625,6 +654,8 @@ def _validate_node(runtime: RunConfig):
             "passages_since_sweep": passages_since,
             "passages_coded": passages_coded,
             "pending": [],
+            "ops": ops,
+            "review": review,
             "warnings": list(state.get("warnings") or []) + notes,
         }
 
@@ -710,13 +741,23 @@ def _sweep_node(runtime: RunConfig):
         sweep_log = list(state.get("sweep_log") or [])
         segments = list(state.get("segments") or [])
 
-        def _point(book: dict) -> dict:
+        prior_points = list(state.get("saturation") or [])
+        prior_codes = 0
+        if prior_points:
+            prior_codes = int(
+                prior_points[-1].get("cumulative_codes_post_merge", prior_points[-1].get("cumulative_codes")) or 0
+            )
+
+        def _point(book: dict, *, pre_len: int | None = None) -> dict:
+            post_len = len(book)
             return saturation_point(
                 batch=sweep_index,
                 passages_in_batch=passages_since,
                 new_codes=new_codes,
                 cumulative_passages=int(state.get("passages_coded") or 0),
-                cumulative_codes=len(book),
+                cumulative_codes=post_len,
+                cumulative_codes_pre_merge=post_len if pre_len is None else pre_len,
+                new_codes_post_merge=post_len - prior_codes,
             )
 
         if not codebook:
@@ -751,8 +792,9 @@ def _sweep_node(runtime: RunConfig):
             if jobs:
                 code_task = asyncio.create_task(_pending_rows(runtime, state, jobs))
         codes = comparison_order(list(codebook.values()))
+        frozen = frozen_pair_keys(list(state.get("pair_decisions") or []), codebook)
         try:
-            parsed, candidates, chunk_count = await _sweep_chunks(runtime, codes, sweep_index)
+            parsed, candidates, chunk_count = await _sweep_chunks(runtime, codes, sweep_index, frozen=frozen)
             overlap_pending: list = []
             if code_task is not None:
                 overlap_pending = await code_task
@@ -771,15 +813,59 @@ def _sweep_node(runtime: RunConfig):
         prompt_log = _take_prompts(runtime, state)
         from automated_grounded_theory.codebook import finalize_candidate_decisions
 
+        pre_merge_book = codebook
+        pre_len = len(codebook)
+        cache = list(state.get("pair_decisions") or [])
+        frozen = frozen_pair_keys(cache, codebook)
+        replay = replay_accepted_pairs(cache, codebook)
+        replay_pairs = {
+            frozenset((code_key(str(item.get("source") or "")), code_key(str(item.get("target") or ""))))
+            for item in replay
+        }
+        proposed = []
+        already = []
+        for merge in parsed.get("merges") or []:
+            pair = frozenset(
+                (code_key(str(merge.get("source") or "")), code_key(str(merge.get("target") or "")))
+            )
+            if pair in replay_pairs:
+                continue
+            if pair in frozen:
+                already.append({**dict(merge), "reason": "already_decided", "confidence": merge.get("confidence", 1.0)})
+            else:
+                proposed.append(merge)
+        verified, verify_rejected = await _verify_proposed_merges(
+            runtime,
+            codebook,
+            proposed,
+            sweep_index,
+        )
+        verify_rejected = list(already) + list(verify_rejected)
         applied = apply_sweep(
             codebook,
             segments,
-            merges=list(parsed.get("merges") or []),
+            merges=list(verified) + replay,
             candidates=candidates,
             definitions=list(parsed.get("definitions") or []),
             overloaded=list(parsed.get("overloaded_codes") or []),
             relation_hints=list(parsed.get("relation_hints") or []),
+            min_merge_confidence=runtime.min_merge_confidence,
+            review_below=runtime.review_below,
+            frozen_pairs=frozen - replay_pairs,
         )
+        applied["rejected_merges"] = list(verify_rejected) + list(applied.get("rejected_merges") or [])
+        if applied["accepted_merges"]:
+            rewritten, rewrite_ops = await _rewrite_survivor_definitions(
+                runtime,
+                applied["codebook"],
+                applied["segments"],
+                applied["accepted_merges"],
+                pre_merge_book,
+                sweep_index,
+            )
+            applied["codebook"] = rewritten
+            applied.setdefault("ops", []).extend(rewrite_ops)
+            applied.setdefault("review", []).extend(op for op in rewrite_ops if op.get("status") == "review")
         finalize_candidate_decisions(
             applied,
             candidates,
@@ -849,7 +935,31 @@ def _sweep_node(runtime: RunConfig):
             "overloaded_codes": overloaded,
             "codes_sent": len(codes),
             "chunks": chunk_count,
+            "review": list(applied.get("review") or []),
         }
+        decision_rows = []
+        for item in applied["accepted_merges"]:
+            decision_rows.append({**item, "decision": "accept"})
+        for item in applied["rejected_merges"]:
+            if item.get("reason") in {"unknown_or_same", "unknown_definition", "not_offered"}:
+                continue
+            decision_rows.append({**item, "decision": "reject"})
+        pair_decisions = remember_pair_decisions(
+            list(state.get("pair_decisions") or []),
+            pre_merge_book,
+            decision_rows,
+        )
+        carried = overlap_state if overlap_state is not None else state
+        ops = list(carried.get("ops") or [])
+        review = list(carried.get("review") or [])
+        for op in applied.get("ops") or []:
+            op = dict(op)
+            if not op.get("op_id"):
+                counters["op"] = int(counters.get("op", 0)) + 1
+                op["op_id"] = f"o{counters['op']:05d}"
+            ops.append(op)
+            if op.get("status") == "review":
+                review.append(op)
         branch_books = state.get("branch_codebooks") or {}
         if state.get("parallel"):
             branch_books = {doc_id: deepcopy(applied["codebook"]) for doc_id in branch_books}
@@ -859,11 +969,14 @@ def _sweep_node(runtime: RunConfig):
             segments=applied["segments"],
             memos=memos,
             counters=counters,
-            saturation=list(state.get("saturation") or []) + [_point(applied["codebook"])],
+            saturation=list(state.get("saturation") or []) + [_point(applied["codebook"], pre_len=pre_len)],
             sweep_log=sweep_log + [record],
             branch_codebooks=branch_books,
             prompt_log=prompt_log,
             warnings=warnings,
+            ops=ops,
+            review=review,
+            pair_decisions=pair_decisions,
         )
         if overlap_state is not None:
             coded_before = int(state.get("passages_since_sweep") or 0)
@@ -894,6 +1007,9 @@ def _sweep_update(
     branch_codebooks: dict | None = None,
     prompt_log: list | None = None,
     warnings: list | None = None,
+    ops: list | None = None,
+    review: list | None = None,
+    pair_decisions: list | None = None,
 ) -> dict:
     return {
         "codebook": codebook,
@@ -907,6 +1023,9 @@ def _sweep_update(
         "new_codes_since_sweep": 0,
         "passages_since_sweep": 0,
         "branch_codebooks": branch_codebooks if branch_codebooks is not None else state.get("branch_codebooks") or {},
+        "ops": list(state.get("ops") or []) if ops is None else ops,
+        "review": list(state.get("review") or []) if review is None else review,
+        "pair_decisions": list(state.get("pair_decisions") or []) if pair_decisions is None else pair_decisions,
     }
 
 
@@ -964,7 +1083,9 @@ def reconcile_sweep_parts(parts: list[dict]) -> dict:
             ):
                 definitions[key] = {
                     "code": update.get("code"),
+                    "code_id": update.get("code_id") or "",
                     "definition": text,
+                    "confidence": update.get("confidence", 1.0),
                     "chunk_index": chunk_index,
                 }
     overloaded: list[str] = []
@@ -1005,7 +1126,12 @@ def reconcile_sweep_parts(parts: list[dict]) -> dict:
     return {
         "merges": merges,
         "definitions": [
-            {"code": item["code"], "definition": item["definition"]}
+            {
+                "code": item["code"],
+                "code_id": item.get("code_id") or "",
+                "definition": item["definition"],
+                "confidence": item.get("confidence", 1.0),
+            }
             for item in sorted(definitions.values(), key=lambda item: code_key(str(item["code"] or "")))
         ],
         "overloaded_codes": overloaded,
@@ -1027,7 +1153,194 @@ def _join_unique(texts) -> str:
     return "\n\n".join(kept)
 
 
-async def _sweep_chunks(runtime: RunConfig, codes: list, sweep_index: int) -> tuple[dict, list, int]:
+def _quotes_for(segments: list, key: str, limit: int = 6) -> list[str]:
+    quotes = []
+    for segment in segments:
+        if (segment.get("code_key") or code_key(str(segment.get("code") or ""))) != key:
+            continue
+        quote = str(segment.get("quote") or "").strip()
+        if quote and quote not in quotes:
+            quotes.append(quote)
+        if len(quotes) >= limit:
+            break
+    return quotes
+
+
+async def _verify_proposed_merges(
+    runtime: RunConfig,
+    codebook: dict,
+    merges: list,
+    sweep_index: int,
+) -> tuple[list, list]:
+    """Second structured look at each proposed merge. Opposite stances are not sent."""
+    from automated_grounded_theory.codebook import opposite_valence
+
+    eligible = []
+    rejected = []
+    for merge in merges:
+        source = code_key(str(merge.get("source") or ""))
+        target = code_key(str(merge.get("target") or ""))
+        if source in codebook and target in codebook and opposite_valence(
+            codebook[source].get("valence"), codebook[target].get("valence")
+        ):
+            rejected.append({**dict(merge), "reason": "opposite_valence", "confidence": merge.get("confidence", 1.0)})
+            continue
+        eligible.append(merge)
+    if not eligible:
+        return [], rejected
+    messages = build_merge_check_messages(
+        context=runtime.context,
+        codebook=codebook,
+        merges=eligible,
+        prompt_cache=runtime.prompt_cache,
+    )
+    payload = await _ainvoke_structured(
+        runtime.sweeper,
+        MergeCheckBatch,
+        messages,
+        kind="merge_verify",
+        model_name=runtime.sweep_model_name,
+        passage_id=f"sweep-{sweep_index}-verify",
+        runtime=runtime,
+    )
+    by_pair = {}
+    for check in payload.get("checks") or []:
+        pair = frozenset(
+            (
+                code_key(str(check.get("source") or "")),
+                code_key(str(check.get("target") or "")),
+            )
+        )
+        if len(pair) == 2:
+            by_pair[pair] = check
+    kept = []
+    for merge in eligible:
+        pair = frozenset((code_key(str(merge.get("source") or "")), code_key(str(merge.get("target") or ""))))
+        check = by_pair.get(pair)
+        if check is None or str(check.get("action") or "") != "accept":
+            rejected.append(
+                {
+                    **dict(merge),
+                    "reason": "verify_rejected" if check else "verify_omitted",
+                    "confidence": 1.0 if check is None else check.get("confidence", 1.0),
+                    "rationale": "" if check is None else check.get("rationale") or merge.get("rationale") or "",
+                }
+            )
+            continue
+        confirmed = dict(merge)
+        confirmed["confidence"] = check.get("confidence", merge.get("confidence", 1.0))
+        confirmed["rationale"] = check.get("rationale") or merge.get("rationale") or ""
+        kept.append(confirmed)
+    return kept, rejected
+
+
+async def _rewrite_survivor_definitions(
+    runtime: RunConfig,
+    codebook: dict,
+    segments: list,
+    accepted: list,
+    pre_merge_book: dict,
+    sweep_index: int,
+) -> tuple[dict, list]:
+    """Keep each survivor's label. Rewrite its definition from the quotes it now holds."""
+    from automated_grounded_theory.codebook import _code_id
+
+    groups: dict[str, list[str]] = {}
+    for merge in accepted:
+        source = code_key(str(merge.get("source") or ""))
+        target = code_key(str(merge.get("target") or ""))
+        survivor = source if source in codebook else target if target in codebook else ""
+        retired = target if survivor == source else source
+        if not survivor:
+            continue
+        label = str(pre_merge_book.get(retired, {}).get("code") or merge.get("source") or merge.get("target") or "")
+        groups.setdefault(survivor, [])
+        if label and label not in groups[survivor] and label != codebook[survivor].get("code"):
+            groups[survivor].append(label)
+    if not groups:
+        return codebook, []
+    rows = []
+    for key, retired in groups.items():
+        entry = codebook[key]
+        rows.append(
+            {
+                "code_id": entry.get("code_id") or _code_id(key),
+                "code": entry.get("code"),
+                "definition": entry.get("definition") or "",
+                "retired_labels": retired,
+                "quotes": _quotes_for(segments, key),
+            }
+        )
+    messages = build_rewrite_messages(context=runtime.context, codes=rows, prompt_cache=runtime.prompt_cache)
+    try:
+        payload = await _ainvoke_structured(
+            runtime.sweeper,
+            DefinitionRewriteBatch,
+            messages,
+            kind="definition_rewrite",
+            model_name=runtime.sweep_model_name,
+            passage_id=f"sweep-{sweep_index}-rewrite",
+            runtime=runtime,
+        )
+    except CodingError as exc:
+        if not is_transient(exc):
+            raise
+        runtime.notes.append(f"Definition rewrite after sweep {sweep_index} was skipped: {exc}")
+        return codebook, []
+    book = {key: dict(entry) for key, entry in codebook.items()}
+    by_id = {str(entry.get("code_id") or _code_id(key)): key for key, entry in book.items()}
+    ops = []
+    for rewrite in payload.get("rewrites") or []:
+        code_id = str(rewrite.get("code_id") or "")
+        confidence = float(rewrite.get("confidence") or 0)
+        key = by_id.get(code_id) or code_key(str(rewrite.get("code") or ""))
+        definition = str(rewrite.get("definition") or "").strip()
+        if key not in groups or key not in book or not definition:
+            ops.append(
+                {
+                    "op_id": "",
+                    "op": "refine_definition",
+                    "status": "rejected",
+                    "confidence": confidence,
+                    "ids": {"code_id": code_id},
+                    "reason": "unknown_code_id",
+                }
+            )
+            continue
+        if confidence < runtime.review_below:
+            ops.append(
+                {
+                    "op_id": "",
+                    "op": "refine_definition",
+                    "status": "review",
+                    "confidence": confidence,
+                    "ids": {"code_id": book[key].get("code_id") or code_id},
+                    "reason": "below_review_threshold",
+                }
+            )
+            continue
+        book[key]["definition"] = definition
+        book[key].setdefault("history", []).append({"event": "definition_rewritten", "definition": definition})
+        ops.append(
+            {
+                "op_id": "",
+                "op": "refine_definition",
+                "status": "applied",
+                "confidence": confidence,
+                "ids": {"code_id": book[key].get("code_id") or code_id},
+                "reason": "",
+            }
+        )
+    return book, ops
+
+
+async def _sweep_chunks(
+    runtime: RunConfig,
+    codes: list,
+    sweep_index: int,
+    *,
+    frozen: set[frozenset[str]] | None = None,
+) -> tuple[dict, list, int]:
     """Detect candidates, confirm merges, and refine definitions per chunk, concurrently.
 
     Chunks share one ``abatch``. Their merge maps are reconciled by chunk index,
@@ -1060,6 +1373,18 @@ async def _sweep_chunks(runtime: RunConfig, codes: list, sweep_index: int) -> tu
         lexical_threshold=runtime.lexical_merge_threshold,
         limit=runtime.candidate_limit,
     )
+    if frozen:
+        hints = [
+            hint
+            for hint in hints
+            if frozenset(
+                (
+                    code_key(str(hint.get("source") or "")),
+                    code_key(str(hint.get("target") or "")),
+                )
+            )
+            not in frozen
+        ]
     for index, hint in enumerate(hints, start=1):
         hint["pair_id"] = f"s{sweep_index}p{index:04d}"
     key_chunk: dict[str, int] = {}
@@ -1159,14 +1484,9 @@ async def _ainvoke_structured(
     passage_id: str,
     runtime: RunConfig,
 ) -> dict:
-    runnable = structured_runnable(model, schema)
     try:
-        result = await runtime.limiter.ainvoke(runnable, messages)
+        (payload, usage), used = await ainvoke_structured(model, schema, messages, runtime.limiter)
     except Exception as exc:
-        raise CodingError(f"{kind} failed for {passage_id}: {exc}") from exc
-    try:
-        payload, usage = parse_structured(result, schema)
-    except ValueError as exc:
         raise CodingError(f"{kind} failed for {passage_id}: {exc}") from exc
     _append_prompt_log(
         runtime,
@@ -1174,7 +1494,7 @@ async def _ainvoke_structured(
             "kind": kind,
             "passage_id": passage_id,
             "model": model_name,
-            "messages": serialize_messages(messages),
+            "messages": serialize_messages(used),
             "output": payload,
             "usage": usage,
         },
@@ -1195,6 +1515,8 @@ async def _abatch_structured(
     """One ``abatch`` for every message list. Logs are written in input order."""
     if not message_lists:
         return []
+    from automated_grounded_theory.async_support import parse_structured, structured_runnable
+
     runnable = structured_runnable(model, schema)
     try:
         results = await runtime.limiter.abatch(runnable, message_lists)
@@ -1205,15 +1527,19 @@ async def _abatch_structured(
     for messages, result, passage_id in zip(message_lists, results, passage_ids):
         try:
             payload, usage = parse_structured(result, schema)
-        except ValueError as exc:
-            raise CodingError(f"{kind} failed for {passage_id}: {exc}") from exc
+            used = messages
+        except ValueError:
+            try:
+                (payload, usage), used = await ainvoke_structured(model, schema, messages, runtime.limiter)
+            except Exception as exc:
+                raise CodingError(f"{kind} failed for {passage_id}: {exc}") from exc
         _append_prompt_log(
             runtime,
             {
                 "kind": kind,
                 "passage_id": passage_id,
                 "model": model_name,
-                "messages": serialize_messages(messages),
+                "messages": serialize_messages(used),
                 "output": payload,
                 "usage": usage,
             },
