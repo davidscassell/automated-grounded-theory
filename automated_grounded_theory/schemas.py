@@ -115,6 +115,57 @@ class BatchCoding(_LLMModel):
     passages: list[PassageCoding] = Field(default_factory=list)
 
 
+class ThemeProposal(_LLMModel):
+    """One focused-coding theme. It groups open codes; it is not a new code."""
+
+    name: str = Field(description="Short theme name. Not an open-code label.")
+    definition: str = Field(description="What kind of incident this theme gathers.")
+    properties: list[str] = Field(
+        default_factory=list,
+        description="A few dimensions that vary inside the theme. Empty if none stand out.",
+    )
+    codes: list[str] = Field(
+        default_factory=list,
+        description="Open-code labels in this theme. Copy each CODE_LABEL exactly. Every code belongs to one theme.",
+    )
+
+
+class ThemeTension(_LLMModel):
+    """A pull between themes, or a negative case, grounded in the data."""
+
+    themes: list[str] = Field(
+        default_factory=list,
+        description="Theme names this note is about. Use the names you just proposed.",
+    )
+    note: str = Field(default="", description="How these themes pull against each other.")
+    quote: str = Field(
+        default="",
+        description="Optional exact copy of an EXAMPLE quote from the prompt. Empty if you have none.",
+    )
+    passage_id: str = Field(
+        default="",
+        description="passage_id of that example when the prompt shows one. Otherwise empty.",
+    )
+
+
+class ThemeNegative(_LLMModel):
+    """A code or passage that sits awkwardly inside a theme."""
+
+    theme: str = Field(default="", description="Theme name this case strains.")
+    note: str = Field(default="")
+    code: str = Field(default="", description="Open-code label, or empty.")
+    quote: str = Field(default="", description="Exact EXAMPLE quote, or empty.")
+    passage_id: str = Field(default="")
+
+
+class ThemeCoding(_LLMModel):
+    """Focused coding of one codebook. Does not invent open codes."""
+
+    themes: list[ThemeProposal] = Field(default_factory=list)
+    tensions: list[ThemeTension] = Field(default_factory=list)
+    negative_cases: list[ThemeNegative] = Field(default_factory=list)
+
+
 class SweepCoding(_LLMModel):
     """Code-to-code comparison. May propose merges. Does not invent codes."""
 

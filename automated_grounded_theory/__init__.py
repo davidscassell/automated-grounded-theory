@@ -1,7 +1,7 @@
-"""LLM-assisted first-round grounded theory open coding.
+"""LLM-assisted grounded theory: open coding, then focused coding into themes.
 
 Codes are produced passage by passage from the corpus. The research context
-sensitizes attention and is not a codebook.
+sensitizes attention and is not a codebook. Themes group those codes afterwards.
 """
 
 from automated_grounded_theory.api import (
@@ -21,6 +21,7 @@ from automated_grounded_theory.retrieval import (
 )
 from automated_grounded_theory.segment import plan_coding
 from automated_grounded_theory.stability import StabilityReport
+from automated_grounded_theory.themes import ThemeError, ThemeResult, abuild_themes, build_themes
 from automated_grounded_theory.version import __version__
 
 __all__ = [
@@ -32,8 +33,12 @@ __all__ = [
     "PresetCodesError",
     "ResearchContext",
     "StabilityReport",
+    "ThemeError",
+    "ThemeResult",
     "__version__",
+    "abuild_themes",
     "aopen_code",
+    "build_themes",
     "chen_metrics",
     "compare_runs",
     "evaluate_run",

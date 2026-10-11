@@ -1,8 +1,8 @@
 # automated_grounded_theory
 
-First-round **open coding** in the grounded theory tradition. A chat model reads every passage, in a seeded random order, and builds a codebook as it goes. A second pass every N passages compares codes with codes. The package reports how many new codes each batch added. It does not decide that the data are saturated.
+**Open coding**, then **focused coding**, in the grounded theory tradition. A chat model reads every passage, in a seeded random order, and builds a codebook as it goes. A second pass every N passages compares codes with codes. The package reports how many new codes each batch added. It does not decide that the data are saturated.
 
-This round is open coding only. It does not do axial coding, selective coding, or theoretical sampling.
+`build_themes` is the next round: it groups those open codes into themes. It does not do axial coding, selective coding, or theoretical sampling.
 
 ## Install
 
@@ -26,6 +26,7 @@ Coding uses a LangChain chat model. Install the extra for the provider you actua
 | `cohere` | Cohere |
 | `huggingface` | Hugging Face |
 | `checkpoint` | SQLite resume (`langgraph-checkpoint-sqlite`) |
+| `plots` | Theme prevalence chart (`matplotlib`) |
 
 ```bash
 pip install "automated_grounded_theory[xai]"
@@ -135,6 +136,48 @@ Taguette writes REFI-QDA `.qdc` and does not import it. `codebook.qdc` follows t
 
 Prompt caching: the instructions and research context sit in a stable system prefix. The codebook and the passages stay in the user message, which changes every call. Anthropic also gets an explicit `cache_control` breakpoint. Providers that cache a repeated prefix on their own (including xAI and OpenAI, when that model supports it) see the same stable prefix. Set `prompt_cache=True` or `False` to force the explicit breakpoint on or off.
 
+## Focused coding
+
+`build_themes` takes an `open_code` result and groups every open code into one theme. This is focused coding (Charmaz): the codes already exist, and the model categorizes them. It does not read the passages again and it does not mint codes.
+
+```python
+from automated_grounded_theory import build_themes
+
+themes = build_themes(
+    result,
+    context,
+    model="xai:grok-4",
+    n_themes=None,
+    seed=7,
+    output_dir="coding_run/themes",
+)
+```
+
+`model` is the same kind of argument as in `open_code`: a `provider:model-name` string or a `BaseChatModel`. `n_themes=None` lets the model choose how many themes the codes support. Set it to ask for a specific number. `seed` only shuffles the order of codes in the prompt. Representative quotes do not use it.
+
+A small LangGraph calls the model, then checks the assignment. Every open code must be assigned, and every name must be a code from the codebook. Unknown names are dropped. A code named twice keeps the first theme. If anything is missing, the model is shown that list and called again (`validation_retries`, default 1). `ThemeError` is raised when codes are still missing after those retries.
+
+Counts are computed from the coded segments, not by the model:
+
+- a passage counts toward a theme when any segment in it carries a member code
+- a document counts when any of its passages does (`n_comments` is that same document count, for a survey where each comment is a document)
+- a respondent comes from metadata (`respondent_id`, `respondent`, `participant_id`, or `participant`), or from `respondent_key` if you pass one. With none of those, each document is its own respondent
+- every metadata field on those passages is broken down (for example `question`), as document counts
+
+Each theme keeps up to three representative quotes (`quotes_per_theme`). A quote has to be a verbatim substring of its passage. Shorter than `min_quote_chars` (default 15) is skipped. Only one quote is kept per respondent. The longer quote from the more frequent code is preferred. Tensions and negative cases come from the model; a quote on those is kept only when it is verbatim, and dropped otherwise. Passages with no segment, including ones skipped as empty or `n/a`, are listed as uncoded.
+
+`output_dir` receives:
+
+- `themes.md` — definition, properties, prevalence, metadata breakdowns, member codes, quotes, tensions, uncoded passages
+- `themes.csv` — `theme,definition,codes,n_passages,pct_passages,n_documents,pct_documents,n_comments,pct_comments,n_respondents,pct_respondents`
+- `themes.json` — the same records, plus tensions, negative cases, and uncoded passages
+- `taguette_themes.csv` — Taguette codebook, one row per code, tag path `Theme.Code` (dots inside a label are replaced, so the only split is between theme and code)
+- `theme_prevalence.png` — horizontal bars for percent of passages and percent of respondents
+
+The chart needs matplotlib (`pip install "automated_grounded_theory[plots]"`). If it is not installed, the other files are still written and `themes.warnings` says the chart was skipped. Taguette imports `taguette_themes.csv` from Project info → Import codebook. It does not import highlights.
+
+`context` is the same sensitizing context as open coding. A mapping with preset codes raises `PresetCodesError` and does not call the model.
+
 ## Evaluate
 
 `evaluate_run` scores a result or an output directory. It does not call a model.
@@ -175,7 +218,7 @@ pytest
 
 `pytest` puts the repository root on `pythonpath`, so `tests` imports without an extra install step. The `dev` extra includes `langgraph-checkpoint-sqlite`. If that package is missing, the sqlite resume test is skipped and the in-memory resume test still runs.
 
-Tests use a fake chat model and a four-document corpus in `tests/corpus.py`. They do not call a provider.
+Tests use a fake chat model and a four-document corpus in `tests/corpus.py`. Focused-coding tests use a second fake that groups those codes. They do not call a provider.
 
 ## License
 

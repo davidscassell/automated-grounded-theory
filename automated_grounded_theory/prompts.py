@@ -272,6 +272,82 @@ def build_sweep_messages(
     return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content="\n".join(parts))]
 
 
+THEME_SYSTEM = """You are doing focused coding, the round after open coding (Charmaz).
+
+The open codes already exist. Group them into themes. A theme gathers codes \
+about the same kind of incident. Name the theme, define the incident it gathers, \
+and list a few properties (dimensions that vary inside it) when the codes show any.
+
+Assign every CODE_LABEL to exactly one theme. Copy the label text exactly. Do not \
+invent a code, do not rename a code, and do not drop one to keep the list short. \
+A code that could sit in two themes still goes to the one it fits best.
+
+Themes are categories of the codes in front of you. The research context is only \
+for understanding those codes. It is not a list of themes to force, and it is not \
+evidence. Do not mint a theme the codes have not earned. Do not put a respondent's \
+department, tenure, role, or name into a theme name or definition.
+
+Tensions are places where themes pull against each other. Negative cases are codes \
+that fit a theme awkwardly. An optional quote must be copied from an EXAMPLE line. \
+Leave the quote empty rather than paraphrase. passage_id, when you set it, must be \
+the one shown next to that example."""
+
+
+def theme_system_text(context: ResearchContext, n_themes: int | None) -> str:
+    if n_themes:
+        count = f"Propose exactly {n_themes} themes."
+    else:
+        count = (
+            "Propose as many themes as the codes support. A handful is typical. "
+            "Do not add themes to hit a round number, and do not drop codes to keep the list short."
+        )
+    return THEME_SYSTEM + "\n\n" + count + "\n\n" + render_context(context)
+
+
+def format_theme_codebook(codes: Sequence[Mapping[str, Any]]) -> str:
+    if not codes:
+        return "OPEN CODES\n(none)"
+    lines = [
+        "OPEN CODES",
+        "Assign every CODE_LABEL below to exactly one theme. Copy the label text exactly.",
+    ]
+    for entry in codes:
+        lines.append(f"CODE_LABEL: {entry.get('code', '')}")
+        definition = clip(str(entry.get("definition") or ""), 500)
+        if definition:
+            lines.append(f"DEFINITION: {definition}")
+        lines.append(f"COUNT: {entry.get('frequency', 0)}")
+        examples = entry.get("examples") or []
+        for example in examples[:2]:
+            quote = clip(str(example.get("quote") or ""), 240)
+            if not quote:
+                continue
+            lines.append(f"EXAMPLE: {quote}")
+            if example.get("passage_id"):
+                lines.append(f"PASSAGE_ID: {example.get('passage_id')}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def build_theme_messages(
+    *,
+    context: ResearchContext,
+    codes: Sequence[Mapping[str, Any]],
+    n_themes: int | None,
+    feedback: str,
+    prompt_cache: bool,
+) -> list:
+    parts = [
+        format_theme_codebook(codes),
+        "",
+        "Return one theme per group. Every CODE_LABEL appears under exactly one theme.",
+    ]
+    if feedback:
+        parts.extend(["", feedback])
+    system = theme_system_text(context, n_themes)
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content="\n".join(parts))]
+
+
 def validation_feedback(rejections: Sequence[Mapping[str, Any]]) -> str:
     lines = [
         "The previous coding was checked against the passage and these items were rejected.",
