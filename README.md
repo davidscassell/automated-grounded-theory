@@ -1,6 +1,6 @@
 # automated_grounded_theory
 
-**Open coding**, then **focused coding**, in the grounded theory tradition (Glaser and Strauss 1967; Glaser 1978, 1992; Strauss and Corbin 1990/1998; Charmaz 2006/2014). By default the model reads every document in a seeded order, and every passage of that document in reading order, comparing each incident with the codebook earned so far. It does not decide that the data are saturated. How each step maps onto those sources is in [docs/methodology.md](docs/methodology.md). A short notebook with the same citations and the Taguette import steps is [docs/open_coding.ipynb](docs/open_coding.ipynb).
+**Open coding**, then **focused coding**, in the grounded theory tradition (Glaser and Strauss 1967; Glaser 1978, 1992; Strauss and Corbin 1990/1998; Charmaz 2006/2014). By default the model reads every document in a seeded order, and every passage of that document in reading order, comparing each incident with the codebook earned so far. It does not decide that the data are saturated. How each step maps onto those sources is in [docs/methodology.md](docs/methodology.md). A short notebook with the same citations and the Taguette import steps is [docs/open_coding.ipynb](docs/open_coding.ipynb). A full walkthrough on a fictional employee survey, including an offline mode that needs no API key, is [examples/demo.ipynb](examples/demo.ipynb).
 
 `build_themes` is the next round: it groups those open codes into themes. It does not do axial coding, selective coding, or theoretical sampling.
 
@@ -236,6 +236,8 @@ pytest
 `pytest` puts the repository root on `pythonpath`, so `tests` imports without an extra install step. The `dev` extra includes `langgraph-checkpoint-sqlite`. If that package is missing, the sqlite resume test is skipped and the in-memory resume test still runs.
 
 Tests use a fake chat model and a four-document corpus in `tests/corpus.py`. Focused-coding tests use a second fake that groups those codes. Async tests cover a running event loop, rate-limit retry, and order-independent reconciliation. If Taguette is installed, `tests/test_taguette_roundtrip.py` imports the CSV through `taguette.import_codebook.list_tags` and checks that `Theme\Code` paths validate. They do not call a provider.
+
+`tests/test_demo_notebook.py` executes [examples/demo.ipynb](examples/demo.ipynb) offline, in the same style as `nbmake`. The notebook in the repository is already executed in that offline mode. `pytest --nbmake examples/demo.ipynb` runs it the same way when the `dev` extra is installed.
 
 ## License
 

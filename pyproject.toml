@@ -26,7 +26,14 @@ cohere = ["langchain-cohere"]
 huggingface = ["langchain-huggingface"]
 checkpoint = ["langgraph-checkpoint-sqlite"]
 plots = ["matplotlib"]
-dev = ["pytest", "langgraph-checkpoint-sqlite"]
+dev = [
+    "pytest",
+    "langgraph-checkpoint-sqlite",
+    "matplotlib",
+    "nbclient",
+    "ipykernel",
+    "nbmake",
+]
 
 [project.scripts]
 agt-evaluate = "automated_grounded_theory.evaluate:main"
