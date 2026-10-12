@@ -109,6 +109,14 @@ def display_label(label: str) -> str:
     return re.sub(r"\s+", " ", label.strip())
 
 
+# A blank label is stored under this name so the incident stays in the book.
+EMPTY_LABEL = "(empty label)"
+# Empty and over-long labels are retried, then kept. Generic labels are not.
+LENIENT_LABEL_REASONS = frozenset({"empty_code", "code_too_long"})
+LABEL_HOLD_REASONS = ("empty_code", "code_too_long", "bundled_concepts")
+_CONCEPT_AND = re.compile(r"\band\b", re.IGNORECASE)
+
+
 def gerund_ok(label: str) -> bool:
     """True when the label has an -ing token that is not a false friend."""
     for match in _GERUND.finditer(label):
@@ -138,6 +146,53 @@ def flexible_contains(needle: str, haystack: str) -> bool:
 def in_vivo_supported(label: str, passage: str) -> bool:
     """An in-vivo label has to be the participant's words, present in the passage."""
     return flexible_contains(label, passage)
+
+
+def split_joined_label(label: str) -> list[str]:
+    """Split a semicolon-joined label into separate candidate codes.
+
+    A label with no semicolon is one piece, including a blank label. Empty
+    pieces around a semicolon are dropped. A label that is only semicolons
+    becomes one blank piece so it is flagged instead of discarded.
+    """
+    text = str(label or "")
+    if ";" not in text:
+        return [text]
+    parts = [display_label(part) for part in text.split(";") if display_label(part)]
+    return parts or [""]
+
+
+def bundled_concepts(label: str) -> bool:
+    """True when a label names several concepts instead of one.
+
+    A comma list of three or more concepts counts. So does a chain of three
+    or more concepts joined by ``and`` (``flexibility and friction and
+    coworkers``). One pair, such as ``pay and benefits``, does not.
+    """
+    shown = display_label(label)
+    if not shown:
+        return False
+    comma_parts = [part.strip() for part in shown.split(",") if part.strip()]
+    if len(comma_parts) >= 3:
+        return True
+    and_parts = [part.strip() for part in _CONCEPT_AND.split(shown) if part.strip()]
+    return len(and_parts) >= 3
+
+
+def lenient_label_fields(label: str, *, in_vivo: bool, passage: str) -> dict[str, Any]:
+    """Normalized fields for an empty or over-long label that is kept.
+
+    A blank label is stored as ``(empty label)`` so the incident has a key
+    and can be reviewed. The caller still flags the original failure.
+    """
+    shown = display_label(label) or EMPTY_LABEL
+    kept_in_vivo = bool(in_vivo) and shown != EMPTY_LABEL and in_vivo_supported(shown, passage)
+    return {
+        "code": shown,
+        "key": code_key(shown),
+        "in_vivo": kept_in_vivo,
+        "gerund_ok": gerund_ok(shown),
+    }
 
 
 @dataclass(frozen=True)

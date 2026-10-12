@@ -116,7 +116,9 @@ For each passage the model says which code each incident indicates, and whether 
 A plain check then runs, with no model:
 
 - a quote is anchored, never dropped: exact, normalized (whitespace, case, punctuation), fuzzy (small edits, with a similarity), possibly modified, or unanchored. `...` can match several spans. Search is the passage, then neighbors, then the document. Possibly modified and unanchored quotes are flagged and coding continues
-- empty and generic labels (`experience`, `theme`, `discussion`, ...) are dropped
+- a semicolon-joined label is split into separate codes, and a piece that matches an existing code is reused
+- an empty label, a label over the length limit, or a new label that bundles several concepts (a comma list of three or more, or several concepts joined by "and") is retried once with feedback. If it is still invalid, the code is kept and flagged for review. A blank label is stored as `(empty label)`
+- generic labels (`experience`, `theme`, `discussion`, ...) are dropped
 - an in-vivo flag is cleared when the label is not in the passage
 - a non-gerund label is kept and flagged, unless `require_gerund=True`
 - a new code with no nearest code, or a definition that repeats respondent metadata, is kept and flagged for review
