@@ -158,7 +158,7 @@ def compare_runs(runs: Sequence, *, soft_threshold_note: str = "0.5") -> Stabili
             "passage after labels are aligned, and aligned_assignment_alpha is "
             "Krippendorff's alpha on that passage-by-code matrix. "
             "None of these scores decides which seed is correct, and none is a validity coefficient. "
-            "Open-coding labels are expected to move."
+            "The report does not pick a winning seed. Open-coding labels are expected to move."
         ),
         runs=list(runs),
     )

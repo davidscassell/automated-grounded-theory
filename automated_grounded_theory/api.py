@@ -700,7 +700,7 @@ async def amulti_seed_stability(
         raise ValueError("multi_seed_stability needs at least two seeds.")
     if "seed" in open_code_kwargs:
         raise ValueError("Pass seeds to multi_seed_stability, not seed=.")
-        limiter = open_code_kwargs.pop("limiter", None)
+    limiter = open_code_kwargs.pop("limiter", None)
     if limiter is None:
         limiter = CallLimiter(
             int(open_code_kwargs.get("max_concurrent_requests") or open_code_kwargs.get("concurrency", 4)),

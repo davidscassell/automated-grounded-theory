@@ -98,7 +98,10 @@ def test_negated_near_duplicate_is_proposed_not_merged():
     assert {proposals[0]["source"], proposals[0]["target"]} == {TRUST, DISTRUST}
     applied = apply_sweep(
         book,
-        [],
+        [
+            {"code_key": TRUST, "code": TRUST, "quote": "I trust them.", "passage_id": "p1", "doc_id": "d"},
+            {"code_key": DISTRUST, "code": DISTRUST, "quote": "I do not trust them.", "passage_id": "p2", "doc_id": "d"},
+        ],
         merges=[
             {
                 "source": DISTRUST,
