@@ -2711,12 +2711,7 @@ async def _abatch_structured(
     """One ``abatch`` for every message list. Logs are written in input order."""
     if not message_lists:
         return []
-    from automated_grounded_theory.async_support import (
-        combine_usage,
-        parse_structured,
-        structured_runnable,
-        usage_from_result,
-    )
+    from automated_grounded_theory.async_support import parse_structured, structured_runnable
 
     runnable = structured_runnable(model, schema)
     try:
@@ -2733,12 +2728,13 @@ async def _abatch_structured(
             payload, usage = parse_structured(result, schema)
             used = messages
         except ValueError:
-            failed_usage = usage_from_result(result)
+            # The failed response is already in the limiter cache. Replaying it
+            # through ainvoke_structured repairs once and reports that usage
+            # plus the repaired response. Adding it here would count it twice.
             try:
                 (payload, usage), used = await ainvoke_structured(
                     model, schema, messages, runtime.limiter, timeout=timeout
                 )
-                usage = combine_usage(failed_usage, usage)
             except Exception as exc:
                 raise CodingError(f"{kind} failed for {passage_id}: {exc}") from exc
         _append_prompt_log(
