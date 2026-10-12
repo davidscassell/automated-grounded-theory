@@ -13,6 +13,7 @@ from langchain_core.runnables import RunnableLambda
 from automated_grounded_theory.prompts import extract_payload, message_text
 from automated_grounded_theory.schemas import (
     BatchCoding,
+    CandidateDiscovery,
     CodeProposal,
     DefinitionRewrite,
     DefinitionRewriteBatch,
@@ -97,7 +98,9 @@ class FakeCoder(BaseChatModel):
             self.call_count += 1
             text = "\n".join(message_text(message) for message in messages)
             name = getattr(schema, "__name__", "")
-            if name == "SweepCoding":
+            if name == "CandidateDiscovery":
+                parsed = CandidateDiscovery(pairs=[])
+            elif name == "SweepCoding":
                 parsed = self.sweep(text)
             elif name == "InBatchComparison":
                 parsed = self.in_batch(text)

@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.6.7
+
+- A rate-limit reservation larger than the bucket raises `OversizedReservation` instead of waiting until a provider timeout. The message names the bucket (`tokens_per_minute` or `requests_per_minute`) and `allow_oversized`. `allow_oversized=True` waits until the bucket is full, then drains it.
+- In-flight embedding calls are dropped when the owner is cancelled, and other waiters shield the shared future so one cancellation does not cancel them. A later request for the same text embeds again. The cache key includes a fingerprint of output-affecting configuration (dimensions, endpoint, deployment, base URL, API version, and model kwargs). A vector whose width does not match the configured dimensions is not stored.
+- `token_budget` (default 6000, was 4000) is the request that will be sent. Neighbors are retrieved and unioned across the passages in the call, then the messages, JSON schema, and a short repair allowance are counted, plus reserved output. A batch that does not fit is repacked into fewer passages, and retrieved codes are trimmed. A passage is split on whitespace only when the text itself still does not fit. A schema repair is measured again and shortened to the same budget. The default rose because the schema and the repair allowance are now inside the count.
+- `aligned_assignment_agreement` aligns exact labels and spelling variants (case, whitespace, punctuation, plural, gerund). A negation does not align, so `trusting managers to share information` and `not trusting managers to share information` score 0. `mapping` is an explicit reviewed equivalence. `align_threshold` is an opt-in Jaccard fallback that still refuses a polarity flip.
+- A sweep chunk no longer repeats the whole book's label index. Each chunk carries its own codes plus a bounded neighborhood (`cross_chunk_limit`, default 8). One compact label-only discovery call covers the rest of the book. User-message characters at chunk size 20:
+
+  | codes | 0.6.4 | 0.6.5 repeated index | 0.6.7 | 0.6.7 + 8 cross-chunk codes |
+  | ---: | ---: | ---: | ---: | ---: |
+  | 20 | 9,347 | 5,467 | 5,467 | 5,467 |
+  | 40 | 54,028 | 14,846 | 13,355 | 17,297 |
+  | 80 | 178,806 | 36,922 | 26,577 | 34,437 |
+  | 160 | 642,142 | 103,334 | 53,261 | 68,957 |
+  | 320 | 2,423,837 | 324,781 | 106,812 | 138,180 |
+  | 640 | 9,404,813 | 1,120,941 | 213,900 | 276,612 |
+  | 1280 | 37,091,765 | 4,145,141 | 429,196 | 554,596 |
+
+  From 160 to 640 codes the 0.6.7 payload grows 4.02x (four times the codes). From 20 to 1280 it grows 78.5x (64 times the codes). The repeated index grows 10.85x from 160 to 640. `scripts/benchmark_sweep_payload.py` prints the table. `policy_version` is `0.6.7`.
+
 ## 0.6.6
 
 - Every model call shares one adaptive gate. `abatch` no longer opens a private semaphore, so two concurrent batches cannot exceed the in-flight ceiling. `max_in_flight` is the peak number of calls that held a slot. Coding, sweeps, and evaluation all use that gate.

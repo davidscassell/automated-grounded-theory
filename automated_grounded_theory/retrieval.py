@@ -13,7 +13,7 @@ import json
 import math
 import re
 import threading
-from typing import Mapping, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 from automated_grounded_theory.validation import code_key
 
@@ -63,13 +63,108 @@ def code_text(entry: Mapping) -> str:
     )
 
 
+# Output-affecting settings. Two clients with the same model name and different
+# dimensions, endpoints, or deployments must not share vectors.
+_FINGERPRINT_FIELDS = (
+    "dimensions",
+    "embedding_dimensions",
+    "output_dimensionality",
+    "azure_endpoint",
+    "azure_deployment",
+    "deployment",
+    "deployment_name",
+    "base_url",
+    "openai_api_base",
+    "api_base",
+    "endpoint",
+    "api_version",
+    "openai_api_version",
+    "model_kwargs",
+)
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return str(value)
+
+
+def embedding_config_fingerprint(embeddings) -> str:
+    """Stable hash of settings that change the vectors, not of the instance id."""
+    payload = {}
+    for attr in _FINGERPRINT_FIELDS:
+        value = getattr(embeddings, attr, None)
+        if value in (None, "", {}, []):
+            continue
+        payload[attr] = _json_safe(value)
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
 def embedding_model_id(embeddings) -> str:
-    """Identity of the embedding model. Two instances of the same named model share a cache."""
+    """Identity of the embedding model and the settings that change its vectors.
+
+    Two instances of the same named model share a cache when their dimensions,
+    endpoint, and deployment match. A 3-dimension client and a 5-dimension
+    client do not, even when ``model`` is the same string.
+    """
+    name = ""
     for attr in ("model", "model_name", "model_id"):
         value = getattr(embeddings, attr, None)
         if isinstance(value, str) and value.strip():
-            return f"{type(embeddings).__qualname__}:{value.strip()}"
-    return f"{type(embeddings).__qualname__}:{id(embeddings)}"
+            name = value.strip()
+            break
+    ident = name or str(id(embeddings))
+    return f"{type(embeddings).__qualname__}:{ident}:{embedding_config_fingerprint(embeddings)}"
+
+
+def expected_dimensions(embeddings) -> int | None:
+    """Configured output width, or None when the client does not declare one."""
+    for attr in ("dimensions", "embedding_dimensions", "output_dimensionality"):
+        found = _positive_int(getattr(embeddings, attr, None))
+        if found is not None:
+            return found
+    kwargs = getattr(embeddings, "model_kwargs", None)
+    if isinstance(kwargs, dict):
+        for attr in ("dimensions", "embedding_dimensions", "output_dimensionality"):
+            found = _positive_int(kwargs.get(attr))
+            if found is not None:
+                return found
+    return None
+
+
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int) and value > 0:
+        return value
+    if isinstance(value, str) and value.strip().isdigit() and int(value.strip()) > 0:
+        return int(value.strip())
+    return None
+
+
+def _check_vectors(embeddings, vectors: Sequence[Sequence[float]]) -> None:
+    """Refuse to cache a batch whose width is mixed or not the configured width."""
+    if not vectors:
+        return
+    lengths = {len(vector) for vector in vectors}
+    if len(lengths) != 1:
+        raise RuntimeError(
+            f"Embedding model returned mixed vector lengths {sorted(lengths)}. Refusing to cache them."
+        )
+    got = next(iter(lengths))
+    if got <= 0:
+        raise RuntimeError("Embedding model returned an empty vector.")
+    expected = expected_dimensions(embeddings)
+    if expected is not None and got != expected:
+        raise RuntimeError(
+            f"Embedding model returned {got} dimensions but is configured for {expected}. "
+            "Refusing to cache a vector that does not match the configured output size."
+        )
 
 
 def _content_key(model_id: str, text: str, role: str) -> tuple[str, str]:
@@ -114,6 +209,29 @@ def _store_vector(key: tuple[str, str], vector: Sequence[float]) -> list[float]:
     return stored
 
 
+def _abort_future(future: asyncio.Future | None, exc: BaseException) -> None:
+    """Fail a shared future. Cancellation is propagated, not stored as a result."""
+    if future is None or future.done():
+        return
+    if isinstance(exc, asyncio.CancelledError):
+        future.cancel()
+        return
+    future.set_exception(exc)
+    future.add_done_callback(_silence_future)
+
+
+def _silence_future(future: asyncio.Future) -> None:
+    if future.cancelled():
+        return
+    future.exception()
+
+
+def _abort_inflight(keys: Sequence[tuple[str, str]], exc: BaseException) -> None:
+    with _VECTOR_CACHE.lock:
+        for key in keys:
+            _abort_future(_VECTOR_CACHE.inflight.pop(key, None), exc)
+
+
 def cached_embed_texts(
     embeddings,
     texts: Sequence[str],
@@ -146,6 +264,7 @@ def cached_embed_texts(
         fresh = embed_fn([texts[index] for index in missing])
         if len(fresh) != len(missing):
             raise RuntimeError("embedding model returned a different number of vectors than texts")
+        _check_vectors(embeddings, fresh)
         with _VECTOR_CACHE.lock:
             for index, vector in zip(missing, fresh):
                 result[index] = _store_vector(keys[index], vector)
@@ -200,29 +319,21 @@ async def cached_aembed_texts(
                 batch_size=batch_size,
                 limiter=limiter,
             )
-        except Exception as exc:
+            if len(embedded) != len(mine_texts):
+                raise RuntimeError("embedding model returned a different number of vectors than texts")
+            _check_vectors(embeddings, embedded)
             with _VECTOR_CACHE.lock:
-                for key in mine_keys:
+                for key, vector in zip(mine_keys, embedded):
+                    stored = _store_vector(key, vector)
                     future = _VECTOR_CACHE.inflight.pop(key, None)
                     if future is not None and not future.done():
-                        future.set_exception(exc)
+                        future.set_result(stored)
+        except BaseException as exc:
+            _abort_inflight(mine_keys, exc)
             raise
-        if len(embedded) != len(mine_texts):
-            exc = RuntimeError("embedding model returned a different number of vectors than texts")
-            with _VECTOR_CACHE.lock:
-                for key in mine_keys:
-                    future = _VECTOR_CACHE.inflight.pop(key, None)
-                    if future is not None and not future.done():
-                        future.set_exception(exc)
-            raise exc
-        with _VECTOR_CACHE.lock:
-            for key, vector in zip(mine_keys, embedded):
-                stored = _store_vector(key, vector)
-                future = _VECTOR_CACHE.inflight.pop(key, None)
-                if future is not None and not future.done():
-                    future.set_result(stored)
     for index, future in waiting:
-        result[index] = list(await future)
+        # shield: cancelling this waiter must not cancel the shared call.
+        result[index] = list(await asyncio.shield(future))
     with _VECTOR_CACHE.lock:
         for index, key in enumerate(keys):
             if result[index] is None:
@@ -261,7 +372,8 @@ async def shared_codebook_vectors(
             _VECTOR_CACHE.snapshot_inflight[snap] = waiter
             owner = True
     if not owner:
-        return [list(vector) for vector in await waiter]
+        vectors = await asyncio.shield(waiter)
+        return [list(vector) for vector in vectors]
     try:
         vectors = await cached_aembed_texts(
             embeddings,
@@ -269,11 +381,10 @@ async def shared_codebook_vectors(
             batch_size=batch_size,
             limiter=limiter,
         )
-    except Exception as exc:
+    except BaseException as exc:
         with _VECTOR_CACHE.lock:
             _VECTOR_CACHE.snapshot_inflight.pop(snap, None)
-        if not waiter.done():
-            waiter.set_exception(exc)
+        _abort_future(waiter, exc)
         raise
     with _VECTOR_CACHE.lock:
         _VECTOR_CACHE.snapshots[snap] = vectors

@@ -20,6 +20,7 @@ import statistics
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from automated_grounded_theory.codebook import negation_differs, spelling_variant
 from automated_grounded_theory.async_support import (
     CallLimiter,
     parse_structured,
@@ -403,18 +404,46 @@ def nominal_krippendorff_alpha(units: Sequence[Sequence[Any]]) -> float:
     return 1.0 - (observed_disagreement / expected)
 
 
+def _labels_match(left: str, right: str, *, align_threshold: float | None) -> bool:
+    """Exact key or spelling variant. A negation or polarity flip does not match.
+
+    ``align_threshold`` is an explicit Jaccard fallback. It still refuses a
+    polarity difference. The default does not use token overlap.
+    """
+    left_key = code_key(left)
+    right_key = code_key(right)
+    if left_key and left_key == right_key:
+        return True
+    if negation_differs(left, right):
+        return False
+    if spelling_variant(left, right):
+        return True
+    if align_threshold is None:
+        return False
+    return jaccard(left, right) >= float(align_threshold)
+
+
 def aligned_assignment_agreement(
     left: Any,
     right: Any,
     *,
-    align_threshold: float = 0.5,
+    align_threshold: float | None = None,
+    mapping: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Per-passage code-set agreement after aligning codes by label.
 
-    Codes are paired greedily when their labels are the same key or have token
-    Jaccard of at least ``align_threshold``. Each passage then contributes the
-    Jaccard of its two code sets, using those aligned identities. Unmatched
-    codes stay distinct.
+    The default alignment is exact (case and whitespace) or a spelling variant
+    (punctuation, plural, gerund). ``trusting managers to share information``
+    and ``not trusting managers to share information`` do not align: token
+    Jaccard is high, and the polarity is opposite.
+
+    ``mapping`` is an explicit reviewed equivalence, ``{label: other label}``.
+    Those pairs align even when the default would keep them apart. Pass
+    ``align_threshold`` to also pair labels at that token Jaccard, still
+    without pairing a polarity flip.
+
+    Each passage then contributes the Jaccard of its two code sets, using
+    those aligned identities. Unmatched codes stay distinct.
 
     ``krippendorff_alpha`` is nominal alpha on the aligned passage-by-code
     matrix: each cell is whether that coder applied that code to that passage.
@@ -429,38 +458,63 @@ def aligned_assignment_agreement(
     right_sets = _passage_code_sets(right)
     left_codes = {code for labels in left_sets.values() for code in labels}
     right_codes = {code for labels in right_sets.values() for code in labels}
-    pairs: list[tuple[float, str, str]] = []
+    parent: dict[str, str] = {}
+
+    def find(key: str) -> str:
+        parent.setdefault(key, key)
+        root = key
+        while parent[root] != root:
+            root = parent[root]
+        while parent[key] != root:
+            nxt = parent[key]
+            parent[key] = root
+            key = nxt
+        return root
+
+    def union(left_key: str, right_key: str) -> None:
+        left_root = find(left_key)
+        right_root = find(right_key)
+        if left_root == right_root:
+            return
+        if right_root < left_root:
+            left_root, right_root = right_root, left_root
+        parent[right_root] = left_root
+
     for left_code in left_codes:
         for right_code in right_codes:
-            left_key = code_key(left_code)
-            right_key = code_key(right_code)
-            if not left_key or not right_key:
-                continue
-            score = 1.0 if left_key == right_key else jaccard(left_code, right_code)
-            pairs.append((score, left_key, right_key))
-    pairs.sort(key=lambda item: (-item[0], item[1], item[2]))
-    right_to_left: dict[str, str] = {}
-    used_left: set[str] = set()
-    used_right: set[str] = set()
-    for score, left_key, right_key in pairs:
-        if score < align_threshold or left_key in used_left or right_key in used_right:
-            continue
-        used_left.add(left_key)
-        used_right.add(right_key)
-        right_to_left[right_key] = left_key
+            if _labels_match(left_code, right_code, align_threshold=align_threshold):
+                left_key = code_key(left_code)
+                right_key = code_key(right_code)
+                if left_key and right_key:
+                    union(left_key, right_key)
+    if mapping:
+        for raw_left, raw_right in mapping.items():
+            left_key = code_key(str(raw_left))
+            right_key = code_key(str(raw_right))
+            if left_key and right_key:
+                union(left_key, right_key)
 
-    def canon(label: str, *, side: str) -> str:
+    def canon(label: str) -> str:
         key = code_key(label)
-        if side == "right":
-            return right_to_left.get(key, key)
-        return key
+        if not key:
+            return ""
+        return find(key)
+
+    left_roots = {canon(code) for code in left_codes}
+    aligned_roots: set[str] = set()
+    for code in right_codes:
+        root = canon(code)
+        if root and root in left_roots:
+            aligned_roots.add(root)
 
     passages = sorted(set(left_sets) | set(right_sets))
     scores: list[float] = []
     units: list[tuple[int, int]] = []
     for passage_id in passages:
-        left_canon = {canon(label, side="left") for label in left_sets.get(passage_id, set())}
-        right_canon = {canon(label, side="right") for label in right_sets.get(passage_id, set())}
+        left_canon = {canon(label) for label in left_sets.get(passage_id, set())}
+        right_canon = {canon(label) for label in right_sets.get(passage_id, set())}
+        left_canon.discard("")
+        right_canon.discard("")
         scores.append(_set_jaccard(left_canon, right_canon))
         for code in left_canon | right_canon:
             units.append((1 if code in left_canon else 0, 1 if code in right_canon else 0))
@@ -469,7 +523,7 @@ def aligned_assignment_agreement(
         "mean_jaccard": round(mean, 4),
         "krippendorff_alpha": round(nominal_krippendorff_alpha(units), 4),
         "passages": len(passages),
-        "aligned_codes": len(right_to_left),
+        "aligned_codes": len(aligned_roots),
     }
 
 

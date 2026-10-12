@@ -544,12 +544,33 @@ class HintInput(_LLMModel):
     method: str = ""
 
 
+class DiscoveryPair(_LLMModel):
+    """Two labels a discovery pass thinks might be the same incident."""
+
+    source: str = ""
+    target: str = ""
+
+
+class CandidateDiscovery(_LLMModel):
+    """Pairs from one compact label-only pass. Not a merge decision."""
+
+    pairs: list[DiscoveryPair] = Field(default_factory=list)
+
+
+class CandidateDiscoveryRequest(_LLMModel):
+    """Ids and short labels for the whole codebook. No definitions or examples."""
+
+    note: str = ""
+    labels: list[LabelRef] = Field(default_factory=list)
+
+
 class SweepRequest(_LLMModel):
     """Typed input for a sweep chunk.
 
-    ``codes`` and ``cross_chunk`` carry definitions and examples. ``label_index``
-    is the rest of the book as ids and short labels. ``audit`` is ``full`` or
-    ``incremental``.
+    ``codes`` and ``cross_chunk`` carry definitions and examples. ``cross_chunk``
+    is a bounded neighborhood. ``label_index``, when present, is a bounded set
+    of extra candidate labels, not a copy of the whole book. ``audit`` is
+    ``full`` or ``incremental``.
     """
 
     chunk_index: int = 1

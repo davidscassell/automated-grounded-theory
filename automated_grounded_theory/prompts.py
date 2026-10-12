@@ -16,6 +16,7 @@ from automated_grounded_theory.context import ResearchContext
 from automated_grounded_theory.schemas import (
     CodeInput,
     CodingRequest,
+    CandidateDiscoveryRequest,
     HintGroupInput,
     HintInput,
     JudgeRequest,
@@ -163,10 +164,10 @@ Record a link only when the examples make it obvious, and phrase it as a hint.
 
 Do not create new codes. Do not invent examples. If this request is one chunk of a \
 larger codebook, definitions and examples are only on the codes in this chunk and on \
-cross_chunk (similar codes retrieved from other chunks). The label index lists every \
-code as an id and a short label. Merge a code in the chunk with a cross_chunk code \
-when they name the same incident. Do not merge a code that appears only as an id and \
-a short label. Use the labels exactly as written."""
+cross_chunk, a bounded neighborhood of similar codes from other chunks. A separate \
+candidate-discovery step chooses that neighborhood. It is not a full label index \
+repeated on every chunk. Merge a code in the chunk with a cross_chunk code when \
+they name the same incident. Use the labels exactly as written."""
 
 
 def clip(text: str, limit: int) -> str:
@@ -385,6 +386,28 @@ def format_sweep_codebook(codes: Sequence[Mapping[str, Any]]) -> str:
     return "\n".join(lines).rstrip()
 
 
+def build_candidate_discovery_messages(
+    *,
+    context: ResearchContext,
+    codes: Sequence[Mapping[str, Any]],
+    prompt_cache: bool,
+) -> list:
+    """One label-only request for the whole book. No definitions and no examples."""
+    request = CandidateDiscoveryRequest(
+        note=(
+            "Candidate discovery for the whole codebook. These are ids and short labels only. "
+            "Name pairs that might be the same incident. Do not merge in this step."
+        ),
+        labels=[label_ref(entry) for entry in codes],
+    )
+    system = (
+        "You are listing possible duplicate codes from ids and short labels. "
+        "You do not have definitions or examples here. Return pairs that might name the same incident. "
+        "This step only discovers candidates. It does not merge them.\n\n" + render_context(context)
+    )
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=dump_request(request))]
+
+
 def build_sweep_messages(
     *,
     context: ResearchContext,
@@ -397,6 +420,9 @@ def build_sweep_messages(
     chunk_count: int = 1,
     consolidation: bool = False,
     audit: str = "full",
+    full_label_index: bool = False,
+    neighborhood: Sequence[Mapping[str, Any]] | None = None,
+    neighborhood_limit: int = 16,
 ) -> list:
     by_label = {code_key(str(entry.get("code") or "")): stable_code_id(entry) for entry in list(codes) + list(all_codes or [])}
     hints = []
@@ -431,23 +457,35 @@ def build_sweep_messages(
     if mode == "incremental":
         note += (
             " Incremental review: these codes are new or their label, definition, or examples changed. "
-            "Unchanged codes are ids and short labels."
+            "Compare them with the other codes in this request."
         )
-    elif all_codes:
+    elif all_codes and full_label_index:
         note += " Full codebook audit."
-    if all_codes:
+    elif chunk_count > 1:
+        note += " Full codebook audit." if mode == "full" else ""
+    if full_label_index and all_codes:
         note += (
             " Definitions and examples are on this chunk and on cross_chunk. "
             "The label index is ids and short labels for the whole codebook."
         )
+        index_rows = list(all_codes)
+    else:
+        if chunk_count > 1:
+            note += (
+                " Definitions and examples are on this chunk and on cross_chunk, "
+                "a bounded neighborhood of similar codes. Other candidates were chosen "
+                "in a separate discovery step and are not repeated here."
+            )
+        cap = max(0, int(neighborhood_limit))
+        index_rows = list(neighborhood or [])[:cap]
     request = SweepRequest(
         chunk_index=chunk_index,
         chunk_count=chunk_count,
         note=note,
-        audit=mode if all_codes or mode == "incremental" else "",
+        audit=mode if all_codes or mode == "incremental" or chunk_count > 1 else "",
         codes=[code_input(entry) for entry in codes],
         cross_chunk=[code_input(entry) for entry in (cross_chunk or [])],
-        label_index=[label_ref(entry) for entry in all_codes] if all_codes else [],
+        label_index=[label_ref(entry) for entry in index_rows],
         hints=hints,
     )
     system = SWEEP_SYSTEM + "\n\n" + render_context(context)
@@ -462,16 +500,27 @@ def aggregate_sweep_chars(
     cross_chunks: Sequence[Sequence[Mapping[str, Any]]] | None = None,
     audit: str = "full",
     user_only: bool = False,
+    full_label_index: bool = False,
+    discover: bool = True,
 ) -> int:
     """Character length of the sweep messages for ``codes`` at ``chunk_size``.
 
     ``cross_chunks`` lines up with chunk order. A missing entry is empty.
     ``user_only`` drops the stable system prefix, which does not grow with the book.
+    ``full_label_index`` repeats every label on every chunk (the 0.6.5 payload).
+    Otherwise each chunk carries a bounded neighborhood, and one compact
+    label-only discovery request is counted when the book spans several chunks.
     """
     rows = list(codes)
     size = max(1, int(chunk_size))
     chunks = [rows[start : start + size] for start in range(0, len(rows), size)] or [[]]
     total = 0
+    if discover and not full_label_index and len(chunks) > 1:
+        discovery = build_candidate_discovery_messages(context=context, codes=rows, prompt_cache=False)
+        if user_only:
+            total += len(message_text(discovery[-1]))
+        else:
+            total += sum(len(message_text(message)) for message in discovery)
     for index, chunk in enumerate(chunks, start=1):
         cross: Sequence[Mapping[str, Any]] = []
         if cross_chunks and index - 1 < len(cross_chunks):
@@ -483,11 +532,12 @@ def aggregate_sweep_chars(
             codes=chunk,
             candidates=[],
             prompt_cache=False,
-            all_codes=rows if show_index else None,
+            all_codes=rows if (full_label_index and show_index) or show_index else None,
             cross_chunk=cross,
             chunk_index=index,
             chunk_count=len(chunks),
             audit=audit,
+            full_label_index=full_label_index and show_index,
         )
         if user_only:
             total += len(message_text(messages[-1]))

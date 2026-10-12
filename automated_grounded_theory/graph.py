@@ -38,8 +38,11 @@ from automated_grounded_theory.async_support import ainvoke_structured, is_trans
 from automated_grounded_theory.batching import (
     count_message_tokens,
     pack_indices,
+    repair_allowance_tokens,
+    request_input_tokens,
     reserved_output_tokens,
     resolve_tokenizer,
+    schema_token_count,
 )
 from automated_grounded_theory.codebook import (
     agreement_confidence,
@@ -61,6 +64,7 @@ from automated_grounded_theory.export import export_result
 from automated_grounded_theory.prompts import (
     CODING_SYSTEM,
     SWEEP_SYSTEM,
+    build_candidate_discovery_messages,
     build_coding_messages,
     build_merge_check_messages,
     build_rewrite_messages,
@@ -86,6 +90,7 @@ from automated_grounded_theory.validation import code_key, context_term_set, lab
 from automated_grounded_theory.saturation import saturation_point
 from automated_grounded_theory.schemas import (
     BatchCoding,
+    CandidateDiscovery,
     DefinitionRewriteBatch,
     LeakCheckBatch,
     MergeCheckBatch,
@@ -174,7 +179,7 @@ class RunConfig:
     sweep_timeout: float = 300.0
     check_model: Any = None
     pipeline: bool = True
-    token_budget: int = 4000
+    token_budget: int = 6000
     model_name: str = ""
     sweep_model_name: str = ""
     prompt_log_path: str | None = None
@@ -770,7 +775,7 @@ def _pack_jobs(
         names=names,
         tokenizer=resolve_tokenizer(runtime.coder),
         reserved_output=reserve,
-        measure=_coding_measure(runtime, state, doc_id),
+        measure=_coding_measure(runtime, state, doc_id, token_budget),
     )
     jobs = []
     for batch in batches:
@@ -781,41 +786,196 @@ def _pack_jobs(
     return jobs
 
 
-def _coding_measure(runtime: RunConfig, state: CodingState, doc_id: str | None):
-    """Token count of the coding request those passages would assemble into.
+def _embedding_fallback_note(exc: BaseException) -> str:
+    return f"Code retrieval embeddings failed ({exc}). Nearest codes used label overlap instead."
 
-    The codebook view is the longest entries that could be retrieved, capped
-    at ``top_k_codes + frequent_codes``, so the budget covers definitions,
-    examples, neighbors, metadata, and the instructions.
+
+def _remember_note(runtime: RunConfig, note: str) -> None:
+    if note and note not in runtime.notes:
+        runtime.notes.append(note)
+
+
+def _rank_labels(runtime: RunConfig, text: str, entries: Sequence[Mapping[str, Any]]) -> list[str]:
+    rank = getattr(runtime.retriever, "rank", None)
+    if rank is None or runtime.top_k_codes <= 0 or not entries:
+        return []
+    try:
+        labels = rank(text, entries, k=runtime.top_k_codes) or []
+    except Exception as exc:
+        if not isinstance(runtime.retriever, EmbeddingCodeRetriever) or not is_transient(exc):
+            raise
+        _remember_note(runtime, _embedding_fallback_note(exc))
+        labels = LexicalCodeRetriever().rank(text, entries, k=runtime.top_k_codes) or []
+    return [str(label) for label in labels if str(label)]
+
+
+def _union_labels(per_passage: Sequence[Sequence[str]]) -> list[str]:
+    ranked: list[str] = []
+    seen: set[str] = set()
+    for labels in per_passage:
+        for label in labels:
+            key = label.casefold()
+            if key and key not in seen:
+                seen.add(key)
+                ranked.append(label)
+    return ranked
+
+
+def _coding_messages_for(
+    runtime: RunConfig,
+    passages: Sequence[Mapping[str, Any]],
+    per_passage: Sequence[Sequence[str]],
+    feedback: Mapping[str, str] | None,
+    view: Sequence[Mapping[str, Any]],
+    omitted: int,
+) -> list:
+    return build_coding_messages(
+        context=runtime.context,
+        codebook_view=view,
+        omitted_codes=omitted,
+        passages=passages,
+        neighbor_chars=runtime.neighbor_chars,
+        feedback=feedback,
+        prompt_cache=runtime.prompt_cache,
+        nearest=per_passage,
+    )
+
+
+def _coding_request_cost(runtime: RunConfig, messages: Sequence, n_passages: int) -> int:
+    """Assembled input, schema, repair headroom, and reserved output."""
+    tokenizer = resolve_tokenizer(runtime.coder)
+    reserved = reserved_output_tokens(n_passages, max_codes_per_passage=runtime.max_codes_per_passage)
+    return request_input_tokens(messages, BatchCoding, tokenizer) + repair_allowance_tokens(BatchCoding, tokenizer) + reserved
+
+
+def _view_for(
+    entries: Sequence[Mapping[str, Any]],
+    per_passage: Sequence[Sequence[str]],
+    frequent_codes: int,
+) -> tuple[list[dict], int]:
+    return select_prompt_codes(entries, _union_labels(per_passage), frequent_limit=frequent_codes)
+
+
+def _fit_coding_messages(
+    runtime: RunConfig,
+    passages: Sequence[Mapping[str, Any]],
+    entries: Sequence[Mapping[str, Any]],
+    per_passage: Sequence[Sequence[str]],
+    feedback: Mapping[str, str] | None,
+    budget: int,
+) -> list:
+    """Assemble the real request, then drop trailing codes until it fits."""
+    view, omitted = _view_for(entries, per_passage, runtime.frequent_codes)
+    full = len(view)
+    while True:
+        extra = full - len(view)
+        messages = _coding_messages_for(runtime, passages, per_passage, feedback, view, omitted + extra)
+        if _coding_request_cost(runtime, messages, len(passages)) <= budget or not view:
+            if extra:
+                note = (
+                    f"Trimmed the coding context from {full} codes to {len(view)} "
+                    f"to fit token_budget ({budget})."
+                )
+                if note not in runtime.notes:
+                    runtime.notes.append(note)
+            return messages
+        view = view[:-1]
+
+
+def _passage_groups(
+    runtime: RunConfig,
+    passages: Sequence[Mapping[str, Any]],
+    entries: Sequence[Mapping[str, Any]],
+    per_passage: Sequence[Sequence[str]],
+    feedback: Mapping[str, str] | None,
+    budget: int,
+) -> list[list[int]]:
+    """Split a batch whose real retrieved union does not fit."""
+    groups: list[list[int]] = []
+    current: list[int] = []
+
+    def cost(indexes: Sequence[int]) -> int:
+        subset = [passages[index] for index in indexes]
+        ranks = [per_passage[index] for index in indexes]
+        view, omitted = _view_for(entries, ranks, runtime.frequent_codes)
+        messages = _coding_messages_for(runtime, subset, ranks, feedback, view, omitted)
+        return _coding_request_cost(runtime, messages, len(subset))
+
+    for index in range(len(passages)):
+        if current and cost([*current, index]) > budget:
+            groups.append(current)
+            current = [index]
+        else:
+            current.append(index)
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _input_cost(messages: Sequence, tokenizer) -> int:
+    """Messages, JSON schema, and the short repair note. Reserved output is separate."""
+    return (
+        count_message_tokens(messages, tokenizer)
+        + schema_token_count(BatchCoding, tokenizer)
+        + repair_allowance_tokens(BatchCoding, tokenizer)
+    )
+
+
+def _coding_measure(runtime: RunConfig, state: CodingState, doc_id: str | None, token_budget: int):
+    """Token count of the request these passages would actually send.
+
+    Neighbors are retrieved for the passages in the candidate batch and
+    unioned, then the messages are built and the schema is counted. The old
+    estimate used only ``top_k_codes + frequent_codes`` of the longest entries
+    and missed both the union across passages and the schema.
+
+    A batch of several passages returns that full cost, so the packer splits
+    the batch when the union does not fit. A single passage trims retrieved
+    codes down to the budget before the packer splits the passage text. The
+    text is split only when it still does not fit with an empty codebook view.
     """
     tokenizer = resolve_tokenizer(runtime.coder)
-    book = list(_book_for(state, doc_id).values())
-    cap = max(0, int(runtime.top_k_codes)) + max(0, int(runtime.frequent_codes))
+    entries = list(_book_for(state, doc_id).values())
+    ranked_cache: dict[str, list[str]] = {}
+    reserve = reserved_output_tokens(1, max_codes_per_passage=runtime.max_codes_per_passage)
+    budget = max(1, int(token_budget))
 
-    def bulk(entry: Mapping[str, Any]) -> int:
-        quotes = sum(len(str(item.get("quote") or "")) for item in (entry.get("examples") or [])[:2])
-        return len(str(entry.get("definition") or "")) + quotes
+    def labels_for(text: str) -> list[str]:
+        cached = ranked_cache.get(text)
+        if cached is None:
+            cached = _rank_labels(runtime, text, entries)
+            ranked_cache[text] = cached
+        return cached
 
-    ranked = sorted(book, key=bulk, reverse=True)[:cap]
+    def cost_for(
+        passages: Sequence[Mapping[str, Any]],
+        per_passage: Sequence[Sequence[str]],
+        view: Sequence[Mapping[str, Any]],
+        omitted: int,
+    ) -> int:
+        messages = _coding_messages_for(runtime, passages, per_passage, None, view, omitted)
+        return _input_cost(messages, tokenizer)
 
     def measure(batch: Sequence[int], overrides: Mapping[int, str] | None = None) -> int:
         passages = []
+        per_passage: list[list[str]] = []
         for index in batch:
             passage = dict(state["passages"][index])
             if overrides and index in overrides:
                 passage["text"] = overrides[index]
             passages.append(passage)
-        messages = build_coding_messages(
-            context=runtime.context,
-            codebook_view=ranked,
-            omitted_codes=max(0, len(book) - len(ranked)),
-            passages=passages,
-            neighbor_chars=runtime.neighbor_chars,
-            feedback=None,
-            prompt_cache=runtime.prompt_cache,
-            nearest=[[] for _ in passages],
-        )
-        return count_message_tokens(messages, tokenizer)
+            per_passage.append(labels_for(str(passage.get("text") or "")))
+        view, omitted = _view_for(entries, per_passage, runtime.frequent_codes)
+        cost = cost_for(passages, per_passage, view, omitted)
+        if len(batch) != 1:
+            return cost
+        # pack_indices adds one reserved-output block on top of this return.
+        ceiling = budget - reserve
+        full = len(view)
+        while cost > ceiling and view:
+            view = view[:-1]
+            cost = cost_for(passages, per_passage, view, omitted + (full - len(view)))
+        return cost
 
     return measure
 
@@ -1263,18 +1423,14 @@ async def _code_batch(
     return done
 
 
-async def _invoke_coding(
+async def _rank_passages(
     runtime: RunConfig,
-    passages: list[dict],
-    codebook: dict,
-    feedback: dict[str, str] | None,
-) -> list[dict]:
-    ranked: list[str] = []
-    seen: set[str] = set()
-    entries = list(codebook.values())
+    passages: Sequence[Mapping[str, Any]],
+    entries: Sequence[Mapping[str, Any]],
+) -> list[list[str]]:
     if isinstance(runtime.retriever, EmbeddingCodeRetriever):
         try:
-            per_passage = await runtime.retriever.arank_many(
+            return await runtime.retriever.arank_many(
                 [str(passage.get("text") or "") for passage in passages],
                 entries,
                 k=runtime.top_k_codes,
@@ -1284,51 +1440,58 @@ async def _invoke_coding(
         except Exception as exc:
             if not is_transient(exc):
                 raise
-            runtime.notes.append(
-                f"Code retrieval embeddings failed ({exc}). Nearest codes used label overlap instead."
-            )
+            _remember_note(runtime, _embedding_fallback_note(exc))
             lexical = LexicalCodeRetriever()
-            per_passage = [
+            return [
                 lexical.rank(str(passage.get("text") or ""), entries, k=runtime.top_k_codes)
                 for passage in passages
             ]
-    else:
-        per_passage = [
-            runtime.retriever.rank(str(passage.get("text") or ""), entries, k=runtime.top_k_codes)
-            for passage in passages
-        ]
-    for labels in per_passage:
-        for label in labels:
-            key = label.casefold()
-            if key not in seen:
-                seen.add(key)
-                ranked.append(label)
-    view, omitted = select_prompt_codes(entries, ranked, frequent_limit=runtime.frequent_codes)
-    messages = build_coding_messages(
-        context=runtime.context,
-        codebook_view=view,
-        omitted_codes=omitted,
-        passages=passages,
-        neighbor_chars=runtime.neighbor_chars,
-        feedback=feedback,
-        prompt_cache=runtime.prompt_cache,
-        nearest=per_passage,
-    )
-    passage_ids = ",".join(str(passage.get("passage_id")) for passage in passages)
-    parsed = await _ainvoke_structured(
-        runtime.coder,
-        BatchCoding,
-        messages,
-        kind="code_passage",
-        model_name=runtime.model_name,
-        passage_id=passage_ids,
-        runtime=runtime,
-        reserved_output=reserved_output_tokens(
-            len(passages),
-            max_codes_per_passage=runtime.max_codes_per_passage,
-        ),
-    )
-    return _align_batch(parsed, passages)
+    return [
+        runtime.retriever.rank(str(passage.get("text") or ""), entries, k=runtime.top_k_codes)
+        for passage in passages
+    ]
+
+
+async def _invoke_coding(
+    runtime: RunConfig,
+    passages: list[dict],
+    codebook: dict,
+    feedback: dict[str, str] | None,
+) -> list[dict]:
+    """Retrieve, measure the real request, then repack or trim to the budget."""
+    entries = list(codebook.values())
+    per_passage = await _rank_passages(runtime, passages, entries)
+    budget = max(1, int(runtime.token_budget))
+    groups = _passage_groups(runtime, passages, entries, per_passage, feedback, budget)
+    if len(groups) > 1:
+        note = (
+            f"Repacked {len(passages)} passages into {len(groups)} coding requests "
+            f"to fit token_budget ({budget})."
+        )
+        if note not in runtime.notes:
+            runtime.notes.append(note)
+    aligned: list[dict] = []
+    for group in groups:
+        subset = [passages[index] for index in group]
+        ranks = [per_passage[index] for index in group]
+        messages = _fit_coding_messages(runtime, subset, entries, ranks, feedback, budget)
+        passage_ids = ",".join(str(passage.get("passage_id")) for passage in subset)
+        parsed = await _ainvoke_structured(
+            runtime.coder,
+            BatchCoding,
+            messages,
+            kind="code_passage",
+            model_name=runtime.model_name,
+            passage_id=passage_ids,
+            runtime=runtime,
+            reserved_output=reserved_output_tokens(
+                len(subset),
+                max_codes_per_passage=runtime.max_codes_per_passage,
+            ),
+            token_budget=budget,
+        )
+        aligned.extend(_align_batch(parsed, subset))
+    return aligned
 
 
 def _align_batch(payload: dict, passages: list[dict]) -> list[dict]:
@@ -2399,6 +2562,33 @@ async def _rewrite_survivor_definitions(
     return book, ops
 
 
+async def _label_discovery_pairs(runtime: RunConfig, codes: list, sweep_index: int) -> list[dict]:
+    """One compact label-only pass. It does not repeat definitions on every chunk."""
+    messages = build_candidate_discovery_messages(
+        context=runtime.context,
+        codes=codes,
+        prompt_cache=runtime.prompt_cache,
+    )
+    payload = await _ainvoke_structured(
+        runtime.sweeper,
+        CandidateDiscovery,
+        messages,
+        kind="candidate_discovery",
+        model_name=runtime.sweep_model_name,
+        passage_id=f"sweep-{sweep_index}-discovery",
+        runtime=runtime,
+    )
+    known = {code_key(str(entry.get("code") or "")): str(entry.get("code") or "") for entry in codes}
+    pairs = []
+    for item in payload.get("pairs") or []:
+        source = known.get(code_key(str(item.get("source") or "")))
+        target = known.get(code_key(str(item.get("target") or "")))
+        if not source or not target or code_key(source) == code_key(target):
+            continue
+        pairs.append({"source": source, "target": target, "score": 1.0, "method": "discovery"})
+    return pairs
+
+
 async def _sweep_chunks(
     runtime: RunConfig,
     codes: list,
@@ -2503,6 +2693,25 @@ async def _sweep_chunks(
             continue
         hints.append(proposal)
         offered.add(pair)
+    warnings: list[str] = [embed_note] if embed_note else []
+    if len(chunks) > 1:
+        try:
+            discovered = await _label_discovery_pairs(runtime, codes, sweep_index)
+        except CodingError as exc:
+            if not is_transient(exc):
+                raise
+            discovered = []
+            warnings.append(
+                f"Sweep {sweep_index} candidate discovery was skipped after a timeout or connection error: {exc}"
+            )
+        for proposal in discovered:
+            source_key = code_key(str(proposal.get("source") or ""))
+            target_key = code_key(str(proposal.get("target") or ""))
+            pair = frozenset((source_key, target_key))
+            if not pair or pair in offered or (frozen and pair in frozen):
+                continue
+            hints.append(proposal)
+            offered.add(pair)
     for index, hint in enumerate(hints, start=1):
         hint["pair_id"] = f"s{sweep_index}p{index:04d}"
     key_chunk: dict[str, int] = {}
@@ -2519,7 +2728,6 @@ async def _sweep_chunks(
         for number in sorted(owners):
             per_chunk_candidates[number - 1].append(hint)
     candidates = hints
-    warnings: list[str] = [embed_note] if embed_note else []
     if len(codes) >= 2 and not hints:
         warnings.append(
             f"Sweep {sweep_index} found no similarity hints among {len(codes)} codes. "
@@ -2529,14 +2737,12 @@ async def _sweep_chunks(
 
     async def confirm(index: int, chunk: list) -> tuple[int, dict, str | None]:
         passage_id = f"sweep-{sweep_index}" if len(chunks) == 1 else f"sweep-{sweep_index}-chunk-{index:04d}"
-        chunk_keys = {code_key(str(entry.get("code") or "")) for entry in chunk}
-        show_index = any(code_key(str(entry.get("code") or "")) not in chunk_keys for entry in codes)
         messages = build_sweep_messages(
             context=runtime.context,
             codes=chunk,
             candidates=per_chunk_candidates[index - 1],
             prompt_cache=runtime.prompt_cache,
-            all_codes=codes if show_index else None,
+            all_codes=codes,
             cross_chunk=_cross_chunk_for(
                 codes,
                 chunk,
@@ -2669,9 +2875,10 @@ async def _ainvoke_structured(
     passage_id: str,
     runtime: RunConfig,
     reserved_output: int | None = None,
+    token_budget: int | None = None,
 ) -> dict:
     timeout = None
-    if kind in {"sweep", "merge_verify", "definition_rewrite", "quote_fit"}:
+    if kind in {"sweep", "merge_verify", "definition_rewrite", "quote_fit", "candidate_discovery"}:
         timeout = sweep_deadline(runtime.limiter.request_timeout, runtime.sweep_timeout)
     try:
         (payload, usage), used = await ainvoke_structured(
@@ -2681,6 +2888,8 @@ async def _ainvoke_structured(
             runtime.limiter,
             timeout=timeout,
             reserved_output=reserved_output,
+            token_budget=token_budget,
+            tokenizer=resolve_tokenizer(model),
         )
     except Exception as exc:
         raise CodingError(f"{kind} failed for {passage_id}: {exc}") from exc
@@ -2720,7 +2929,7 @@ async def _abatch_structured(
         label = passage_ids[0] if passage_ids else kind
         raise CodingError(f"{kind} failed for {label}: {exc}") from exc
     timeout = None
-    if kind in {"sweep", "merge_verify", "definition_rewrite", "quote_fit"}:
+    if kind in {"sweep", "merge_verify", "definition_rewrite", "quote_fit", "candidate_discovery"}:
         timeout = sweep_deadline(runtime.limiter.request_timeout, runtime.sweep_timeout)
     payloads = []
     for messages, result, passage_id in zip(message_lists, results, passage_ids):
