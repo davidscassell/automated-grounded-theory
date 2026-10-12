@@ -15,7 +15,7 @@ import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Annotated, Any, Mapping
+from typing import Annotated, Any, Mapping, Sequence
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
@@ -35,7 +35,12 @@ from automated_grounded_theory.records import (
 )
 
 from automated_grounded_theory.async_support import ainvoke_structured, is_transient, sweep_deadline
-from automated_grounded_theory.batching import pack_indices
+from automated_grounded_theory.batching import (
+    count_message_tokens,
+    pack_indices,
+    reserved_output_tokens,
+    resolve_tokenizer,
+)
 from automated_grounded_theory.codebook import (
     agreement_confidence,
     apply_post_merge,
@@ -68,11 +73,14 @@ from automated_grounded_theory.retrieval import (
     CodeRetriever,
     EmbeddingCodeRetriever,
     LexicalCodeRetriever,
-    aembed_texts,
-    code_text,
+    code_needs_review,
     comparison_order,
+    full_audit_due,
     hint_pairs,
+    review_fingerprint,
+    select_cross_chunk,
     select_prompt_codes,
+    shared_codebook_vectors,
 )
 from automated_grounded_theory.validation import code_key, context_term_set, label_restates_context
 from automated_grounded_theory.saturation import saturation_point
@@ -157,6 +165,8 @@ class RunConfig:
     passages_per_codebook_update: int = 1
     sweep_chunk: int = 20
     embed_batch_size: int = 64
+    full_audit_every: int = 4
+    cross_chunk_limit: int = 8
     review_mode: str = "document"
     review_below: float = 0.5
     min_merge_confidence: float = 0.5
@@ -295,6 +305,7 @@ class WorkerInput(TypedDict, total=False):
     worker_doc_id: str | None
     worker_indices: list
     worker_passages: list
+    worker_slices: list
     worker_codebook: dict
     worker_documents: dict
 
@@ -385,6 +396,7 @@ def _route_round(state: CodingState):
                     "worker_policy_version": state.get("policy_version") or POLICY_VERSION,
                     "worker_doc_id": doc_id,
                     "worker_indices": indices,
+                    "worker_slices": job.get("slices"),
                     "worker_passages": [state["passages"][index] for index in indices],
                     "worker_codebook": deepcopy(_book_for(state, doc_id)),
                     "worker_documents": documents,
@@ -428,11 +440,16 @@ def _prepare_round(runtime: RunConfig):
         frozen = freeze_snapshot(state, version=version)
         jobs = _wave(state, runtime)
         packaged = []
-        for index, (doc_id, indices) in enumerate(jobs):
+        warnings = list(state.get("warnings") or [])
+        for index, (doc_id, indices, meta) in enumerate(jobs):
+            warning = str((meta or {}).get("warning") or "")
+            if warning and warning not in warnings:
+                warnings.append(warning)
             packaged.append(
                 {
                     "doc_id": doc_id,
                     "indices": list(indices),
+                    "slices": (meta or {}).get("slices"),
                     "job_id": f"{frozen['snapshot_id']}-j{index:03d}",
                 }
             )
@@ -441,6 +458,7 @@ def _prepare_round(runtime: RunConfig):
             "batch_id": frozen["snapshot_id"],
             "round_jobs": packaged,
             "proposal_buffer": {"__reset__": True},
+            "warnings": warnings,
         }
 
     return prepare_round
@@ -459,9 +477,11 @@ def _code_worker(runtime: RunConfig):
             "policy_version": state.get("worker_policy_version") or POLICY_VERSION,
         }
         book = dict(state.get("worker_codebook") or {})
-        coded = await _code_batch(
+        coded = await _code_indexed(
             runtime,
             passages,
+            list(range(len(passages))),
+            state.get("worker_slices"),
             book,
             documents=dict(state.get("worker_documents") or {}),
         )
@@ -656,6 +676,138 @@ def _code_node(runtime: RunConfig):
     return code_passage
 
 
+def _pack_jobs(
+    state: CodingState,
+    runtime: RunConfig,
+    indices: Sequence[int],
+    token_budget: int,
+    per_request: int,
+    doc_id: str | None,
+) -> list[tuple]:
+    """Pack passage indexes so each request, plus reserved output, fits the budget."""
+    if not indices:
+        return []
+    texts = [str(passage.get("text") or "") for passage in state["passages"]]
+    names = [str(passage.get("passage_id") or "") for passage in state["passages"]]
+    reserve = reserved_output_tokens(1, max_codes_per_passage=runtime.max_codes_per_passage)
+    batches, _warnings = pack_indices(
+        indices,
+        texts,
+        batch_size=per_request,
+        token_budget=token_budget,
+        names=names,
+        tokenizer=resolve_tokenizer(runtime.coder),
+        reserved_output=reserve,
+        measure=_coding_measure(runtime, state, doc_id),
+    )
+    jobs = []
+    for batch in batches:
+        if not batch.indices:
+            continue
+        slices = [list(span) for span in batch.slices] if batch.slices else None
+        jobs.append((doc_id, list(batch.indices), {"slices": slices, "warning": batch.warning}))
+    return jobs
+
+
+def _coding_measure(runtime: RunConfig, state: CodingState, doc_id: str | None):
+    """Token count of the coding request those passages would assemble into.
+
+    The codebook view is the longest entries that could be retrieved, capped
+    at ``top_k_codes + frequent_codes``, so the budget covers definitions,
+    examples, neighbors, metadata, and the instructions.
+    """
+    tokenizer = resolve_tokenizer(runtime.coder)
+    book = list(_book_for(state, doc_id).values())
+    cap = max(0, int(runtime.top_k_codes)) + max(0, int(runtime.frequent_codes))
+
+    def bulk(entry: Mapping[str, Any]) -> int:
+        quotes = sum(len(str(item.get("quote") or "")) for item in (entry.get("examples") or [])[:2])
+        return len(str(entry.get("definition") or "")) + quotes
+
+    ranked = sorted(book, key=bulk, reverse=True)[:cap]
+
+    def measure(batch: Sequence[int], overrides: Mapping[int, str] | None = None) -> int:
+        passages = []
+        for index in batch:
+            passage = dict(state["passages"][index])
+            if overrides and index in overrides:
+                passage["text"] = overrides[index]
+            passages.append(passage)
+        messages = build_coding_messages(
+            context=runtime.context,
+            codebook_view=ranked,
+            omitted_codes=max(0, len(book) - len(ranked)),
+            passages=passages,
+            neighbor_chars=runtime.neighbor_chars,
+            feedback=None,
+            prompt_cache=runtime.prompt_cache,
+            nearest=[[] for _ in passages],
+        )
+        return count_message_tokens(messages, tokenizer)
+
+    return measure
+
+
+def _sliced_passages(passage: Mapping[str, Any], spans: Sequence[Sequence[int]]) -> list[dict]:
+    text = str(passage.get("text") or "")
+    clones = []
+    for span in spans:
+        start, end = int(span[0]), int(span[1])
+        clone = dict(passage)
+        clone["text"] = text[start:end]
+        clones.append(clone)
+    return clones
+
+
+def _merge_codings(left: Mapping[str, Any], right: Mapping[str, Any]) -> dict:
+    """Union of two slice codings. The commit anchors quotes on the full passage."""
+    merged = dict(left)
+    seen = {
+        (str(item.get("code") or ""), str(item.get("quote") or ""))
+        for item in (left.get("codes") or [])
+    }
+    codes = [dict(item) for item in (left.get("codes") or [])]
+    for item in right.get("codes") or []:
+        marker = (str(item.get("code") or ""), str(item.get("quote") or ""))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        codes.append(dict(item))
+    merged["codes"] = codes
+    memos = []
+    for memo in (left.get("memo"), right.get("memo")):
+        text = str(memo or "").strip()
+        if text and text not in memos:
+            memos.append(text)
+    merged["memo"] = "\n\n".join(memos)
+    return merged
+
+
+async def _code_indexed(
+    runtime: RunConfig,
+    passages: Sequence[Mapping[str, Any]],
+    indices: Sequence[int],
+    slices: Sequence[Sequence[int]] | None,
+    book: dict,
+    documents: dict[str, str] | None,
+) -> dict[str, tuple[dict, list]]:
+    """Code ``indices``. An oversized passage's slices are coded, then merged."""
+    selected = [passages[index] for index in indices]
+    if slices and len(selected) == 1:
+        base = dict(selected[0])
+        passage_id = str(base.get("passage_id"))
+        merged: dict | None = None
+        errors: list = []
+        for clone in _sliced_passages(base, slices):
+            coded = await _code_batch(runtime, [clone], book, documents=documents)
+            coding, attempt_errors = coded[passage_id]
+            errors.extend(attempt_errors)
+            merged = coding if merged is None else _merge_codings(merged, coding)
+        empty = {"passage_id": passage_id, "codes": [], "memo": ""}
+        return {passage_id: (merged or empty, errors)}
+    return await _code_batch(runtime, selected, book, documents=documents)
+
+
 def _coding_schedule(metadata: Mapping[str, Any], runtime: RunConfig) -> tuple[int, int, int]:
     """Request size, commit cadence, and in-flight cap.
 
@@ -713,7 +865,7 @@ def _wave(
     window = min(room, commit_every)
 
     if state.get("parallel"):
-        jobs: list[tuple[str | None, list[int]]] = []
+        jobs: list[tuple] = []
         used = 0
         documents = 0
         for doc_id in sorted(state.get("branch_queues") or {}):
@@ -726,10 +878,7 @@ def _wave(
             if take <= 0:
                 break
             indices = queue[:take]
-            for start in range(0, len(indices), per_request):
-                chunk = indices[start : start + per_request]
-                if chunk:
-                    jobs.append((doc_id, chunk))
+            jobs.extend(_pack_jobs(state, runtime, indices, token_budget, per_request, doc_id))
             used += take
             documents += 1
         return jobs
@@ -758,18 +907,25 @@ def _wave(
     else:
         take = min(room, commit_every, len(queue) - index)
         indices = queue[index : index + take]
-    texts = [str(state["passages"][item].get("text") or "") for item in range(len(state["passages"]))]
-    packed = pack_indices(indices, texts, batch_size=per_request, token_budget=token_budget)
-    return [(None, batch) for batch in packed if batch]
+    return _pack_jobs(state, runtime, indices, token_budget, per_request, None)
 
 
-async def _pending_rows(runtime: RunConfig, state: CodingState, jobs: list[tuple[str | None, list[int]]]) -> list[dict]:
+async def _pending_rows(runtime: RunConfig, state: CodingState, jobs: list[tuple]) -> list[dict]:
     """Code every batch in ``jobs`` against the codebook frozen on ``state``."""
 
-    async def one(doc_id: str | None, indices: list[int]) -> list[dict]:
-        passages = [state["passages"][index] for index in indices]
+    async def one(doc_id: str | None, indices: list[int], meta: dict | None) -> list[dict]:
+        warning = str((meta or {}).get("warning") or "")
+        if warning and warning not in runtime.notes:
+            runtime.notes.append(warning)
         book = _book_for(state, doc_id)
-        coded = await _code_batch(runtime, passages, book, documents=_document_texts(state))
+        coded = await _code_indexed(
+            runtime,
+            state["passages"],
+            indices,
+            (meta or {}).get("slices"),
+            book,
+            documents=_document_texts(state),
+        )
         rows = []
         for index in indices:
             passage = state["passages"][index]
@@ -784,7 +940,12 @@ async def _pending_rows(runtime: RunConfig, state: CodingState, jobs: list[tuple
             )
         return rows
 
-    groups = await asyncio.gather(*(one(doc_id, indices) for doc_id, indices in jobs))
+    normalized = []
+    for job in jobs:
+        doc_id, indices = job[0], job[1]
+        meta = job[2] if len(job) > 2 else None
+        normalized.append((doc_id, indices, meta))
+    groups = await asyncio.gather(*(one(doc_id, indices, meta) for doc_id, indices, meta in normalized))
     return [row for group in groups for row in group]
 
 
@@ -1562,6 +1723,9 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
         )
         applied["codebook"] = book
         applied["segments"] = rows
+        for key, fingerprint in (parsed.get("reviewed_revisions") or {}).items():
+            if key in applied["codebook"]:
+                applied["codebook"][key]["reviewed_revision"] = fingerprint
         applied.setdefault("ops", []).extend(post_ops)
         applied.setdefault("review", []).extend(op for op in post_ops if op.get("status") == "review")
         if runtime.check_model is not None and applied["accepted_merges"] and quote_stats["quotes_checked"] == 0:
@@ -1653,7 +1817,8 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
             "merge_map": applied["merge_map"],
             "relation_hints": applied["relation_hints"],
             "overloaded_codes": overloaded,
-            "codes_sent": len(codes),
+            "codes_sent": int(parsed.get("codes_sent", len(codes))),
+            "audit": str(parsed.get("audit") or "full"),
             "chunks": chunk_count,
             "review": list(applied.get("review") or []),
             "consolidation": consolidation,
@@ -2167,14 +2332,42 @@ async def _sweep_chunks(
     Chunks share one ``abatch``. Their merge maps are reconciled by chunk index,
     not by which chunk returned first.
     """
-    chunks = iter_sweep_chunks(codes, runtime.sweep_chunk)
+    audit_all = full_audit_due(
+        sweep_index,
+        consolidation=consolidation,
+        full_audit_every=runtime.full_audit_every,
+    )
+    audit = "full" if audit_all else "incremental"
+    due = list(codes) if audit_all else [entry for entry in codes if code_needs_review(entry)]
+    if not due:
+        return (
+            {
+                "merges": [],
+                "rejections": [],
+                "definitions": [],
+                "overloaded_codes": [],
+                "relation_hints": [],
+                "integrative_memo": "",
+                "reflexive_memo": "",
+                "skipped_candidates": [],
+                "warnings": [
+                    f"Sweep {sweep_index} skipped the model. No code was new or materially changed."
+                ],
+                "reviewed_revisions": {},
+                "audit": audit,
+                "codes_sent": 0,
+            },
+            [],
+            0,
+        )
+    chunks = iter_sweep_chunks(due, runtime.sweep_chunk)
     vectors = None
     embed_note = ""
     if runtime.embeddings is not None:
         try:
-            vectors = await aembed_texts(
+            vectors = await shared_codebook_vectors(
                 runtime.embeddings,
-                [code_text(entry) for entry in codes],
+                codes,
                 batch_size=runtime.embed_batch_size,
                 limiter=runtime.limiter,
             )
@@ -2186,6 +2379,12 @@ async def _sweep_chunks(
                 f"Sweep embeddings failed ({exc}). Merge candidates used label overlap instead."
             )
 
+    due_keys = {code_key(str(entry.get("code") or "")) for entry in due}
+    due_indexes = [
+        index
+        for index, entry in enumerate(codes)
+        if code_key(str(entry.get("code") or "")) in due_keys
+    ]
     hints = await asyncio.to_thread(
         hint_pairs,
         codes,
@@ -2193,6 +2392,7 @@ async def _sweep_chunks(
         embedding_threshold=runtime.merge_threshold,
         lexical_threshold=runtime.lexical_merge_threshold,
         limit=runtime.candidate_limit,
+        chunk_indexes=None if audit_all else due_indexes,
     )
     if frozen:
         hints = [
@@ -2214,8 +2414,12 @@ async def _sweep_chunks(
         for hint in hints
     }
     for proposal in lexical_comparison_proposals(codes):
-        pair = frozenset((code_key(str(proposal.get("source") or "")), code_key(str(proposal.get("target") or ""))))
+        source_key = code_key(str(proposal.get("source") or ""))
+        target_key = code_key(str(proposal.get("target") or ""))
+        pair = frozenset((source_key, target_key))
         if not pair or pair in offered or (frozen and pair in frozen):
+            continue
+        if not audit_all and source_key not in due_keys and target_key not in due_keys:
             continue
         hints.append(proposal)
         offered.add(pair)
@@ -2245,15 +2449,27 @@ async def _sweep_chunks(
 
     async def confirm(index: int, chunk: list) -> tuple[int, dict, str | None]:
         passage_id = f"sweep-{sweep_index}" if len(chunks) == 1 else f"sweep-{sweep_index}-chunk-{index:04d}"
+        chunk_keys = {code_key(str(entry.get("code") or "")) for entry in chunk}
+        show_index = any(code_key(str(entry.get("code") or "")) not in chunk_keys for entry in codes)
         messages = build_sweep_messages(
             context=runtime.context,
             codes=chunk,
             candidates=per_chunk_candidates[index - 1],
             prompt_cache=runtime.prompt_cache,
-            all_codes=codes if len(chunks) > 1 else None,
+            all_codes=codes if show_index else None,
+            cross_chunk=_cross_chunk_for(
+                codes,
+                chunk,
+                vectors,
+                per_chunk_candidates[index - 1],
+                limit=runtime.cross_chunk_limit,
+                embedding_threshold=runtime.merge_threshold,
+                lexical_threshold=runtime.lexical_merge_threshold,
+            ),
             chunk_index=index,
             chunk_count=len(chunks),
             consolidation=consolidation,
+            audit=audit,
         )
         try:
             payload = await _ainvoke_structured(
@@ -2286,11 +2502,17 @@ async def _sweep_chunks(
     confirmed = await asyncio.gather(*(confirm(index, chunk) for index, chunk in enumerate(chunks, start=1)))
     confirmed.sort(key=lambda item: item[0])
     parts = []
+    reviewed: dict[str, str] = {}
     for index, parsed, note in confirmed:
         if note:
             warnings.append(note)
             for candidate in per_chunk_candidates[index - 1]:
                 skipped_candidates.append({**candidate, "rationale": note})
+        else:
+            for entry in chunks[index - 1]:
+                key = code_key(str(entry.get("code") or ""))
+                if key:
+                    reviewed[key] = review_fingerprint(entry)
         parts.append(
             {
                 "chunk_index": index,
@@ -2306,7 +2528,55 @@ async def _sweep_chunks(
     reconciled = reconcile_sweep_parts(parts)
     reconciled["skipped_candidates"] = skipped_candidates
     reconciled["warnings"] = warnings
+    reconciled["reviewed_revisions"] = reviewed
+    reconciled["audit"] = audit
+    reconciled["codes_sent"] = len(due)
     return reconciled, candidates, len(chunks)
+
+
+def _cross_chunk_for(
+    codes: list,
+    chunk: list,
+    vectors,
+    hints: list,
+    *,
+    limit: int,
+    embedding_threshold: float,
+    lexical_threshold: float,
+) -> list:
+    """Full evidence for hinted partners outside the chunk, then other similar codes."""
+    cap = max(0, int(limit))
+    if cap == 0:
+        return []
+    by_key = {}
+    for entry in codes:
+        key = code_key(str(entry.get("code") or ""))
+        if key:
+            by_key[key] = entry
+    in_chunk = {code_key(str(entry.get("code") or "")) for entry in chunk}
+    selected: list = []
+    seen: set[str] = set()
+
+    def add(key: str) -> None:
+        if key in in_chunk or key in seen or key not in by_key or len(selected) >= cap:
+            return
+        seen.add(key)
+        selected.append(by_key[key])
+
+    for hint in hints:
+        add(code_key(str(hint.get("source") or "")))
+        add(code_key(str(hint.get("target") or "")))
+    if len(selected) < cap:
+        for entry in select_cross_chunk(
+            codes,
+            chunk,
+            vectors,
+            limit=cap,
+            embedding_threshold=embedding_threshold,
+            lexical_threshold=lexical_threshold,
+        ):
+            add(code_key(str(entry.get("code") or "")))
+    return selected
 
 
 async def _ainvoke_structured(

@@ -8,8 +8,11 @@ embeddings, cosine similarity. Pass any object with ``rank()`` as
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import math
 import re
+import threading
 from typing import Mapping, Protocol, Sequence
 
 from automated_grounded_theory.validation import code_key
@@ -60,6 +63,260 @@ def code_text(entry: Mapping) -> str:
     )
 
 
+def embedding_model_id(embeddings) -> str:
+    """Identity of the embedding model. Two instances of the same named model share a cache."""
+    for attr in ("model", "model_name", "model_id"):
+        value = getattr(embeddings, attr, None)
+        if isinstance(value, str) and value.strip():
+            return f"{type(embeddings).__qualname__}:{value.strip()}"
+    return f"{type(embeddings).__qualname__}:{id(embeddings)}"
+
+
+def _content_key(model_id: str, text: str, role: str) -> tuple[str, str]:
+    """Cache key: embedding model (and role) plus the sha256 of the exact text."""
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return (f"{model_id}:{role}", digest)
+
+
+class _VectorCache:
+    """Process-wide vectors and one codebook snapshot index.
+
+    Concurrent callers that ask for the same text share one embedding call.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.vectors: dict[tuple[str, str], list[float]] = {}
+        self.inflight: dict[tuple[str, str], asyncio.Future] = {}
+        self.snapshots: dict[tuple[str, str], list[list[float]]] = {}
+        self.snapshot_inflight: dict[tuple[str, str], asyncio.Future] = {}
+
+
+_VECTOR_CACHE = _VectorCache()
+
+
+def _require_vectors(result: Sequence[list[float] | None]) -> list[list[float]]:
+    if any(vector is None for vector in result):
+        raise RuntimeError("embedding cache missed a text it had claimed")
+    return [list(vector) for vector in result]
+
+
+def clear_embedding_cache() -> None:
+    """Drop cached vectors. In-flight calls are left to finish."""
+    with _VECTOR_CACHE.lock:
+        _VECTOR_CACHE.vectors.clear()
+        _VECTOR_CACHE.snapshots.clear()
+
+
+def _store_vector(key: tuple[str, str], vector: Sequence[float]) -> list[float]:
+    stored = [float(item) for item in vector]
+    _VECTOR_CACHE.vectors[key] = stored
+    return stored
+
+
+def cached_embed_texts(
+    embeddings,
+    texts: Sequence[str],
+    *,
+    role: str = "document",
+    embed=None,
+) -> list[list[float]]:
+    """Embed ``texts``, reusing vectors whose exact content is already cached.
+
+    ``embed`` defaults to ``embeddings.embed_documents``. Pass a callable that
+    maps a list of strings to vectors when the call is ``embed_query`` instead.
+    """
+    if not texts:
+        return []
+    model = embedding_model_id(embeddings)
+    keys = [_content_key(model, text, role) for text in texts]
+    result: list[list[float] | None] = [None] * len(texts)
+    missing: list[int] = []
+    seen: set[tuple[str, str]] = set()
+    with _VECTOR_CACHE.lock:
+        for index, key in enumerate(keys):
+            hit = _VECTOR_CACHE.vectors.get(key)
+            if hit is not None:
+                result[index] = hit
+            elif key not in seen:
+                seen.add(key)
+                missing.append(index)
+    if missing:
+        embed_fn = embed or embeddings.embed_documents
+        fresh = embed_fn([texts[index] for index in missing])
+        if len(fresh) != len(missing):
+            raise RuntimeError("embedding model returned a different number of vectors than texts")
+        with _VECTOR_CACHE.lock:
+            for index, vector in zip(missing, fresh):
+                result[index] = _store_vector(keys[index], vector)
+    with _VECTOR_CACHE.lock:
+        for index, key in enumerate(keys):
+            if result[index] is None:
+                result[index] = list(_VECTOR_CACHE.vectors[key])
+    return _require_vectors(result)
+
+
+async def cached_aembed_texts(
+    embeddings,
+    texts: Sequence[str],
+    *,
+    batch_size: int,
+    limiter,
+    role: str = "document",
+) -> list[list[float]]:
+    """Async form of :func:`cached_embed_texts`. Identical in-flight texts share one call."""
+    if not texts:
+        return []
+    model = embedding_model_id(embeddings)
+    keys = [_content_key(model, text, role) for text in texts]
+    loop = asyncio.get_running_loop()
+    result: list[list[float] | None] = [None] * len(texts)
+    mine_keys: list[tuple[str, str]] = []
+    mine_texts: list[str] = []
+    waiting: list[tuple[int, asyncio.Future]] = []
+    claimed: set[tuple[str, str]] = set()
+    with _VECTOR_CACHE.lock:
+        for index, key in enumerate(keys):
+            hit = _VECTOR_CACHE.vectors.get(key)
+            if hit is not None:
+                result[index] = hit
+                continue
+            inflight = _VECTOR_CACHE.inflight.get(key)
+            if inflight is not None:
+                waiting.append((index, inflight))
+                continue
+            if key in claimed:
+                continue
+            claimed.add(key)
+            future: asyncio.Future = loop.create_future()
+            _VECTOR_CACHE.inflight[key] = future
+            mine_keys.append(key)
+            mine_texts.append(texts[index])
+    if mine_texts:
+        try:
+            embedded = await aembed_texts(
+                embeddings,
+                mine_texts,
+                batch_size=batch_size,
+                limiter=limiter,
+            )
+        except Exception as exc:
+            with _VECTOR_CACHE.lock:
+                for key in mine_keys:
+                    future = _VECTOR_CACHE.inflight.pop(key, None)
+                    if future is not None and not future.done():
+                        future.set_exception(exc)
+            raise
+        if len(embedded) != len(mine_texts):
+            exc = RuntimeError("embedding model returned a different number of vectors than texts")
+            with _VECTOR_CACHE.lock:
+                for key in mine_keys:
+                    future = _VECTOR_CACHE.inflight.pop(key, None)
+                    if future is not None and not future.done():
+                        future.set_exception(exc)
+            raise exc
+        with _VECTOR_CACHE.lock:
+            for key, vector in zip(mine_keys, embedded):
+                stored = _store_vector(key, vector)
+                future = _VECTOR_CACHE.inflight.pop(key, None)
+                if future is not None and not future.done():
+                    future.set_result(stored)
+    for index, future in waiting:
+        result[index] = list(await future)
+    with _VECTOR_CACHE.lock:
+        for index, key in enumerate(keys):
+            if result[index] is None:
+                result[index] = list(_VECTOR_CACHE.vectors[key])
+    return _require_vectors(result)
+
+
+def _snapshot_key(model_id: str, texts: Sequence[str]) -> tuple[str, str]:
+    digest = hashlib.sha256("\0".join(texts).encode("utf-8")).hexdigest()
+    return (model_id, digest)
+
+
+async def shared_codebook_vectors(
+    embeddings,
+    entries: Sequence[Mapping],
+    *,
+    limiter,
+    batch_size: int,
+) -> list[list[float]]:
+    """One vector list for this codebook snapshot, shared by concurrent callers.
+
+    A later snapshot re-embeds only the texts whose content changed.
+    """
+    texts = [code_text(entry) for entry in entries]
+    snap = _snapshot_key(embedding_model_id(embeddings), texts)
+    loop = asyncio.get_running_loop()
+    with _VECTOR_CACHE.lock:
+        cached = _VECTOR_CACHE.snapshots.get(snap)
+        if cached is not None:
+            return [list(vector) for vector in cached]
+        waiter = _VECTOR_CACHE.snapshot_inflight.get(snap)
+        if waiter is not None:
+            owner = False
+        else:
+            waiter = loop.create_future()
+            _VECTOR_CACHE.snapshot_inflight[snap] = waiter
+            owner = True
+    if not owner:
+        return [list(vector) for vector in await waiter]
+    try:
+        vectors = await cached_aembed_texts(
+            embeddings,
+            texts,
+            batch_size=batch_size,
+            limiter=limiter,
+        )
+    except Exception as exc:
+        with _VECTOR_CACHE.lock:
+            _VECTOR_CACHE.snapshot_inflight.pop(snap, None)
+        if not waiter.done():
+            waiter.set_exception(exc)
+        raise
+    with _VECTOR_CACHE.lock:
+        _VECTOR_CACHE.snapshots[snap] = vectors
+        _VECTOR_CACHE.snapshot_inflight.pop(snap, None)
+    if not waiter.done():
+        waiter.set_result(vectors)
+    return [list(vector) for vector in vectors]
+
+
+def review_fingerprint(entry: Mapping) -> str:
+    """Revision token for a code. Label, definition, revision, and example quotes.
+
+    Frequency does not change it. A sweep stores this on ``reviewed_revision``.
+    """
+    payload = {
+        "revision": int(entry.get("revision") or 1),
+        "label": str(entry.get("code") or entry.get("label") or ""),
+        "definition": str(entry.get("definition") or ""),
+        "examples": [str(item.get("quote") or "") for item in (entry.get("examples") or [])[:3]],
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+    return f"{payload['revision']}:{digest}"
+
+
+def code_needs_review(entry: Mapping) -> bool:
+    """True when the code is new or its review fingerprint changed."""
+    return str(entry.get("reviewed_revision") or "") != review_fingerprint(entry)
+
+
+def full_audit_due(sweep_index: int, *, consolidation: bool, full_audit_every: int) -> bool:
+    """Consolidation is always a full audit. Otherwise every ``full_audit_every`` sweeps.
+
+    ``full_audit_every`` of 0 audits only on consolidation. Sweep 1 is a full
+    audit when the interval is positive, because ``(1 - 1) % n == 0``.
+    """
+    if consolidation:
+        return True
+    every = int(full_audit_every)
+    if every <= 0:
+        return False
+    return (int(sweep_index) - 1) % every == 0
+
+
 class CodeRetriever(Protocol):
     """Rank codebook entries for a passage. Most relevant label first."""
 
@@ -95,8 +352,13 @@ class EmbeddingCodeRetriever:
         if k <= 0 or not codebook:
             return []
         labels = [str(entry.get("code") or "") for entry in codebook]
-        vectors = self.embeddings.embed_documents([code_text(entry) for entry in codebook])
-        query = self.embeddings.embed_query(passage)
+        vectors = cached_embed_texts(self.embeddings, [code_text(entry) for entry in codebook])
+        query = cached_embed_texts(
+            self.embeddings,
+            [passage],
+            role="query",
+            embed=lambda texts: [self.embeddings.embed_query(text) for text in texts],
+        )[0]
         return _rank_vectors(labels, vectors, query, k)
 
     async def arank_many(
@@ -108,17 +370,20 @@ class EmbeddingCodeRetriever:
         limiter,
         batch_size: int = 64,
     ) -> list[list[str]]:
-        """Rank every passage. The codebook is embedded once, in batches."""
+        """Rank every passage. Unchanged codebook rows are not embedded again.
+
+        Concurrent callers with the same snapshot share one vector list.
+        """
         if k <= 0 or not codebook or not passages:
             return [[] for _ in passages]
         labels = [str(entry.get("code") or "") for entry in codebook]
-        vectors = await aembed_texts(
+        vectors = await shared_codebook_vectors(
             self.embeddings,
-            [code_text(entry) for entry in codebook],
-            batch_size=batch_size,
+            codebook,
             limiter=limiter,
+            batch_size=batch_size,
         )
-        queries = await aembed_texts(
+        queries = await cached_aembed_texts(
             self.embeddings,
             list(passages),
             batch_size=batch_size,
@@ -215,7 +480,7 @@ def merge_candidates(
     entries = [entry for entry in codebook if entry.get("code")]
     vectors = None
     if embeddings is not None and entries:
-        vectors = embeddings.embed_documents([code_text(entry) for entry in entries])
+        vectors = cached_embed_texts(embeddings, [code_text(entry) for entry in entries])
     return hint_pairs(
         entries,
         vectors,
@@ -232,6 +497,7 @@ def hint_pairs(
     embedding_threshold: float = 0.65,
     lexical_threshold: float = 0.5,
     limit: int | None = 30,
+    chunk_indexes: Sequence[int] | None = None,
 ) -> list[dict]:
     """Union of lexical hints and, when vectors are present, embedding hints.
 
@@ -248,6 +514,7 @@ def hint_pairs(
             embedding_threshold=embedding_threshold,
             lexical_threshold=lexical_threshold,
             limit=None,
+            chunk_indexes=chunk_indexes,
         )
     ]
     if vectors is not None:
@@ -258,6 +525,7 @@ def hint_pairs(
                 embedding_threshold=embedding_threshold,
                 lexical_threshold=lexical_threshold,
                 limit=None,
+                chunk_indexes=chunk_indexes,
             )
         )
     paired = union_candidates(groups)
@@ -340,6 +608,54 @@ def union_candidates(groups: Sequence[Sequence[Mapping]]) -> list[dict]:
     pairs = list(best.values())
     pairs.sort(key=lambda item: (-float(item["score"]), str(item["source"]).casefold(), str(item["target"]).casefold()))
     return pairs
+
+
+def select_cross_chunk(
+    codes: Sequence[Mapping],
+    chunk: Sequence[Mapping],
+    vectors: Sequence[Sequence[float]] | None = None,
+    *,
+    limit: int = 8,
+    embedding_threshold: float = 0.65,
+    lexical_threshold: float = 0.5,
+) -> list[dict]:
+    """Codes outside ``chunk`` that are similar to a code inside it.
+
+    Embeddings are used when ``vectors`` lines up with ``codes``. Token overlap
+    of the label, definition, and first example is always considered. The result
+    is capped at ``limit``, highest score first.
+    """
+    cap = max(0, int(limit))
+    if cap == 0 or not codes or not chunk:
+        return []
+    chunk_keys = {
+        code_key(str(entry.get("code") or entry.get("label") or ""))
+        for entry in chunk
+    }
+    chunk_keys.discard("")
+    indexed = []
+    for index, entry in enumerate(codes):
+        key = code_key(str(entry.get("code") or entry.get("label") or ""))
+        if key:
+            indexed.append((index, key, entry))
+    best: dict[str, tuple[float, dict]] = {}
+    insiders = [(index, key, entry) for index, key, entry in indexed if key in chunk_keys]
+    outsiders = [(index, key, entry) for index, key, entry in indexed if key not in chunk_keys]
+    for left_index, _left_key, left in insiders:
+        left_text = code_text(left)
+        for right_index, right_key, right in outsiders:
+            lexical = jaccard(left_text, code_text(right))
+            embedding = 0.0
+            if vectors is not None and left_index < len(vectors) and right_index < len(vectors):
+                embedding = cosine(vectors[left_index], vectors[right_index])
+            if lexical < lexical_threshold and embedding < embedding_threshold:
+                continue
+            score = max(lexical, embedding)
+            current = best.get(right_key)
+            if current is None or score > current[0]:
+                best[right_key] = (score, right)
+    ranked = sorted(best.values(), key=lambda item: (-item[0], str(item[1].get("code") or "").casefold()))
+    return [entry for _score, entry in ranked[:cap]]
 
 
 def select_prompt_codes(
