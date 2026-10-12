@@ -1312,6 +1312,89 @@ def apply_post_merge(
     }
 
 
+def plan_in_batch_aliases(
+    proposals: Sequence[Mapping[str, Any]],
+    merges: Sequence[Mapping[str, Any]],
+    *,
+    min_merge_confidence: float = 0.5,
+) -> dict[str, Any]:
+    """Decide which new codes from one round are the same concept.
+
+    The proposals are not in the frozen codebook. ``merges`` are the model's
+    structured decisions. The same alias gate used by a sweep applies, so a
+    mixed or different concept stays two codes. Returns label rewrites for the
+    commit and the pair rows to export apart from cross-snapshot duplicates.
+    """
+    book: dict[str, dict] = {}
+    segments: list[dict] = []
+    for item in proposals:
+        label = str(item.get("code") or "").strip()
+        key = code_key(label)
+        if not key or key in book:
+            continue
+        book[key] = {
+            "code": label,
+            "key": key,
+            "definition": str(item.get("definition") or ""),
+            "valence": str(item.get("valence") or "neutral"),
+            "code_id": "",
+            "history": [],
+        }
+        for quote in item.get("quotes") or []:
+            text = str(quote or "").strip()
+            if not text:
+                continue
+            segments.append(
+                {
+                    "code": label,
+                    "code_key": key,
+                    "quote": text,
+                    "passage_id": str(item.get("passage_id") or ""),
+                }
+            )
+    if len(book) < 2:
+        return {"rewrites": {}, "definitions": {}, "pairs": []}
+    applied = apply_sweep(
+        book,
+        segments,
+        merges=list(merges),
+        candidates=[],
+        min_merge_confidence=min_merge_confidence,
+        max_merges_per_sweep=None,
+    )
+    rewrites: dict[str, str] = {}
+    for retired, survivor in (applied.get("merge_map") or {}).items():
+        retired_key = code_key(str(retired))
+        if retired_key and survivor:
+            rewrites[retired_key] = str(survivor)
+    definitions: dict[str, str] = {}
+    for merge in applied.get("accepted_merges") or []:
+        definition = str(merge.get("rewritten_definition") or "").strip()
+        if not definition:
+            continue
+        source = code_key(str(merge.get("source") or ""))
+        target = code_key(str(merge.get("target") or ""))
+        survivor = source if source <= target else target
+        if survivor:
+            definitions[survivor] = definition
+    pairs = []
+    for merge in list(applied.get("accepted_merges") or []) + list(applied.get("rejected_merges") or []):
+        pairs.append(
+            {
+                "scope": "in_batch",
+                "source": merge.get("source"),
+                "target": merge.get("target"),
+                "comparison_op": merge.get("comparison_op") or merge.get("decision") or "",
+                "decision": merge.get("decision") or "",
+                "reason": merge.get("reason") or "",
+                "confidence": merge.get("confidence"),
+                "rationale": merge.get("rationale") or "",
+                "applied": str(merge.get("decision") or "") == "accept",
+            }
+        )
+    return {"rewrites": rewrites, "definitions": definitions, "pairs": pairs}
+
+
 def apply_sweep(
     codebook: dict[str, dict],
     segments: list[dict],

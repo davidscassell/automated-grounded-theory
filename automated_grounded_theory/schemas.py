@@ -416,6 +416,35 @@ class ThemeCoding(_LLMModel):
     negative_cases: list[ThemeNegative] = Field(default_factory=list)
 
 
+class InBatchCode(_LLMModel):
+    """One new code proposed in this round, not yet in the frozen codebook."""
+
+    label: str
+    definition: str = ""
+    quotes: list[str] = Field(default_factory=list)
+    valence: str = ""
+
+
+class InBatchRequest(_LLMModel):
+    """The new codes from one round, for a single comparison call."""
+
+    note: str = ""
+    codes: list[InBatchCode] = Field(default_factory=list)
+
+
+class InBatchComparison(_LLMModel):
+    """Decisions among the new codes of one round. Does not invent codes."""
+
+    merges: list[MergeDecision] = Field(
+        default_factory=list,
+        description=(
+            "Pairs among these newly proposed codes. "
+            "alias_duplicate only when definition and evidence name one concept. "
+            "Otherwise keep_distinct, link_to_category, or defer."
+        ),
+    )
+
+
 class SameCodeJudgment(_LLMModel):
     """Whether two open codes name the same kind of incident."""
 

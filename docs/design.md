@@ -1,4 +1,4 @@
-# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1 and 0.6.2)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
 Status: steps 1 and 2 of the v0.6 plan. Category development, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
@@ -76,7 +76,7 @@ Uncertainty flags: `ambiguous_span`, `insufficient_context`, `competing_code`, `
 
 `segment_and_shuffle` → `prepare_round` → `Send("code_worker")` → `commit` → `sweep` → `consolidate` → `export`.
 
-`prepare_round` freezes `snapshot_id`, `definition_revision`, `evidence_revision`, and `policy_version` (`0.6.1`). Workers do not mutate the codebook. The proposal reducer dedupes by proposal id, drops conflicting payloads, sorts, and clears only on `{"__reset__": True}`. `commit` rejects a stale snapshot id, skips proposal ids already committed, and is the only writer of definitions.
+`prepare_round` freezes `snapshot_id`, `definition_revision`, `evidence_revision`, and `policy_version` (`0.6.2`). Workers do not mutate the codebook. The proposal reducer dedupes by proposal id, drops conflicting payloads, sorts, and clears only on `{"__reset__": True}`. `commit` rejects a stale snapshot id, skips proposal ids already committed, and is the only writer of definitions.
 
 `get_graph("themes")` fans chunk workers out with `Send` into `theme_worker`, then joins at `validate`. The reporting graph is separate from category development.
 
@@ -125,11 +125,19 @@ RAND Muse E2 under 0.5.4, as scored: precision 0.60, recall 0.19, F1 0.29 agains
 - `duplicates_before_reconciliation` counts proposals born in the same snapshot that a later comparison aliases or judges as the same concept (`same_action` and `same_object`). It does not count identical labels. Exact proposal-id collisions stay in `exact_proposal_collisions`. Each round's pairs are in `duplicate_rounds.json`.
 - Every accepted alias is exported with both definitions, up to three quotes from each side, and the rationale (`kind: accepted_alias` in `lost_distinction_candidates.json`). `merges_later_split` counts aliases a later quote split pulled apart.
 - The shared limiter releases its slot before a retry sleep. `Retry-After` cannot exceed `max_backoff`. Pipeline overlap does not start a coding task when `concurrency` is 1, so a sweep is not stuck behind its own overlap. The run metadata includes the in-flight timeline.
-- In document mode, a document that still has at least `batch_size` passages stays inside that document (up to `batch_size * concurrency` workers, one commit). A shorter document, such as one comment per respondent, continues into the next documents until the round holds `batch_size` passages. Reconciliation runs once per round. `batch_size` still defaults to 1.
+- 0.6.1 filled a short document's round from the following documents, and kept a long document's passages together. 0.6.2 replaces that round shape when `batch_size` is above 1; see below. `batch_size` still defaults to 1.
 - `run_sync` reuses one background event loop and does not close HTTP clients the caller still holds. `build_themes` can follow `open_code` on the same model instance.
 - `alias_duplicate` requires the same action, the same object, a contrast check, no material contrast, and evidence that is not mixed. Labels that each name an object or aspect the other lacks stay `keep_distinct` (`aspects_differ`), including when they share a platform name. Mixed `quote_fits` or `evidence_same` false is `defer`. A missing rubric is `keep_distinct`. Valence is still not a reason to alias or to refuse. A trivial near-duplicate with the same stance still aliases without a model call.
 - `presentation_themes` folds reporting themes that share a content word. Analytic membership is unchanged. There is no theme quota. The prevalence chart uses that reporting view. `presentation_themes.json` is the list.
 
-## 10. Out of scope
+## 10. Corrections in 0.6.2
+
+When `batch_size` is above 1, document mode builds each round by round-robin over the seeded document order. A round takes at most one passage from each document. Incident order inside a document stays as it was. Adjacent passages of one document share a round only when that document is the only one left. `batch_size` still defaults to 1, and that setting still reads a document through before the next.
+
+Before the commit writes a round, one comparison call judges the new codes proposed in that round against each other. It uses the same alias, keep-distinct, link, and defer rules as a sweep. A pair that is not one concept stays two codes. Accepted aliases are written once. Those pairs are `in_batch` in `duplicate_rounds.json`. `cross_snapshot` is the later same-snapshot count, and `duplicates_before_reconciliation` still counts only that list.
+
+Sweep, merge-check, definition-rewrite, and quote-fit calls use `sweep_timeout` (default 300 seconds) when that is longer than `request_timeout`. A zero on either side waits with no deadline.
+
+## 11. Out of scope
 
 Category feedback, focused recoding of earlier negatives, relationship hypotheses, sampling briefs, and a Taguette project-file adapter. See the v0.6 plan steps 3–5.

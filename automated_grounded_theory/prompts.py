@@ -411,6 +411,50 @@ def build_sweep_messages(
     return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=request.model_dump_json(indent=2))]
 
 
+IN_BATCH_SYSTEM = """You are comparing codes that were just proposed in one round.
+
+These codes are not in the frozen codebook yet. The passages were coded in \
+parallel, so the proposals have not been compared with each other. Read every \
+code. Alias two of them only when the definitions name the same concept and \
+the quotes show that same concept. Set comparison_op to alias_duplicate only \
+then, with same_action and same_object true, contrast_checked true, and \
+material_contrast false. If the objects or aspects differ, set comparison_op \
+to keep_distinct. If the quotes disagree, set evidence_same false and \
+comparison_op to defer. If they belong in one category but are not one code, \
+set comparison_op to link_to_category. Stance is context, not a reason to \
+alias and not a reason to refuse. Do not invent codes. Do not merge a chain \
+into one code. Set confidence from 0 to 1. Write a rationale of one to three \
+sentences on every decision."""
+
+
+def build_in_batch_messages(
+    *,
+    context: ResearchContext,
+    codes: Sequence[Mapping[str, Any]],
+    prompt_cache: bool,
+) -> list:
+    from automated_grounded_theory.schemas import InBatchCode, InBatchRequest
+
+    request = InBatchRequest(
+        note=(
+            "These codes were proposed against the same frozen snapshot. "
+            "Compare them with each other before they are committed. "
+            "Leave a distinct concept as its own code."
+        ),
+        codes=[
+            InBatchCode(
+                label=str(entry.get("code") or ""),
+                definition=str(entry.get("definition") or ""),
+                quotes=[str(quote) for quote in (entry.get("quotes") or []) if str(quote).strip()][:3],
+                valence=str(entry.get("valence") or ""),
+            )
+            for entry in codes
+        ],
+    )
+    system = IN_BATCH_SYSTEM + "\n\n" + render_context(context)
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=request.model_dump_json(indent=2))]
+
+
 THEME_SYSTEM = """You are doing focused coding, the round after open coding (Charmaz).
 
 The open codes already exist. Group them into themes. A theme gathers codes \

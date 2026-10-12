@@ -74,8 +74,12 @@ class CallLimiter:
         self.timeline: list[dict] = []
         self._timeline_origin: float | None = None
 
-    async def ainvoke(self, runnable, payload):
-        """``await runnable.ainvoke(payload)`` under the AIMD cap, with rate-limit retries."""
+    async def ainvoke(self, runnable, payload, *, timeout: float | None = None):
+        """``await runnable.ainvoke(payload)`` under the AIMD cap, with rate-limit retries.
+
+        ``timeout`` overrides ``request_timeout`` for this call. ``None`` keeps
+        the limiter default. ``0`` waits with no deadline.
+        """
         key = cache_key(payload, **(self.cache_context or {}))
         cached = self.cache.get(key)
         if cached is not None:
@@ -83,7 +87,7 @@ class CallLimiter:
             return cached
         await self._acquire()
         try:
-            result = await self._retry(lambda: self._invoke(runnable, payload))
+            result = await self._retry(lambda: self._invoke(runnable, payload, timeout=timeout))
             self._on_success()
             self.cache[key] = result
             return result
@@ -236,16 +240,17 @@ class CallLimiter:
             "max_in_flight": self.max_in_flight,
         }
 
-    async def _invoke(self, runnable, payload):
-        """One model call, cut off at ``request_timeout`` seconds.
+    async def _invoke(self, runnable, payload, *, timeout: float | None = None):
+        """One model call, cut off at ``timeout`` seconds, or ``request_timeout``.
 
         A timeout of 0 or less waits for the provider. The default is 120.
         """
         self._mark("call_start")
+        limit = self.request_timeout if timeout is None else float(timeout)
         try:
             call = runnable.ainvoke(payload)
-            if self.request_timeout and self.request_timeout > 0:
-                return await asyncio.wait_for(call, self.request_timeout)
+            if limit and limit > 0:
+                return await asyncio.wait_for(call, limit)
             return await call
         finally:
             self._mark("call_end")
@@ -533,7 +538,21 @@ def parse_structured(result, schema) -> tuple[dict, dict]:
     return payload, usage_from_message(raw)
 
 
-async def ainvoke_structured(model, schema, messages: Sequence, limiter) -> tuple[tuple[dict, dict], list]:
+def sweep_deadline(request_timeout: float, sweep_timeout: float) -> float:
+    """How long a sweep call may run.
+
+    Sweeps read the whole codebook chunk, so the deadline is longer than the
+    coding deadline (300 seconds unless ``sweep_timeout`` is set higher).
+    Zero on either side means no deadline.
+    """
+    coding = float(request_timeout)
+    sweep = float(sweep_timeout)
+    if coding <= 0 or sweep <= 0:
+        return 0.0
+    return max(coding, sweep)
+
+
+async def ainvoke_structured(model, schema, messages: Sequence, limiter, *, timeout: float | None = None) -> tuple[tuple[dict, dict], list]:
     """Invoke ``schema`` once, then repair a single malformed output.
 
     The follow-up user message starts with ``REPAIR THIS OUTPUT``. The second
@@ -542,7 +561,8 @@ async def ainvoke_structured(model, schema, messages: Sequence, limiter) -> tupl
     from langchain_core.messages import HumanMessage
 
     runnable = structured_runnable(model, schema)
-    result = await limiter.ainvoke(runnable, list(messages))
+    extra = {} if timeout is None else {"timeout": timeout}
+    result = await limiter.ainvoke(runnable, list(messages), **extra)
     try:
         return parse_structured(result, schema), list(messages)
     except ValueError as first:
@@ -557,7 +577,7 @@ async def ainvoke_structured(model, schema, messages: Sequence, limiter) -> tupl
         ]
         try:
             limiter.schema_repairs = int(getattr(limiter, "schema_repairs", 0) or 0) + 1
-            repaired = await limiter.ainvoke(runnable, repair)
+            repaired = await limiter.ainvoke(runnable, repair, **extra)
             return parse_structured(repaired, schema), repair
         except ValueError:
             raise first from None

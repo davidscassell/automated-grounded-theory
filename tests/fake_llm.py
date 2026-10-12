@@ -19,6 +19,7 @@ from automated_grounded_theory.schemas import (
     DefinitionUpdate,
     MergeCheck,
     MergeCheckBatch,
+    InBatchComparison,
     MergeDecision,
     PassageCoding,
     SweepCoding,
@@ -98,6 +99,8 @@ class FakeCoder(BaseChatModel):
             name = getattr(schema, "__name__", "")
             if name == "SweepCoding":
                 parsed = self.sweep(text)
+            elif name == "InBatchComparison":
+                parsed = self.in_batch(text)
             elif name == "MergeCheckBatch":
                 parsed = self.verify(text)
             elif name == "DefinitionRewriteBatch":
@@ -218,6 +221,37 @@ class FakeCoder(BaseChatModel):
                 )
             )
         return DefinitionRewriteBatch(rewrites=rewrites)
+
+    def in_batch(self, text: str) -> InBatchComparison:
+        payload = _payload(text)
+        labels = []
+        for item in payload.get("codes") or []:
+            label = str(item.get("label") or item.get("code") or "")
+            if label:
+                labels.append(label)
+        merges = []
+        packing = [label for label in labels if "packing" in label.casefold()]
+        if len(packing) >= 2:
+            source, target = packing[0], packing[1]
+            if "up" in source.casefold() and "up" not in target.casefold():
+                source, target = target, source
+            merges.append(
+                MergeDecision(
+                    source=source,
+                    target=target,
+                    rationale="These packing labels name the same incident of bagging possessions before leaving.",
+                    rewritten_definition="Bagging and boxing possessions while leaving a place.",
+                    confidence=0.9,
+                    same_action=True,
+                    same_object=True,
+                    same_stance=True,
+                    contrast_checked=True,
+                    material_contrast=False,
+                    evidence_same=True,
+                    comparison_op="alias_duplicate",
+                )
+            )
+        return InBatchComparison(merges=merges)
 
     def sweep(self, text: str) -> SweepCoding:
         payload = _payload(text)

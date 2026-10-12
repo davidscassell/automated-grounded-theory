@@ -385,7 +385,14 @@ def export_result(result, directory: str | Path) -> dict[str, str]:
     metadata = dict(result.metadata)
     metadata["interrupted"] = result.interrupted
     metadata["saturation_note"] = result.saturation_report.get("note")
-    _write_json(place("duplicate_rounds.json"), list((metadata.get("metrics") or {}).get("duplicate_rounds") or []))
+    metrics = metadata.get("metrics") or {}
+    _write_json(
+        place("duplicate_rounds.json"),
+        {
+            "in_batch": list(metrics.get("in_batch_rounds") or []),
+            "cross_snapshot": list(metrics.get("duplicate_rounds") or []),
+        },
+    )
     _write_json(place("lost_distinction_candidates.json"), list(metadata.get("lost_distinction_audit") or []))
     _write_json(place("run_metadata.json"), metadata)
     _write_json(place("run.json"), result.to_dict())

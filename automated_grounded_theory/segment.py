@@ -11,7 +11,7 @@ from __future__ import annotations
 import random
 import re
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Mapping, Sequence
 
 from automated_grounded_theory.corpus import LoadedDocument, load_corpus, normalize_newlines
 from automated_grounded_theory.validation import exclusion_reason
@@ -59,6 +59,73 @@ class CodingPlan:
     queue: list[int] = field(default_factory=list)
     branch_queues: dict[str, list[int]] = field(default_factory=dict)
     parallel: bool = False
+
+
+def interleave_document_queue(passages: Sequence[Mapping], queue: Sequence[int], batch_size: int) -> list[int]:
+    """Round-robin passages across documents, keeping each document in reading order.
+
+    A prefix of the result, up to ``batch_size`` passages, takes at most one
+    passage from each document. When only one document still has passages, the
+    rest of the queue is that document, in order. ``queue`` already lists
+    documents in seeded order and passages in reading order within a document.
+    """
+    width = max(1, int(batch_size))
+    by_doc: dict[str, list[int]] = {}
+    doc_order: list[str] = []
+    for index in queue:
+        doc_id = str(passages[index].get("doc_id") or "")
+        if doc_id not in by_doc:
+            doc_order.append(doc_id)
+            by_doc[doc_id] = []
+        by_doc[doc_id].append(index)
+    cursors = {doc: 0 for doc in doc_order}
+    remaining = {doc: len(indices) for doc, indices in by_doc.items()}
+    ordered: list[int] = []
+    count = len(doc_order)
+    cursor = 0
+    while any(remaining.values()):
+        alive = [doc for doc in doc_order if remaining[doc] > 0]
+        if len(alive) <= 1:
+            doc = alive[0]
+            ordered.extend(by_doc[doc][cursors[doc] :])
+            break
+        taken: set[str] = set()
+        guard = 0
+        while len(taken) < min(width, len(alive)) and guard < count * 2:
+            doc = doc_order[cursor % count]
+            cursor += 1
+            guard += 1
+            if remaining[doc] <= 0 or doc in taken:
+                continue
+            ordered.append(by_doc[doc][cursors[doc]])
+            cursors[doc] += 1
+            remaining[doc] -= 1
+            taken.add(doc)
+        if not taken:
+            break
+    return ordered
+
+
+def next_round_count(passages: Sequence[Mapping], indices: Sequence[int], batch_size: int) -> int:
+    """How many leading passages belong to the next interleaved round.
+
+    The count stops before a document would contribute a second passage, and
+    it stops at ``batch_size``. A run of one document is cut only by ``batch_size``.
+    """
+    if not indices:
+        return 0
+    width = max(1, int(batch_size))
+    docs = [str(passages[index].get("doc_id") or "") for index in indices]
+    if len(set(docs)) <= 1:
+        return min(width, len(indices))
+    seen: set[str] = set()
+    count = 0
+    for doc in docs:
+        if doc in seen or count >= width:
+            break
+        seen.add(doc)
+        count += 1
+    return count
 
 
 def plan_coding(
