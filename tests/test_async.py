@@ -124,7 +124,8 @@ def test_document_mode_reviews_every_passage_in_seeded_order():
     assert {item["doc_id"] for item in first.passages} == {"alex", "blair", "casey", "drew"}
     assert len(first.segments) == 4
     assert any(memo["kind"] == "document" for memo in first.memos)
-    assert any(memo["kind"] == "reflexive" for memo in first.memos)
+    assert any(memo["kind"] == "provenance" for memo in first.memos)
+    assert not any(str(memo.get("text") or "").startswith("Read ") and memo["kind"] == "reflexive" for memo in first.memos)
     assert first.metadata["review_mode"] == "document"
 
 
@@ -138,6 +139,7 @@ def test_wave_mode_can_show_an_empty_codebook_to_two_batches():
         sweep_every=25,
         batch_size=1,
         concurrency=2,
+        passages_per_codebook_update=2,
         review_mode="wave",
         pipeline=False,
     )

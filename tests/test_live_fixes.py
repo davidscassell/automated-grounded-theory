@@ -439,7 +439,8 @@ def test_theme_review_leaves_distinct_themes_split():
 def test_in_vivo_prompt_requires_a_vivid_phrase():
     assert "Pay. Pay. Pay." in CODING_SYSTEM
     assert "feels like a number" in CODING_SYSTEM
-    assert "staying for the team" in CODING_SYSTEM
+    assert "expressing liking for the team" in CODING_SYSTEM
+    assert "staying for the team" not in CODING_SYSTEM
     assert "set in_vivo true only when every one of these is true" in CODING_SYSTEM
     assert "participant's language" in CODING_SYSTEM
     assert "50 to 120" in CODING_SYSTEM
@@ -470,7 +471,8 @@ def test_empty_document_memo_is_omitted():
         [{"passage_index": 0}],
         {"passages": [{"passage_id": "p1", "doc_id": "d1", "doc_name": "Ada"}]},
     )
-    assert [item["kind"] for item in notes] == ["reflexive"]
+    assert [item["kind"] for item in notes] == ["provenance"]
+    assert "not a reflexivity memo" in notes[0]["text"]
     assert all("No property" not in item["text"] for item in notes)
 
 

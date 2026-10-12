@@ -139,6 +139,15 @@ async def aevaluate(
             sum(assignment_ari(run, other) for other in others) / len(others),
             4,
         )
+        agreements = [aligned_assignment_agreement(run, other) for other in others]
+        metrics["aligned_assignment_agreement"] = round(
+            sum(item["mean_jaccard"] for item in agreements) / len(agreements),
+            4,
+        )
+        metrics["aligned_assignment_alpha"] = round(
+            sum(item["krippendorff_alpha"] for item in agreements) / len(agreements),
+            4,
+        )
     if model is None:
         metrics["chen_metrics"] = chen_metrics(books) if len(books) >= 2 else _CHEN_NOTE
         metrics.setdefault("stage_seconds", {})["eval"] = round(time.perf_counter() - started, 4)
@@ -307,7 +316,12 @@ def assignment_ari(left: Mapping[str, Any], right: Mapping[str, Any]) -> float:
 
     Passages are paired by ``passage_id``. Several codes on one passage are
     joined in sorted order so the labeling does not depend on segment order.
-    This is the stability score across seeds. It is not a claim of saturation.
+    This is a stability score across seeds. It is not a claim of saturation.
+
+    The index compares partitions, not labels. Two runs that give every
+    passage its own different code score 1.0, because no two passages share a
+    cluster in either run. Use :func:`aligned_assignment_agreement` when the
+    question is whether the same codes were applied to the same passages.
     """
     left_labels = _passage_labels(left)
     right_labels = _passage_labels(right)
@@ -320,9 +334,148 @@ def assignment_ari(left: Mapping[str, Any], right: Mapping[str, Any]) -> float:
     )
 
 
-def _passage_labels(run: Mapping[str, Any]) -> dict[str, str]:
+def _run_segments(run: Any) -> list[Mapping[str, Any]]:
+    if isinstance(run, Mapping):
+        return [item for item in (run.get("segments") or []) if isinstance(item, Mapping)]
+    return [item for item in (getattr(run, "segments", []) or []) if isinstance(item, Mapping)]
+
+
+def _passage_code_sets(run: Any) -> dict[str, set[str]]:
+    grouped: dict[str, set[str]] = {}
+    for segment in _run_segments(run):
+        passage_id = str(segment.get("passage_id") or "")
+        code = str(segment.get("code") or "")
+        if passage_id and code:
+            grouped.setdefault(passage_id, set()).add(code)
+    return grouped
+
+
+def _set_jaccard(left: set[str], right: set[str]) -> float:
+    if not left and not right:
+        return 1.0
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def nominal_krippendorff_alpha(units: Sequence[Sequence[Any]]) -> float:
+    """Nominal Krippendorff's alpha. ``None`` in a unit is a missing rating.
+
+    Returns 1 when there is no disagreement to explain, including a single
+    category with perfect agreement.
+    """
+    observed: list[list[Any]] = []
+    for unit in units:
+        ratings = [value for value in unit if value is not None]
+        if len(ratings) >= 2:
+            observed.append(ratings)
+    if len(observed) < 2:
+        return 1.0
+    categories = sorted({value for ratings in observed for value in ratings}, key=str)
+    index = {category: position for position, category in enumerate(categories)}
+    size = len(categories)
+    coincidence = [[0.0 for _ in range(size)] for _ in range(size)]
+    for ratings in observed:
+        count = len(ratings)
+        for left_index, left in enumerate(ratings):
+            for right_index, right in enumerate(ratings):
+                if left_index == right_index:
+                    continue
+                coincidence[index[left]][index[right]] += 1.0 / (count - 1)
+    total = sum(sum(row) for row in coincidence)
+    if total <= 1:
+        return 1.0
+    observed_disagreement = 0.0
+    for left in range(size):
+        for right in range(size):
+            if left != right:
+                observed_disagreement += coincidence[left][right]
+    observed_disagreement /= total
+    marginal = [sum(coincidence[left][right] for right in range(size)) for left in range(size)]
+    expected = 0.0
+    for left in range(size):
+        for right in range(size):
+            if left != right:
+                expected += marginal[left] * marginal[right]
+    expected /= total * (total - 1)
+    if expected == 0:
+        return 1.0
+    return 1.0 - (observed_disagreement / expected)
+
+
+def aligned_assignment_agreement(
+    left: Any,
+    right: Any,
+    *,
+    align_threshold: float = 0.5,
+) -> dict[str, Any]:
+    """Per-passage code-set agreement after aligning codes by label.
+
+    Codes are paired greedily when their labels are the same key or have token
+    Jaccard of at least ``align_threshold``. Each passage then contributes the
+    Jaccard of its two code sets, using those aligned identities. Unmatched
+    codes stay distinct.
+
+    ``krippendorff_alpha`` is nominal alpha on the aligned passage-by-code
+    matrix: each cell is whether that coder applied that code to that passage.
+    Cells where neither coder applied the code are omitted.
+
+    Unlike :func:`assignment_ari`, different singleton codes on every passage
+    score low here. Adjusted Rand only asks whether passages were grouped
+    together, so an all-singleton partition scores 1 even when the codes share
+    no labels.
+    """
+    left_sets = _passage_code_sets(left)
+    right_sets = _passage_code_sets(right)
+    left_codes = {code for labels in left_sets.values() for code in labels}
+    right_codes = {code for labels in right_sets.values() for code in labels}
+    pairs: list[tuple[float, str, str]] = []
+    for left_code in left_codes:
+        for right_code in right_codes:
+            left_key = code_key(left_code)
+            right_key = code_key(right_code)
+            if not left_key or not right_key:
+                continue
+            score = 1.0 if left_key == right_key else jaccard(left_code, right_code)
+            pairs.append((score, left_key, right_key))
+    pairs.sort(key=lambda item: (-item[0], item[1], item[2]))
+    right_to_left: dict[str, str] = {}
+    used_left: set[str] = set()
+    used_right: set[str] = set()
+    for score, left_key, right_key in pairs:
+        if score < align_threshold or left_key in used_left or right_key in used_right:
+            continue
+        used_left.add(left_key)
+        used_right.add(right_key)
+        right_to_left[right_key] = left_key
+
+    def canon(label: str, *, side: str) -> str:
+        key = code_key(label)
+        if side == "right":
+            return right_to_left.get(key, key)
+        return key
+
+    passages = sorted(set(left_sets) | set(right_sets))
+    scores: list[float] = []
+    units: list[tuple[int, int]] = []
+    for passage_id in passages:
+        left_canon = {canon(label, side="left") for label in left_sets.get(passage_id, set())}
+        right_canon = {canon(label, side="right") for label in right_sets.get(passage_id, set())}
+        scores.append(_set_jaccard(left_canon, right_canon))
+        for code in left_canon | right_canon:
+            units.append((1 if code in left_canon else 0, 1 if code in right_canon else 0))
+    mean = sum(scores) / len(scores) if scores else 1.0
+    return {
+        "mean_jaccard": round(mean, 4),
+        "krippendorff_alpha": round(nominal_krippendorff_alpha(units), 4),
+        "passages": len(passages),
+        "aligned_codes": len(right_to_left),
+    }
+
+
+def _passage_labels(run: Any) -> dict[str, str]:
     grouped: dict[str, list[str]] = {}
-    for segment in run.get("segments") or []:
+    for segment in _run_segments(run):
         passage_id = str(segment.get("passage_id") or "")
         if not passage_id:
             continue

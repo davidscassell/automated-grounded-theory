@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+import warnings
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -45,7 +46,116 @@ __all__ = [
     "multi_seed_stability",
     "open_code",
     "plan_coding",
+    "resolve_coding_schedule",
+    "strict_sequential_settings",
 ]
+
+
+def strict_sequential_settings() -> dict[str, Any]:
+    """One passage at a time, committed before the next passage is coded.
+
+    ``review_mode`` is ``document``. One passage is sent per request, one
+    request is in flight, and the codebook is committed after every passage.
+    Pipeline overlap is off, and documents are not coded in parallel. A later
+    passage therefore sees codes committed from earlier passages.
+
+    Pass the dict as keyword arguments to :func:`open_code`, or set
+    ``procedure="strict_sequential"``.
+    """
+    return {
+        "procedure": "strict_sequential",
+        "review_mode": "document",
+        "passages_per_request": 1,
+        "max_concurrent_requests": 1,
+        "passages_per_codebook_update": 1,
+        "batch_size": 1,
+        "concurrency": 1,
+        "pipeline": False,
+        "parallel_documents": False,
+    }
+
+
+def resolve_coding_schedule(
+    *,
+    batch_size: int = 1,
+    concurrency: int = 4,
+    passages_per_request: int | None = None,
+    max_concurrent_requests: int | None = None,
+    passages_per_codebook_update: int | None = None,
+    procedure: str | None = None,
+    review_mode: str = "document",
+    pipeline: bool = True,
+    parallel_documents: bool = False,
+) -> dict[str, Any]:
+    """Split the old batch and concurrency knobs into procedure and performance.
+
+    ``passages_per_request`` is how many passages share one model call.
+    ``max_concurrent_requests`` caps in-flight calls and does not change which
+    passages share a codebook. ``passages_per_codebook_update`` is how many
+    passages are coded before that codebook is committed.
+
+    ``batch_size`` is the deprecated alias of ``passages_per_request``.
+    ``concurrency`` is the deprecated alias of ``max_concurrent_requests``.
+    When ``batch_size`` is 1, concurrency used to code several passages of one
+    document against one frozen codebook. That no longer happens. Set
+    ``passages_per_codebook_update`` to ask for that wider window on purpose.
+    """
+    if procedure not in (None, "", "strict_sequential"):
+        raise ValueError("procedure must be 'strict_sequential' or omitted.")
+    if procedure == "strict_sequential":
+        if review_mode != "document":
+            raise ValueError("strict_sequential uses review_mode='document'.")
+        if parallel_documents:
+            raise ValueError("strict_sequential does not code documents in parallel.")
+        if batch_size != 1:
+            raise ValueError("strict_sequential sends one passage per request. Do not set batch_size.")
+        if concurrency not in (1, 4):
+            raise ValueError(
+                "strict_sequential uses one request at a time. "
+                "Do not set concurrency; use strict_sequential_settings()."
+            )
+        if passages_per_request not in (None, 1) or max_concurrent_requests not in (None, 1):
+            raise ValueError("strict_sequential uses one passage per request and one request in flight.")
+        if passages_per_codebook_update not in (None, 1):
+            raise ValueError("strict_sequential commits the codebook after every passage.")
+        return strict_sequential_settings()
+
+    per_request = batch_size if passages_per_request is None else passages_per_request
+    concurrent = concurrency if max_concurrent_requests is None else max_concurrent_requests
+    if passages_per_request is not None and batch_size not in (1, passages_per_request):
+        warnings.warn(
+            "batch_size is ignored because passages_per_request is set.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+    if (
+        passages_per_request is None
+        and max_concurrent_requests is None
+        and passages_per_codebook_update is None
+        and batch_size == 1
+        and concurrency > 1
+    ):
+        warnings.warn(
+            "concurrency no longer codes several passages against one frozen codebook. "
+            "It only caps in-flight requests (max_concurrent_requests). "
+            "batch_size is the number of passages per request (passages_per_request). "
+            "Set passages_per_codebook_update to code more than one passage before the codebook is committed. "
+            "strict_sequential_settings() commits after every passage.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+    commit_every = per_request if passages_per_codebook_update is None else passages_per_codebook_update
+    return {
+        "procedure": procedure or "",
+        "review_mode": review_mode,
+        "passages_per_request": int(per_request),
+        "max_concurrent_requests": int(concurrent),
+        "passages_per_codebook_update": int(commit_every),
+        "batch_size": int(per_request),
+        "concurrency": int(concurrent),
+        "pipeline": pipeline,
+        "parallel_documents": parallel_documents,
+    }
 
 
 def open_code(
@@ -65,6 +175,10 @@ def open_code(
     parallel_documents: bool = False,
     batch_size: int = 1,
     concurrency: int = 4,
+    passages_per_request: int | None = None,
+    max_concurrent_requests: int | None = None,
+    passages_per_codebook_update: int | None = None,
+    procedure: str | None = None,
     top_k_codes: int = 12,
     frequent_codes: int = 8,
     merge_threshold: float = 0.65,
@@ -117,10 +231,16 @@ def open_code(
     sensitizing concepts). It is rejected if it contains preset codes.
 
     The saturation curve is reported and is not a stopping decision.
-    ``batch_size`` passages share one model call. ``concurrency`` is the cap on
-    in-flight model calls. A wave stops at the next sweep, then the codebook is
-    updated. Sweep chunks (candidates, merge confirmation, definition updates)
-    run together under that cap and are reconciled in chunk order.
+    ``passages_per_request`` passages share one model call (``batch_size`` is
+    the same setting). ``max_concurrent_requests`` (``concurrency``) caps
+    in-flight model calls and does not change how many passages share a
+    codebook. ``passages_per_codebook_update`` is how many passages are coded
+    before that codebook is committed. ``procedure="strict_sequential"`` sends
+    one passage per request, allows one request, commits after every passage,
+    and turns pipeline overlap and parallel documents off. A wave stops at the
+    next sweep, then the codebook is updated. Sweep chunks (candidates, merge
+    confirmation, definition updates) run together under the in-flight cap and
+    are reconciled in chunk order.
     ``parallel_documents`` codes each document against its own codebook and
     merges those codebooks at each sweep. It is off by default because that
     delays constant comparison across documents.
@@ -164,6 +284,10 @@ def open_code(
             parallel_documents=parallel_documents,
             batch_size=batch_size,
             concurrency=concurrency,
+            passages_per_request=passages_per_request,
+            max_concurrent_requests=max_concurrent_requests,
+            passages_per_codebook_update=passages_per_codebook_update,
+            procedure=procedure,
             top_k_codes=top_k_codes,
             frequent_codes=frequent_codes,
             merge_threshold=merge_threshold,
@@ -223,6 +347,10 @@ async def aopen_code(
     parallel_documents: bool = False,
     batch_size: int = 1,
     concurrency: int = 4,
+    passages_per_request: int | None = None,
+    max_concurrent_requests: int | None = None,
+    passages_per_codebook_update: int | None = None,
+    procedure: str | None = None,
     top_k_codes: int = 12,
     frequent_codes: int = 8,
     merge_threshold: float = 0.65,
@@ -264,6 +392,26 @@ async def aopen_code(
     limiter: CallLimiter | None = None,
 ) -> OpenCodeResult:
     """Async form of :func:`open_code`."""
+    schedule = resolve_coding_schedule(
+        batch_size=batch_size,
+        concurrency=concurrency,
+        passages_per_request=passages_per_request,
+        max_concurrent_requests=max_concurrent_requests,
+        passages_per_codebook_update=passages_per_codebook_update,
+        procedure=procedure,
+        review_mode=review_mode,
+        pipeline=pipeline,
+        parallel_documents=parallel_documents,
+    )
+    review_mode = schedule["review_mode"]
+    pipeline = schedule["pipeline"]
+    parallel_documents = schedule["parallel_documents"]
+    batch_size = schedule["batch_size"]
+    concurrency = schedule["concurrency"]
+    passages_per_request = schedule["passages_per_request"]
+    max_concurrent_requests = schedule["max_concurrent_requests"]
+    passages_per_codebook_update = schedule["passages_per_codebook_update"]
+    procedure = schedule["procedure"] or None
     _validate_params(
         unit=unit,
         sweep_every=sweep_every,
@@ -272,6 +420,9 @@ async def aopen_code(
         validation_retries=validation_retries,
         batch_size=batch_size,
         concurrency=concurrency,
+        passages_per_request=passages_per_request,
+        max_concurrent_requests=max_concurrent_requests,
+        passages_per_codebook_update=passages_per_codebook_update,
         sweep_chunk=sweep_chunk,
         embed_batch_size=embed_batch_size,
         max_retries=max_retries,
@@ -361,6 +512,10 @@ async def aopen_code(
         parallel_documents=parallel_documents,
         batch_size=batch_size,
         concurrency=concurrency,
+        passages_per_request=passages_per_request,
+        max_concurrent_requests=max_concurrent_requests,
+        passages_per_codebook_update=passages_per_codebook_update,
+        procedure=procedure,
         review_mode=review_mode,
         review_below=review_below,
         min_merge_confidence=min_merge_confidence,
@@ -412,6 +567,9 @@ async def aopen_code(
         candidate_limit=candidate_limit,
         batch_size=batch_size,
         concurrency=concurrency,
+        passages_per_request=passages_per_request or batch_size,
+        max_concurrent_requests=max_concurrent_requests or concurrency,
+        passages_per_codebook_update=passages_per_codebook_update or batch_size,
         sweep_chunk=sweep_chunk,
         embed_batch_size=embed_batch_size,
         model_name=model_name,
@@ -542,10 +700,10 @@ async def amulti_seed_stability(
         raise ValueError("multi_seed_stability needs at least two seeds.")
     if "seed" in open_code_kwargs:
         raise ValueError("Pass seeds to multi_seed_stability, not seed=.")
-    limiter = open_code_kwargs.pop("limiter", None)
+        limiter = open_code_kwargs.pop("limiter", None)
     if limiter is None:
         limiter = CallLimiter(
-            int(open_code_kwargs.get("concurrency", 4)),
+            int(open_code_kwargs.get("max_concurrent_requests") or open_code_kwargs.get("concurrency", 4)),
             max_retries=int(open_code_kwargs.get("max_retries", 4)),
             backoff=float(open_code_kwargs.get("retry_backoff", 0.5)),
             max_backoff=float(open_code_kwargs.get("retry_max_backoff", 8.0)),
@@ -582,6 +740,9 @@ def _validate_params(
     validation_retries: int,
     batch_size: int,
     concurrency: int,
+    passages_per_request: int = 1,
+    max_concurrent_requests: int = 1,
+    passages_per_codebook_update: int = 1,
     sweep_chunk: int,
     embed_batch_size: int,
     max_retries: int,
@@ -599,6 +760,10 @@ def _validate_params(
         raise ValueError("sweep_every must be at least 1.")
     if batch_size < 1 or concurrency < 1:
         raise ValueError("batch_size and concurrency must be at least 1.")
+    if passages_per_request < 1 or max_concurrent_requests < 1 or passages_per_codebook_update < 1:
+        raise ValueError(
+            "passages_per_request, max_concurrent_requests, and passages_per_codebook_update must be at least 1."
+        )
     if sweep_chunk < 1 or embed_batch_size < 1:
         raise ValueError("sweep_chunk and embed_batch_size must be at least 1.")
     if max_retries < 0 or retry_backoff < 0:
@@ -631,6 +796,10 @@ def _metadata(**kwargs: Any) -> dict:
         "parallel_documents": kwargs["parallel_documents"],
         "batch_size": kwargs["batch_size"],
         "concurrency": kwargs["concurrency"],
+        "passages_per_request": kwargs.get("passages_per_request", kwargs["batch_size"]),
+        "max_concurrent_requests": kwargs.get("max_concurrent_requests", kwargs["concurrency"]),
+        "passages_per_codebook_update": kwargs.get("passages_per_codebook_update", kwargs["batch_size"]),
+        "procedure": kwargs.get("procedure") or "",
         "review_mode": kwargs["review_mode"],
         "review_below": kwargs.get("review_below", 0.5),
         "min_merge_confidence": kwargs.get("min_merge_confidence", 0.5),
@@ -661,6 +830,9 @@ def _metadata(**kwargs: Any) -> dict:
             "parallel_documents": kwargs["parallel_documents"],
             "batch_size": kwargs["batch_size"],
             "concurrency": kwargs["concurrency"],
+            "passages_per_request": kwargs.get("passages_per_request", kwargs["batch_size"]),
+            "max_concurrent_requests": kwargs.get("max_concurrent_requests", kwargs["concurrency"]),
+            "passages_per_codebook_update": kwargs.get("passages_per_codebook_update", kwargs["batch_size"]),
         },
         "context": {
             "research_question": context.research_question,

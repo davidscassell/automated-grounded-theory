@@ -6,6 +6,7 @@ double-count applications.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from copy import deepcopy
 from typing import Any, Mapping, Sequence
@@ -86,7 +87,7 @@ def _fallback_rationale(op: str, reason: str) -> str:
             "The label mostly restates the research context, so it needs wording grounded in the participant's passage."
         ),
         "already_decided": (
-            "This pair was already decided in this run, and neither definition has changed in substance."
+            "This pair was already decided in this run, and neither definition nor its evidence has changed."
         ),
         "opposite_valence": "These codes take opposite stances, so they stay separate.",
         "below_merge_confidence": "The agreement confidence is below the merge threshold, so the merge waits for review.",
@@ -205,24 +206,21 @@ def opposite_valence(left: Any, right: Any) -> bool:
 
 
 def definitions_changed_materially(previous: str, current: str) -> bool:
-    """True when a definition change is large enough to reopen a pair decision.
+    """True when the definition text is not the same string.
 
-    Wording tweaks stay frozen. A change is material when the token overlap
-    of the two definitions falls below 0.5.
+    Any edit reopens a pair. Token overlap is not a threshold: adding "not"
+    keeps most of the words and still counts as a change.
     """
-    old = str(previous or "").strip()
-    new = str(current or "").strip()
-    if old == new:
-        return False
-    return jaccard(old, new) < 0.5
+    return str(previous or "") != str(current or "")
 
 
 def agreement_confidence(merge: Mapping[str, Any]) -> float | None:
     """Rubric agreement as a second confidence, using the 0.2 / 0.5 / 0.95 anchors.
 
     ``None`` means the model did not set the rubric, so the caller's own
-    confidence stands. An accept needs the same action, the same object, and
-    the same stance. A reject is confident when that rubric fails.
+    confidence stands. The three flags are action, object, and stance. Stance
+    is recorded and is not a veto: two of the three still score 0.5. A reject
+    is confident when that rubric fails.
     """
     flags = [merge.get("same_action"), merge.get("same_object"), merge.get("same_stance")]
     if all(flag is None for flag in flags):
@@ -254,20 +252,171 @@ def decision_confidence(merge: Mapping[str, Any]) -> float:
 
 TRIVIAL_LABEL_JACCARD = 0.8
 
+# Closed-class negation. These tokens are not stemmed, so "not trusting" does
+# not collapse into "trusting" and a polarity flip cannot auto-merge.
+_NEGATION_TOKENS = frozenset(
+    {
+        "not",
+        "no",
+        "never",
+        "without",
+        "neither",
+        "nor",
+        "nobody",
+        "nothing",
+        "nowhere",
+        "cannot",
+        "cant",
+        "dont",
+        "doesnt",
+        "didnt",
+        "wont",
+        "isnt",
+        "arent",
+        "wasnt",
+        "werent",
+        "hasnt",
+        "havent",
+        "hadnt",
+        "wouldnt",
+        "shouldnt",
+        "couldnt",
+        "mustnt",
+        "aint",
+    }
+)
+
+
+def _surface_tokens(text: str) -> list[str]:
+    """Case-folded words. Punctuation and extra whitespace are separators."""
+    folded = str(text or "").casefold().replace("'", "").replace("’", "").replace("`", "")
+    return re.findall(r"[a-z0-9]+", folded)
+
+
+def _token_forms(token: str) -> set[str]:
+    """Spelling plus plural and gerund forms of one word. Negation stays put."""
+    if token in _NEGATION_TOKENS:
+        return {token}
+    forms = {token}
+    if token.endswith("ing") and len(token) > 5:
+        stem = token[:-3]
+        if stem:
+            forms.add(stem)
+            if len(stem) >= 2 and stem[-1] == stem[-2] and stem[-1] not in "aeiou":
+                forms.add(stem[:-1])
+            if stem[-1] not in "aeiou":
+                forms.add(stem + "e")
+    if token.endswith("ies") and len(token) > 4:
+        forms.add(token[:-3] + "y")
+    if token.endswith("es") and len(token) > 4:
+        forms.add(token[:-2])
+    if token.endswith("s") and not token.endswith("ss") and len(token) > 3:
+        forms.add(token[:-1])
+    return forms
+
+
+def _negation_tokens(text: str) -> tuple[str, ...]:
+    return tuple(token for token in _surface_tokens(text) if token in _NEGATION_TOKENS)
+
+
+def negation_differs(left: str, right: str) -> bool:
+    """True when one text has a negation the other does not, in a different place."""
+    return _negation_tokens(left) != _negation_tokens(right)
+
+
+def _forms_match(left: str, right: str) -> bool:
+    left_tokens = _surface_tokens(left)
+    right_tokens = _surface_tokens(right)
+    if len(left_tokens) != len(right_tokens) or not left_tokens:
+        return False
+    return all(_token_forms(a) & _token_forms(b) for a, b in zip(left_tokens, right_tokens))
+
+
+def spelling_variant(left: str, right: str) -> bool:
+    """True for case, punctuation, whitespace, plural, or gerund variants.
+
+    An added or moved negation is not a spelling variant.
+    """
+    if negation_differs(left, right):
+        return False
+    return _forms_match(left, right)
+
+
+def definitions_compatible(left: str, right: str) -> bool:
+    """True when two definitions do not contradict and differ only by inflection.
+
+    An empty definition does not contradict a definition that has no negation.
+    A negation on one side only is not compatible. Any other wording difference
+    waits for the full comparison.
+    """
+    if negation_differs(left, right):
+        return False
+    if not _surface_tokens(left) or not _surface_tokens(right):
+        return True
+    return _forms_match(left, right)
+
+
+def _polarity_differs(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    if opposite_valence(left.get("valence"), right.get("valence")):
+        return True
+    if negation_differs(str(left.get("code") or ""), str(right.get("code") or "")):
+        return True
+    return negation_differs(str(left.get("definition") or ""), str(right.get("definition") or ""))
+
 
 def trivial_pair(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
-    """Near-identical labels with the same stance can merge without a model call."""
-    if opposite_valence(left.get("valence"), right.get("valence")):
+    """Spelling or inflection variants with compatible definitions, and no polarity flip.
+
+    Token overlap is not enough. ``trusting managers to share information`` and
+    ``not trusting managers to share information`` are similar and stay two codes.
+    """
+    if _polarity_differs(left, right):
         return False
-    left_stance = str(left.get("valence") or "neutral").strip().casefold() or "neutral"
-    right_stance = str(right.get("valence") or "neutral").strip().casefold() or "neutral"
-    if left_stance != right_stance:
+    if not spelling_variant(str(left.get("code") or ""), str(right.get("code") or "")):
         return False
-    return jaccard(str(left.get("code") or ""), str(right.get("code") or "")) >= TRIVIAL_LABEL_JACCARD
+    return definitions_compatible(str(left.get("definition") or ""), str(right.get("definition") or ""))
+
+
+def lexical_comparison_proposals(
+    codes: Sequence[Mapping[str, Any]],
+    *,
+    threshold: float = TRIVIAL_LABEL_JACCARD,
+) -> list[dict]:
+    """Label overlap at or above ``threshold`` proposes a comparison. It does not merge.
+
+    Pairs that are spelling variants are left to :func:`trivial_merges`. Every
+    other pair, including contradictory near-duplicates, is only a hint.
+    """
+    ordered = [entry for entry in codes if str(entry.get("code") or "").strip()]
+    proposals: list[dict] = []
+    for index, left in enumerate(ordered):
+        left_label = str(left.get("code") or "")
+        left_key = code_key(left_label)
+        if not left_key:
+            continue
+        for right in ordered[index + 1 :]:
+            right_label = str(right.get("code") or "")
+            right_key = code_key(right_label)
+            if not right_key or left_key == right_key or trivial_pair(left, right):
+                continue
+            score = jaccard(left_label, right_label)
+            if score < threshold:
+                continue
+            proposals.append(
+                {
+                    "source": left_label,
+                    "target": right_label,
+                    "score": float(score),
+                    "method": "lexical",
+                    "proposed": True,
+                }
+            )
+    proposals.sort(key=lambda item: (-float(item["score"]), str(item["source"]).casefold(), str(item["target"]).casefold()))
+    return proposals
 
 
 def trivial_merges(codes: Sequence[Mapping[str, Any]], frozen: set[frozenset[str]] | None = None) -> list[dict]:
-    """Deterministic merges for near-duplicate labels. These skip the sweep model."""
+    """Auto-merges for spelling and inflection variants. Everything else is only proposed."""
     blocked = frozen or set()
     ordered = sorted(codes, key=lambda entry: code_key(str(entry.get("code") or "")))
     merges: list[dict] = []
@@ -288,14 +437,14 @@ def trivial_merges(codes: Sequence[Mapping[str, Any]], frozen: set[frozenset[str
                     "source_valence": str(left.get("valence") or ""),
                     "target_valence": str(right.get("valence") or ""),
                     "rationale": (
-                        "These labels are near-duplicates and share the same stance, "
-                        "so the merge did not need a model call."
+                        "These labels differ only by spelling or inflection and their definitions "
+                        "are compatible, so the merge did not need a model call."
                     ),
                     "confidence": 0.95,
                     "agreement_confidence": 0.95,
                     "same_action": True,
                     "same_object": True,
-                    "same_stance": True,
+                    "same_stance": str(left.get("valence") or "") == str(right.get("valence") or ""),
                     "trivial": True,
                     "action": "accept",
                     "contrast_checked": True,
@@ -393,6 +542,19 @@ def _definitions_differ(left_label: str, left_def: str, right_label: str, right_
     return not (aspect_tokens(left_text) & aspect_tokens(right_text))
 
 
+def _entry_for_merge(merge: Mapping[str, Any], codebook: Mapping[str, Mapping[str, Any]], side: str) -> dict:
+    label = str(merge.get(side) or "")
+    entry = dict(codebook.get(code_key(label)) or {})
+    entry.setdefault("code", label)
+    valence = merge.get(f"{side}_valence")
+    if valence and not entry.get("valence"):
+        entry["valence"] = valence
+    definition = merge.get(f"{side}_definition")
+    if definition and not entry.get("definition"):
+        entry["definition"] = definition
+    return entry
+
+
 def classify_comparison(merge: Mapping[str, Any], codebook: Mapping[str, Mapping[str, Any]]) -> tuple[str, str]:
     """Decide whether an alias is the same concept in the definitions and the quotes.
 
@@ -400,12 +562,28 @@ def classify_comparison(merge: Mapping[str, Any], codebook: Mapping[str, Mapping
     check that found no material difference, and evidence that is not mixed.
     Anything else stays ``keep_distinct``, ``defer``, or the operation the
     model already named. Valence is not part of this gate.
+
+    A ``trivial`` flag auto-merges only a spelling or inflection variant whose
+    definitions are compatible. Lexical similarity does not skip these checks,
+    and a negation or polarity difference never auto-merges.
     """
     named = str(merge.get("comparison_op") or merge.get("op") or "").strip()
     if named in {"keep_distinct", "defer", "link_to_category", "record_dimension", "split_code", "refine_definition"}:
         return named, named
     if merge.get("trivial"):
-        return "alias_duplicate", "trivial_pair"
+        source_entry = _entry_for_merge(merge, codebook, "source")
+        target_entry = _entry_for_merge(merge, codebook, "target")
+        if trivial_pair(source_entry, target_entry):
+            return "alias_duplicate", "trivial_pair"
+        if _polarity_differs(source_entry, target_entry):
+            return "keep_distinct", "polarity_differs"
+        left_def = str(source_entry.get("definition") or "")
+        right_def = str(target_entry.get("definition") or "")
+        if spelling_variant(str(source_entry.get("code") or ""), str(target_entry.get("code") or "")) and not definitions_compatible(
+            left_def, right_def
+        ):
+            return "keep_distinct", "definitions_incompatible"
+        return "keep_distinct", "not_spelling_variant"
     fits = list(merge.get("quote_fits") or [])
     if any(isinstance(item, Mapping) and item.get("fits") is False for item in fits):
         return "defer", "mixed_evidence"
@@ -430,30 +608,89 @@ def classify_comparison(merge: Mapping[str, Any], codebook: Mapping[str, Mapping
     return "alias_duplicate", "same_concept"
 
 
+def definition_fingerprint(entry: Mapping[str, Any]) -> str:
+    """Hash of the definition text. Any edit, including a negation, changes it."""
+    return hashlib.sha256(str(entry.get("definition") or "").encode("utf-8")).hexdigest()[:16]
+
+
+def evidence_fingerprint(entry: Mapping[str, Any]) -> str:
+    """Hash of examples and assignments. Frequency is not included."""
+    rows: list[str] = []
+    for item in list(entry.get("examples") or []) + list(entry.get("assignments") or []):
+        if isinstance(item, str):
+            rows.append(item)
+            continue
+        if not isinstance(item, Mapping):
+            continue
+        rows.append(
+            "|".join(
+                (
+                    str(item.get("segment_id") or ""),
+                    str(item.get("passage_id") or ""),
+                    str(item.get("doc_id") or ""),
+                    "" if item.get("doc_start") is None else str(item.get("doc_start")),
+                    "" if item.get("doc_end") is None else str(item.get("doc_end")),
+                    str(item.get("quote") or ""),
+                )
+            )
+        )
+    return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()[:16]
+
+
+def _pair_evidence_current(
+    row: Mapping[str, Any],
+    codebook: Mapping[str, Mapping[str, Any]],
+    ids: Sequence[str],
+    by_id: Mapping[str, str],
+) -> bool:
+    """False when either code's definition revision, text, or evidence changed.
+
+    There is no lexical threshold. Adding "not" to a definition, bumping the
+    revision, or replacing an example reopens the pair.
+    """
+    stored_defs = {str(key): str(value or "") for key, value in (row.get("definitions") or {}).items()}
+    stored_hashes = {str(key): str(value) for key, value in (row.get("definition_hashes") or {}).items()}
+    stored_revs = {str(key): str(value) for key, value in (row.get("definition_revisions") or {}).items()}
+    stored_evidence = {str(key): str(value) for key, value in (row.get("evidence_hashes") or {}).items()}
+    for item in ids:
+        entry = codebook[by_id[item]]
+        if stored_hashes:
+            if stored_hashes.get(item) != definition_fingerprint(entry):
+                return False
+        elif definitions_changed_materially(stored_defs.get(item, ""), str(entry.get("definition") or "")):
+            return False
+        stored_rev = stored_revs.get(item, "")
+        current_rev = str(entry.get("revision") or "")
+        if stored_rev and current_rev and stored_rev != current_rev:
+            return False
+        if "evidence_hashes" in row and stored_evidence.get(item, "") != evidence_fingerprint(entry):
+            return False
+    return True
+
+
 def _pair_still_current(
     row: Mapping[str, Any],
     codebook: Mapping[str, Mapping[str, Any]],
     by_id: Mapping[str, str],
 ) -> tuple[str, str] | None:
-    """Code keys for a cached pair that still exists with the same definitions."""
+    """Code keys for a cached pair that still exists with the same definition and evidence."""
     ids = [str(item) for item in (row.get("ids") or []) if str(item)]
     if len(ids) != 2:
         return None
     keys = [by_id.get(item) for item in ids]
     if any(key is None for key in keys) or keys[0] == keys[1]:
         return None
-    stored = {str(key): str(value or "") for key, value in (row.get("definitions") or {}).items()}
-    current = {item: str(codebook[by_id[item]].get("definition") or "") for item in ids}
-    if any(definitions_changed_materially(stored.get(item, ""), current[item]) for item in ids):
+    if not _pair_evidence_current(row, codebook, ids, by_id):
         return None
     return str(keys[0]), str(keys[1])
 
 
 def frozen_pair_keys(cache: Sequence[Mapping[str, Any]], codebook: Mapping[str, Mapping[str, Any]]) -> set[frozenset[str]]:
-    """Pairs already decided this run whose definitions have not changed.
+    """Pairs already decided this run whose definitions and evidence have not changed.
 
     The key is the two code keys. A later sweep skips asking the model again
-    until one definition is different from the definition stored with the decision.
+    until a definition revision, the definition text, or the examples or
+    assignments of either code change. Token overlap does not keep a pair frozen.
     """
     by_id = _index_ids(codebook)
     frozen: set[frozenset[str]] = set()
@@ -532,11 +769,11 @@ def remember_pair_decisions(
             ids[0]: str(codebook[by_key[ids[0]]].get("definition") or ""),
             ids[1]: str(codebook[by_key[ids[1]]].get("definition") or ""),
         }
+        current_hashes = {item: definition_fingerprint(codebook[by_key[item]]) for item in ids}
+        current_revs = {item: str(codebook[by_key[item]].get("revision") or "") for item in ids}
+        current_evidence = {item: evidence_fingerprint(codebook[by_key[item]]) for item in ids}
         if previous and str(previous.get("decision")) == "reject" and str(decision) == "accept":
-            stored_defs = previous.get("definitions") or {}
-            if not any(
-                definitions_changed_materially(str(stored_defs.get(item) or ""), current_defs[item]) for item in ids
-            ):
+            if _pair_evidence_current(previous, codebook, list(ids), by_key):
                 continue
         stored[ids] = {
             "ids": list(ids),
@@ -547,6 +784,9 @@ def remember_pair_decisions(
             "source_valence": str(row.get("source_valence") or codebook[source].get("valence") or ""),
             "target_valence": str(row.get("target_valence") or codebook[target].get("valence") or ""),
             "definitions": current_defs,
+            "definition_hashes": current_hashes,
+            "definition_revisions": current_revs,
+            "evidence_hashes": current_evidence,
             "same_action": row.get("same_action"),
             "same_object": row.get("same_object"),
             "same_stance": row.get("same_stance"),

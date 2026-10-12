@@ -168,7 +168,10 @@ class MergeDecision(_LLMModel):
     )
     same_stance: bool | None = Field(
         default=None,
-        description="True when both codes take the same stance. Never true for positive paired with negative.",
+        description=(
+            "True when both codes take the same stance. Record it when the stances differ. "
+            "Stance is context, not a merge veto."
+        ),
     )
     source_valence: str = Field(default="", description="positive, negative, neutral, or mixed for the source code.")
     target_valence: str = Field(default="", description="positive, negative, neutral, or mixed for the target code.")
@@ -240,7 +243,10 @@ class MergeCheck(_LLMModel):
     source: str = Field(default="", description="Label of one code. Copy it exactly.")
     target: str = Field(default="", description="Label of the other code. Copy it exactly.")
     action: Literal["accept", "reject"] = Field(
-        description="accept only when both codes name the same incident and the same stance."
+        description=(
+            "accept only when both codes name the same incident. "
+            "Stance is context, not a merge veto, and it is not by itself a reason to alias."
+        )
     )
     rationale: str = Field(default="", description=RATIONALE_HELP)
     confidence: float = Field(default=1.0, ge=0.0, le=1.0, description=CONFIDENCE_HELP)
