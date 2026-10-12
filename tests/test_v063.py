@@ -27,7 +27,7 @@ TOO_LONG = (
 
 
 def test_version_is_0_6_3():
-    assert __version__ == "0.6.5"
+    assert __version__ == "0.6.6"
     assert POLICY_VERSION == "0.6.5"
 
 

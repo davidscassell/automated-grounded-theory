@@ -12,6 +12,7 @@ from langchain_core.embeddings import Embeddings
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from automated_grounded_theory.async_support import CallLimiter, run_sync
+from automated_grounded_theory.batching import reserved_output_tokens
 from automated_grounded_theory.backends import (
     describe_model,
     prompt_cache_supported,
@@ -219,6 +220,8 @@ def open_code(
     retry_max_backoff: float = 8.0,
     request_timeout: float = 120.0,
     sweep_timeout: float = 300.0,
+    tokens_per_minute: float = 0,
+    requests_per_minute: float = 0,
 ) -> OpenCodeResult:
     """Run first-round grounded-theory open coding over ``corpus``.
 
@@ -335,6 +338,8 @@ def open_code(
             retry_max_backoff=retry_max_backoff,
             request_timeout=request_timeout,
             sweep_timeout=sweep_timeout,
+            tokens_per_minute=tokens_per_minute,
+            requests_per_minute=requests_per_minute,
         )
     )
 
@@ -400,6 +405,8 @@ async def aopen_code(
     retry_max_backoff: float = 8.0,
     request_timeout: float = 120.0,
     sweep_timeout: float = 300.0,
+    tokens_per_minute: float = 0,
+    requests_per_minute: float = 0,
     limiter: CallLimiter | None = None,
 ) -> OpenCodeResult:
     """Async form of :func:`open_code`."""
@@ -449,6 +456,8 @@ async def aopen_code(
     )
     if max_merges_per_sweep < 1:
         raise ValueError("max_merges_per_sweep must be at least 1.")
+    if tokens_per_minute < 0 or requests_per_minute < 0:
+        raise ValueError("tokens_per_minute and requests_per_minute must be zero or more.")
     parsed_context = parse_context(context)
     documents = load_corpus(corpus)
     coder = resolve_chat_model(
@@ -554,6 +563,8 @@ async def aopen_code(
         validation_retries=validation_retries,
         require_gerund=require_gerund,
         retriever=type(retriever).__name__,
+        tokens_per_minute=tokens_per_minute,
+        requests_per_minute=requests_per_minute,
         context=parsed_context,
     )
     runtime = RunConfig(
@@ -601,6 +612,9 @@ async def aopen_code(
             backoff=retry_backoff,
             max_backoff=retry_max_backoff,
             request_timeout=request_timeout,
+            tokens_per_minute=tokens_per_minute,
+            requests_per_minute=requests_per_minute,
+            reserved_output_tokens=reserved_output_tokens(1, max_codes_per_passage=max_codes_per_passage),
         ),
     )
     limit = recursion_limit if recursion_limit is not None else 250_000
@@ -725,6 +739,12 @@ async def amulti_seed_stability(
             backoff=float(open_code_kwargs.get("retry_backoff", 0.5)),
             max_backoff=float(open_code_kwargs.get("retry_max_backoff", 8.0)),
             request_timeout=float(open_code_kwargs.get("request_timeout", 120.0)),
+            tokens_per_minute=float(open_code_kwargs.get("tokens_per_minute", 0) or 0),
+            requests_per_minute=float(open_code_kwargs.get("requests_per_minute", 0) or 0),
+            reserved_output_tokens=reserved_output_tokens(
+                1,
+                max_codes_per_passage=int(open_code_kwargs.get("max_codes_per_passage", 6) or 6),
+            ),
         )
     base_thread = open_code_kwargs.get("thread_id")
     base_output = open_code_kwargs.get("output_dir")
@@ -828,6 +848,8 @@ def _metadata(**kwargs: Any) -> dict:
         "check_model": kwargs.get("check_model") or "",
         "pipeline": kwargs["pipeline"],
         "token_budget": kwargs["token_budget"],
+        "tokens_per_minute": kwargs.get("tokens_per_minute", 0),
+        "requests_per_minute": kwargs.get("requests_per_minute", 0),
         "full_audit_every": kwargs.get("full_audit_every", 4),
         "cross_chunk_limit": kwargs.get("cross_chunk_limit", 8),
         "prompt_cache": kwargs["prompt_cache"],
@@ -858,6 +880,8 @@ def _metadata(**kwargs: Any) -> dict:
             "passages_per_codebook_update": kwargs.get("passages_per_codebook_update", kwargs["batch_size"]),
             "full_audit_every": kwargs.get("full_audit_every", 4),
             "cross_chunk_limit": kwargs.get("cross_chunk_limit", 8),
+            "tokens_per_minute": kwargs.get("tokens_per_minute", 0),
+            "requests_per_minute": kwargs.get("requests_per_minute", 0),
         },
         "context": {
             "research_question": context.research_question,
