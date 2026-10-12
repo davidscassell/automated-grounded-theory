@@ -207,7 +207,7 @@ def open_code(
     max_merges_per_sweep: int = 12,
     check_model: BaseChatModel | str | None = None,
     pipeline: bool = True,
-    token_budget: int = 4000,
+    token_budget: int = 6000,
     prompt_cache: bool | None = None,
     recursion_limit: int | None = None,
     checkpointer: Any = None,
@@ -222,6 +222,7 @@ def open_code(
     sweep_timeout: float = 300.0,
     tokens_per_minute: float = 0,
     requests_per_minute: float = 0,
+    allow_oversized: bool = False,
 ) -> OpenCodeResult:
     """Run first-round grounded-theory open coding over ``corpus``.
 
@@ -260,12 +261,19 @@ def open_code(
     merge map is applied afterwards, in a fixed order. ``sweep_model`` defaults
     to ``model``. Sweep chunks default to 20 codes, sorted alphabetically by
     label and then by definition. A chunk carries full evidence for its own
-    codes and for similar codes from other chunks. The rest of the book is an
-    id and a short label. Sweeps after the first review only new or changed
-    codes, and every ``full_audit_every`` sweeps (default 4), plus the final
-    consolidation, read the whole book again. The sweep model reads each chunk
-    and proposes duplicate merges with a reason. ``token_budget`` bounds the
-    assembled coding request plus reserved output. Token overlap, and embeddings when you pass
+    codes and for a bounded neighborhood of similar codes from other chunks.
+    It does not repeat an index of the whole book. One compact label-only
+    discovery call names candidates across the book. Sweeps after the first
+    review only new or changed codes, and every ``full_audit_every`` sweeps
+    (default 4), plus the final consolidation, read the whole book again. The
+    sweep model reads each chunk and proposes duplicate merges with a reason.
+    ``token_budget`` (default 6000) bounds the request that will be sent:
+    retrieved codes, the JSON schema, a short repair allowance, and reserved
+    output. A batch that does not fit is repacked, and retrieved codes are
+    trimmed. A reservation larger than ``tokens_per_minute`` or
+    ``requests_per_minute`` raises ``OversizedReservation``.
+    ``allow_oversized=True`` waits for a full bucket and then drains it.
+    Token overlap, and embeddings when you pass
     them, are optional hints. Merging does not require an embeddings model.
     Every hinted pair and every model-proposed merge is logged. A sweep chunk
     that still times out after retries is skipped with a warning instead of
@@ -340,6 +348,7 @@ def open_code(
             sweep_timeout=sweep_timeout,
             tokens_per_minute=tokens_per_minute,
             requests_per_minute=requests_per_minute,
+            allow_oversized=allow_oversized,
         )
     )
 
@@ -392,7 +401,7 @@ async def aopen_code(
     max_merges_per_sweep: int = 12,
     check_model: BaseChatModel | str | None = None,
     pipeline: bool = True,
-    token_budget: int = 4000,
+    token_budget: int = 6000,
     prompt_cache: bool | None = None,
     recursion_limit: int | None = None,
     checkpointer: Any = None,
@@ -407,6 +416,7 @@ async def aopen_code(
     sweep_timeout: float = 300.0,
     tokens_per_minute: float = 0,
     requests_per_minute: float = 0,
+    allow_oversized: bool = False,
     limiter: CallLimiter | None = None,
 ) -> OpenCodeResult:
     """Async form of :func:`open_code`."""
@@ -565,6 +575,7 @@ async def aopen_code(
         retriever=type(retriever).__name__,
         tokens_per_minute=tokens_per_minute,
         requests_per_minute=requests_per_minute,
+        allow_oversized=allow_oversized,
         context=parsed_context,
     )
     runtime = RunConfig(
@@ -614,6 +625,7 @@ async def aopen_code(
             request_timeout=request_timeout,
             tokens_per_minute=tokens_per_minute,
             requests_per_minute=requests_per_minute,
+            allow_oversized=allow_oversized,
             reserved_output_tokens=reserved_output_tokens(1, max_codes_per_passage=max_codes_per_passage),
         ),
     )
@@ -741,6 +753,7 @@ async def amulti_seed_stability(
             request_timeout=float(open_code_kwargs.get("request_timeout", 120.0)),
             tokens_per_minute=float(open_code_kwargs.get("tokens_per_minute", 0) or 0),
             requests_per_minute=float(open_code_kwargs.get("requests_per_minute", 0) or 0),
+            allow_oversized=bool(open_code_kwargs.get("allow_oversized", False)),
             reserved_output_tokens=reserved_output_tokens(
                 1,
                 max_codes_per_passage=int(open_code_kwargs.get("max_codes_per_passage", 6) or 6),
@@ -850,6 +863,7 @@ def _metadata(**kwargs: Any) -> dict:
         "token_budget": kwargs["token_budget"],
         "tokens_per_minute": kwargs.get("tokens_per_minute", 0),
         "requests_per_minute": kwargs.get("requests_per_minute", 0),
+        "allow_oversized": bool(kwargs.get("allow_oversized", False)),
         "full_audit_every": kwargs.get("full_audit_every", 4),
         "cross_chunk_limit": kwargs.get("cross_chunk_limit", 8),
         "prompt_cache": kwargs["prompt_cache"],
@@ -882,6 +896,7 @@ def _metadata(**kwargs: Any) -> dict:
             "cross_chunk_limit": kwargs.get("cross_chunk_limit", 8),
             "tokens_per_minute": kwargs.get("tokens_per_minute", 0),
             "requests_per_minute": kwargs.get("requests_per_minute", 0),
+            "allow_oversized": bool(kwargs.get("allow_oversized", False)),
         },
         "context": {
             "research_question": context.research_question,

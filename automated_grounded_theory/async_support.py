@@ -41,6 +41,10 @@ class CallLimiter:
     ``tokens_per_minute`` reserves estimated input tokens plus reserved output
     before the call, then reconciles to the provider's actual usage. It is not
     a request counter. ``requests_per_minute`` consumes one unit per attempt.
+    A reservation larger than the bucket's capacity is rejected: the bucket
+    never refills past that capacity, so waiting for it would not end.
+    ``allow_oversized`` is the explicit exception. It waits until the bucket
+    is full, then drains it and lets the call proceed.
 
     Jitter changes only the wait, never the stored result. ``Retry-After``
     on the exception, when present, replaces the computed wait.
@@ -55,6 +59,7 @@ class CallLimiter:
         max_backoff: float = 8.0,
         tokens_per_minute: float = 0,
         requests_per_minute: float = 0,
+        allow_oversized: bool = False,
         reserved_output_tokens: int = 0,
         cache: dict | None = None,
         request_timeout: float = 120.0,
@@ -67,6 +72,7 @@ class CallLimiter:
         self.max_backoff = max(self.backoff, float(max_backoff))
         self.tokens_per_minute = max(0.0, float(tokens_per_minute))
         self.requests_per_minute = max(0.0, float(requests_per_minute))
+        self.allow_oversized = bool(allow_oversized)
         self.reserved_output_tokens = max(0, int(reserved_output_tokens))
         self.request_timeout = float(request_timeout)
         self._tokens = self.tokens_per_minute
@@ -199,8 +205,8 @@ class CallLimiter:
         started = self._clock()
         await self._take_amount(1, kind="requests")
         if self.tokens_per_minute > 0 and estimate > 0:
-            await self._take_amount(estimate, kind="tokens")
-            record["reserved"] = float(estimate)
+            taken = await self._take_amount(estimate, kind="tokens")
+            record["reserved"] = float(taken)
         record["queue_wait"] = max(0.0, self._clock() - started)
 
     async def _acquire_slot(self, record: dict) -> None:
@@ -216,23 +222,58 @@ class CallLimiter:
             self._leave()
             self._gate.notify()
 
-    async def _take_amount(self, amount: float, *, kind: str) -> None:
-        """Wait until ``kind`` (``tokens`` or ``requests``) can spare ``amount``."""
+    async def _take_amount(self, amount: float, *, kind: str) -> float:
+        """Wait until ``kind`` (``tokens`` or ``requests``) can spare ``amount``.
+
+        Returns the units actually removed from the bucket. A request larger
+        than the capacity cannot be satisfied by waiting: refill stops at the
+        capacity. That raises :class:`OversizedReservation` unless
+        ``allow_oversized`` is set, in which case this waits for a full bucket
+        and then drains it.
+        """
         cap = self.tokens_per_minute if kind == "tokens" else self.requests_per_minute
         amount = float(amount)
         if cap <= 0 or amount <= 0:
-            return
+            return 0.0
+        if amount > cap + 1e-9:
+            if not self.allow_oversized:
+                unit = "tokens" if kind == "tokens" else "requests"
+                setting = "tokens_per_minute" if kind == "tokens" else "requests_per_minute"
+                raise OversizedReservation(
+                    f"Reservation of {amount:g} {unit} exceeds the {setting} capacity of {cap:g}. "
+                    "The bucket refills only up to that capacity, so waiting would never finish "
+                    "and the provider timeout would never start. "
+                    f"Raise {setting} to at least {amount:g}, send a smaller request, "
+                    "or set allow_oversized=True to wait until the bucket is full and then drain it."
+                )
+            return await self._drain_full_bucket(kind)
         while True:
             async with self._budget_lock:
                 self._refill(self._clock(), kind)
                 level = self._tokens if kind == "tokens" else self._requests
-                if level >= amount:
+                if level + 1e-9 >= amount:
                     if kind == "tokens":
                         self._tokens = level - amount
                     else:
                         self._requests = level - amount
-                    return
+                    return amount
                 delay = (amount - level) * 60.0 / cap
+            await self._sleep(max(0.0, delay))
+
+    async def _drain_full_bucket(self, kind: str) -> float:
+        """Wait until ``kind`` is full, then take the whole bucket."""
+        cap = self.tokens_per_minute if kind == "tokens" else self.requests_per_minute
+        while True:
+            async with self._budget_lock:
+                self._refill(self._clock(), kind)
+                level = self._tokens if kind == "tokens" else self._requests
+                if level + 1e-6 >= cap:
+                    if kind == "tokens":
+                        self._tokens = 0.0
+                    else:
+                        self._requests = 0.0
+                    return float(cap)
+                delay = (cap - level) * 60.0 / cap
             await self._sleep(max(0.0, delay))
 
     def _refill(self, now: float, kind: str) -> None:
@@ -491,6 +532,10 @@ def _retry_after(exc: BaseException | None) -> float | None:
         return None
 
 
+class OversizedReservation(ValueError):
+    """A rate-limit reservation is larger than the bucket can ever hold."""
+
+
 def is_timeout(exc: BaseException) -> bool:
     """True for deadline and provider read-timeout errors."""
     if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
@@ -746,6 +791,8 @@ async def ainvoke_structured(
     *,
     timeout: float | None = None,
     reserved_output: int | None = None,
+    token_budget: int | None = None,
+    tokenizer=None,
 ) -> tuple[tuple[dict, dict], list]:
     """Invoke ``schema`` once, then repair a single malformed output.
 
@@ -753,6 +800,10 @@ async def ainvoke_structured(
     failure raises the first parse error. Returns ``((payload, usage), messages)``.
     Usage on a repaired call includes the failed response as well as the
     successful one.
+
+    When ``token_budget`` is set, the repair request is measured again,
+    including the schema, and the repair note is shortened until the input
+    plus ``reserved_output`` fits that budget.
     """
     from langchain_core.messages import HumanMessage
 
@@ -776,6 +827,12 @@ async def ainvoke_structured(
                 )
             )
         ]
+        if token_budget is not None:
+            from automated_grounded_theory.batching import shrink_repair_messages
+
+            reserved = 0 if reserved_output is None else max(0, int(reserved_output))
+            ceiling = max(1, int(token_budget) - reserved)
+            repair = shrink_repair_messages(repair, schema, ceiling, tokenizer)
         try:
             limiter.schema_repairs = int(getattr(limiter, "schema_repairs", 0) or 0) + 1
             repaired = await limiter.ainvoke(runnable, repair, **extra)

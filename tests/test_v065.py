@@ -41,21 +41,34 @@ def _benchmark():
 
 def test_sweep_payload_matches_review_table_and_grows_near_linear():
     table = _benchmark().payload_table()
+    sizes = [row["codes"] for row in table]
+    assert sizes[0] == 20 and sizes[-1] >= 640 and len(sizes) >= 6
     before = [row["before"] for row in table]
+    indexed = [row["indexed"] for row in table]
     after = [row["after"] for row in table]
     capped = [row["after_capped"] for row in table]
+    by_size = {row["codes"]: row for row in table}
     for row in table:
-        assert abs(row["before"] - row["published"]) / row["published"] < 0.03
+        if row["published"] is not None:
+            assert abs(row["before"] - row["published"]) / row["published"] < 0.03
+        assert row["after"] < row["indexed"] <= row["before"] or row["codes"] == 20
         assert row["after"] < row["before"]
         assert row["after_capped"] < row["before"]
-    for prev, nxt in zip(after, after[1:]):
-        assert nxt / prev < 3.0
+    # 20 codes is one chunk, so discovery starts at 40. Later doublings stay near 2x
+    # through 640 and 1280. The repeated index fails that check on the same range.
+    assert after[1] / after[0] < 3.5
+    for prev, nxt in zip(after[1:], after[2:]):
+        assert nxt / prev < 2.5
+    span = sizes[-1] / sizes[0]
+    assert after[-1] / after[0] < span * 2.5
+    assert by_size[640]["indexed"] / by_size[160]["indexed"] >= 8
+    assert by_size[640]["after"] / by_size[160]["after"] < 5
     assert capped[1] / capped[0] < 3.5
     for prev, nxt in zip(capped[1:], capped[2:]):
-        assert nxt / prev < 3.0
-    assert after[-1] / after[0] < 22
-    assert before[-1] / before[0] > 50
+        assert nxt / prev < 2.5
+    assert before[sizes.index(160)] / before[0] > 50
     assert capped[-1] < before[-1] * 0.35
+    assert indexed[sizes.index(640)] > indexed[sizes.index(160)] * 8
 
 
 def test_sweep_request_is_compact_and_does_not_repeat_the_first_quote():
@@ -104,9 +117,9 @@ def test_sweep_request_is_compact_and_does_not_repeat_the_first_quote():
     assert "example" not in code
     assert code["examples"][0]["quote"] == "packing my suitcase"
     assert json.dumps(code, separators=(",", ":")).count("packing my suitcase") == 1
-    assert set(payload["label_index"][0]) == {"code_id", "label"}
-    assert "definition" not in payload["label_index"][0]
+    assert payload["label_index"] == []
     assert payload["cross_chunk"][0]["definition"] == "putting clothes in luggage"
+    assert set(payload["cross_chunk"][0]) >= {"code_id", "label", "definition"}
     assert payload["audit"] == "full"
     assert json.loads(message_text(incremental[-1]))["audit"] == "incremental"
     coding = build_coding_messages(

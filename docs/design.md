@@ -1,4 +1,4 @@
-# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, and 0.6.6)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, and 0.6.7)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
 Status: steps 1 and 2 of the v0.6 plan. Category development, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
@@ -43,7 +43,7 @@ result = await aopen_code(
     review_below=0.5,
     min_merge_confidence=0.5,
     max_merges_per_sweep=12,
-    token_budget=4000,
+    token_budget=6000,
 )
 themes = await abuild_themes(result, context, model=model, max_themes=12, max_theme_share=0.30)
 report = await aevaluate(result, compare_to=[other])
@@ -178,6 +178,30 @@ Schema repair adds the usage of the failed response to the successful one. When 
 
 `tokens_per_minute` reserves estimated input tokens plus reserved output before the call, then replaces that reservation with the provider's actual input and output. It does not consume one unit per request. `requests_per_minute` does, one per attempt. Zero leaves a bucket open. Both values are stored on the run metadata. `policy_version` stays `0.6.5`.
 
-## 15. Out of scope
+## 15. Corrections in 0.6.7
+
+A reservation larger than `tokens_per_minute` or `requests_per_minute` raises `OversizedReservation`. The bucket cannot hold it, so waiting cannot succeed. `allow_oversized=True` waits until the bucket is full and then drains it.
+
+Cancelling the owner of an in-flight embedding removes that future. Other waiters use `asyncio.shield`, so one cancellation does not cancel the shared call. The cache key is the model, a fingerprint of dimensions, endpoint, deployment, base URL, API version, and model kwargs, and the sha256 of the text. Two clients with the same model name and different dimensions do not share vectors. A batch whose width is mixed, or not the configured width, is not stored.
+
+`token_budget` (default 6000) is measured after retrieval. The neighbors of every passage in the call are unioned, the messages are built, and the JSON schema plus a short repair allowance are counted with reserved output. The previous estimate used `top_k_codes + frequent_codes` of the longest entries and omitted the schema. The review measured four passages at 8,759 estimated tokens against 19,250 actually sent (up to 48 retrieved codes plus 8 frequent codes, against an estimate of 20). A batch over the budget is repacked into fewer passages. Retrieved codes are trimmed from the end of the view until the assembled request fits. Whitespace splitting is only for a passage whose text still does not fit with an empty view. A schema repair is measured again, and the repair note is shortened until it fits. The default moved from 4000 to 6000 because the schema (1,686 tokens for `BatchCoding`) and the repair allowance are now inside the budget.
+
+`aligned_assignment_agreement` aligns a label with the same code key or a spelling variant. `trusting managers to share information` and `not trusting managers to share information` do not align. `mapping={label: other}` is a reviewed equivalence and does align them. `align_threshold` adds a Jaccard fallback that still refuses a polarity flip.
+
+Sweep chunks do not repeat the global label index. `cross_chunk` is a bounded neighborhood (`cross_chunk_limit`, default 8). One `CandidateDiscovery` call sends ids and short labels for the whole book and returns candidate pairs. On the review fixture, chunk size 20, user-message characters are:
+
+| codes | 0.6.4 | 0.6.5 repeated index | 0.6.7 | 0.6.7 + 8 cross-chunk codes |
+| ---: | ---: | ---: | ---: | ---: |
+| 20 | 9,347 | 5,467 | 5,467 | 5,467 |
+| 40 | 54,028 | 14,846 | 13,355 | 17,297 |
+| 80 | 178,806 | 36,922 | 26,577 | 34,437 |
+| 160 | 642,142 | 103,334 | 53,261 | 68,957 |
+| 320 | 2,423,837 | 324,781 | 106,812 | 138,180 |
+| 640 | 9,404,813 | 1,120,941 | 213,900 | 276,612 |
+| 1280 | 37,091,765 | 4,145,141 | 429,196 | 554,596 |
+
+From 160 to 640 codes the 0.6.7 column grows 4.02x. From 20 to 1280 it grows 78.5x. The repeated-index column grows 10.85x from 160 to 640. `scripts/benchmark_sweep_payload.py` rebuilds the table. `policy_version` is `0.6.7`.
+
+## 16. Out of scope
 
 Category feedback, focused recoding of earlier negatives, relationship hypotheses, sampling briefs, and a Taguette project-file adapter. See the v0.6 plan steps 3–5.

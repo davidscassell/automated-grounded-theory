@@ -13,9 +13,12 @@ If no piece fits, that passage is sent alone and named in a warning.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Callable, Mapping, Sequence
+
+from langchain_core.messages import HumanMessage
 
 from automated_grounded_theory.prompts import message_text
 
@@ -72,6 +75,61 @@ def count_text_tokens(text: str, tokenizer=None) -> int:
             _BROKEN_TOKENIZERS.add(id(tokenizer))
             return estimate_tokens(text)
     return estimate_tokens(text)
+
+
+def schema_token_count(schema, tokenizer=None) -> int:
+    """Tokens in the JSON schema sent with a structured request.
+
+    Message text does not include it. A budget that ignores it under-counts
+    every call.
+    """
+    if schema is None:
+        return 0
+    model = getattr(schema, "model_json_schema", None)
+    if not callable(model):
+        return 0
+    raw = json.dumps(model(), ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return count_text_tokens(raw, tokenizer)
+
+
+def repair_note(schema) -> str:
+    """The short repair instruction reserved inside ``token_budget``."""
+    name = getattr(schema, "__name__", "output")
+    return (
+        "REPAIR THIS OUTPUT\n"
+        f"The previous output was not valid {name}. Return only the structured object."
+    )
+
+
+def repair_allowance_tokens(schema, tokenizer=None) -> int:
+    """Tokens a single repair note adds on top of the original messages."""
+    return count_message_tokens([HumanMessage(content=repair_note(schema))], tokenizer)
+
+
+def request_input_tokens(messages: Sequence, schema, tokenizer=None) -> int:
+    """Input tokens for messages plus the structured-output schema."""
+    return count_message_tokens(messages, tokenizer) + schema_token_count(schema, tokenizer)
+
+
+def shrink_repair_messages(messages: Sequence, schema, input_budget: int, tokenizer=None) -> list:
+    """Shorten a repair note until the assembled input fits ``input_budget``.
+
+    The original messages stay intact. Only the trailing repair note is cut,
+    down to :func:`repair_note`.
+    """
+    fitted = list(messages)
+    budget = max(1, int(input_budget))
+    short = repair_note(schema)
+    for _ in range(24):
+        if request_input_tokens(fitted, schema, tokenizer) <= budget:
+            return fitted
+        text = message_text(fitted[-1])
+        if len(text) <= len(short):
+            fitted[-1] = HumanMessage(content=short)
+            return fitted
+        fitted[-1] = HumanMessage(content=text[: max(len(short), len(text) // 2)])
+    fitted[-1] = HumanMessage(content=short)
+    return fitted
 
 
 def count_message_tokens(messages: Sequence, tokenizer=None) -> int:
