@@ -25,6 +25,7 @@ from automated_grounded_theory.schemas import (
     PassageInput,
     RewriteCodeInput,
     RewriteRequest,
+    LabelRef,
     SweepRequest,
     ThemeInput,
     ThemeRequest,
@@ -161,8 +162,11 @@ Relation hints are optional notes for a later round. They are not axial coding. 
 Record a link only when the examples make it obvious, and phrase it as a hint.
 
 Do not create new codes. Do not invent examples. If this request is one chunk of a \
-larger codebook, you may merge a code in the chunk with a code that appears only in \
-the full label index. Use the labels exactly as written."""
+larger codebook, definitions and examples are only on the codes in this chunk and on \
+cross_chunk (similar codes retrieved from other chunks). The label index lists every \
+code as an id and a short label. Merge a code in the chunk with a cross_chunk code \
+when they name the same incident. Do not merge a code that appears only as an id and \
+a short label. Use the labels exactly as written."""
 
 
 def clip(text: str, limit: int) -> str:
@@ -281,10 +285,24 @@ def code_input(entry: Mapping[str, Any]) -> CodeInput:
         label=str(entry.get("code") or entry.get("label") or ""),
         definition=clip(str(entry.get("definition") or ""), 500),
         frequency=int(entry.get("frequency") or 0),
-        example=examples[0]["quote"] if examples else "",
         examples=examples,
         valence=str(entry.get("valence") or ""),
     )
+
+
+def label_ref(entry: Mapping[str, Any]) -> LabelRef:
+    """Id plus a short label. No definition and no examples."""
+    return LabelRef(
+        code_id=stable_code_id(entry),
+        label=clip(str(entry.get("code") or entry.get("label") or ""), 80),
+    )
+
+
+def dump_request(payload: Any) -> str:
+    """Compact JSON for a model request. No indent and no extra spaces."""
+    if hasattr(payload, "model_dump_json"):
+        return payload.model_dump_json()
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def extract_payload(text: str) -> dict:
@@ -347,7 +365,7 @@ def build_coding_messages(
     )
     return [
         _system_message(coding_system_text(context), prompt_cache=prompt_cache),
-        HumanMessage(content=request.model_dump_json(indent=2)),
+        HumanMessage(content=dump_request(request)),
     ]
 
 
@@ -374,9 +392,11 @@ def build_sweep_messages(
     candidates: Sequence[Mapping[str, Any]],
     prompt_cache: bool,
     all_codes: Sequence[Mapping[str, Any]] | None = None,
+    cross_chunk: Sequence[Mapping[str, Any]] | None = None,
     chunk_index: int = 1,
     chunk_count: int = 1,
     consolidation: bool = False,
+    audit: str = "full",
 ) -> list:
     by_label = {code_key(str(entry.get("code") or "")): stable_code_id(entry) for entry in list(codes) + list(all_codes or [])}
     hints = []
@@ -407,16 +427,73 @@ def build_sweep_messages(
         note += " This is the final consolidation pass over the full codebook, in sorted order."
     if not hints:
         note += " No similarity hints. Read every code and propose duplicates yourself."
+    mode = "incremental" if str(audit or "") == "incremental" else "full"
+    if mode == "incremental":
+        note += (
+            " Incremental review: these codes are new or their label, definition, or examples changed. "
+            "Unchanged codes are ids and short labels."
+        )
+    elif all_codes:
+        note += " Full codebook audit."
+    if all_codes:
+        note += (
+            " Definitions and examples are on this chunk and on cross_chunk. "
+            "The label index is ids and short labels for the whole codebook."
+        )
     request = SweepRequest(
         chunk_index=chunk_index,
         chunk_count=chunk_count,
         note=note,
+        audit=mode if all_codes or mode == "incremental" else "",
         codes=[code_input(entry) for entry in codes],
-        label_index=[code_input(entry) for entry in (all_codes or [])] if chunk_count > 1 else [],
+        cross_chunk=[code_input(entry) for entry in (cross_chunk or [])],
+        label_index=[label_ref(entry) for entry in all_codes] if all_codes else [],
         hints=hints,
     )
     system = SWEEP_SYSTEM + "\n\n" + render_context(context)
-    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=request.model_dump_json(indent=2))]
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=dump_request(request))]
+
+
+def aggregate_sweep_chars(
+    codes: Sequence[Mapping[str, Any]],
+    *,
+    context: ResearchContext,
+    chunk_size: int = 20,
+    cross_chunks: Sequence[Sequence[Mapping[str, Any]]] | None = None,
+    audit: str = "full",
+    user_only: bool = False,
+) -> int:
+    """Character length of the sweep messages for ``codes`` at ``chunk_size``.
+
+    ``cross_chunks`` lines up with chunk order. A missing entry is empty.
+    ``user_only`` drops the stable system prefix, which does not grow with the book.
+    """
+    rows = list(codes)
+    size = max(1, int(chunk_size))
+    chunks = [rows[start : start + size] for start in range(0, len(rows), size)] or [[]]
+    total = 0
+    for index, chunk in enumerate(chunks, start=1):
+        cross: Sequence[Mapping[str, Any]] = []
+        if cross_chunks and index - 1 < len(cross_chunks):
+            cross = cross_chunks[index - 1]
+        chunk_ids = {stable_code_id(entry) for entry in chunk}
+        show_index = any(stable_code_id(entry) not in chunk_ids for entry in rows)
+        messages = build_sweep_messages(
+            context=context,
+            codes=chunk,
+            candidates=[],
+            prompt_cache=False,
+            all_codes=rows if show_index else None,
+            cross_chunk=cross,
+            chunk_index=index,
+            chunk_count=len(chunks),
+            audit=audit,
+        )
+        if user_only:
+            total += len(message_text(messages[-1]))
+        else:
+            total += sum(len(message_text(message)) for message in messages)
+    return total
 
 
 IN_BATCH_SYSTEM = """You are comparing codes that were just proposed in one round.
@@ -459,7 +536,7 @@ def build_in_batch_messages(
         ],
     )
     system = IN_BATCH_SYSTEM + "\n\n" + render_context(context)
-    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=request.model_dump_json(indent=2))]
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=dump_request(request))]
 
 
 THEME_SYSTEM = """You are doing focused coding, the round after open coding (Charmaz).
@@ -547,7 +624,7 @@ def build_theme_messages(
         feedback=feedback,
     )
     system = theme_system_text(context, n_themes, max_themes)
-    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=request.model_dump_json(indent=2))]
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=dump_request(request))]
 
 
 JUDGE_SYSTEM = """You compare two open codes from a grounded-theory codebook.
@@ -560,7 +637,7 @@ would still be coded with the other."""
 def build_judge_messages(left: Mapping[str, Any], right: Mapping[str, Any]) -> list:
     """One pair. The caller keeps the pair identity; the model only answers same/not."""
     request = JudgeRequest(left=code_input(left), right=code_input(right))
-    return [SystemMessage(content=JUDGE_SYSTEM), HumanMessage(content=request.model_dump_json(indent=2))]
+    return [SystemMessage(content=JUDGE_SYSTEM), HumanMessage(content=dump_request(request))]
 
 
 def build_theme_review_messages(
@@ -612,7 +689,7 @@ def build_theme_review_messages(
         "Hints are optional. Embeddings are not required. "
         f"One theme must not hold more than {ceiling}% of the codes.\n\n" + _render(context)
     )
-    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=request.model_dump_json(indent=2))]
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=dump_request(request))]
 
 
 def build_leftover_messages(
@@ -639,7 +716,7 @@ def build_leftover_messages(
         "You are finishing focused coding. Assign only the leftover open codes. "
         "Do not invent a code_id.\n\n" + render_context(context)
     )
-    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=request.model_dump_json(indent=2))]
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=dump_request(request))]
 
 
 def build_merge_check_messages(
@@ -687,7 +764,7 @@ def build_merge_check_messages(
         + " Set confidence on every check.\n\n"
         + render_context(context)
     )
-    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=request.model_dump_json(indent=2))]
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=dump_request(request))]
 
 
 def build_rewrite_messages(
@@ -719,7 +796,7 @@ def build_rewrite_messages(
         "The label stays. The definition must fit the quotes listed for that code, "
         "not the definition of a code that was retired.\n\n" + render_context(context)
     )
-    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=request.model_dump_json(indent=2))]
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=dump_request(request))]
 
 
 _LABEL_FEEDBACK = {
@@ -802,7 +879,7 @@ def build_leak_messages(*, context: ResearchContext, labels: Sequence[Mapping[st
         "A grounded label uses the participant's words. "
         "Set confidence and a rationale on every check.\n\n" + render_context(context)
     )
-    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=json.dumps(payload, indent=2))]
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=dump_request(payload))]
 
 
 def build_quote_fit_messages(*, context: ResearchContext, codes: Sequence[Mapping[str, Any]], prompt_cache: bool) -> list:
@@ -827,7 +904,7 @@ def build_quote_fit_messages(*, context: ResearchContext, codes: Sequence[Mappin
         "Split a quote out only when it names a different action, object, or stance. "
         "Set confidence and a rationale on every check.\n\n" + render_context(context)
     )
-    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=json.dumps(payload, indent=2))]
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=dump_request(payload))]
 
 
 MAPPING_SYSTEM = """You compare one coder's labels with another coder's labels.
@@ -871,7 +948,7 @@ def build_code_match_messages(
     }
     return [
         _system_message(MAPPING_SYSTEM, prompt_cache=prompt_cache),
-        HumanMessage(content=json.dumps(payload, indent=2)),
+        HumanMessage(content=dump_request(payload)),
     ]
 
 

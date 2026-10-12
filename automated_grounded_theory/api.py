@@ -212,6 +212,8 @@ def open_code(
     checkpointer: Any = None,
     sweep_chunk: int = 20,
     embed_batch_size: int = 64,
+    full_audit_every: int = 4,
+    cross_chunk_limit: int = 8,
     max_retries: int = 4,
     retry_backoff: float = 0.5,
     retry_max_backoff: float = 8.0,
@@ -254,8 +256,13 @@ def open_code(
     the next document or wave is coded against the pre-merge snapshot. The
     merge map is applied afterwards, in a fixed order. ``sweep_model`` defaults
     to ``model``. Sweep chunks default to 20 codes, sorted alphabetically by
-    label and then by definition. The sweep model reads each chunk and proposes
-    duplicate merges with a reason. Token overlap, and embeddings when you pass
+    label and then by definition. A chunk carries full evidence for its own
+    codes and for similar codes from other chunks. The rest of the book is an
+    id and a short label. Sweeps after the first review only new or changed
+    codes, and every ``full_audit_every`` sweeps (default 4), plus the final
+    consolidation, read the whole book again. The sweep model reads each chunk
+    and proposes duplicate merges with a reason. ``token_budget`` bounds the
+    assembled coding request plus reserved output. Token overlap, and embeddings when you pass
     them, are optional hints. Merging does not require an embeddings model.
     Every hinted pair and every model-proposed merge is logged. A sweep chunk
     that still times out after retries is skipped with a warning instead of
@@ -321,6 +328,8 @@ def open_code(
             checkpointer=checkpointer,
             sweep_chunk=sweep_chunk,
             embed_batch_size=embed_batch_size,
+            full_audit_every=full_audit_every,
+            cross_chunk_limit=cross_chunk_limit,
             max_retries=max_retries,
             retry_backoff=retry_backoff,
             retry_max_backoff=retry_max_backoff,
@@ -384,6 +393,8 @@ async def aopen_code(
     checkpointer: Any = None,
     sweep_chunk: int = 20,
     embed_batch_size: int = 64,
+    full_audit_every: int = 4,
+    cross_chunk_limit: int = 8,
     max_retries: int = 4,
     retry_backoff: float = 0.5,
     retry_max_backoff: float = 8.0,
@@ -425,6 +436,8 @@ async def aopen_code(
         passages_per_codebook_update=passages_per_codebook_update,
         sweep_chunk=sweep_chunk,
         embed_batch_size=embed_batch_size,
+        full_audit_every=full_audit_every,
+        cross_chunk_limit=cross_chunk_limit,
         max_retries=max_retries,
         retry_backoff=retry_backoff,
         review_mode=review_mode,
@@ -523,6 +536,8 @@ async def aopen_code(
         check_model=checker_name,
         pipeline=pipeline,
         token_budget=token_budget,
+        full_audit_every=full_audit_every,
+        cross_chunk_limit=cross_chunk_limit,
         prompt_cache=cache,
         api_key_provided=api_key is not None,
         thread_id=thread_id,
@@ -572,6 +587,8 @@ async def aopen_code(
         passages_per_codebook_update=passages_per_codebook_update or batch_size,
         sweep_chunk=sweep_chunk,
         embed_batch_size=embed_batch_size,
+        full_audit_every=full_audit_every,
+        cross_chunk_limit=cross_chunk_limit,
         model_name=model_name,
         sweep_model_name=sweep_name,
         prompt_log_path=str(prompt_log_path) if prompt_log_path else None,
@@ -745,6 +762,8 @@ def _validate_params(
     passages_per_codebook_update: int = 1,
     sweep_chunk: int,
     embed_batch_size: int,
+    full_audit_every: int = 4,
+    cross_chunk_limit: int = 8,
     max_retries: int,
     retry_backoff: float,
     review_mode: str,
@@ -766,6 +785,8 @@ def _validate_params(
         )
     if sweep_chunk < 1 or embed_batch_size < 1:
         raise ValueError("sweep_chunk and embed_batch_size must be at least 1.")
+    if full_audit_every < 0 or cross_chunk_limit < 0:
+        raise ValueError("full_audit_every and cross_chunk_limit must be zero or more.")
     if max_retries < 0 or retry_backoff < 0:
         raise ValueError("max_retries and retry_backoff must be zero or more.")
     if request_timeout < 0 or sweep_timeout < 0:
@@ -807,6 +828,8 @@ def _metadata(**kwargs: Any) -> dict:
         "check_model": kwargs.get("check_model") or "",
         "pipeline": kwargs["pipeline"],
         "token_budget": kwargs["token_budget"],
+        "full_audit_every": kwargs.get("full_audit_every", 4),
+        "cross_chunk_limit": kwargs.get("cross_chunk_limit", 8),
         "prompt_cache": kwargs["prompt_cache"],
         "api_key_provided": kwargs["api_key_provided"],
         "thread_id": kwargs["thread_id"],
@@ -833,6 +856,8 @@ def _metadata(**kwargs: Any) -> dict:
             "passages_per_request": kwargs.get("passages_per_request", kwargs["batch_size"]),
             "max_concurrent_requests": kwargs.get("max_concurrent_requests", kwargs["concurrency"]),
             "passages_per_codebook_update": kwargs.get("passages_per_codebook_update", kwargs["batch_size"]),
+            "full_audit_every": kwargs.get("full_audit_every", 4),
+            "cross_chunk_limit": kwargs.get("cross_chunk_limit", 8),
         },
         "context": {
             "research_question": context.research_question,

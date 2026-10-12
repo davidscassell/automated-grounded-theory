@@ -486,15 +486,25 @@ class SweepCoding(_LLMModel):
 
 
 class CodeInput(_LLMModel):
-    """One codebook row sent to the model. Ids are assigned by the pipeline."""
+    """One codebook row sent to the model. Ids are assigned by the pipeline.
+
+    Examples live only in ``examples``. A separate ``example`` string would
+    repeat the first quote.
+    """
 
     code_id: str
     label: str
     definition: str = ""
     frequency: int = 0
-    example: str = ""
     examples: list[dict] = Field(default_factory=list)
     valence: str = ""
+
+
+class LabelRef(_LLMModel):
+    """Compact codebook row: id and a short label, no definition or examples."""
+
+    code_id: str
+    label: str
 
 
 class PassageInput(_LLMModel):
@@ -535,13 +545,20 @@ class HintInput(_LLMModel):
 
 
 class SweepRequest(_LLMModel):
-    """Typed input for a sweep chunk."""
+    """Typed input for a sweep chunk.
+
+    ``codes`` and ``cross_chunk`` carry definitions and examples. ``label_index``
+    is the rest of the book as ids and short labels. ``audit`` is ``full`` or
+    ``incremental``.
+    """
 
     chunk_index: int = 1
     chunk_count: int = 1
     note: str = ""
+    audit: str = ""
     codes: list[CodeInput] = Field(default_factory=list)
-    label_index: list[CodeInput] = Field(default_factory=list)
+    cross_chunk: list[CodeInput] = Field(default_factory=list)
+    label_index: list[LabelRef] = Field(default_factory=list)
     hints: list[HintInput] = Field(default_factory=list)
 
 

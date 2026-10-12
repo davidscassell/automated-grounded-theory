@@ -1,4 +1,4 @@
-# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, and 0.6.4)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, and 0.6.5)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
 Status: steps 1 and 2 of the v0.6 plan. Category development, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
@@ -78,7 +78,7 @@ Uncertainty flags: `ambiguous_span`, `insufficient_context`, `competing_code`, `
 
 `segment_and_shuffle` → `prepare_round` → `Send("code_worker")` → `commit` → `sweep` → `consolidate` → `export`.
 
-`prepare_round` freezes `snapshot_id`, `definition_revision`, `evidence_revision`, and `policy_version` (`0.6.4`). Workers do not mutate the codebook. `passages_per_codebook_update` is how many passages share that snapshot. `max_concurrent_requests` only caps in-flight calls. The proposal reducer dedupes by proposal id, drops conflicting payloads, sorts, and clears only on `{"__reset__": True}`. `commit` rejects a stale snapshot id, skips proposal ids already committed, and is the only writer of definitions.
+`prepare_round` freezes `snapshot_id`, `definition_revision`, `evidence_revision`, and `policy_version` (`0.6.5`). Workers do not mutate the codebook. `passages_per_codebook_update` is how many passages share that snapshot. `max_concurrent_requests` only caps in-flight calls. The proposal reducer dedupes by proposal id, drops conflicting payloads, sorts, and clears only on `{"__reset__": True}`. `commit` rejects a stale snapshot id, skips proposal ids already committed, and is the only writer of definitions.
 
 `get_graph("themes")` fans chunk workers out with `Send` into `theme_worker`, then joins at `validate`. The reporting graph is separate from category development.
 
@@ -156,8 +156,18 @@ A cached pair judgment is invalidated when either definition's text or revision 
 
 Sweep, in-batch, and merge-check prompts share one stance sentence: stance is context, not a merge veto, and it is not by itself a reason to alias. The open-coding example maps "I like my team" to `expressing liking for the team`. Automatic notes that only record reading order are `provenance`. They do not claim reflexivity.
 
-`adjusted_rand_index` stays and documents its limit: different singleton codes on every passage score 1.0. `aligned_assignment_agreement` reports mean set Jaccard per passage after greedy label alignment, and nominal Krippendorff's alpha on the aligned passage-by-code matrix. Those different singletons score low. `policy_version` is `0.6.4`.
+`adjusted_rand_index` stays and documents its limit: different singleton codes on every passage score 1.0. `aligned_assignment_agreement` reports mean set Jaccard per passage after greedy label alignment, and nominal Krippendorff's alpha on the aligned passage-by-code matrix. Those different singletons score low. `policy_version` was `0.6.4` in that release.
 
-## 13. Out of scope
+## 13. Corrections in 0.6.5
+
+A sweep chunk carries definitions and examples for its own codes and for similar codes retrieved from other chunks (`cross_chunk_limit`, default 8). The rest of the book is an index of ids and short labels. The first example quote is not copied into a second field, and request JSON is compact. On the review fixture (chunk size 20), user-message characters for 20, 40, 80, and 160 codes drop from 9,347 / 54,028 / 178,806 / 642,142 to 5,467 / 14,846 / 36,922 / 103,334. Filling the cross-chunk cap on every chunk is 5,467 / 18,788 / 44,782 / 119,030. `scripts/benchmark_sweep_payload.py` rebuilds that table.
+
+Each code stores `reviewed_revision`, a fingerprint of its label, definition, revision, and example quotes. Frequency does not change it. A later sweep sends only codes whose fingerprint is new or changed. Every `full_audit_every` sweeps (default 4; 0 means consolidation only) and the final consolidation pass read the whole book.
+
+Embedding vectors are cached by embedding model and the sha256 of the exact text. A batch embeds a codebook row only when that text changed. Concurrent workers and sweeps that ask for the same snapshot share one vector list.
+
+`token_budget` is the assembled coding request plus reserved output. Instructions, retrieved definitions, examples, neighbors, metadata, and schema framing count. When the model exposes `encode`, that tokenizer is used. Otherwise the estimate is characters / 3. A passage that still does not fit is split on whitespace, or sent alone with a warning when no slice fits. `policy_version` is `0.6.5`.
+
+## 14. Out of scope
 
 Category feedback, focused recoding of earlier negatives, relationship hypotheses, sampling briefs, and a Taguette project-file adapter. See the v0.6 plan steps 3–5.
