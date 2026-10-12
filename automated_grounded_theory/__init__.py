@@ -10,6 +10,7 @@ from automated_grounded_theory.api import (
     compare_runs,
     multi_seed_stability,
     open_code,
+    strict_sequential_settings,
 )
 from automated_grounded_theory.evaluate import aevaluate, chen_metrics, evaluate_run
 from automated_grounded_theory.context import PresetCodesError, ResearchContext
@@ -50,4 +51,5 @@ __all__ = [
     "multi_seed_stability",
     "open_code",
     "plan_coding",
+    "strict_sequential_settings",
 ]

@@ -15,7 +15,7 @@ import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Mapping
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
@@ -46,6 +46,7 @@ from automated_grounded_theory.codebook import (
     interpret_coding,
     remember_pair_decisions,
     replay_accepted_pairs,
+    lexical_comparison_proposals,
     trivial_merges,
     union_codebooks,
 )
@@ -151,6 +152,9 @@ class RunConfig:
     candidate_limit: int = 30
     batch_size: int = 1
     concurrency: int = 2
+    passages_per_request: int = 1
+    max_concurrent_requests: int = 2
+    passages_per_codebook_update: int = 1
     sweep_chunk: int = 20
     embed_batch_size: int = 64
     review_mode: str = "document"
@@ -616,10 +620,11 @@ def _segment_node(state: CodingState) -> dict:
     )
     branch_codebooks = {doc_id: {} for doc_id in plan.branch_queues} if plan.parallel else {}
     queue = list(plan.queue)
-    batch_size = max(1, int(metadata.get("batch_size") or 1))
+    per_request = max(1, int(metadata.get("passages_per_request") or metadata.get("batch_size") or 1))
+    commit_every = max(1, int(metadata.get("passages_per_codebook_update") or per_request))
     review_mode = str(metadata.get("review_mode") or "document")
-    if not plan.parallel and review_mode == "document" and batch_size > 1:
-        queue = interleave_document_queue(plan.passages, queue, batch_size)
+    if not plan.parallel and review_mode == "document" and commit_every > 1:
+        queue = interleave_document_queue(plan.passages, queue, commit_every)
         for order, index in enumerate(queue):
             plan.passages[index]["coding_order"] = order
     return {
@@ -651,6 +656,29 @@ def _code_node(runtime: RunConfig):
     return code_passage
 
 
+def _coding_schedule(metadata: Mapping[str, Any], runtime: RunConfig) -> tuple[int, int, int]:
+    """Request size, commit cadence, and in-flight cap.
+
+    ``max_concurrent_requests`` does not widen the frozen codebook. Only
+    ``passages_per_codebook_update`` decides how many passages share a snapshot.
+    """
+    per_request = max(
+        1,
+        int(metadata.get("passages_per_request") or metadata.get("batch_size") or runtime.batch_size or 1),
+    )
+    # Missing commit cadence follows the request size. It does not follow
+    # concurrency. The runtime default of 1 must not override a larger batch.
+    if metadata.get("passages_per_codebook_update") is not None:
+        commit_every = max(1, int(metadata.get("passages_per_codebook_update") or 1))
+    else:
+        commit_every = per_request
+    concurrent = max(
+        1,
+        int(metadata.get("max_concurrent_requests") or metadata.get("concurrency") or runtime.concurrency or 1),
+    )
+    return per_request, commit_every, concurrent
+
+
 def _wave(
     state: CodingState,
     runtime: RunConfig,
@@ -659,10 +687,14 @@ def _wave(
 ) -> list[tuple[str | None, list[int]]]:
     """One coding step against a frozen codebook snapshot.
 
-    Document mode (the default) takes the next document only, in reading
-    order, and packs its passages into token-bounded batches. Those batches
-    share the snapshot; the codebook is committed after the document.
+    The step covers ``passages_per_codebook_update`` passages, packed into
+    requests of ``passages_per_request``. Those passages share the snapshot.
+    The codebook is committed when the step finishes, so the next step sees
+    the codes. ``max_concurrent_requests`` only limits how many of those
+    requests are in flight. It does not add passages to the step.
 
+    Document mode with a commit cadence of 1 stays inside the current document
+    and takes one passage. A larger cadence round-robins across documents.
     Wave mode may mix passages from several documents. It is opt-in because
     that weakens constant comparison.
 
@@ -670,8 +702,7 @@ def _wave(
     run during that sweep, so the sweep window is treated as already reset.
     """
     metadata = state.get("metadata") or {}
-    batch_size = max(1, int(metadata.get("batch_size") or runtime.batch_size))
-    concurrency = max(1, int(metadata.get("concurrency") or runtime.concurrency))
+    per_request, commit_every, concurrent = _coding_schedule(metadata, runtime)
     sweep_every = max(1, int(metadata.get("sweep_every") or 1))
     since = 0 if upcoming else int(state.get("passages_since_sweep") or 0)
     room = sweep_every - since
@@ -679,60 +710,56 @@ def _wave(
         return []
     token_budget = max(1, int(metadata.get("token_budget") or runtime.token_budget))
     review_mode = str(metadata.get("review_mode") or runtime.review_mode or "document")
+    window = min(room, commit_every)
 
     if state.get("parallel"):
         jobs: list[tuple[str | None, list[int]]] = []
         used = 0
+        documents = 0
         for doc_id in sorted(state.get("branch_queues") or {}):
-            if len(jobs) >= concurrency or used >= room:
+            if documents >= concurrent or used >= room:
                 break
             queue = list(state["branch_queues"][doc_id])
             if not queue:
                 continue
-            take = min(batch_size, len(queue), room - used)
+            take = min(window, len(queue), room - used)
             if take <= 0:
                 break
-            jobs.append((doc_id, queue[:take]))
+            indices = queue[:take]
+            for start in range(0, len(indices), per_request):
+                chunk = indices[start : start + per_request]
+                if chunk:
+                    jobs.append((doc_id, chunk))
             used += take
+            documents += 1
         return jobs
 
     index = int(state.get("next_index") or 0)
     queue = list(state.get("queue") or [])
     if index >= len(queue):
         return []
-    if review_mode == "document" and batch_size > 1:
+    if review_mode == "document" and commit_every > 1:
         # The queue is already round-robin across documents. One round takes
         # at most one passage from each document, unless only one document
-        # is left.
-        count = next_round_count(state["passages"], queue[index:], batch_size)
+        # is left. The round width is the commit cadence, not the concurrency.
+        count = next_round_count(state["passages"], queue[index:], commit_every)
         indices = queue[index : index + min(room, count)]
     elif review_mode == "document":
-        # batch_size 1 stays inside the current document. Concurrency may
-        # still code several of its next passages against one snapshot.
+        # Commit after each passage (or each commit cadence) inside this document.
+        # Later passages are a later step and see the codes just committed.
         doc_id = state["passages"][queue[index]].get("doc_id")
-        doc_rest = 0
-        for passage_index in queue[index:]:
-            if state["passages"][passage_index].get("doc_id") != doc_id:
-                break
-            doc_rest += 1
-        if doc_rest >= batch_size:
-            cap = min(room, batch_size * concurrency)
-            stay = True
-        else:
-            cap = min(room, batch_size)
-            stay = False
         indices = []
         for passage_index in queue[index:]:
-            if len(indices) >= cap:
+            if len(indices) >= window:
                 break
-            if stay and state["passages"][passage_index].get("doc_id") != doc_id:
+            if state["passages"][passage_index].get("doc_id") != doc_id:
                 break
             indices.append(passage_index)
     else:
-        take = min(room, batch_size * concurrency, len(queue) - index)
+        take = min(room, commit_every, len(queue) - index)
         indices = queue[index : index + take]
     texts = [str(state["passages"][item].get("text") or "") for item in range(len(state["passages"]))]
-    packed = pack_indices(indices, texts, batch_size=batch_size, token_budget=token_budget)
+    packed = pack_indices(indices, texts, batch_size=per_request, token_budget=token_budget)
     return [(None, batch) for batch in packed if batch]
 
 
@@ -1274,11 +1301,12 @@ def _validate_node(runtime: RunConfig):
 
 
 def _append_reading_notes(memos: list, counters: dict, pending_sorted: list, state: CodingState) -> None:
-    """One comparison memo and one reflexivity note per document in this commit.
+    """One comparison memo and one provenance note per document in this commit.
 
     The comparison memo quotes the incident memos the model wrote. It does not
-    call the model again. The reflexivity note records that this document was
-    read in seeded order and was not skipped.
+    call the model again. The provenance note records reading order only. It
+    is not a reflexivity memo. A reflexivity memo is the one the sweep model
+    writes when it has something to say about the analyst's position.
     """
     groups: list[tuple[str, str, list]] = []
     for item in pending_sorted:
@@ -1317,14 +1345,14 @@ def _append_reading_notes(memos: list, counters: dict, pending_sorted: list, sta
         memos.append(
             {
                 "memo_id": memo_id,
-                "kind": "reflexive",
+                "kind": "provenance",
                 "doc_id": doc_id,
                 "passage_id": None,
                 "sweep_index": None,
                 "text": (
-                    f"Read {doc_name} in seeded document order before later documents. "
+                    f"Provenance: read {doc_name} in seeded document order before later documents. "
                     f"Passages reviewed: {listed}. "
-                    "The research context sensitized attention and was not used as a code list."
+                    "This note records reading order. It is not a reflexivity memo."
                 ),
             }
         )
@@ -1475,7 +1503,8 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
                 row["target_valence"] = str(codebook.get(target_key, {}).get("valence") or "")
             if not str(row.get("rationale") or "").strip():
                 row["rationale"] = (
-                    "The sweep judged this pair with the same-action, same-object, same-stance rubric."
+                    "The sweep judged this pair with the same-action, same-object rubric. "
+                    "Stance is context, not a merge veto."
                 )
             return row
 
@@ -1496,7 +1525,7 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
                         "decision": "reject",
                         "confidence": merge.get("confidence", 1.0),
                         "rationale": merge.get("rationale")
-                        or "This pair was already decided in this run, and neither definition has changed in substance.",
+                        or "This pair was already decided in this run, and neither definition nor its evidence has changed.",
                     }
                 )
             else:
@@ -2177,6 +2206,19 @@ async def _sweep_chunks(
             )
             not in frozen
         ]
+    # Jaccard at the proposal threshold is a hint, not an auto-merge. Pairs the
+    # lexical threshold already returned stay as they are. This adds any
+    # near-duplicate the cap or a higher threshold would have dropped.
+    offered = {
+        frozenset((code_key(str(hint.get("source") or "")), code_key(str(hint.get("target") or ""))))
+        for hint in hints
+    }
+    for proposal in lexical_comparison_proposals(codes):
+        pair = frozenset((code_key(str(proposal.get("source") or "")), code_key(str(proposal.get("target") or ""))))
+        if not pair or pair in offered or (frozen and pair in frozen):
+            continue
+        hints.append(proposal)
+        offered.add(pair)
     for index, hint in enumerate(hints, start=1):
         hint["pair_id"] = f"s{sweep_index}p{index:04d}"
     key_chunk: dict[str, int] = {}

@@ -100,7 +100,12 @@ def test_alias_requires_the_same_concept_and_a_contrast_check():
     assert evidence["accepted_merges"] == []
     assert evidence["rejected_merges"][0]["reason"] == "mixed_evidence"
     decision, reason = classify_comparison({"source": "packing bags", "target": "packing bags up", "trivial": True}, {})
-    assert (decision, reason) == ("alias_duplicate", "trivial_pair")
+    assert (decision, reason) == ("keep_distinct", "not_spelling_variant")
+    variant, variant_reason = classify_comparison(
+        {"source": "packing bags", "target": "packing bag", "trivial": True},
+        {},
+    )
+    assert (variant, variant_reason) == ("alias_duplicate", "trivial_pair")
 
 
 def test_same_round_duplicates_follow_meaning_and_the_audit_records_a_later_split():

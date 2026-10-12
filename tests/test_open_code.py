@@ -211,6 +211,7 @@ def test_batching_and_waves_cut_calls():
         sweep_every=25,
         batch_size=1,
         concurrency=2,
+        passages_per_codebook_update=2,
         review_mode="wave",
         pipeline=False,
     )

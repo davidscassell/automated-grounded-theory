@@ -1,4 +1,4 @@
-# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, and 0.6.3)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, and 0.6.4)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
 Status: steps 1 and 2 of the v0.6 plan. Category development, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
@@ -33,11 +33,13 @@ result = await aopen_code(
     model="xai:grok-4",          # or a BaseChatModel
     seed=42,
     unit="incident",             # default
-    batch_size=1,                # reference; 4 is the comparison setting
-    concurrency=4,               # shared in-flight cap
+    passages_per_request=1,      # alias: batch_size
+    max_concurrent_requests=4,   # alias: concurrency; in-flight cap only
+    passages_per_codebook_update=1,
     review_mode="document",      # "wave" is opt-in
     sweep_every=25,
     pipeline=True,
+    # procedure="strict_sequential"  # one passage, commit each time, no pipeline
     review_below=0.5,
     min_merge_confidence=0.5,
     max_merges_per_sweep=12,
@@ -76,7 +78,7 @@ Uncertainty flags: `ambiguous_span`, `insufficient_context`, `competing_code`, `
 
 `segment_and_shuffle` → `prepare_round` → `Send("code_worker")` → `commit` → `sweep` → `consolidate` → `export`.
 
-`prepare_round` freezes `snapshot_id`, `definition_revision`, `evidence_revision`, and `policy_version` (`0.6.3`). Workers do not mutate the codebook. The proposal reducer dedupes by proposal id, drops conflicting payloads, sorts, and clears only on `{"__reset__": True}`. `commit` rejects a stale snapshot id, skips proposal ids already committed, and is the only writer of definitions.
+`prepare_round` freezes `snapshot_id`, `definition_revision`, `evidence_revision`, and `policy_version` (`0.6.4`). Workers do not mutate the codebook. `passages_per_codebook_update` is how many passages share that snapshot. `max_concurrent_requests` only caps in-flight calls. The proposal reducer dedupes by proposal id, drops conflicting payloads, sorts, and clears only on `{"__reset__": True}`. `commit` rejects a stale snapshot id, skips proposal ids already committed, and is the only writer of definitions.
 
 `get_graph("themes")` fans chunk workers out with `Send` into `theme_worker`, then joins at `validate`. The reporting graph is separate from category development.
 
@@ -127,7 +129,7 @@ RAND Muse E2 under 0.5.4, as scored: precision 0.60, recall 0.19, F1 0.29 agains
 - The shared limiter releases its slot before a retry sleep. `Retry-After` cannot exceed `max_backoff`. Pipeline overlap does not start a coding task when `concurrency` is 1, so a sweep is not stuck behind its own overlap. The run metadata includes the in-flight timeline.
 - 0.6.1 filled a short document's round from the following documents, and kept a long document's passages together. 0.6.2 replaces that round shape when `batch_size` is above 1; see below. `batch_size` still defaults to 1.
 - `run_sync` reuses one background event loop and does not close HTTP clients the caller still holds. `build_themes` can follow `open_code` on the same model instance.
-- `alias_duplicate` requires the same action, the same object, a contrast check, no material contrast, and evidence that is not mixed. Labels that each name an object or aspect the other lacks stay `keep_distinct` (`aspects_differ`), including when they share a platform name. Mixed `quote_fits` or `evidence_same` false is `defer`. A missing rubric is `keep_distinct`. Valence is still not a reason to alias or to refuse. A trivial near-duplicate with the same stance still aliases without a model call.
+- `alias_duplicate` requires the same action, the same object, a contrast check, no material contrast, and evidence that is not mixed. Labels that each name an object or aspect the other lacks stay `keep_distinct` (`aspects_differ`), including when they share a platform name. Mixed `quote_fits` or `evidence_same` false is `defer`. A missing rubric is `keep_distinct`. Valence is still not a reason to alias or to refuse. 0.6.1 auto-merged a trivial near-duplicate with the same stance. 0.6.4 replaces that rule; see below.
 - `presentation_themes` folds reporting themes that share a content word. Analytic membership is unchanged. There is no theme quota. The prevalence chart uses that reporting view. `presentation_themes.json` is the list.
 
 ## 10. Corrections in 0.6.2
@@ -142,8 +144,20 @@ Sweep, merge-check, definition-rewrite, and quote-fit calls use `sweep_timeout` 
 
 A semicolon-joined label is split into separate candidate codes before validation. Each piece is checked on its own. A piece whose label matches a code already in the book is reused.
 
-An empty label, a label over the length limit, and a new label that bundles several concepts are not dropped. Bundling means a comma list of three or more concepts, or three or more concepts joined by "and". The passage is sent back once with feedback that names the problem and asks for one concept. If the retry is still empty, too long, or bundled, or if it returns no codes, the code is kept and flagged (`empty_code`, `code_too_long`, or `bundled_concepts`). A blank label is stored as `(empty label)`. Generic labels are still rejected. `policy_version` is `0.6.3`.
+An empty label, a label over the length limit, and a new label that bundles several concepts are not dropped. Bundling means a comma list of three or more concepts, or three or more concepts joined by "and". The passage is sent back once with feedback that names the problem and asks for one concept. If the retry is still empty, too long, or bundled, or if it returns no codes, the code is kept and flagged (`empty_code`, `code_too_long`, or `bundled_concepts`). A blank label is stored as `(empty label)`. Generic labels are still rejected. `policy_version` was `0.6.3` in that release.
 
-## 12. Out of scope
+## 12. Corrections in 0.6.4
+
+Lexical similarity proposes a comparison. It does not merge. Auto-merge is only a normalized spelling or inflection variant: case, punctuation, whitespace, and plural or gerund forms, with compatible definitions. Negation or a polarity difference never auto-merges. `trusting managers to share information` and `not trusting managers to share information` (Jaccard about 0.83, contradictory definitions) are proposed and then judged on definitions and evidence. Everything else uses that same full comparison.
+
+`passages_per_request`, `max_concurrent_requests`, and `passages_per_codebook_update` are separate. `batch_size` and `concurrency` remain as aliases. Setting `batch_size=1` and `concurrency=4` without the new names warns: concurrency no longer widens the frozen window. `strict_sequential_settings()` and `procedure="strict_sequential"` are the documented sequential baseline: document mode, one passage per request, one request in flight, commit after every passage, pipeline off, parallel documents off. Later passages see earlier codes.
+
+A cached pair judgment is invalidated when either definition's text or revision id changes, or when that code's examples or assignments change. There is no token-overlap threshold. Negating `Employees trust...` to `Employees do not trust...` reopens the pair.
+
+Sweep, in-batch, and merge-check prompts share one stance sentence: stance is context, not a merge veto, and it is not by itself a reason to alias. The open-coding example maps "I like my team" to `expressing liking for the team`. Automatic notes that only record reading order are `provenance`. They do not claim reflexivity.
+
+`adjusted_rand_index` stays and documents its limit: different singleton codes on every passage score 1.0. `aligned_assignment_agreement` reports mean set Jaccard per passage after greedy label alignment, and nominal Krippendorff's alpha on the aligned passage-by-code matrix. Those different singletons score low. `policy_version` is `0.6.4`.
+
+## 13. Out of scope
 
 Category feedback, focused recoding of earlier negatives, relationship hypotheses, sampling briefs, and a Taguette project-file adapter. See the v0.6 plan steps 3–5.

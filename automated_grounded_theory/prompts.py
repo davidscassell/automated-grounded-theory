@@ -32,6 +32,10 @@ from automated_grounded_theory.schemas import (
 )
 from automated_grounded_theory.validation import code_key
 
+STANCE_POLICY = (
+    "Stance is context, not a merge veto, and it is not by itself a reason to alias."
+)
+
 CODING_SYSTEM = """You are doing first-round open coding in the grounded theory tradition.
 
 This is initial coding only, incident by incident. You are not writing themes, \
@@ -62,7 +66,7 @@ Examples:
 The repetition is the incident.
 - "now it feels like a number" → code "feels like a number", in_vivo true. \
 The metaphor is the incident.
-- "I like my team" has no vivid phrase → code "staying for the team", in_vivo false.
+- "I like my team" has no vivid phrase → code "expressing liking for the team", in_vivo false.
 
 Constant comparison: the user message lists the nearest existing codes, retrieved by \
 similarity, plus other frequent codes. Prefer reuse. Prefer refine when this incident \
@@ -136,8 +140,7 @@ If the quotes disagree, set evidence_same false and comparison_op to defer. \
 If they belong in one category but are not one code, set comparison_op to \
 link_to_category. Set same_action, same_object, and same_stance on every merge \
 and rejection. Keep the clearer label as the target and name the other code as \
-the source. Record source_valence and target_valence. Stance is context, not a \
-merge veto, and it is not by itself a reason to alias. Do not treat a chain of \
+the source. Record source_valence and target_valence. """ + STANCE_POLICY + """ Do not treat a chain of \
 pairs as one merge. On each accept, set rewritten_label and rewritten_definition \
 from the member quotes, and set quote_fits for each example quote (fits false \
 means the evidence is mixed, so do not alias). Set confidence from 0 to 1. \
@@ -394,7 +397,10 @@ def build_sweep_messages(
             )
         )
     note = (
-        "Merge only when same action, same object, and same stance all hold. "
+        "Merge only when the definitions name the same concept and the quotes show it: "
+        "same action, same object, contrast checked, and no material contrast. "
+        + STANCE_POLICY
+        + " Record same_stance, but do not require it. "
         "Rewrite the survivor label and definition from the member quotes in this same response."
     )
     if consolidation:
@@ -423,8 +429,7 @@ then, with same_action and same_object true, contrast_checked true, and \
 material_contrast false. If the objects or aspects differ, set comparison_op \
 to keep_distinct. If the quotes disagree, set evidence_same false and \
 comparison_op to defer. If they belong in one category but are not one code, \
-set comparison_op to link_to_category. Stance is context, not a reason to \
-alias and not a reason to refuse. Do not invent codes. Do not merge a chain \
+set comparison_op to link_to_category. """ + STANCE_POLICY + """ Do not invent codes. Do not merge a chain \
 into one code. Set confidence from 0 to 1. Write a rationale of one to three \
 sentences on every decision."""
 
@@ -644,7 +649,7 @@ def build_merge_check_messages(
     merges: Sequence[Mapping[str, Any]],
     prompt_cache: bool,
 ) -> list:
-    """Second structured look at proposed merges. Opposite stances are already removed."""
+    """Second structured look at proposed merges. Stance is context, not a veto."""
     by_key = {code_key(str(entry.get("key") or entry.get("code") or "")): entry for entry in codebook.values()}
     pairs = []
     for merge in merges:
@@ -669,16 +674,18 @@ def build_merge_check_messages(
         )
     request = MergeCheckRequest(
         note=(
-            "Accept a pair only when both codes name the same incident and the same stance. "
-            "Reject praise merged with criticism. Set confidence from 0 to 1."
+            "Accept a pair only when both codes name the same incident. "
+            + STANCE_POLICY
+            + " Set confidence from 0 to 1."
         ),
         pairs=pairs,
     )
     system = (
         "You are verifying proposed code merges. "
-        "Accept only when the quotes show the same incident and the same stance. "
-        "Never accept a positive code merged with a negative code. "
-        "Set confidence on every check.\n\n" + render_context(context)
+        "Accept only when the quotes show the same incident. "
+        + STANCE_POLICY
+        + " Set confidence on every check.\n\n"
+        + render_context(context)
     )
     return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=request.model_dump_json(indent=2))]
 

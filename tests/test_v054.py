@@ -130,7 +130,7 @@ def test_rejected_pair_stays_decided_until_the_definition_changes():
 
     tweaked = deepcopy(book)
     tweaked[ROLLOUT]["definition"] = "Criticizing a rollout that skipped the training."
-    assert frozen_pair_keys(cache, tweaked)
+    assert frozen_pair_keys(cache, tweaked) == set()
 
     changed = deepcopy(book)
     changed[ROLLOUT]["definition"] = "Praising the cafeteria menu on Fridays."
@@ -200,15 +200,25 @@ def test_quote_that_does_not_fit_is_split_back():
 
 
 def test_trivial_merge_skips_the_model_and_the_cap_defers():
-    left = {"code": "criticizing rollout without training", "valence": "negative"}
-    right = {"code": "criticizing rollout without any training", "valence": "negative"}
+    left = {
+        "code": "criticizing the rollout",
+        "valence": "negative",
+        "definition": "Criticizing a rollout that skipped training.",
+    }
+    right = {
+        "code": "criticizing the rollouts",
+        "valence": "negative",
+        "definition": "Criticizing a rollout that skipped training.",
+    }
     assert trivial_pair(left, right)
     opposite = {**right, "valence": "positive"}
     assert not trivial_pair(left, opposite)
+    extra = {**right, "code": "criticizing the rollout without any training"}
+    assert not trivial_pair(left, extra)
     merges = trivial_merges([left, right])
     assert len(merges) == 1
     assert merges[0]["confidence"] == 0.95
-    assert "near-duplicates" in merges[0]["rationale"]
+    assert "inflection" in merges[0]["rationale"]
 
     labels = [
         "recording the alpha delay",

@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Sequence
 
+from automated_grounded_theory.evaluate import aligned_assignment_agreement, assignment_ari
 from automated_grounded_theory.retrieval import jaccard
 from automated_grounded_theory.validation import code_key
 
@@ -114,6 +115,7 @@ def compare_runs(runs: Sequence, *, soft_threshold_note: str = "0.5") -> Stabili
             )
             jaccards.append(exact)
             soft.append(soft_score)
+            agreement = aligned_assignment_agreement(runs[i], runs[j])
             pairwise.append(
                 {
                     "seed_a": seeds[i],
@@ -122,6 +124,9 @@ def compare_runs(runs: Sequence, *, soft_threshold_note: str = "0.5") -> Stabili
                     "soft_jaccard": soft_score,
                     "soft_match_threshold": soft_threshold_note,
                     "shared_codes": sorted(label_sets[i][key] for key in sorted(left & right)),
+                    "adjusted_rand_index": round(assignment_ari(runs[i], runs[j]), 4),
+                    "aligned_assignment_jaccard": agreement["mean_jaccard"],
+                    "aligned_assignment_alpha": agreement["krippendorff_alpha"],
                 }
             )
 
@@ -147,8 +152,13 @@ def compare_runs(runs: Sequence, *, soft_threshold_note: str = "0.5") -> Stabili
         note=(
             "Exact Jaccard uses case-folded code labels. Soft Jaccard greedily matches "
             "labels, or label-plus-definition text, at token overlap 0.5. "
-            "Neither score decides which seed is correct, and neither is a validity coefficient. "
-            "Open-coding labels are expected to move."
+            "adjusted_rand_index compares passage partitions, not code labels: "
+            "different singleton codes on every passage score 1.0. "
+            "aligned_assignment_jaccard is the mean Jaccard of the code set on each "
+            "passage after labels are aligned, and aligned_assignment_alpha is "
+            "Krippendorff's alpha on that passage-by-code matrix. "
+            "None of these scores decides which seed is correct, and none is a validity coefficient. "
+            "The report does not pick a winning seed. Open-coding labels are expected to move."
         ),
         runs=list(runs),
     )
