@@ -1,4 +1,4 @@
-# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, and 0.6.5)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, and 0.6.6)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
 Status: steps 1 and 2 of the v0.6 plan. Category development, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
@@ -82,9 +82,9 @@ Uncertainty flags: `ambiguous_span`, `insufficient_context`, `competing_code`, `
 
 `get_graph("themes")` fans chunk workers out with `Send` into `theme_worker`, then joins at `validate`. The reporting graph is separate from category development.
 
-One `CallLimiter` is shared by coding and sweep calls in a run, including retries. Cache keys add snapshot, definition, evidence, and policy versions when those are set. Transport retries and the one schema repair are counted separately (`transport_retries`, `schema_repairs`).
+One `CallLimiter` is shared by coding, sweep, and evaluation calls in a run, including `abatch` and retries. Concurrent batches take slots from that same adaptive gate. Cache keys add snapshot, definition, evidence, and policy versions when those are set. Transport retries and the one schema repair are counted separately (`transport_retries`, `schema_repairs`). A repaired call's `usage` adds the failed response to the successful one.
 
-Metrics on `metadata["metrics"]`: duplicates before reconciliation, reconciliation calls and seconds, coding p50/p95, tokens, retries, lost-distinction candidates, `merges_later_split`, and `activity` (in-flight events and idle gaps of at least 0.05 seconds). `duplicate_rounds.json` and `lost_distinction_candidates.json` are written next to the codebook.
+Metrics on `metadata["metrics"]`: duplicates before reconciliation, reconciliation calls and seconds, coding wall time, per-request latency (`coding_seconds`, `coding_p50`, `coding_p95`), queue wait, tokens, retries, lost-distinction candidates, `merges_later_split`, `max_in_flight`, and `activity` (in-flight events, idle gaps of at least 0.05 seconds, and the same peak). `duplicate_rounds.json` and `lost_distinction_candidates.json` are written next to the codebook.
 
 Checkpoint state is serializable (snapshot refs, passages, proposals). Models and the limiter stay on the runtime object.
 
@@ -168,6 +168,16 @@ Embedding vectors are cached by embedding model and the sha256 of the exact text
 
 `token_budget` is the assembled coding request plus reserved output. Instructions, retrieved definitions, examples, neighbors, metadata, and schema framing count. When the model exposes `encode`, that tokenizer is used. Otherwise the estimate is characters / 3. A passage that still does not fit is split on whitespace, or sent alone with a warning when no slice fits. `policy_version` is `0.6.5`.
 
-## 14. Out of scope
+## 14. Corrections in 0.6.6
+
+`abatch` takes one slot per call from the same AIMD gate as `ainvoke`. A batch does not create a semaphore of its own. Two concurrent batches with a ceiling of 2 stay at 2 in-flight calls. `max_in_flight` is that peak, on `metrics.max_in_flight` and `metrics.activity.max_in_flight`. Embeddings keep a separate semaphore so retrieval does not hold the model slot.
+
+Coding time is three numbers. `stage_seconds.coding` and `metrics.coding_wall_seconds` are wall time: each batch interval is counted once, and overlapping batches in a round contribute their union. `metrics.coding_seconds` and `metrics.coding_request_latency_seconds` are the provider latency of each model call. `metrics.coding_queue_wait_seconds` is time waiting on the gate, on a token bucket, or on retry backoff. A batch duration is not copied onto each passage and summed. `coding_p50` and `coding_p95` are percentiles of the per-request latencies. `metrics.request_latency_seconds` and `metrics.queue_wait_seconds` are the same split for every model call in the run, including sweeps.
+
+Schema repair adds the usage of the failed response to the successful one. When more than one response was billed, `usage.attempt_usage` lists them. Prompt-log totals and `input_tokens` / `output_tokens` include those attempts.
+
+`tokens_per_minute` reserves estimated input tokens plus reserved output before the call, then replaces that reservation with the provider's actual input and output. It does not consume one unit per request. `requests_per_minute` does, one per attempt. Zero leaves a bucket open. Both values are stored on the run metadata. `policy_version` stays `0.6.5`.
+
+## 15. Out of scope
 
 Category feedback, focused recoding of earlier negatives, relationship hypotheses, sampling briefs, and a Taguette project-file adapter. See the v0.6 plan steps 3–5.

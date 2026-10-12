@@ -1,8 +1,9 @@
 """Shared concurrency limit, retry backoff, and a notebook-safe sync runner.
 
 LLM calls go through :meth:`CallLimiter.ainvoke` or :meth:`CallLimiter.abatch`.
-Embeddings use a separate semaphore of the same size so a coding task can embed
-and then call the model without taking the model slot twice.
+Both take slots from one adaptive gate. Embeddings use a separate semaphore
+of the same size so a coding task can embed and then call the model without
+taking the model slot twice.
 
 :func:`run_sync` drives a coroutine from ordinary Python and from a running
 loop (Jupyter). Inside a running loop the coroutine is executed on a worker
@@ -12,13 +13,14 @@ thread with its own loop, so the notebook loop is not re-entered.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import hashlib
 import json
 import random
 import threading
 import time
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 class CallLimiter:
     """Cap in-flight work, adapt on 429, and retry transient failures with full-jitter backoff.
@@ -30,9 +32,15 @@ class CallLimiter:
 
     ``ainvoke`` takes one slot from an AIMD limit (the configured concurrency
     is the ceiling; a rate limit halves it, and a streak of successes adds one
-    back). ``abatch`` runs one ``ainvoke`` per input under that same limit.
+    back). ``abatch`` runs one ``ainvoke`` per input under that same gate, so
+    two batches cannot each open a private ceiling. ``max_in_flight`` is the
+    peak number of model calls that held a slot.
     A response cache keyed by the payload replays an identical prompt without
     calling the model again.
+
+    ``tokens_per_minute`` reserves estimated input tokens plus reserved output
+    before the call, then reconciles to the provider's actual usage. It is not
+    a request counter. ``requests_per_minute`` consumes one unit per attempt.
 
     Jitter changes only the wait, never the stored result. ``Retry-After``
     on the exception, when present, replaces the computed wait.
@@ -46,6 +54,8 @@ class CallLimiter:
         backoff: float = 0.5,
         max_backoff: float = 8.0,
         tokens_per_minute: float = 0,
+        requests_per_minute: float = 0,
+        reserved_output_tokens: int = 0,
         cache: dict | None = None,
         request_timeout: float = 120.0,
     ) -> None:
@@ -56,12 +66,17 @@ class CallLimiter:
         self.backoff = max(0.0, float(backoff))
         self.max_backoff = max(self.backoff, float(max_backoff))
         self.tokens_per_minute = max(0.0, float(tokens_per_minute))
+        self.requests_per_minute = max(0.0, float(requests_per_minute))
+        self.reserved_output_tokens = max(0, int(reserved_output_tokens))
         self.request_timeout = float(request_timeout)
         self._tokens = self.tokens_per_minute
-        self._token_stamp = 0.0
+        self._token_stamp: float | None = None
+        self._requests = self.requests_per_minute
+        self._request_stamp: float | None = None
         self.semaphore = asyncio.Semaphore(self.concurrency)
         self.embed_semaphore = asyncio.Semaphore(self.concurrency)
         self._gate = asyncio.Condition()
+        self._budget_lock = asyncio.Lock()
         self.max_in_flight = 0
         self._in_flight = 0
         self.rate_limit_retries = 0
@@ -71,80 +86,81 @@ class CallLimiter:
         self.cache_hits = 0
         self.cache_context: dict = {}
         self.schema_repairs = 0
+        self.request_latencies: list[float] = []
+        self.queue_waits: list[float] = []
         self.timeline: list[dict] = []
         self._timeline_origin: float | None = None
+        self._clock_override: Callable[[], float] | None = None
+        self._sleep_override: Callable[[float], Any] | None = None
+        self._accounting: contextvars.ContextVar[list | None] = contextvars.ContextVar(
+            f"agt_acct_{id(self)}",
+            default=None,
+        )
 
-    async def ainvoke(self, runnable, payload, *, timeout: float | None = None):
+    def push_accounting(self, bucket: list) -> contextvars.Token:
+        """Attribute model calls on this task to ``bucket`` until :meth:`pop_accounting`."""
+        return self._accounting.set(bucket)
+
+    def pop_accounting(self, token: contextvars.Token) -> None:
+        self._accounting.reset(token)
+
+    async def ainvoke(
+        self,
+        runnable,
+        payload,
+        *,
+        timeout: float | None = None,
+        reserved_output: int | None = None,
+    ):
         """``await runnable.ainvoke(payload)`` under the AIMD cap, with rate-limit retries.
 
         ``timeout`` overrides ``request_timeout`` for this call. ``None`` keeps
-        the limiter default. ``0`` waits with no deadline.
+        the limiter default. ``0`` waits with no deadline. ``reserved_output``
+        is added to the estimated input when the token bucket reserves a call.
         """
         key = cache_key(payload, **(self.cache_context or {}))
         cached = self.cache.get(key)
         if cached is not None:
             self.cache_hits += 1
             return cached
-        await self._acquire()
-        try:
-            result = await self._retry(lambda: self._invoke(runnable, payload, timeout=timeout))
-            self._on_success()
-            self.cache[key] = result
-            return result
-        finally:
-            await self._release_async()
+        estimate = self._estimate(payload, reserved_output)
+        result = await self._retry(lambda: self._attempt(runnable, payload, timeout=timeout, estimate=estimate))
+        self.cache[key] = result
+        return result
 
-    async def abatch(self, runnable, inputs: Sequence[Any]) -> list[Any]:
-        """``runnable.abatch`` with the current AIMD limit, then retry rate-limited rows.
+    async def abatch(
+        self,
+        runnable,
+        inputs: Sequence[Any],
+        *,
+        timeout: float | None = None,
+        reserved_output: int | None = None,
+    ) -> list[Any]:
+        """One :meth:`ainvoke` per input, all on the shared AIMD gate.
 
-        Results stay aligned with ``inputs``. Completion order does not matter.
+        Results stay aligned with ``inputs``. A private semaphore is not
+        created, so concurrent batches share ``max_in_flight`` and the ceiling.
         Cached rows are not sent again.
         """
         if not inputs:
             return []
-        output: list[Any] = [None] * len(inputs)
-        pending: list[int] = []
-        for index, payload in enumerate(inputs):
-            cached = self.cache.get(cache_key(payload, **(self.cache_context or {})))
-            if cached is not None:
-                self.cache_hits += 1
-                output[index] = cached
-            else:
-                pending.append(index)
-        attempt_base = 0
-        for attempt in range(self.max_retries + 1):
-            if not pending:
-                break
-            batch = [inputs[index] for index in pending]
+
+        async def one(payload):
             try:
-                results = await self._gather(runnable, batch)
+                return await self.ainvoke(
+                    runnable,
+                    payload,
+                    timeout=timeout,
+                    reserved_output=reserved_output,
+                )
             except Exception as exc:
-                if attempt >= self.max_retries or not is_transient(exc):
-                    raise
-                self._note_transient(exc)
-                await asyncio.sleep(self._wait(attempt, exc))
-                continue
-            still: list[int] = []
-            retry_exc: BaseException | None = None
-            for index, result in zip(pending, results):
-                if isinstance(result, Exception) and is_transient(result) and attempt < self.max_retries:
-                    still.append(index)
-                    retry_exc = result
-                elif isinstance(result, Exception):
-                    raise result
-                else:
-                    output[index] = result
-                    self.cache[cache_key(inputs[index], **(self.cache_context or {}))] = result
-            if still:
-                self._note_transient(retry_exc, len(still))
-                await asyncio.sleep(self._wait(attempt, retry_exc))
-            else:
-                self._on_success()
-            pending = still
-            attempt_base = attempt
-        if pending:
-            raise RuntimeError(f"{len(pending)} calls still failed after {attempt_base + 1} attempts")
-        return output
+                return exc
+
+        results = list(await asyncio.gather(*(one(payload) for payload in inputs)))
+        for result in results:
+            if isinstance(result, Exception):
+                raise result
+        return results
 
     async def call(self, func: Callable, /, *args, **kwargs):
         """Run a synchronous function on a worker thread under the same cap."""
@@ -155,34 +171,151 @@ class CallLimiter:
             finally:
                 self._leave()
 
-    async def _acquire(self) -> None:
-        await self._take_tokens()
+    def _estimate(self, payload: Any, reserved_output: int | None) -> int:
+        if self.tokens_per_minute <= 0:
+            return 0
+        reserve = self.reserved_output_tokens if reserved_output is None else max(0, int(reserved_output))
+        return estimate_input_tokens(payload) + reserve
+
+    async def _attempt(self, runnable, payload, *, timeout: float | None, estimate: int):
+        """One provider attempt: reserve budgets, hold one shared slot, reconcile."""
+        record = {"queue_wait": 0.0, "latency": None, "reserved": 0.0, "usage": None}
+        held = False
+        try:
+            await self._reserve_budgets(record, estimate)
+            await self._acquire_slot(record)
+            held = True
+            result = await self._invoke(runnable, payload, timeout=timeout, record=record)
+            record["usage"] = usage_from_result(result)
+            self._on_success()
+            return result
+        finally:
+            await self._reconcile(record)
+            self._remember(record)
+            if held:
+                await self._release_async()
+
+    async def _reserve_budgets(self, record: dict, estimate: int) -> None:
+        started = self._clock()
+        await self._take_amount(1, kind="requests")
+        if self.tokens_per_minute > 0 and estimate > 0:
+            await self._take_amount(estimate, kind="tokens")
+            record["reserved"] = float(estimate)
+        record["queue_wait"] = max(0.0, self._clock() - started)
+
+    async def _acquire_slot(self, record: dict) -> None:
+        started = self._clock()
         async with self._gate:
             while self._in_flight >= self.limit:
                 await self._gate.wait()
             self._enter()
+        record["queue_wait"] = float(record.get("queue_wait") or 0) + max(0.0, self._clock() - started)
 
     async def _release_async(self) -> None:
         async with self._gate:
             self._leave()
             self._gate.notify()
 
-    async def _take_tokens(self) -> None:
-        """Optional token bucket. ``tokens_per_minute`` of 0 leaves it open."""
+    async def _take_amount(self, amount: float, *, kind: str) -> None:
+        """Wait until ``kind`` (``tokens`` or ``requests``) can spare ``amount``."""
+        cap = self.tokens_per_minute if kind == "tokens" else self.requests_per_minute
+        amount = float(amount)
+        if cap <= 0 or amount <= 0:
+            return
+        while True:
+            async with self._budget_lock:
+                self._refill(self._clock(), kind)
+                level = self._tokens if kind == "tokens" else self._requests
+                if level >= amount:
+                    if kind == "tokens":
+                        self._tokens = level - amount
+                    else:
+                        self._requests = level - amount
+                    return
+                delay = (amount - level) * 60.0 / cap
+            await self._sleep(max(0.0, delay))
+
+    def _refill(self, now: float, kind: str) -> None:
+        cap = self.tokens_per_minute if kind == "tokens" else self.requests_per_minute
+        if cap <= 0:
+            return
+        if kind == "tokens":
+            stamp = self._token_stamp
+            level = self._tokens
+        else:
+            stamp = self._request_stamp
+            level = self._requests
+        if stamp is None:
+            if kind == "tokens":
+                self._token_stamp = now
+            else:
+                self._request_stamp = now
+            return
+        elapsed = max(0.0, now - float(stamp))
+        level = min(cap, level + elapsed * (cap / 60.0))
+        if kind == "tokens":
+            self._tokens = level
+            self._token_stamp = now
+        else:
+            self._requests = level
+            self._request_stamp = now
+
+    async def _reconcile(self, record: dict) -> None:
+        """Replace the reservation with actual input + output when the provider reported it."""
         if self.tokens_per_minute <= 0:
             return
-        loop = asyncio.get_running_loop()
-        while True:
-            now = loop.time()
-            if self._token_stamp <= 0:
-                self._token_stamp = now
-            elapsed = now - self._token_stamp
-            self._tokens = min(self.tokens_per_minute, self._tokens + elapsed * (self.tokens_per_minute / 60.0))
-            self._token_stamp = now
-            if self._tokens >= 1:
-                self._tokens -= 1
-                return
-            await asyncio.sleep(max(0.01, (1 - self._tokens) * 60.0 / self.tokens_per_minute))
+        reserved = float(record.get("reserved") or 0)
+        if reserved <= 0:
+            return
+        usage = record.get("usage") or {}
+        actual = int(usage.get("total_tokens") or 0)
+        if actual <= 0:
+            actual = int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
+        if actual <= 0:
+            return
+        async with self._budget_lock:
+            self._refill(self._clock(), "tokens")
+            self._tokens += reserved - actual
+            if self._tokens > self.tokens_per_minute:
+                self._tokens = self.tokens_per_minute
+
+    def _clock(self) -> float:
+        if self._clock_override is not None:
+            return float(self._clock_override())
+        return asyncio.get_running_loop().time()
+
+    async def _sleep(self, seconds: float) -> None:
+        seconds = max(0.0, float(seconds))
+        if self._sleep_override is not None:
+            await self._sleep_override(seconds)
+            return
+        # Sleep even for zero so a retry yields the slot to another waiter.
+        await asyncio.sleep(seconds)
+
+    def _remember(self, record: dict) -> None:
+        latency = record.get("latency")
+        queue = float(record.get("queue_wait") or 0)
+        if latency is not None:
+            self.request_latencies.append(float(latency))
+        if queue > 0:
+            self.queue_waits.append(queue)
+        bucket = self._accounting.get()
+        if bucket is not None:
+            bucket.append(
+                {
+                    "latency": None if latency is None else float(latency),
+                    "queue_wait": queue,
+                }
+            )
+
+    def _add_queue_wait(self, seconds: float) -> None:
+        seconds = float(seconds or 0)
+        if seconds <= 0:
+            return
+        self.queue_waits.append(seconds)
+        bucket = self._accounting.get()
+        if bucket is not None:
+            bucket.append({"latency": None, "queue_wait": seconds})
 
     def _on_success(self) -> None:
         self._success_streak += 1
@@ -238,14 +371,18 @@ class CallLimiter:
             "idle_seconds": idle_seconds,
             "max_idle_seconds": round(max((float(item["seconds"]) for item in gaps), default=0.0), 4),
             "max_in_flight": self.max_in_flight,
+            "request_latency_seconds": [round(item, 4) for item in self.request_latencies],
+            "queue_wait_seconds": round(sum(self.queue_waits), 4),
         }
 
-    async def _invoke(self, runnable, payload, *, timeout: float | None = None):
+    async def _invoke(self, runnable, payload, *, timeout: float | None = None, record: dict | None = None):
         """One model call, cut off at ``timeout`` seconds, or ``request_timeout``.
 
         A timeout of 0 or less waits for the provider. The default is 120.
+        Latency on ``record`` is the provider call only, not queue or backoff.
         """
         self._mark("call_start")
+        started = time.perf_counter()
         limit = self.request_timeout if timeout is None else float(timeout)
         try:
             call = runnable.ainvoke(payload)
@@ -253,17 +390,9 @@ class CallLimiter:
                 return await asyncio.wait_for(call, limit)
             return await call
         finally:
+            if record is not None:
+                record["latency"] = time.perf_counter() - started
             self._mark("call_end")
-
-    async def _gather(self, runnable, batch: Sequence[Any]) -> list[Any]:
-        """Run a batch with one deadline per call and the current concurrency cap."""
-        gate = asyncio.Semaphore(max(1, self.limit))
-
-        async def one(payload):
-            async with gate:
-                return await self._invoke(runnable, payload)
-
-        return list(await asyncio.gather(*(one(payload) for payload in batch), return_exceptions=True))
 
     def _wait(self, attempt: int, exc: BaseException | None) -> float:
         """Backoff for one retry. ``Retry-After`` cannot exceed ``max_backoff``.
@@ -288,14 +417,11 @@ class CallLimiter:
                     raise
                 self._note_transient(exc)
                 wait = self._wait(attempt, exc)
-                # Release the slot before sleeping so a sweep or another
-                # passage can use it. The slot is taken again for the retry.
-                await self._release_async()
-                try:
-                    self._mark("idle_sleep", seconds=round(wait, 4))
-                    await asyncio.sleep(wait)
-                finally:
-                    await self._acquire()
+                # The attempt already released its slot. Sleep with the gate
+                # free so another passage or sweep can use it, then retry.
+                self._mark("idle_sleep", seconds=round(wait, 4))
+                self._add_queue_wait(wait)
+                await self._sleep(wait)
         raise RuntimeError("retry loop exited without a result")
 
     def _enter(self) -> None:
@@ -453,6 +579,66 @@ def usage_from_message(raw: Any) -> dict[str, int]:
     }
 
 
+def usage_from_result(result: Any) -> dict[str, int]:
+    """Token counts from a structured result, including a response that failed to parse."""
+    raw = result
+    if isinstance(result, dict) and "parsed" in result:
+        raw = result.get("raw")
+    return usage_from_message(raw)
+
+
+def combine_usage(*parts: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Sum token usage. A schema repair keeps every attempt, not only the success."""
+    keys = ("input_tokens", "output_tokens", "total_tokens")
+    total = {key: 0 for key in keys}
+    attempts: list[dict[str, int]] = []
+    for part in parts:
+        if not part:
+            continue
+        nested = part.get("attempt_usage")
+        if isinstance(nested, list) and nested:
+            for row in nested:
+                attempts.append({key: int((row or {}).get(key) or 0) for key in keys})
+        else:
+            row = {key: int(part.get(key) or 0) for key in keys}
+            if row["total_tokens"] == 0:
+                row["total_tokens"] = row["input_tokens"] + row["output_tokens"]
+            if any(row.values()):
+                attempts.append(row)
+        for key in keys:
+            total[key] += int(part.get(key) or 0)
+    if total["total_tokens"] == 0:
+        total["total_tokens"] = total["input_tokens"] + total["output_tokens"]
+    if len(attempts) > 1:
+        total["attempt_usage"] = attempts
+    return total
+
+
+def estimate_input_tokens(payload: Any) -> int:
+    """Estimated input tokens for a limiter reservation.
+
+    Chat messages use the coding tokenizer estimate. Anything else is the
+    character estimate of its JSON form.
+    """
+    from automated_grounded_theory.batching import count_message_tokens, estimate_tokens
+
+    if payload is None:
+        return 0
+    if isinstance(payload, str):
+        return estimate_tokens(payload)
+    if isinstance(payload, (list, tuple)) and payload and _is_message(payload[0]):
+        return count_message_tokens(payload)
+    try:
+        raw = json.dumps(_jsonable(payload), ensure_ascii=False)
+    except TypeError:
+        raw = repr(payload)
+    return estimate_tokens(raw)
+
+
+def _is_message(value: Any) -> bool:
+    return hasattr(value, "content") and not isinstance(value, (str, bytes, dict, list, tuple))
+
+
 def structured_runnable(model, schema):
     """Prefer strict JSON schema, then looser structured output, always with raw usage when possible."""
     attempts = (
@@ -552,20 +738,35 @@ def sweep_deadline(request_timeout: float, sweep_timeout: float) -> float:
     return max(coding, sweep)
 
 
-async def ainvoke_structured(model, schema, messages: Sequence, limiter, *, timeout: float | None = None) -> tuple[tuple[dict, dict], list]:
+async def ainvoke_structured(
+    model,
+    schema,
+    messages: Sequence,
+    limiter,
+    *,
+    timeout: float | None = None,
+    reserved_output: int | None = None,
+) -> tuple[tuple[dict, dict], list]:
     """Invoke ``schema`` once, then repair a single malformed output.
 
     The follow-up user message starts with ``REPAIR THIS OUTPUT``. The second
     failure raises the first parse error. Returns ``((payload, usage), messages)``.
+    Usage on a repaired call includes the failed response as well as the
+    successful one.
     """
     from langchain_core.messages import HumanMessage
 
     runnable = structured_runnable(model, schema)
-    extra = {} if timeout is None else {"timeout": timeout}
+    extra: dict[str, Any] = {}
+    if timeout is not None:
+        extra["timeout"] = timeout
+    if reserved_output is not None:
+        extra["reserved_output"] = reserved_output
     result = await limiter.ainvoke(runnable, list(messages), **extra)
     try:
         return parse_structured(result, schema), list(messages)
     except ValueError as first:
+        failed_usage = usage_from_result(result)
         repair = list(messages) + [
             HumanMessage(
                 content=(
@@ -578,7 +779,8 @@ async def ainvoke_structured(model, schema, messages: Sequence, limiter, *, time
         try:
             limiter.schema_repairs = int(getattr(limiter, "schema_repairs", 0) or 0) + 1
             repaired = await limiter.ainvoke(runnable, repair, **extra)
-            return parse_structured(repaired, schema), repair
+            payload, usage = parse_structured(repaired, schema)
+            return (payload, combine_usage(failed_usage, usage)), repair
         except ValueError:
             raise first from None
 

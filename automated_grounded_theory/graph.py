@@ -477,15 +477,25 @@ def _code_worker(runtime: RunConfig):
             "policy_version": state.get("worker_policy_version") or POLICY_VERSION,
         }
         book = dict(state.get("worker_codebook") or {})
-        coded = await _code_indexed(
-            runtime,
-            passages,
-            list(range(len(passages))),
-            state.get("worker_slices"),
-            book,
-            documents=dict(state.get("worker_documents") or {}),
-        )
-        elapsed = time.perf_counter() - started
+        bucket: list[dict] = []
+        push = getattr(runtime.limiter, "push_accounting", None)
+        token = push(bucket) if push is not None else None
+        try:
+            coded = await _code_indexed(
+                runtime,
+                passages,
+                list(range(len(passages))),
+                state.get("worker_slices"),
+                book,
+                documents=dict(state.get("worker_documents") or {}),
+            )
+        finally:
+            pop = getattr(runtime.limiter, "pop_accounting", None)
+            if pop is not None and token is not None:
+                pop(token)
+        ended = time.perf_counter()
+        latencies = [float(row["latency"]) for row in bucket if row.get("latency") is not None]
+        queues = [float(row.get("queue_wait") or 0) for row in bucket]
         items = []
         for index, passage in zip(indices, passages):
             passage_key = str(passage.get("passage_id"))
@@ -501,12 +511,67 @@ def _code_worker(runtime: RunConfig):
                     "doc_id": state.get("worker_doc_id"),
                     "coding": coding,
                     "attempt_errors": attempt_errors,
-                    "elapsed": round(elapsed, 4),
+                    "wall_start": started,
+                    "wall_end": ended,
+                    "request_latencies": latencies,
+                    "queue_waits": queues,
                 }
             )
         return {"proposal_buffer": {"items": items, "duplicates": 0, "conflicts": []}}
 
     return code_worker
+
+
+def union_seconds(intervals: Sequence[tuple[float, float]]) -> float:
+    """Seconds covered by ``intervals``, counting overlap once."""
+    ordered = sorted((float(start), float(end)) for start, end in intervals if end >= start)
+    if not ordered:
+        return 0.0
+    total = 0.0
+    start, end = ordered[0]
+    for left, right in ordered[1:]:
+        if left <= end:
+            end = max(end, right)
+        else:
+            total += end - start
+            start, end = left, right
+    return total + (end - start)
+
+
+def fold_coding_times(proposals: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Wall time, per-request latency, and queue wait for one commit.
+
+    A batch duration is stored on every passage that shared the call. It is
+    counted once, keyed by ``job_id``. Overlapping batches contribute the
+    union of their intervals to wall time. Latency samples are the provider
+    calls, not a copy of that wall time.
+    """
+    intervals: list[tuple[float, float]] = []
+    latencies: list[float] = []
+    queue = 0.0
+    seen: set[str] = set()
+    for index, item in enumerate(proposals):
+        job = str(item.get("job_id") or "")
+        if not job:
+            job = f"row-{item.get('passage_index', index)}"
+        if job in seen:
+            continue
+        seen.add(job)
+        start = item.get("wall_start")
+        end = item.get("wall_end")
+        if start is not None and end is not None:
+            intervals.append((float(start), float(end)))
+        for sample in item.get("request_latencies") or []:
+            if sample is None:
+                continue
+            latencies.append(float(sample))
+        for sample in item.get("queue_waits") or []:
+            queue += float(sample or 0)
+    return {
+        "wall_seconds": round(union_seconds(intervals), 4),
+        "request_latencies": [round(sample, 4) for sample in latencies],
+        "queue_wait_seconds": round(queue, 4),
+    }
 
 
 def _commit_node(runtime: RunConfig):
@@ -578,16 +643,23 @@ def _commit_node(runtime: RunConfig):
                 {"snapshot_id": str(state.get("snapshot_id") or ""), "pairs": in_batch_pairs}
             )
             metrics["in_batch_rounds"] = in_batch_rounds
-        samples = list(metrics.get("coding_seconds") or [])
-        samples.extend(float(item.get("elapsed") or 0) for item in fresh)
+        folded = fold_coding_times(list(fresh) + list(stale))
+        samples = list(metrics.get("coding_request_latency_seconds") or metrics.get("coding_seconds") or [])
+        samples.extend(folded["request_latencies"])
         metrics["coding_seconds"] = samples
+        metrics["coding_request_latency_seconds"] = samples
         metrics["coding_p50"] = percentile(samples, 50)
         metrics["coding_p95"] = percentile(samples, 95)
-        timing = dict(update.get("stage_seconds") or state.get("stage_seconds") or {})
-        timing["coding"] = round(
-            float(timing.get("coding") or 0) + sum(float(item.get("elapsed") or 0) for item in fresh),
+        metrics["coding_queue_wait_seconds"] = round(
+            float(metrics.get("coding_queue_wait_seconds") or 0) + folded["queue_wait_seconds"],
             4,
         )
+        metrics["coding_wall_seconds"] = round(
+            float(metrics.get("coding_wall_seconds") or 0) + folded["wall_seconds"],
+            4,
+        )
+        timing = dict(update.get("stage_seconds") or state.get("stage_seconds") or {})
+        timing["coding"] = metrics["coding_wall_seconds"]
         update["stage_seconds"] = timing
         limiter = runtime.limiter
         metrics["transport_retries"] = int(getattr(limiter, "timeout_retries", 0) or 0) + int(
@@ -1251,6 +1323,10 @@ async def _invoke_coding(
         model_name=runtime.model_name,
         passage_id=passage_ids,
         runtime=runtime,
+        reserved_output=reserved_output_tokens(
+            len(passages),
+            max_codes_per_passage=runtime.max_codes_per_passage,
+        ),
     )
     return _align_batch(parsed, passages)
 
@@ -1946,7 +2022,11 @@ def _sweep_update(
 def _export_node(runtime: RunConfig):
     def export_node(state: CodingState) -> dict:
         metrics = dict(state.get("metrics") or {})
-        metrics["activity"] = runtime.limiter.activity_report()
+        report = runtime.limiter.activity_report()
+        metrics["activity"] = report
+        metrics["max_in_flight"] = report.get("max_in_flight")
+        metrics["request_latency_seconds"] = list(report.get("request_latency_seconds") or [])
+        metrics["queue_wait_seconds"] = report.get("queue_wait_seconds")
         state = {**state, "metrics": metrics}
         provisional = result_from_state(state, interrupted=False, thread_id=str(state.get("metadata", {}).get("thread_id") or ""), resumable=False)
         paths: dict[str, str] = {}
@@ -2588,13 +2668,19 @@ async def _ainvoke_structured(
     model_name: str,
     passage_id: str,
     runtime: RunConfig,
+    reserved_output: int | None = None,
 ) -> dict:
     timeout = None
     if kind in {"sweep", "merge_verify", "definition_rewrite", "quote_fit"}:
         timeout = sweep_deadline(runtime.limiter.request_timeout, runtime.sweep_timeout)
     try:
         (payload, usage), used = await ainvoke_structured(
-            model, schema, messages, runtime.limiter, timeout=timeout
+            model,
+            schema,
+            messages,
+            runtime.limiter,
+            timeout=timeout,
+            reserved_output=reserved_output,
         )
     except Exception as exc:
         raise CodingError(f"{kind} failed for {passage_id}: {exc}") from exc
@@ -2642,6 +2728,9 @@ async def _abatch_structured(
             payload, usage = parse_structured(result, schema)
             used = messages
         except ValueError:
+            # The failed response is already in the limiter cache. Replaying it
+            # through ainvoke_structured repairs once and reports that usage
+            # plus the repaired response. Adding it here would count it twice.
             try:
                 (payload, usage), used = await ainvoke_structured(
                     model, schema, messages, runtime.limiter, timeout=timeout

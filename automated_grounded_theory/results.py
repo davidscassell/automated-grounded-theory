@@ -158,7 +158,7 @@ def result_from_state(
             key: round(float(value), 4) for key, value in dict(state.get("stage_seconds") or {}).items()
         }
     metrics = dict(state.get("metrics") or {})
-    samples = list(metrics.get("coding_seconds") or [])
+    samples = list(metrics.get("coding_request_latency_seconds") or metrics.get("coding_seconds") or [])
     if samples:
         metrics["coding_p50"] = percentile(samples, 50)
         metrics["coding_p95"] = percentile(samples, 95)
