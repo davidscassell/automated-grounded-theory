@@ -45,7 +45,9 @@ Prefer one action and one object. Before you finish a code, ask whether it hides
 second idea (who, why, or a consequence). If it does, return another code. Return \
 one code per distinct incident. Spans may overlap. A passage may carry zero codes \
 or several. A passage that both praises and criticizes needs a separate code for \
-each incident.
+each incident. One new label names a single concept. Do not join two codes with a \
+semicolon. Do not put a comma list of concepts, or several concepts joined by \
+"and", into one new label. Return each concept as its own code.
 
 In-vivo codes: set in_vivo true only when every one of these is true. If one fails, \
 in_vivo is false.
@@ -713,19 +715,46 @@ def build_rewrite_messages(
     return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=request.model_dump_json(indent=2))]
 
 
+_LABEL_FEEDBACK = {
+    "empty_code": (
+        "The label was empty. Return one short code for this incident. Do not leave the code blank."
+    ),
+    "code_too_long": (
+        "The label is too long. Return one short gerund, usually two to six words "
+        "(at most 8 words and 80 characters, or 12 words and 120 characters when in_vivo is true)."
+    ),
+    "bundled_concepts": (
+        "This new label bundles several concepts. Return a single concept. "
+        "Put each other concept in its own code. Do not join codes with a semicolon, "
+        "a comma list, or repeated 'and'."
+    ),
+}
+
+
 def validation_feedback(rejections: Sequence[Mapping[str, Any]]) -> str:
     lines = [
         "The previous coding was checked against the passage, its neighbors, and the document.",
         "Copy the participant's words. A closer quote is better.",
         "quote_not_verbatim means the quote was not found as written. The code is kept either way.",
     ]
+    saw: set[str] = set()
     for item in rejections:
-        status = item.get("quote_status") or item.get("reason", "rejected")
+        item_reasons = [str(item.get("reason") or "rejected")]
+        for extra in item.get("reasons") or []:
+            name = str(extra)
+            if name not in item_reasons:
+                item_reasons.append(name)
+        status = item.get("quote_status") or item_reasons[0]
         lines.append(
-            f"- code {item.get('code', '')!r}: {item.get('reason', 'rejected')} "
+            f"- code {item.get('code', '')!r}: {item_reasons[0]} "
             f"(quote_status={status}; quote_not_verbatim means the quote was not found in the passage)"
         )
-    if any(item.get("reason") == "context_restatement" for item in rejections):
+        for reason in item_reasons:
+            saw.add(reason)
+            detail = _LABEL_FEEDBACK.get(reason)
+            if detail:
+                lines.append(f"  {detail}")
+    if "context_restatement" in saw:
         lines.append(
             "A rejected label mostly restates the research context. "
             "Reword it from the participant's words in the passage."

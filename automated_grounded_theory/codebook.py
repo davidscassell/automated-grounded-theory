@@ -13,14 +13,21 @@ from typing import Any, Mapping, Sequence
 from automated_grounded_theory.retrieval import jaccard
 from automated_grounded_theory.validation import (
     is_code_id_text,
+    LABEL_HOLD_REASONS,
+    LENIENT_LABEL_REASONS,
     QUOTE_FLAG_STATUSES,
     assess_label,
     attribute_leak,
     bounded_unit,
+    bundled_concepts,
     code_key,
+    display_label,
+    gerund_ok,
     label_restates_context,
+    lenient_label_fields,
     anchor_quote,
     review_passage_flags,
+    split_joined_label,
     substantive_memo,
 )
 
@@ -94,6 +101,9 @@ def _fallback_rationale(op: str, reason: str) -> str:
             "The quote could not be anchored in the passage, its neighbors, or the document, so the code was kept and flagged."
         ),
         "definition_not_survivor": "A definition for a retired code was ignored so it would not replace the survivor.",
+        "empty_code": "The label was empty, so the code was kept under a review flag instead of being dropped.",
+        "code_too_long": "The label is too long, so the code was kept and flagged for review.",
+        "bundled_concepts": "The label bundles several concepts, so the code was kept and flagged for review.",
     }.get(reason)
     if text:
         return text
@@ -133,6 +143,59 @@ def _index_ids(codebook: Mapping[str, Mapping[str, Any]]) -> dict[str, str]:
     for key, entry in codebook.items():
         index[str(entry.get("code_id") or _code_id(key))] = key
     return index
+
+
+def expand_joined_labels(proposals: Sequence[Mapping[str, Any]]) -> list[dict]:
+    """Split semicolon-joined labels into one proposal per candidate code.
+
+    Each piece is validated on its own. A later piece does not keep the
+    original code id, so it can match an existing label or become its own
+    code. A label with no semicolon is unchanged.
+    """
+    expanded: list[dict] = []
+    for proposal in proposals:
+        incoming = dict(proposal)
+        label = str(incoming.get("code") or "")
+        if ";" not in label:
+            expanded.append(incoming)
+            continue
+        parts = split_joined_label(label)
+        multi = len(parts) > 1
+        for index, part in enumerate(parts):
+            row = dict(incoming)
+            row["code"] = part
+            if multi:
+                row["code_id"] = ""
+                row["refined_label"] = None
+                row["_joined_part"] = True
+                if index:
+                    row["action"] = "new"
+            expanded.append(row)
+    return expanded
+
+
+def _fields_for_known(entry: Mapping[str, Any], label: str, key: str) -> dict[str, Any]:
+    """Reuse the stored label when a candidate matches a code already in the book."""
+    shown = str(entry.get("code") or display_label(label) or label)
+    return {
+        "code": shown,
+        "key": key,
+        "in_vivo": bool(entry.get("in_vivo", False)),
+        "gerund_ok": bool(entry.get("gerund_ok", gerund_ok(shown))),
+    }
+
+
+def _mark_label_review(entry: dict, reasons: Sequence[str]) -> None:
+    """Keep empty, over-long, and bundled labels visible on the code itself."""
+    flags = [reason for reason in reasons if reason in LABEL_HOLD_REASONS]
+    if not flags:
+        return
+    entry["needs_review"] = True
+    stored = [str(reason) for reason in (entry.get("review_reasons") or [])]
+    for flag in flags:
+        if flag not in stored:
+            stored.append(flag)
+    entry["review_reasons"] = stored
 
 
 def opposite_valence(left: Any, right: Any) -> bool:
@@ -514,14 +577,21 @@ def interpret_coding(
     flagged ``possibly_modified`` or ``unanchored`` and coding continues.
     ``quote_retries`` lists those flags so the caller can ask for a closer
     quote once, then keep the code anyway.
+
+    A semicolon-joined label is split first. Each piece is validated on its
+    own, and a piece that matches an existing code is reused. An empty label,
+    a label over the length limit, or a new label that bundles several
+    concepts is listed on ``label_retries`` and still accepted with a review
+    flag. Generic labels are rejected.
     """
     payload = coding.model_dump() if hasattr(coding, "model_dump") else dict(coding)
-    proposals = list(payload.get("codes") or [])
+    proposals = expand_joined_labels(list(payload.get("codes") or []))
     rejections: list[dict] = []
     accepted: list[dict] = []
     ops: list[dict] = []
     review: list[dict] = []
     quote_retries: list[dict] = []
+    label_retries: list[dict] = []
     seen_keys: set[str] = set()
     low_confidence = bool(payload.get("low_confidence"))
     passage_text = str(passage.get("text") or "")
@@ -611,8 +681,17 @@ def interpret_coding(
             require_gerund=require_gerund,
         )
         if not ok:
-            rejections.append({"code": label, "reason": reasons[0] if reasons else "rejected", "quote": verbatim})
-            continue
+            reason = reasons[0] if reasons else "rejected"
+            matched = provisional_key in known or provisional_key in seen_keys
+            if reason in LENIENT_LABEL_REASONS and matched:
+                fields = _fields_for_known(known.get(provisional_key) or {}, label, provisional_key)
+                reasons = []
+            elif reason in LENIENT_LABEL_REASONS:
+                fields = lenient_label_fields(label, in_vivo=in_vivo, passage=passage_text)
+                reasons = [reason]
+            else:
+                rejections.append({"code": label, "reason": reason, "quote": verbatim})
+                continue
         if quote_flag:
             quote_retries.append(
                 {
@@ -638,16 +717,38 @@ def interpret_coding(
                 require_gerund=require_gerund,
             )
             if not refined_ok:
-                rejections.append(
-                    {
-                        "code": refined_label,
-                        "reason": refined_reasons[0] if refined_reasons else "rejected",
-                        "quote": verbatim,
-                    }
-                )
-                continue
+                reason = refined_reasons[0] if refined_reasons else "rejected"
+                if reason in LENIENT_LABEL_REASONS:
+                    refined_fields = lenient_label_fields(
+                        refined_label,
+                        in_vivo=in_vivo,
+                        passage=passage_text,
+                    )
+                    refined_reasons = [reason]
+                else:
+                    rejections.append({"code": refined_label, "reason": reason, "quote": verbatim})
+                    continue
             fields = refined_fields
-            reasons = list(reasons) + [reason for reason in refined_reasons if reason not in reasons]
+            reasons = [reason for reason in reasons if reason not in LABEL_HOLD_REASONS]
+            reasons.extend(reason for reason in refined_reasons if reason not in reasons)
+
+        prospective_key = str(fields.get("key") or "")
+        if prospective_key in seen_keys and action == "new":
+            action = "reuse"
+        if action == "new" and bundled_concepts(str(fields.get("code") or "")):
+            if "bundled_concepts" not in reasons:
+                reasons.append("bundled_concepts")
+        hold_reasons = [name for name in LABEL_HOLD_REASONS if name in reasons]
+        if hold_reasons:
+            label_retries.append(
+                {
+                    "code": label,
+                    "source_code": str(proposal.get("code") or ""),
+                    "reason": hold_reasons[0],
+                    "reasons": hold_reasons,
+                    "quote": quote,
+                }
+            )
 
         confidence = bounded_unit(proposal.get("confidence"), 1.0)
         if proposal.get("confidence") is not None:
@@ -804,6 +905,18 @@ def interpret_coding(
             )
             ops.append(held_context)
             review.append(held_context)
+        for hold_reason in LABEL_HOLD_REASONS:
+            if hold_reason not in review_flags:
+                continue
+            held_label = _op(
+                op=op_name,
+                status="review",
+                confidence=confidence,
+                ids={"passage_id": passage_id, "code_id": _code_id(key)},
+                reason=hold_reason,
+            )
+            ops.append(held_label)
+            review.append(held_label)
         if "in_vivo_below_review_threshold" in review_flags:
             held_flag = _op(
                 op="in_vivo",
@@ -864,6 +977,8 @@ def interpret_coding(
         "ops": ops,
         "review": review,
         "quote_retries": quote_retries,
+        "label_retries": label_retries,
+        "expanded_codes": proposals,
     }
 
 
@@ -959,6 +1074,7 @@ def commit_passage(
             book[key]["gerund_ok"] = item["gerund_ok"]
         elif item["in_vivo"]:
             book[key]["in_vivo"] = True
+        _mark_label_review(book[key], item.get("review_reasons") or [])
 
         if item.get("doc_start") is None or item.get("doc_end") is None:
             span_key = (

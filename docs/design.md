@@ -1,4 +1,4 @@
-# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1 and 0.6.2)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, and 0.6.3)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
 Status: steps 1 and 2 of the v0.6 plan. Category development, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
@@ -76,7 +76,7 @@ Uncertainty flags: `ambiguous_span`, `insufficient_context`, `competing_code`, `
 
 `segment_and_shuffle` → `prepare_round` → `Send("code_worker")` → `commit` → `sweep` → `consolidate` → `export`.
 
-`prepare_round` freezes `snapshot_id`, `definition_revision`, `evidence_revision`, and `policy_version` (`0.6.2`). Workers do not mutate the codebook. The proposal reducer dedupes by proposal id, drops conflicting payloads, sorts, and clears only on `{"__reset__": True}`. `commit` rejects a stale snapshot id, skips proposal ids already committed, and is the only writer of definitions.
+`prepare_round` freezes `snapshot_id`, `definition_revision`, `evidence_revision`, and `policy_version` (`0.6.3`). Workers do not mutate the codebook. The proposal reducer dedupes by proposal id, drops conflicting payloads, sorts, and clears only on `{"__reset__": True}`. `commit` rejects a stale snapshot id, skips proposal ids already committed, and is the only writer of definitions.
 
 `get_graph("themes")` fans chunk workers out with `Send` into `theme_worker`, then joins at `validate`. The reporting graph is separate from category development.
 
@@ -138,6 +138,12 @@ Before the commit writes a round, one comparison call judges the new codes propo
 
 Sweep, merge-check, definition-rewrite, and quote-fit calls use `sweep_timeout` (default 300 seconds) when that is longer than `request_timeout`. A zero on either side waits with no deadline.
 
-## 11. Out of scope
+## 11. Corrections in 0.6.3
+
+A semicolon-joined label is split into separate candidate codes before validation. Each piece is checked on its own. A piece whose label matches a code already in the book is reused.
+
+An empty label, a label over the length limit, and a new label that bundles several concepts are not dropped. Bundling means a comma list of three or more concepts, or three or more concepts joined by "and". The passage is sent back once with feedback that names the problem and asks for one concept. If the retry is still empty, too long, or bundled, or if it returns no codes, the code is kept and flagged (`empty_code`, `code_too_long`, or `bundled_concepts`). A blank label is stored as `(empty label)`. Generic labels are still rejected. `policy_version` is `0.6.3`.
+
+## 12. Out of scope
 
 Category feedback, focused recoding of earlier negatives, relationship hypotheses, sampling briefs, and a Taguette project-file adapter. See the v0.6 plan steps 3–5.

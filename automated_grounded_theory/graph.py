@@ -914,13 +914,15 @@ async def _code_batch(
     codebook: dict,
     documents: dict[str, str] | None = None,
 ) -> dict[str, tuple[dict, list]]:
-    """Code a batch. Weak quotes are retried once, then kept and flagged."""
+    """Code a batch. Weak quotes and bad labels are retried once, then kept and flagged."""
     pending = list(passages)
     feedback: dict[str, str] = {}
     errors: dict[str, list] = {str(passage.get("passage_id")): [] for passage in passages}
     done: dict[str, tuple[dict, list]] = {}
     earlier_coding: dict[str, dict] = {}
     flagged_keys: dict[str, set[str]] = {}
+    sibling_keys: dict[str, set[str]] = {}
+    label_hold_keys: dict[str, set[str]] = {}
     attempts = max(0, runtime.validation_retries) + 1
     for attempt in range(attempts):
         if not pending:
@@ -941,28 +943,56 @@ async def _code_batch(
                 context_terms=context_term_set(runtime.context),
                 document_text=(documents or {}).get(str(passage.get("doc_id") or ""), ""),
             )
+            coding = _coding_payload(coding)
+            coding["codes"] = list(interpreted.get("expanded_codes") or coding.get("codes") or [])
             quote_failures = list(interpreted.get("quote_retries") or [])
+            label_failures = list(interpreted.get("label_retries") or [])
             restated = [
                 {"code": item.get("code"), "reason": "context_restatement", "quote": item.get("quote")}
                 for item in interpreted["accepted"]
                 if "context_restatement" in (item.get("review_reasons") or [])
             ]
-            retryable = quote_failures + restated
+            label_keyset = {
+                code_key(str(item.get("source_code", item.get("code")) or "")) for item in label_failures
+            }
+            quote_keyset = {
+                code_key(str(item.get("code") or ""))
+                for item in quote_failures
+                if item.get("code") and code_key(str(item.get("code") or "")) not in label_keyset
+            }
+            sibling_keyset = {
+                code_key(str(item.get("code") or ""))
+                for item in coding.get("codes") or []
+                if item.get("_joined_part") and code_key(str(item.get("code") or "")) not in label_keyset
+            }
+            retryable = quote_failures + restated + label_failures
             if retryable and attempt < attempts - 1:
                 errors[passage_id].append(retryable)
-                earlier_coding[passage_id] = _coding_payload(coding)
-                flagged_keys[passage_id] = {
-                    code_key(str(item.get("code") or "")) for item in quote_failures if item.get("code")
-                }
+                earlier_coding[passage_id] = coding
+                flagged_keys[passage_id] = quote_keyset
+                sibling_keys[passage_id] = sibling_keyset
+                label_hold_keys[passage_id] = label_keyset
                 still_pending.append(passage)
                 feedback[passage_id] = validation_feedback(retryable)
             else:
                 if passage_id in earlier_coding:
+                    returned = list(coding.get("codes") or [])
                     coding = _preserve_flagged_codes(
                         earlier_coding[passage_id],
                         coding,
                         flagged_keys.get(passage_id) or set(),
                     )
+                    coding = _preserve_flagged_codes(
+                        earlier_coding[passage_id],
+                        coding,
+                        sibling_keys.get(passage_id) or set(),
+                    )
+                    if not returned:
+                        coding = _preserve_flagged_codes(
+                            earlier_coding[passage_id],
+                            coding,
+                            label_hold_keys.get(passage_id) or set(),
+                        )
                 done[passage_id] = (coding, errors[passage_id])
         pending = still_pending
     if runtime.check_model is not None:
@@ -1132,13 +1162,24 @@ def _validate_node(runtime: RunConfig):
                 for row in interpreted["accepted"]
                 if row.get("quote_status") in {"possibly_modified", "unanchored"}
             ]
-            if kept_quotes:
+            kept_labels = [
+                {
+                    "code": row.get("code"),
+                    "reason": reason,
+                    "quote": row.get("quote"),
+                    "kept": True,
+                }
+                for row in interpreted["accepted"]
+                for reason in (row.get("review_reasons") or [])
+                if reason in {"empty_code", "code_too_long", "bundled_concepts"}
+            ]
+            if kept_quotes or kept_labels:
                 validation_log.append(
                     {
                         "passage_id": passage.get("passage_id"),
                         "doc_id": passage.get("doc_id"),
                         "stage": "kept",
-                        "rejections": kept_quotes,
+                        "rejections": kept_quotes + kept_labels,
                     }
                 )
             for earlier in item.get("attempt_errors") or []:
