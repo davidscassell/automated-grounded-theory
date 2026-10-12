@@ -13,7 +13,7 @@ from automated_grounded_theory.api import (
 )
 from automated_grounded_theory.evaluate import aevaluate, chen_metrics, evaluate_run
 from automated_grounded_theory.context import PresetCodesError, ResearchContext
-from automated_grounded_theory.graph import CodingError
+from automated_grounded_theory.graph import CodingError, get_graph
 from automated_grounded_theory.results import OpenCodeResult, load_run
 from automated_grounded_theory.retrieval import (
     CodeRetriever,
@@ -45,6 +45,7 @@ __all__ = [
     "chen_metrics",
     "compare_runs",
     "evaluate_run",
+    "get_graph",
     "load_run",
     "multi_seed_stability",
     "open_code",

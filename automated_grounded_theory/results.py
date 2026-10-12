@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from automated_grounded_theory.codebook import codebook_list
+from automated_grounded_theory.records import materialize_records, percentile
 from automated_grounded_theory.saturation import saturation_report
 
 
@@ -156,6 +157,44 @@ def result_from_state(
         metadata["stage_seconds"] = {
             key: round(float(value), 4) for key, value in dict(state.get("stage_seconds") or {}).items()
         }
+    metrics = dict(state.get("metrics") or {})
+    samples = list(metrics.get("coding_seconds") or [])
+    if samples:
+        metrics["coding_p50"] = percentile(samples, 50)
+        metrics["coding_p95"] = percentile(samples, 95)
+    prompt_log = list(state.get("prompt_log") or [])
+    input_tokens = 0
+    output_tokens = 0
+    for entry in prompt_log:
+        usage = entry.get("usage") or {}
+        input_tokens += int(usage.get("input_tokens") or 0)
+        output_tokens += int(usage.get("output_tokens") or 0)
+    metrics["input_tokens"] = input_tokens
+    metrics["output_tokens"] = output_tokens
+    metadata["metrics"] = metrics
+    metadata["lost_distinction_audit"] = list(state.get("lost_distinction_candidates") or [])
+    metadata["policy_version"] = state.get("policy_version") or metadata.get("policy_version")
+    records = materialize_records(
+        documents=list(state.get("documents") or []),
+        passages=passages,
+        segments=list(state.get("segments") or []),
+        codebook=state.get("codebook") or {},
+    )
+    metadata["records"] = {
+        "documents": len(records["documents"]),
+        "incidents": len(records["incidents"]),
+        "evidence_spans": len(records["evidence_spans"]),
+        "code_versions": len(records["code_versions"]),
+    }
+    metadata["code_versions"] = records["code_versions"]
+    metadata["coverage"] = [
+        {
+            "incident_id": item["incident_id"],
+            "coverage_status": item["coverage_status"],
+            "exclusion_reason": item["exclusion_reason"],
+        }
+        for item in records["incidents"]
+    ]
     return OpenCodeResult(
         codebook=codebook_list(state.get("codebook") or {}),
         segments=list(state.get("segments") or []),

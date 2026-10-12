@@ -60,7 +60,11 @@ class CodeProposal(_LLMModel):
         description="What incident this code captures, grounded in the quote. Empty only when reusing unchanged.",
     )
     quote: str = Field(
-        description="Exact contiguous substring copied from the passage. Not from the neighboring context."
+        description=(
+            "Copy the participant's words. Prefer an exact span of the passage. "
+            "If the incident continues in the previous or next context, copy from there. "
+            "Use ... only to skip words you are not quoting. Do not paraphrase."
+        )
     )
     in_vivo: bool = Field(
         default=False,
@@ -78,6 +82,13 @@ class CodeProposal(_LLMModel):
     nearest_code_ids: list[str] = Field(
         default_factory=list,
         description="code_id values of the nearest codes you considered before creating. Empty when reusing.",
+    )
+    uncertainty_flags: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional flags: ambiguous_span, insufficient_context, competing_code, unsupported_inference. "
+            "Confidence stays a diagnostic and does not decide the code."
+        ),
     )
     confidence: float = Field(
         default=1.0,
@@ -171,7 +182,26 @@ class MergeDecision(_LLMModel):
     )
     quote_fits: list["QuoteFit"] = Field(
         default_factory=list,
-        description="One row per member quote. fits false means the quote should be split back out.",
+        description="One row per member quote. fits false means the evidence is mixed and the pair must not be aliased.",
+    )
+    comparison_op: str = Field(
+        default="",
+        description=(
+            "alias_duplicate only when definition and evidence name one concept. "
+            "Otherwise keep_distinct, link_to_category, record_dimension, or defer."
+        ),
+    )
+    contrast_checked: bool = Field(
+        default=False,
+        description="True only after comparing both definitions and their quotes for a different object or aspect.",
+    )
+    material_contrast: bool = Field(
+        default=False,
+        description="True when that contrast is a real difference. Do not alias when this is true.",
+    )
+    evidence_same: bool | None = Field(
+        default=None,
+        description="True when the quotes support one concept. False when the evidence is mixed.",
     )
 
 
@@ -386,6 +416,35 @@ class ThemeCoding(_LLMModel):
     negative_cases: list[ThemeNegative] = Field(default_factory=list)
 
 
+class InBatchCode(_LLMModel):
+    """One new code proposed in this round, not yet in the frozen codebook."""
+
+    label: str
+    definition: str = ""
+    quotes: list[str] = Field(default_factory=list)
+    valence: str = ""
+
+
+class InBatchRequest(_LLMModel):
+    """The new codes from one round, for a single comparison call."""
+
+    note: str = ""
+    codes: list[InBatchCode] = Field(default_factory=list)
+
+
+class InBatchComparison(_LLMModel):
+    """Decisions among the new codes of one round. Does not invent codes."""
+
+    merges: list[MergeDecision] = Field(
+        default_factory=list,
+        description=(
+            "Pairs among these newly proposed codes. "
+            "alias_duplicate only when definition and evidence name one concept. "
+            "Otherwise keep_distinct, link_to_category, or defer."
+        ),
+    )
+
+
 class SameCodeJudgment(_LLMModel):
     """Whether two open codes name the same kind of incident."""
 
@@ -444,6 +503,7 @@ class PassageInput(_LLMModel):
     next_text: str = ""
     metadata: dict = Field(default_factory=dict)
     nearest_code_ids: list[str] = Field(default_factory=list)
+    question: str = ""
 
 
 class CodingRequest(_LLMModel):

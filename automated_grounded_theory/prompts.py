@@ -41,8 +41,11 @@ Ask of each passage: what is this data a study of, what is actually happening, \
 and what category does this incident indicate?
 
 Code with short gerunds: simple, active, close to the data, usually two to six words. \
-Code the incident, not the topic. Return one code per distinct incident. A passage \
-that both praises and criticizes needs a separate code for each incident.
+Prefer one action and one object. Before you finish a code, ask whether it hides a \
+second idea (who, why, or a consequence). If it does, return another code. Return \
+one code per distinct incident. Spans may overlap. A passage may carry zero codes \
+or several. A passage that both praises and criticizes needs a separate code for \
+each incident.
 
 In-vivo codes: set in_vivo true only when every one of these is true. If one fails, \
 in_vivo is false.
@@ -65,8 +68,12 @@ shows the label or definition should change. Create a new code only when none of
 nearest codes fits. Before action create, set nearest_code to one of those labels, \
 nearest_code_ids to their code_id values, and why_not_nearest to the property this \
 incident has that the nearest code does not. \
-Do not mint a near-duplicate. Set valence to positive, negative, neutral, or mixed. \
-Praise and criticism are opposite stances and must not share a code. Set confidence \
+Do not mint a near-duplicate. nearest_code may be empty when no code exists yet \
+or no listed code is close. Set valence to positive, negative, neutral, or mixed. \
+Valence is context. It does not stop two codes from informing one category, and it \
+is not by itself a reason to merge them. Set uncertainty_flags when the span is \
+ambiguous, the context is thin, two codes compete, or the inference is unsupported. \
+Confidence is a diagnostic, not a probability. Set confidence \
 from 0 to 1 on the action, on in_vivo, and on the memo. Anchors: 0.2 thin or \
 contradictory evidence, 0.5 plausible, 0.8 the quotes support it, 0.95 the quotes \
 show it directly. Write a rationale of one to three sentences for the action, for \
@@ -83,8 +90,9 @@ words are the participant's. A label that could have been written from the conte
 alone, without this passage, is a leak. Do not write it. Do not quote or cite the \
 context in a memo.
 
-Quotes must be exact contiguous copies from inside the passage markers. Do not quote \
-neighbors, attributes, or the context. Do not paraphrase.
+Quotes should be copied from the participant's words. Prefer the passage. If the \
+incident continues in the previous or next context, copy from there instead of \
+paraphrasing. Use ... only for words you skip. Do not invent wording.
 
 Do not use generic labels such as "experience", "discussion", "theme", or "response".
 
@@ -96,7 +104,8 @@ that the book had no close code), a property or dimension this incident varies, 
 one emerging question the next passage could answer. Do not write a sentence that \
 only says no property was recorded.
 
-If several passages are in the user message, code every one of them."""
+If several passages are in the user message, return one passages item for every \
+passage_id. A missing passage_id is a failed slot, not an empty coding."""
 
 SWEEP_SYSTEM = """You are comparing codes with codes during open coding.
 
@@ -115,14 +124,22 @@ Each hint has a pair_id. Decide every hinted pair_id once. Put a hint you accept
 in merges. Put a hint you reject in rejections, with that pair_id and a rationale. \
 Do not omit a hinted pair. Do not reject a pair that was not hinted. Also propose \
 every other duplicate pair you find in this chunk, each with a rationale. Do not \
-merge codes that merely share a verb, a topic, or a sensitizing concept. When you \
-merge only when the codes share the same action, the same object, and the same \
-stance. Set same_action, same_object, and same_stance on every merge and rejection. \
-Keep the clearer label as the target and name the other code as the source. Never \
-merge a positive code with a negative code. Record source_valence and target_valence. \
-On each accept, set rewritten_label and rewritten_definition from the member quotes, \
-and set quote_fits for each example quote (fits false when a quote should be split \
-back out). Set confidence from 0 to 1. Anchors: 0.2 thin or contradictory, 0.5 \
+merge codes that merely share a verb, a topic, a platform name, or a sensitizing \
+concept. alias_duplicate only when the definitions name the same concept and the \
+quotes show that same concept. Set same_action and same_object true only then. \
+Before alias_duplicate, set contrast_checked true and material_contrast false: \
+you compared both definitions and their quotes and found no different object or \
+aspect. If the objects or aspects differ, set comparison_op to keep_distinct. \
+If the quotes disagree, set evidence_same false and comparison_op to defer. \
+If they belong in one category but are not one code, set comparison_op to \
+link_to_category. Set same_action, same_object, and same_stance on every merge \
+and rejection. Keep the clearer label as the target and name the other code as \
+the source. Record source_valence and target_valence. Stance is context, not a \
+merge veto, and it is not by itself a reason to alias. Do not treat a chain of \
+pairs as one merge. On each accept, set rewritten_label and rewritten_definition \
+from the member quotes, and set quote_fits for each example quote (fits false \
+means the evidence is mixed, so do not alias). Set confidence from 0 to 1. \
+Anchors: 0.2 thin or contradictory, 0.5 \
 plausible, 0.8 the quotes support it, 0.95 the quotes show it directly. Write a \
 rationale of one to three sentences on every merge, rejection, and definition.
 
@@ -312,6 +329,7 @@ def build_coding_messages(
                 next_text=clip(str(passage.get("next_text") or ""), 400),
                 metadata=dict(passage.get("metadata") or {}),
                 nearest_code_ids=[by_label.get(code_key(label), "") for label in labels if code_key(label)],
+                question=str(passage.get("question") or ""),
             )
         )
     notes = [note for note in (feedback or {}).values() if note]
@@ -393,15 +411,60 @@ def build_sweep_messages(
     return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=request.model_dump_json(indent=2))]
 
 
+IN_BATCH_SYSTEM = """You are comparing codes that were just proposed in one round.
+
+These codes are not in the frozen codebook yet. The passages were coded in \
+parallel, so the proposals have not been compared with each other. Read every \
+code. Alias two of them only when the definitions name the same concept and \
+the quotes show that same concept. Set comparison_op to alias_duplicate only \
+then, with same_action and same_object true, contrast_checked true, and \
+material_contrast false. If the objects or aspects differ, set comparison_op \
+to keep_distinct. If the quotes disagree, set evidence_same false and \
+comparison_op to defer. If they belong in one category but are not one code, \
+set comparison_op to link_to_category. Stance is context, not a reason to \
+alias and not a reason to refuse. Do not invent codes. Do not merge a chain \
+into one code. Set confidence from 0 to 1. Write a rationale of one to three \
+sentences on every decision."""
+
+
+def build_in_batch_messages(
+    *,
+    context: ResearchContext,
+    codes: Sequence[Mapping[str, Any]],
+    prompt_cache: bool,
+) -> list:
+    from automated_grounded_theory.schemas import InBatchCode, InBatchRequest
+
+    request = InBatchRequest(
+        note=(
+            "These codes were proposed against the same frozen snapshot. "
+            "Compare them with each other before they are committed. "
+            "Leave a distinct concept as its own code."
+        ),
+        codes=[
+            InBatchCode(
+                label=str(entry.get("code") or ""),
+                definition=str(entry.get("definition") or ""),
+                quotes=[str(quote) for quote in (entry.get("quotes") or []) if str(quote).strip()][:3],
+                valence=str(entry.get("valence") or ""),
+            )
+            for entry in codes
+        ],
+    )
+    system = IN_BATCH_SYSTEM + "\n\n" + render_context(context)
+    return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=request.model_dump_json(indent=2))]
+
+
 THEME_SYSTEM = """You are doing focused coding, the round after open coding (Charmaz).
 
 The open codes already exist. Group them into themes. A theme gathers codes \
 about the same kind of incident. Name the theme, define the incident it gathers, \
 and list a few properties (dimensions that vary inside it) when the codes show any.
 
-Assign every CODE_LABEL to exactly one theme. Copy the label text exactly. Do not \
-invent a code, do not rename a code, and do not drop one to keep the list short. \
-A code that could sit in two themes still goes to the one it fits best.
+Assign every CODE_LABEL to at least one theme. A code may belong to more than one \
+theme when it genuinely informs both. Copy the label text exactly. Do not invent a \
+code, do not rename a code, and do not drop one to keep the list short. \
+max_themes is a presentation budget, not a reason to erase a membership.
 
 Themes are categories of the codes in front of you. The research context is only \
 for understanding those codes. It is not a list of themes to force, and it is not \
@@ -652,13 +715,15 @@ def build_rewrite_messages(
 
 def validation_feedback(rejections: Sequence[Mapping[str, Any]]) -> str:
     lines = [
-        "The previous coding was checked against the passage and these items were rejected.",
-        "Copy quotes exactly from the passage markers. Do not repeat a rejected quote.",
+        "The previous coding was checked against the passage, its neighbors, and the document.",
+        "Copy the participant's words. A closer quote is better.",
+        "quote_not_verbatim means the quote was not found as written. The code is kept either way.",
     ]
     for item in rejections:
+        status = item.get("quote_status") or item.get("reason", "rejected")
         lines.append(
             f"- code {item.get('code', '')!r}: {item.get('reason', 'rejected')} "
-            f"(quote_not_verbatim means the quote was not found in the passage)"
+            f"(quote_status={status}; quote_not_verbatim means the quote was not found in the passage)"
         )
     if any(item.get("reason") == "context_restatement" for item in rejections):
         lines.append(

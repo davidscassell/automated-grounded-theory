@@ -1,6 +1,6 @@
 # Methodology
 
-This note maps the pipeline onto grounded theory practice. It is an engineering account of what the code does, not a claim that a model run is a finished analysis. Saturation is reported and is not declared.
+The default procedure is **Charmaz-informed automated analysis**: initial coding, constant comparison, and focused coding as a reporting view. It is not an axial-coding template and it does not claim theoretical saturation. Category development, theoretical sampling, and theory integration are later work. The engineering design is [docs/design.md](design.md).
 
 ## Sources
 
@@ -22,38 +22,40 @@ Hubert and Arabie (1985) is the adjustment used for the Adjusted Rand index on p
 | Step | Parameter | Practice |
 | --- | --- | --- |
 | Reject preset codes | `context` must not carry `codes`, `codebook`, `tags`, or a coding paradigm | Glaser 1992: emergence over forcing. The research question and sensitizing concepts only steer attention. |
-| Segment | `unit`: paragraph, sentence, line, or speaker turn | Charmaz: line-by-line or incident coding. Neighbors stay attached (JMIR 2025: context was a weak spot). |
+| Segment | `unit` default `incident` (also paragraph, sentence, line, speaker turn) | Interviewer question plus the full answer, then incidents of about 150–800 characters, never cut mid-sentence, capped near 1,200. Short survey comments stay one incident. Neighbors and the question stay attached. |
 | Order | `seed` shuffles documents; passages stay in reading order | Every document is read. The seed makes the document order repeatable. It is not theoretical sampling. |
-| Code | one document at a time; `batch_size` 1 commits after each passage | Constant comparison: a new incident is compared with codes already earned. The model must name the nearest code and why it does not fit before minting a new one (Glaser 1978; Charmaz). |
-| Within-document batches | `batch_size` above 1, capped by `token_budget` | Several passages of the *same* document share the codebook from the start of that step. That is faster and a milder break in comparison than mixing documents. Duplicates are left for synthesis. |
-| Memos | incident memo only when the passage adds a property, dimension, condition, consequence, or comparison | Corbin and Strauss; Charmaz. A document memo copies those incident memos. Empty passages are not sent and do not get a passage memo. |
+| Code | `batch_size` default 1; `concurrency` default 4 | Workers read one frozen snapshot (`Send`) and only the commit updates definitions. An incident may carry several overlapping spans. `nearest_code_id` may be empty. A quote that does not match is kept and flagged (`quote_status`), not dropped. |
+| Within-document batches | `batch_size` above 1, capped by `token_budget` | Each round takes the next incident from a different document, in the seeded document order, up to `batch_size`. A document contributes a second passage in that round only when it is the only document left. Incident order inside a document stays intact. One reconciliation follows the round, after the new codes in the round have been compared with each other. |
+| Exclusions | empty text, `n/a`, `I don't know` | The row is kept with `coverage_status=excluded` and `exclusion_reason`. It is not sent to the model. |
 | Reflexivity | one note per document reading | Charmaz: the analyst is in the work. The note records that this document was read in seeded order and that the context was not used as codes. |
-| Synthesis | `sweep_every`, and a final consolidation pass | Code-to-code comparison (Glaser and Strauss). The codebook is sorted alphabetically and chunked (default 20 codes). Those chunks run concurrently. One structured call per chunk proposes merges, checks that they share an action, an object, and a stance, and rewrites the survivor label and definition from the member quotes. A quote that does not fit is split back out. Near-duplicate labels with the same stance merge without a model call. Token overlap, and embeddings when supplied, are optional hints, not a gate. A positive code is not merged with a negative code. Each pair is decided once unless a definition changes in substance. At most `max_merges_per_sweep` merges are applied; the rest wait for review. Decisions below `min_merge_confidence` or `review_below` go to a review list and are not applied. Every hint and every model-proposed pair is logged with a rationale. A chunk that times out is skipped with a warning rather than failing the run. Union-find keeps the lexicographically smaller code id. Overloaded codes are flagged, not split, because splitting would reassign old segments without rereading them. |
+| Synthesis | `sweep_every`, and a final consolidation pass | Code-to-code comparison. Operations are `alias_duplicate`, `refine_definition`, `split_code`, `link_to_category`, `record_dimension`, `keep_distinct`, and `defer`. `relate_categories` is stored only. Stance is context, not a merge veto. A chain of pairs is not merged unless every pair in the component was judged. The survivor is the lexicographically smaller code key. The code id stays stable across renames; a raw 16-character hex string is never a label. |
 | Overlap | `pipeline=True` | Synthesis of the finished step runs while the next document is coded against the pre-merge snapshot. The merge map is applied afterwards, in chunk order, not in completion order. The next document therefore does not yet see the merged labels. That is one step of lag, not a race. |
-| Saturation | `result.saturation` | New codes per window, both before merges and as the net change in codebook size after merges. `judgment` is always null. Charmaz: do not let the software declare saturation. |
-| Focused coding | `build_themes` | A separate call. It does not read the corpus again and it does not mint open codes (Charmaz's focused coding, operationalized as grouping codes). With `n_themes` unset, the prompt asks for about 6 to 12 themes. The model then reviews the themes in alphabetical order and proposes duplicate groups with a reason. Token overlap and optional embeddings are hints only. A fold that would hold more than about 30% of the codes is not kept. Every hinted or proposed pair is logged. Prevalence and quotes are counted and checked in ordinary code. Leftover codes get one reassignment call, then `Ungrouped incidents`. |
+| Saturation | `result.saturation` | New codes before and after alias resolution (`new_codes_pre_alias`, `new_codes_post_alias`). `judgment` is always null. An absence of new labels is not meaning saturation. |
+| Focused coding | `build_themes` | A descriptive reporting view. A code may sit in more than one theme. `max_theme_share` and `max_themes` are presentation budgets, not analytic quotas. Prevalence states its denominators; percentages may overlap. Leftover codes go to `Ungrouped incidents`. |
 | Wave mode | `review_mode="wave"` | **Weakens constant comparison.** Passages from several documents can be coded together against one frozen snapshot, and a later passage in a document can be coded before an earlier one. New codes inside the wave are invisible to the other batches. Use it only when that tradeoff is acceptable. `parallel_documents=True` weakens comparison further: each document has its own codebook until a sweep. |
 
-`concurrency` is a ceiling. A rate-limit response (HTTP 429 or a message that says so) halves it; successes add one back up to the ceiling. Waits use full jitter and `Retry-After` when the exception carries one. Jitter does not change the codebook. An identical prompt is replayed from a response cache so a rerun with the same seed does not depend on provider sampling. Provider temperature 0 is still not a proof of bit-identical output; the cache is the rerun guarantee for prompts this process has already seen.
+`concurrency` is a ceiling. A rate-limit response (HTTP 429 or a message that says so) halves it; successes add one back up to the ceiling. Waits use full jitter. `Retry-After` is honored up to `max_backoff`, and the limiter releases its slot while it sleeps. Jitter does not change the codebook. An identical prompt is replayed from a response cache so a rerun with the same seed does not depend on provider sampling. Provider temperature 0 is still not a proof of bit-identical output; the cache is the rerun guarantee for prompts this process has already seen.
 
 Code ids stored on new codes are a hash of the normalized label, so the same spelling is the same id. The merge root is that label's sort order, not which chunk finished first.
 
 ## Speed and quality on a fake model
 
-`scripts/benchmark_review_modes.py` sleeps 0.05 seconds per call. Corpus: 6 documents, 4 passages each (24 passages), seed 7, `sweep_every=8`. No API key. Measured in this environment:
+`scripts/benchmark_review_modes.py` sleeps 0.05 seconds per call. Corpus: 6 documents, 4 passages each (24 passages), seed 7, `sweep_every=8`, `unit="paragraph"`. The paragraph unit keeps each blank-line block as its own passage; the study default `unit="incident"` would pack these short documents. No API key. Measured on 0.6.0 in this environment. 0.6.1 was not remeasured:
 
 | Mode | Seconds | Calls | Passages/s | Codes | Merges | Near-duplicate pairs left |
 | --- | --- | --- | --- | --- | --- | --- |
-| sequential (`document`, `pipeline=False`, `batch_size=1`, `concurrency=1`) | 1.588 | 28 | 15.11 | 3 | 3 | 0 |
-| document (background synthesis, `batch_size=4`, `concurrency=4`) | 0.525 | 10 | 45.73 | 3 | 3 | 0 |
-| wave (background synthesis, `batch_size=4`, `concurrency=4`) | 0.315 | 9 | 76.19 | 3 | 1 | 0 |
+| sequential (`document`, `pipeline=False`, `batch_size=1`, `concurrency=1`) | 1.690 | 28 | 14.20 | 3 | 3 | 0 |
+| document (background synthesis, `batch_size=4`, `concurrency=4`) | 0.543 | 10 | 44.18 | 3 | 3 | 0 |
+| wave (background synthesis, `batch_size=4`, `concurrency=4`) | 0.307 | 9 | 78.20 | 3 | 1 | 0 |
 
 The fake coder reuses a label when that exact label is already in the snapshot, so identical sentences collapse at commit. All three finished with 3 codes and no leftover pair whose labels had Jaccard at least 0.5. Document mode matched the sequential code count and still recorded a merge on each synthesis. Wave mode was fastest and merged in a single pass, because mixed documents shared a snapshot. That is the constant-comparison cost, even when this particular fake did not leave extra codes behind. These times are not a provider benchmark.
 
 ## Taguette
 
-Import `taguette_codebook.csv` or `taguette_themes.csv` from Project info → Import codebook. The theme file uses `Theme\Code` plus a parent row for the theme, which is the path form in Taguette's own tests (`interesting\places`). Taguette does not import highlights or `.qdc`. The `.qdc` files follow Taguette's export shape for other QDA packages.
+Import `taguette_codebook.csv` or `taguette_themes.csv` from Project info → Import codebook. The theme file uses `Theme\Code` plus a parent row for the theme, which is the path form in Taguette's own tests (`interesting\places`). Taguette does not import highlights or `.qdc`. The `.qdc` files follow Taguette's export shape for other QDA packages. A future adapter for a Taguette SQLite project must pin the Taguette version it was tested against. This package does not implement that adapter.
+
+`get_graph("open_code")` and `get_graph("themes")` draw the `Send` fan-out. `draw_mermaid_png` uses mermaid.ink. The `viz` extra installs grandalf; pygraphviz is optional.
 
 ## Evaluation
 
-`evaluate_run` without `model` is offline: coverage, verbatim quotes, gerund and in-vivo rates, singletons, the saturation curve, and lexical Chen metrics when a second codebook is passed. `adjusted_rand_index` compares passage→code assignments across those codebooks. With `model`, near-duplicate pairs are judged concurrently and Chen metrics use those judgments. None of these scores assert saturation.
+`evaluate_run` without `model` is offline: coverage, verbatim quotes, quote-anchor flag rates (`possibly_modified` and `unanchored` are kept and counted, not dropped), gerund and in-vivo rates, singletons, the saturation curve, and lexical Chen metrics when a second codebook is passed. `adjusted_rand_index` compares passage→code assignments across those codebooks. With `model`, near-duplicate pairs are judged concurrently and Chen metrics use those judgments. None of these scores assert saturation.

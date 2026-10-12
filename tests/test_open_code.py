@@ -197,7 +197,8 @@ def test_embedding_candidates_are_optional():
 def test_batching_and_waves_cut_calls():
     batched = FakeCoder()
     result = _run(batched, batch_size=4, concurrency=1, sweep_every=25, review_mode="wave", pipeline=False)
-    assert batched.call_count == 3
+    assert batched.call_count == 4
+    assert sum(item["kind"] == "in_batch" for item in result.prompt_log) == 1
     assert len(result.segments) == 4
     assert result.prompt_log[0]["usage"]["total_tokens"] == 18
 

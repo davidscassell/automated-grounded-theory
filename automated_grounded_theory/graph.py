@@ -15,13 +15,26 @@ import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send
 from typing_extensions import TypedDict
 
-from automated_grounded_theory.async_support import ainvoke_structured, is_transient
+from automated_grounded_theory.records import (
+    POLICY_VERSION,
+    evidence_revision,
+    freeze_snapshot,
+    percentile,
+    proposal_buffer_reducer,
+    proposal_id,
+    select_committable,
+)
+
+from automated_grounded_theory.async_support import ainvoke_structured, is_transient, sweep_deadline
 from automated_grounded_theory.batching import pack_indices
 from automated_grounded_theory.codebook import (
     agreement_confidence,
@@ -70,7 +83,7 @@ from automated_grounded_theory.schemas import (
     QuoteFitBatch,
     SweepCoding,
 )
-from automated_grounded_theory.segment import plan_coding
+from automated_grounded_theory.segment import interleave_document_queue, next_round_count, plan_coding
 
 logger = logging.getLogger("automated_grounded_theory")
 
@@ -105,6 +118,17 @@ class CodingState(TypedDict, total=False):
     pair_decisions: list[dict]
     consolidated: bool
     stage_seconds: dict
+    snapshot_id: str
+    snapshot_version: int
+    definition_revision: str
+    evidence_revision: str
+    policy_version: str
+    batch_id: str
+    round_jobs: list
+    proposal_buffer: Annotated[dict, proposal_buffer_reducer]
+    committed_ids: list
+    metrics: dict
+    lost_distinction_candidates: list
 
 
 @dataclass
@@ -125,7 +149,7 @@ class RunConfig:
     validation_retries: int = 1
     require_gerund: bool = False
     candidate_limit: int = 30
-    batch_size: int = 8
+    batch_size: int = 1
     concurrency: int = 2
     sweep_chunk: int = 20
     embed_batch_size: int = 64
@@ -133,6 +157,7 @@ class RunConfig:
     review_below: float = 0.5
     min_merge_confidence: float = 0.5
     max_merges_per_sweep: int = 12
+    sweep_timeout: float = 300.0
     check_model: Any = None
     pipeline: bool = True
     token_budget: int = 4000
@@ -198,15 +223,31 @@ def initial_state(documents: list[LoadedDocument], metadata: dict) -> CodingStat
         "pair_decisions": [],
         "consolidated": False,
         "stage_seconds": {},
+        "snapshot_id": "s00000",
+        "snapshot_version": 0,
+        "definition_revision": "",
+        "evidence_revision": "",
+        "policy_version": POLICY_VERSION,
+        "batch_id": "",
+        "round_jobs": [],
+        "proposal_buffer": {"items": [], "duplicates": 0, "conflicts": []},
+        "committed_ids": [],
+        "metrics": {},
+        "lost_distinction_candidates": [],
     }
 
 
 def build_graph(runtime: RunConfig):
-    """Return an uncompiled graph. The caller attaches a checkpointer."""
+    """Return an uncompiled graph. Coding rounds fan out with :class:`Send`.
+
+    Workers read one frozen snapshot. ``commit`` is the only writer.
+    """
+    _validate_node(runtime)
     builder = StateGraph(CodingState)
     builder.add_node("segment_and_shuffle", _segment_node)
-    builder.add_node("code_passage", _code_node(runtime))
-    builder.add_node("validate_passage", _validate_node(runtime))
+    builder.add_node("prepare_round", _prepare_round(runtime))
+    builder.add_node("code_worker", _code_worker(runtime), input_schema=WorkerInput)
+    builder.add_node("commit", _commit_node(runtime))
     builder.add_node("sweep", _sweep_node(runtime))
     builder.add_node("consolidate", _sweep_node(runtime, consolidation=True))
     builder.add_node("export", _export_node(runtime))
@@ -214,22 +255,83 @@ def build_graph(runtime: RunConfig):
     builder.add_conditional_edges(
         "segment_and_shuffle",
         _route_after_segment,
-        {"code_passage": "code_passage", "export": "export"},
+        {"prepare_round": "prepare_round", "export": "export"},
     )
-    builder.add_edge("code_passage", "validate_passage")
     builder.add_conditional_edges(
-        "validate_passage",
-        _route_after_validate,
-        {"code_passage": "code_passage", "sweep": "sweep", "export": "export"},
+        "prepare_round",
+        _route_round,
+        ["code_worker", "sweep", "consolidate", "export"],
+    )
+    builder.add_edge("code_worker", "commit")
+    builder.add_conditional_edges(
+        "commit",
+        _route_after_commit,
+        {"prepare_round": "prepare_round", "sweep": "sweep", "consolidate": "consolidate", "export": "export"},
     )
     builder.add_conditional_edges(
         "sweep",
         _route_after_sweep,
-        {"code_passage": "code_passage", "consolidate": "consolidate", "export": "export"},
+        {"prepare_round": "prepare_round", "consolidate": "consolidate", "export": "export"},
     )
     builder.add_edge("consolidate", "export")
     builder.add_edge("export", END)
     return builder
+
+
+class WorkerInput(TypedDict, total=False):
+    """Payload for one Send worker. These keys are not parent-state channels."""
+
+    worker_job_id: str
+    worker_batch_id: str
+    worker_snapshot_id: str
+    worker_snapshot_version: int
+    worker_definition_revision: str
+    worker_evidence_revision: str
+    worker_policy_version: str
+    worker_doc_id: str | None
+    worker_indices: list
+    worker_passages: list
+    worker_codebook: dict
+    worker_documents: dict
+
+
+class _IdleModel(BaseChatModel):
+    """Placeholder so :func:`get_graph` can draw a graph without a provider."""
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="{}"))])
+
+    @property
+    def _llm_type(self) -> str:
+        return "idle"
+
+
+def get_graph(kind: str = "open_code"):
+    """Return the LangGraph for ``open_code`` or ``themes``.
+
+    Both graphs fan out with ``Send``. ``draw_mermaid_png`` posts the diagram
+    to ``mermaid.ink``. ``draw_ascii`` needs the ``viz`` extra (``grandalf``).
+    ``draw_png`` needs optional ``pygraphviz`` and a Graphviz install.
+    """
+    name = str(kind or "open_code").strip().casefold()
+    if name == "open_code":
+        from automated_grounded_theory.context import ResearchContext
+        from automated_grounded_theory.retrieval import LexicalCodeRetriever
+
+        runtime = RunConfig(
+            coder=_IdleModel(),
+            sweeper=_IdleModel(),
+            retriever=LexicalCodeRetriever(),
+            embeddings=None,
+            context=ResearchContext(research_question="What is happening in this text?"),
+            prompt_cache=False,
+        )
+        return build_graph(runtime)
+    if name == "themes":
+        from automated_grounded_theory.themes import build_theme_graph
+
+        return build_theme_graph()
+    raise ValueError("kind must be 'open_code' or 'themes'.")
 
 
 def compile_graph(runtime: RunConfig, checkpointer, *, interrupt_before_sweep: bool = False):
@@ -243,7 +345,49 @@ def compile_graph(runtime: RunConfig, checkpointer, *, interrupt_before_sweep: b
 def _route_after_segment(state: CodingState) -> str:
     if not state.get("passages"):
         return "export"
-    return "code_passage"
+    return "prepare_round"
+
+
+def _route_after_commit(state: CodingState) -> str:
+    destination = _route_after_validate(state)
+    if destination == "code_passage":
+        return "prepare_round"
+    return destination
+
+
+def _route_round(state: CodingState):
+    """Fan out one Send per batch, or leave the round when nothing is queued."""
+    jobs = list(state.get("round_jobs") or [])
+    if not jobs:
+        destination = _route_after_validate(state)
+        if destination == "code_passage":
+            return "export"
+        return destination
+    documents = _document_texts(state)
+    sends = []
+    for job in jobs:
+        doc_id = job.get("doc_id")
+        indices = list(job.get("indices") or [])
+        sends.append(
+            Send(
+                "code_worker",
+                {
+                    "worker_job_id": job.get("job_id"),
+                    "worker_batch_id": state.get("batch_id") or state.get("snapshot_id"),
+                    "worker_snapshot_id": state.get("snapshot_id"),
+                    "worker_snapshot_version": state.get("snapshot_version"),
+                    "worker_definition_revision": state.get("definition_revision"),
+                    "worker_evidence_revision": state.get("evidence_revision"),
+                    "worker_policy_version": state.get("policy_version") or POLICY_VERSION,
+                    "worker_doc_id": doc_id,
+                    "worker_indices": indices,
+                    "worker_passages": [state["passages"][index] for index in indices],
+                    "worker_codebook": deepcopy(_book_for(state, doc_id)),
+                    "worker_documents": documents,
+                },
+            )
+        )
+    return sends
 
 
 def _remaining(state: CodingState) -> bool:
@@ -268,10 +412,176 @@ def _route_after_validate(state: CodingState) -> str:
 
 def _route_after_sweep(state: CodingState) -> str:
     if _remaining(state):
-        return "code_passage"
+        return "prepare_round"
     if not state.get("consolidated") and len(state.get("codebook") or {}) >= 2:
         return "consolidate"
     return "export"
+
+
+def _prepare_round(runtime: RunConfig):
+    def prepare_round(state: CodingState) -> dict:
+        version = int(state.get("snapshot_version") or 0) + 1
+        frozen = freeze_snapshot(state, version=version)
+        jobs = _wave(state, runtime)
+        packaged = []
+        for index, (doc_id, indices) in enumerate(jobs):
+            packaged.append(
+                {
+                    "doc_id": doc_id,
+                    "indices": list(indices),
+                    "job_id": f"{frozen['snapshot_id']}-j{index:03d}",
+                }
+            )
+        return {
+            **frozen,
+            "batch_id": frozen["snapshot_id"],
+            "round_jobs": packaged,
+            "proposal_buffer": {"__reset__": True},
+        }
+
+    return prepare_round
+
+
+def _code_worker(runtime: RunConfig):
+    async def code_worker(state: CodingState) -> dict:
+        started = time.perf_counter()
+        snapshot_id = str(state.get("worker_snapshot_id") or "")
+        passages = list(state.get("worker_passages") or [])
+        indices = list(state.get("worker_indices") or [])
+        runtime.limiter.cache_context = {
+            "snapshot_id": snapshot_id,
+            "definition_revision": state.get("worker_definition_revision") or "",
+            "evidence_revision": state.get("worker_evidence_revision") or "",
+            "policy_version": state.get("worker_policy_version") or POLICY_VERSION,
+        }
+        book = dict(state.get("worker_codebook") or {})
+        coded = await _code_batch(
+            runtime,
+            passages,
+            book,
+            documents=dict(state.get("worker_documents") or {}),
+        )
+        elapsed = time.perf_counter() - started
+        items = []
+        for index, passage in zip(indices, passages):
+            passage_key = str(passage.get("passage_id"))
+            coding, attempt_errors = coded[passage_key]
+            items.append(
+                {
+                    "proposal_id": proposal_id(snapshot_id, passage_key),
+                    "job_id": state.get("worker_job_id"),
+                    "batch_id": state.get("worker_batch_id"),
+                    "snapshot_id": snapshot_id,
+                    "snapshot_version": state.get("worker_snapshot_version"),
+                    "passage_index": index,
+                    "doc_id": state.get("worker_doc_id"),
+                    "coding": coding,
+                    "attempt_errors": attempt_errors,
+                    "elapsed": round(elapsed, 4),
+                }
+            )
+        return {"proposal_buffer": {"items": items, "duplicates": 0, "conflicts": []}}
+
+    return code_worker
+
+
+def _commit_node(runtime: RunConfig):
+    async def commit(state: CodingState) -> dict:
+        started = time.perf_counter()
+        buffer = state.get("proposal_buffer") or {}
+        fresh, stale, _skipped = select_committable(
+            list(buffer.get("items") or []),
+            snapshot_id=str(state.get("snapshot_id") or ""),
+            committed_ids=list(state.get("committed_ids") or []),
+        )
+        pending = [
+            {
+                "passage_index": item["passage_index"],
+                "doc_id": item.get("doc_id"),
+                "coding": item.get("coding") or {},
+                "attempt_errors": item.get("attempt_errors") or [],
+            }
+            for item in fresh
+        ]
+        in_batch_pairs: list = []
+        if pending:
+            pending, in_batch_pairs = await reconcile_in_batch(runtime, state, pending)
+        update = runtime._commit(state, pending=pending) if pending else {}
+        if not isinstance(update, dict):
+            update = {}
+        committed = list(state.get("committed_ids") or [])
+        for item in fresh:
+            pid = str(item.get("proposal_id") or "")
+            if pid and pid not in committed:
+                committed.append(pid)
+        review = list(update.get("review") or state.get("review") or [])
+        for item in stale:
+            review.append(
+                {
+                    "op": "commit",
+                    "status": "rejected",
+                    "reason": "stale_snapshot",
+                    "proposal_id": item.get("proposal_id"),
+                    "snapshot_id": item.get("snapshot_id"),
+                }
+            )
+        metrics = dict(state.get("metrics") or {})
+        metrics["exact_proposal_collisions"] = int(metrics.get("exact_proposal_collisions") or 0) + int(
+            buffer.get("duplicates") or 0
+        )
+        rounds = list(metrics.get("rounds") or [])
+        rounds.append(
+            {
+                "snapshot_id": str(state.get("snapshot_id") or ""),
+                "passage_ids": [
+                    str(state["passages"][item["passage_index"]].get("passage_id") or "") for item in fresh
+                ],
+                "doc_ids": [str(item.get("doc_id") or state["passages"][item["passage_index"]].get("doc_id") or "") for item in fresh],
+                "size": len(fresh),
+            }
+        )
+        metrics["rounds"] = rounds
+        metrics["reconciliation_calls"] = int(metrics.get("reconciliation_calls") or 0) + 1
+        metrics["reconciliation_seconds"] = round(
+            float(metrics.get("reconciliation_seconds") or 0) + time.perf_counter() - started,
+            4,
+        )
+        metrics["stale_proposals"] = int(metrics.get("stale_proposals") or 0) + len(stale)
+        metrics["conflicts"] = list(buffer.get("conflicts") or [])
+        if in_batch_pairs:
+            in_batch_rounds = list(metrics.get("in_batch_rounds") or [])
+            in_batch_rounds.append(
+                {"snapshot_id": str(state.get("snapshot_id") or ""), "pairs": in_batch_pairs}
+            )
+            metrics["in_batch_rounds"] = in_batch_rounds
+        samples = list(metrics.get("coding_seconds") or [])
+        samples.extend(float(item.get("elapsed") or 0) for item in fresh)
+        metrics["coding_seconds"] = samples
+        metrics["coding_p50"] = percentile(samples, 50)
+        metrics["coding_p95"] = percentile(samples, 95)
+        timing = dict(update.get("stage_seconds") or state.get("stage_seconds") or {})
+        timing["coding"] = round(
+            float(timing.get("coding") or 0) + sum(float(item.get("elapsed") or 0) for item in fresh),
+            4,
+        )
+        update["stage_seconds"] = timing
+        limiter = runtime.limiter
+        metrics["transport_retries"] = int(getattr(limiter, "timeout_retries", 0) or 0) + int(
+            getattr(limiter, "rate_limit_retries", 0) or 0
+        )
+        metrics["schema_repairs"] = int(getattr(limiter, "schema_repairs", 0) or 0)
+        metrics["cache_hits"] = int(getattr(limiter, "cache_hits", 0) or 0)
+        update["review"] = review
+        update["committed_ids"] = committed
+        update["proposal_buffer"] = {"__reset__": True}
+        update["round_jobs"] = []
+        update["metrics"] = metrics
+        update["evidence_revision"] = evidence_revision(update.get("segments") or state.get("segments") or [])
+        if stale and "codebook" not in update:
+            update["codebook"] = state.get("codebook") or {}
+        return update
+
+    return commit
 
 
 def _segment_node(state: CodingState) -> dict:
@@ -305,9 +615,16 @@ def _segment_node(state: CodingState) -> dict:
         review_mode=str(metadata.get("review_mode") or "document"),
     )
     branch_codebooks = {doc_id: {} for doc_id in plan.branch_queues} if plan.parallel else {}
+    queue = list(plan.queue)
+    batch_size = max(1, int(metadata.get("batch_size") or 1))
+    review_mode = str(metadata.get("review_mode") or "document")
+    if not plan.parallel and review_mode == "document" and batch_size > 1:
+        queue = interleave_document_queue(plan.passages, queue, batch_size)
+        for order, index in enumerate(queue):
+            plan.passages[index]["coding_order"] = order
     return {
         "passages": plan.passages,
-        "queue": plan.queue,
+        "queue": queue,
         "next_index": 0,
         "parallel": plan.parallel,
         "branch_queues": plan.branch_queues,
@@ -383,17 +700,32 @@ def _wave(
     queue = list(state.get("queue") or [])
     if index >= len(queue):
         return []
-    if review_mode == "document":
-        # Stay inside one document. ``batch_size`` 1 commits after every passage,
-        # so the next passage is compared with codes just earned. A larger batch
-        # codes several passages of this document against one frozen snapshot.
+    if review_mode == "document" and batch_size > 1:
+        # The queue is already round-robin across documents. One round takes
+        # at most one passage from each document, unless only one document
+        # is left.
+        count = next_round_count(state["passages"], queue[index:], batch_size)
+        indices = queue[index : index + min(room, count)]
+    elif review_mode == "document":
+        # batch_size 1 stays inside the current document. Concurrency may
+        # still code several of its next passages against one snapshot.
         doc_id = state["passages"][queue[index]].get("doc_id")
-        cap = min(room, batch_size * concurrency)
-        indices = []
+        doc_rest = 0
         for passage_index in queue[index:]:
             if state["passages"][passage_index].get("doc_id") != doc_id:
                 break
+            doc_rest += 1
+        if doc_rest >= batch_size:
+            cap = min(room, batch_size * concurrency)
+            stay = True
+        else:
+            cap = min(room, batch_size)
+            stay = False
+        indices = []
+        for passage_index in queue[index:]:
             if len(indices) >= cap:
+                break
+            if stay and state["passages"][passage_index].get("doc_id") != doc_id:
                 break
             indices.append(passage_index)
     else:
@@ -410,7 +742,7 @@ async def _pending_rows(runtime: RunConfig, state: CodingState, jobs: list[tuple
     async def one(doc_id: str | None, indices: list[int]) -> list[dict]:
         passages = [state["passages"][index] for index in indices]
         book = _book_for(state, doc_id)
-        coded = await _code_batch(runtime, passages, book)
+        coded = await _code_batch(runtime, passages, book, documents=_document_texts(state))
         rows = []
         for index in indices:
             passage = state["passages"][index]
@@ -429,18 +761,166 @@ async def _pending_rows(runtime: RunConfig, state: CodingState, jobs: list[tuple
     return [row for group in groups for row in group]
 
 
+def _new_round_proposals(state: CodingState, pending: list[dict]) -> list[dict]:
+    """New labels in this round, with the quotes that proposed them."""
+    known: set[str] = set()
+    for entry in (state.get("codebook") or {}).values():
+        key = code_key(str(entry.get("code") or entry.get("key") or ""))
+        if key:
+            known.add(key)
+    for book in (state.get("branch_codebooks") or {}).values():
+        for entry in (book or {}).values():
+            key = code_key(str(entry.get("code") or entry.get("key") or ""))
+            if key:
+                known.add(key)
+    found: dict[str, dict] = {}
+    for item in pending:
+        coding = item.get("coding") or {}
+        if hasattr(coding, "model_dump"):
+            coding = coding.model_dump()
+        passage = state["passages"][item["passage_index"]]
+        for proposal in coding.get("codes") or []:
+            label = str(proposal.get("code") or "").strip()
+            key = code_key(label)
+            if not key or key in known:
+                continue
+            row = found.setdefault(
+                key,
+                {
+                    "code": label,
+                    "definition": str(proposal.get("definition") or ""),
+                    "valence": str(proposal.get("valence") or ""),
+                    "quotes": [],
+                    "passage_id": str(passage.get("passage_id") or ""),
+                },
+            )
+            if not row["definition"]:
+                row["definition"] = str(proposal.get("definition") or "")
+            quote = str(proposal.get("quote") or "").strip()
+            if quote and quote not in row["quotes"]:
+                row["quotes"].append(quote)
+    return list(found.values())
+
+
+def _apply_label_rewrites(pending: list[dict], rewrites: dict[str, str], definitions: dict[str, str]) -> None:
+    """Point retired proposals at the survivor label before the commit writes them."""
+    if not rewrites and not definitions:
+        return
+    for item in pending:
+        coding = item.get("coding") or {}
+        if hasattr(coding, "model_dump"):
+            coding = coding.model_dump()
+        else:
+            coding = dict(coding)
+        codes = []
+        seen: set[str] = set()
+        for proposal in coding.get("codes") or []:
+            row = dict(proposal)
+            key = code_key(str(row.get("code") or ""))
+            if key in rewrites:
+                row["code"] = rewrites[key]
+                row["action"] = "new"
+                row["code_id"] = ""
+                key = code_key(str(row.get("code") or ""))
+            if key in definitions:
+                row["definition"] = definitions[key]
+            if key in seen:
+                continue
+            seen.add(key)
+            codes.append(row)
+        coding["codes"] = codes
+        item["coding"] = coding
+
+
+async def reconcile_in_batch(runtime: RunConfig, state: CodingState, pending: list[dict]) -> tuple[list[dict], list[dict]]:
+    """One comparison of this round's new codes, then rewrite labels that alias.
+
+    A failed comparison leaves the proposals unchanged. Distinct concepts stay
+    distinct. The pair list is for ``duplicate_rounds.json`` and is not the
+    cross-snapshot duplicate count.
+    """
+    from automated_grounded_theory.codebook import plan_in_batch_aliases
+    from automated_grounded_theory.prompts import build_in_batch_messages
+    from automated_grounded_theory.schemas import InBatchComparison
+
+    proposals = _new_round_proposals(state, pending)
+    if len(proposals) < 2:
+        return pending, []
+    messages = build_in_batch_messages(
+        context=runtime.context,
+        codes=proposals,
+        prompt_cache=runtime.prompt_cache,
+    )
+    try:
+        payload = await _ainvoke_structured(
+            runtime.coder,
+            InBatchComparison,
+            messages,
+            kind="in_batch",
+            model_name=runtime.model_name,
+            passage_id=str(state.get("snapshot_id") or "round"),
+            runtime=runtime,
+        )
+    except CodingError as exc:
+        runtime.notes.append(f"In-batch comparison was skipped: {exc}")
+        return pending, []
+    plan = plan_in_batch_aliases(
+        proposals,
+        list(payload.get("merges") or []),
+        min_merge_confidence=runtime.min_merge_confidence,
+    )
+    _apply_label_rewrites(pending, plan["rewrites"], plan["definitions"])
+    return pending, list(plan["pairs"])
+
+
+def _document_texts(state: CodingState) -> dict[str, str]:
+    return {str(doc.get("doc_id")): str(doc.get("text") or "") for doc in state.get("documents") or []}
+
+
+def _coding_payload(coding: Any) -> dict:
+    if hasattr(coding, "model_dump"):
+        return coding.model_dump()
+    return dict(coding)
+
+
+def _preserve_flagged_codes(previous: dict, current: Any, keys: set[str]) -> dict:
+    """Keep a code the retry dropped after a quote mismatch.
+
+    The retry may improve the quote. It must not erase the code.
+    """
+    payload = _coding_payload(current)
+    if not keys:
+        return payload
+    codes = list(payload.get("codes") or [])
+    present = {code_key(str(item.get("code") or "")) for item in codes}
+    for item in previous.get("codes") or []:
+        key = code_key(str(item.get("code") or ""))
+        if key in keys and key not in present:
+            codes.append(dict(item))
+            present.add(key)
+    payload["codes"] = codes
+    return payload
+
+
 def _book_for(state: CodingState, doc_id: str | None) -> dict:
     if state.get("parallel") and doc_id is not None:
         return state.get("branch_codebooks", {}).get(doc_id) or {}
     return state.get("codebook") or {}
 
 
-async def _code_batch(runtime: RunConfig, passages: list[dict], codebook: dict) -> dict[str, tuple[dict, list]]:
-    """Code a batch. Quote failures are retried on their own, not with the batch."""
+async def _code_batch(
+    runtime: RunConfig,
+    passages: list[dict],
+    codebook: dict,
+    documents: dict[str, str] | None = None,
+) -> dict[str, tuple[dict, list]]:
+    """Code a batch. Weak quotes are retried once, then kept and flagged."""
     pending = list(passages)
     feedback: dict[str, str] = {}
     errors: dict[str, list] = {str(passage.get("passage_id")): [] for passage in passages}
     done: dict[str, tuple[dict, list]] = {}
+    earlier_coding: dict[str, dict] = {}
+    flagged_keys: dict[str, set[str]] = {}
     attempts = max(0, runtime.validation_retries) + 1
     for attempt in range(attempts):
         if not pending:
@@ -459,10 +939,9 @@ async def _code_batch(runtime: RunConfig, passages: list[dict], codebook: dict) 
                 long_passage_chars=runtime.long_passage_chars,
                 review_below=runtime.review_below,
                 context_terms=context_term_set(runtime.context),
+                document_text=(documents or {}).get(str(passage.get("doc_id") or ""), ""),
             )
-            quote_failures = [
-                item for item in interpreted["rejections"] if item.get("reason") == "quote_not_verbatim"
-            ]
+            quote_failures = list(interpreted.get("quote_retries") or [])
             restated = [
                 {"code": item.get("code"), "reason": "context_restatement", "quote": item.get("quote")}
                 for item in interpreted["accepted"]
@@ -471,9 +950,19 @@ async def _code_batch(runtime: RunConfig, passages: list[dict], codebook: dict) 
             retryable = quote_failures + restated
             if retryable and attempt < attempts - 1:
                 errors[passage_id].append(retryable)
+                earlier_coding[passage_id] = _coding_payload(coding)
+                flagged_keys[passage_id] = {
+                    code_key(str(item.get("code") or "")) for item in quote_failures if item.get("code")
+                }
                 still_pending.append(passage)
                 feedback[passage_id] = validation_feedback(retryable)
             else:
+                if passage_id in earlier_coding:
+                    coding = _preserve_flagged_codes(
+                        earlier_coding[passage_id],
+                        coding,
+                        flagged_keys.get(passage_id) or set(),
+                    )
                 done[passage_id] = (coding, errors[passage_id])
         pending = still_pending
     if runtime.check_model is not None:
@@ -549,16 +1038,34 @@ async def _invoke_coding(
 
 
 def _align_batch(payload: dict, passages: list[dict]) -> list[dict]:
+    """One output slot per passage. A missing slot is a failure, not an empty coding."""
     items = list(payload.get("passages") or [])
     by_id = {str(item.get("passage_id")): item for item in items if item.get("passage_id")}
     aligned = []
     for index, passage in enumerate(passages):
         passage_id = str(passage.get("passage_id") or "")
         item = by_id.get(passage_id)
-        if item is None and index < len(items):
-            item = items[index]
+        if item is None and index < len(items) and not str(items[index].get("passage_id") or ""):
+            item = dict(items[index])
+            item["passage_id"] = passage_id
+        failed = False
         if item is None:
-            item = {"passage_id": passage_id, "codes": [], "memo": "", "low_confidence": True}
+            failed = True
+            item = {
+                "passage_id": passage_id,
+                "codes": [],
+                "memo": "",
+                "low_confidence": True,
+                "coverage_status": "failed",
+            }
+        else:
+            item = dict(item)
+        if failed:
+            item["coverage_status"] = "failed"
+        elif item.get("codes"):
+            item["coverage_status"] = item.get("coverage_status") or "coded"
+        else:
+            item["coverage_status"] = item.get("coverage_status") or "context_only"
         aligned.append(item)
     return aligned
 
@@ -599,8 +1106,11 @@ def _validate_node(runtime: RunConfig):
             passage = state["passages"][item["passage_index"]]
             doc_id = item.get("doc_id")
             book = branch_books.get(doc_id, {}) if state.get("parallel") and doc_id else codebook
+            coding = item.get("coding") or {}
+            if hasattr(coding, "model_dump"):
+                coding = coding.model_dump()
             interpreted = interpret_coding(
-                item["coding"],
+                coding,
                 passage,
                 book,
                 max_codes=runtime.max_codes_per_passage,
@@ -608,7 +1118,29 @@ def _validate_node(runtime: RunConfig):
                 long_passage_chars=runtime.long_passage_chars,
                 review_below=runtime.review_below,
                 context_terms=context_term_set(runtime.context),
+                document_text=_document_texts(state).get(str(passage.get("doc_id") or ""), ""),
             )
+            kept_quotes = [
+                {
+                    "code": row.get("code"),
+                    "reason": f"quote_{row.get('quote_status')}",
+                    "quote": row.get("model_quote") or row.get("quote"),
+                    "quote_status": row.get("quote_status"),
+                    "quote_similarity": row.get("quote_similarity"),
+                    "kept": True,
+                }
+                for row in interpreted["accepted"]
+                if row.get("quote_status") in {"possibly_modified", "unanchored"}
+            ]
+            if kept_quotes:
+                validation_log.append(
+                    {
+                        "passage_id": passage.get("passage_id"),
+                        "doc_id": passage.get("doc_id"),
+                        "stage": "kept",
+                        "rejections": kept_quotes,
+                    }
+                )
             for earlier in item.get("attempt_errors") or []:
                 validation_log.append(
                     {
@@ -618,6 +1150,13 @@ def _validate_node(runtime: RunConfig):
                         "rejections": earlier,
                     }
                 )
+            coverage = str(coding.get("coverage_status") or "")
+            if coverage == "failed":
+                passage["coverage_status"] = "failed"
+            elif interpreted["accepted"]:
+                passage["coverage_status"] = "coded"
+            else:
+                passage["coverage_status"] = "context_only"
             if interpreted["rejections"]:
                 validation_log.append(
                     {
@@ -636,6 +1175,7 @@ def _validate_node(runtime: RunConfig):
                 passage,
                 interpreted,
                 existing_keys=global_keys,
+                origin_snapshot_id=str(state.get("snapshot_id") or ""),
             )
             segments = committed["segments"]
             memos = committed["memos"]
@@ -685,6 +1225,7 @@ def _validate_node(runtime: RunConfig):
             "ops": ops,
             "review": review,
             "warnings": list(state.get("warnings") or []) + notes,
+            "passages": state.get("passages") or [],
         }
 
     runtime._commit = validate_passage
@@ -758,6 +1299,12 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
     async def sweep(state: CodingState) -> dict:
         started = time.perf_counter()
         extras = {"rewrites": 0.0}
+        runtime.limiter.cache_context = {
+            "snapshot_id": state.get("snapshot_id") or "",
+            "definition_revision": state.get("definition_revision") or "",
+            "evidence_revision": state.get("evidence_revision") or "",
+            "policy_version": POLICY_VERSION,
+        }
 
         def finish(update: dict) -> dict:
             timing = dict(state.get("stage_seconds") or {})
@@ -830,7 +1377,9 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
             )
 
         code_task = None
-        if runtime.pipeline and _remaining(state):
+        # Overlap needs a free slot. At concurrency 1 the coding task takes the
+        # only slot and the sweep waits with nothing of its own in flight.
+        if runtime.pipeline and _remaining(state) and int(runtime.concurrency) > 1:
             jobs = _wave(state, runtime, upcoming=True)
             if jobs:
                 code_task = asyncio.create_task(_pending_rows(runtime, state, jobs))
@@ -848,7 +1397,9 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
             if code_task is not None and not code_task.done():
                 code_task.cancel()
         overlap_state = None
+        overlap_pairs: list = []
         if overlap_pending and getattr(runtime, "_commit", None):
+            overlap_pending, overlap_pairs = await reconcile_in_batch(runtime, state, overlap_pending)
             overlap_state = runtime._commit(state, pending=overlap_pending, take_prompts=False)
             codebook = overlap_state["codebook"]
             segments = overlap_state["segments"]
@@ -958,6 +1509,12 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
                 applied.setdefault("ops", []).extend(more_ops)
                 quote_stats["quotes_checked"] += extra["quotes_checked"]
                 quote_stats["quotes_split"] += extra["quotes_split"]
+                quote_stats["merges_later_split"] = int(quote_stats.get("merges_later_split") or 0) + int(
+                    extra.get("merges_later_split") or 0
+                )
+                quote_stats["split_merges"] = list(quote_stats.get("split_merges") or []) + list(
+                    extra.get("split_merges") or []
+                )
         extras["rewrites"] = time.perf_counter() - rewrite_started
         finalize_candidate_decisions(
             applied,
@@ -1074,6 +1631,32 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
             review=review,
             pair_decisions=pair_decisions,
         )
+        from automated_grounded_theory.codebook import mark_later_splits
+        from automated_grounded_theory.records import accumulate_duplicate_rounds, duplicate_pair_count, same_round_duplicates
+
+        audit = list(state.get("lost_distinction_candidates") or []) + list(
+            applied.get("lost_distinction_candidates") or []
+        )
+        split_merges = list(quote_stats.get("split_merges") or [])
+        mark_later_splits(audit, split_merges)
+        update["lost_distinction_candidates"] = audit
+        judgments = list(applied.get("accepted_merges") or []) + list(applied.get("rejected_merges") or []) + list(proposed)
+        pairs = same_round_duplicates(pre_merge_book, judgments)
+        metrics = dict(state.get("metrics") or {})
+        if overlap_pairs:
+            in_batch_rounds = list(metrics.get("in_batch_rounds") or [])
+            in_batch_rounds.append(
+                {"snapshot_id": str(state.get("snapshot_id") or ""), "pairs": overlap_pairs}
+            )
+            metrics["in_batch_rounds"] = in_batch_rounds
+        rounds = accumulate_duplicate_rounds(list(metrics.get("duplicate_rounds") or []), pairs)
+        metrics["duplicate_rounds"] = rounds
+        metrics["duplicates_before_reconciliation"] = duplicate_pair_count(rounds)
+        metrics["lost_distinction_candidates"] = len(audit)
+        metrics["merges_later_split"] = int(metrics.get("merges_later_split") or 0) + int(
+            quote_stats.get("merges_later_split") or 0
+        )
+        update["metrics"] = metrics
         if overlap_state is not None:
             coded_before = int(state.get("passages_since_sweep") or 0)
             new_before = int(state.get("new_codes_since_sweep") or 0)
@@ -1127,11 +1710,14 @@ def _sweep_update(
 
 def _export_node(runtime: RunConfig):
     def export_node(state: CodingState) -> dict:
+        metrics = dict(state.get("metrics") or {})
+        metrics["activity"] = runtime.limiter.activity_report()
+        state = {**state, "metrics": metrics}
         provisional = result_from_state(state, interrupted=False, thread_id=str(state.get("metadata", {}).get("thread_id") or ""), resumable=False)
         paths: dict[str, str] = {}
         if runtime.output_dir:
             paths = export_result(provisional, runtime.output_dir)
-        return {"export_paths": paths, "finished": True}
+        return {"export_paths": paths, "finished": True, "metrics": metrics}
 
     return export_node
 
@@ -1345,19 +1931,10 @@ async def _verify_proposed_merges(
     merges: list,
     sweep_index: int,
 ) -> tuple[list, list]:
-    """Second structured look at each proposed merge. Opposite stances are not sent."""
-    from automated_grounded_theory.codebook import opposite_valence
-
+    """Second structured look at each proposed merge. Stance is context, not a veto."""
     eligible = []
     rejected = []
     for merge in merges:
-        source = code_key(str(merge.get("source") or ""))
-        target = code_key(str(merge.get("target") or ""))
-        if source in codebook and target in codebook and opposite_valence(
-            codebook[source].get("valence"), codebook[target].get("valence")
-        ):
-            rejected.append({**dict(merge), "reason": "opposite_valence", "confidence": merge.get("confidence", 1.0)})
-            continue
         eligible.append(merge)
     if not eligible:
         return [], rejected
@@ -1659,8 +2236,13 @@ async def _ainvoke_structured(
     passage_id: str,
     runtime: RunConfig,
 ) -> dict:
+    timeout = None
+    if kind in {"sweep", "merge_verify", "definition_rewrite", "quote_fit"}:
+        timeout = sweep_deadline(runtime.limiter.request_timeout, runtime.sweep_timeout)
     try:
-        (payload, usage), used = await ainvoke_structured(model, schema, messages, runtime.limiter)
+        (payload, usage), used = await ainvoke_structured(
+            model, schema, messages, runtime.limiter, timeout=timeout
+        )
     except Exception as exc:
         raise CodingError(f"{kind} failed for {passage_id}: {exc}") from exc
     _append_prompt_log(
@@ -1698,6 +2280,9 @@ async def _abatch_structured(
     except Exception as exc:
         label = passage_ids[0] if passage_ids else kind
         raise CodingError(f"{kind} failed for {label}: {exc}") from exc
+    timeout = None
+    if kind in {"sweep", "merge_verify", "definition_rewrite", "quote_fit"}:
+        timeout = sweep_deadline(runtime.limiter.request_timeout, runtime.sweep_timeout)
     payloads = []
     for messages, result, passage_id in zip(message_lists, results, passage_ids):
         try:
@@ -1705,7 +2290,9 @@ async def _abatch_structured(
             used = messages
         except ValueError:
             try:
-                (payload, usage), used = await ainvoke_structured(model, schema, messages, runtime.limiter)
+                (payload, usage), used = await ainvoke_structured(
+                    model, schema, messages, runtime.limiter, timeout=timeout
+                )
             except Exception as exc:
                 raise CodingError(f"{kind} failed for {passage_id}: {exc}") from exc
         _append_prompt_log(

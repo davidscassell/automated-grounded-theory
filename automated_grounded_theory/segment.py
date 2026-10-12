@@ -11,13 +11,20 @@ from __future__ import annotations
 import random
 import re
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Mapping, Sequence
 
 from automated_grounded_theory.corpus import LoadedDocument, load_corpus, normalize_newlines
-from automated_grounded_theory.validation import is_trivial_passage
+from automated_grounded_theory.validation import exclusion_reason
 
-Unit = Literal["paragraph", "sentence", "line", "speaker_turn"]
-UNITS: tuple[str, ...] = ("paragraph", "sentence", "line", "speaker_turn")
+Unit = Literal["paragraph", "sentence", "line", "speaker_turn", "incident"]
+UNITS: tuple[str, ...] = ("paragraph", "sentence", "line", "speaker_turn", "incident")
+INCIDENT_FLOOR = 150
+INCIDENT_TARGET = 800
+INCIDENT_CAP = 1200
+_QUESTION_SPEAKER = re.compile(
+    r"^(interviewer|moderator|question|q)\b",
+    re.IGNORECASE,
+)
 
 # Titles and a few Latin abbreviations. The sentence splitter does not try to
 # solve "U.S.A." or similar chains.
@@ -52,6 +59,73 @@ class CodingPlan:
     queue: list[int] = field(default_factory=list)
     branch_queues: dict[str, list[int]] = field(default_factory=dict)
     parallel: bool = False
+
+
+def interleave_document_queue(passages: Sequence[Mapping], queue: Sequence[int], batch_size: int) -> list[int]:
+    """Round-robin passages across documents, keeping each document in reading order.
+
+    A prefix of the result, up to ``batch_size`` passages, takes at most one
+    passage from each document. When only one document still has passages, the
+    rest of the queue is that document, in order. ``queue`` already lists
+    documents in seeded order and passages in reading order within a document.
+    """
+    width = max(1, int(batch_size))
+    by_doc: dict[str, list[int]] = {}
+    doc_order: list[str] = []
+    for index in queue:
+        doc_id = str(passages[index].get("doc_id") or "")
+        if doc_id not in by_doc:
+            doc_order.append(doc_id)
+            by_doc[doc_id] = []
+        by_doc[doc_id].append(index)
+    cursors = {doc: 0 for doc in doc_order}
+    remaining = {doc: len(indices) for doc, indices in by_doc.items()}
+    ordered: list[int] = []
+    count = len(doc_order)
+    cursor = 0
+    while any(remaining.values()):
+        alive = [doc for doc in doc_order if remaining[doc] > 0]
+        if len(alive) <= 1:
+            doc = alive[0]
+            ordered.extend(by_doc[doc][cursors[doc] :])
+            break
+        taken: set[str] = set()
+        guard = 0
+        while len(taken) < min(width, len(alive)) and guard < count * 2:
+            doc = doc_order[cursor % count]
+            cursor += 1
+            guard += 1
+            if remaining[doc] <= 0 or doc in taken:
+                continue
+            ordered.append(by_doc[doc][cursors[doc]])
+            cursors[doc] += 1
+            remaining[doc] -= 1
+            taken.add(doc)
+        if not taken:
+            break
+    return ordered
+
+
+def next_round_count(passages: Sequence[Mapping], indices: Sequence[int], batch_size: int) -> int:
+    """How many leading passages belong to the next interleaved round.
+
+    The count stops before a document would contribute a second passage, and
+    it stops at ``batch_size``. A run of one document is cut only by ``batch_size``.
+    """
+    if not indices:
+        return 0
+    width = max(1, int(batch_size))
+    docs = [str(passages[index].get("doc_id") or "") for index in indices]
+    if len(set(docs)) <= 1:
+        return min(width, len(indices))
+    seen: set[str] = set()
+    count = 0
+    for doc in docs:
+        if doc in seen or count >= width:
+            break
+        seen.add(doc)
+        count += 1
+    return count
 
 
 def plan_coding(
@@ -156,6 +230,8 @@ def segment_document(document: LoadedDocument, *, unit: Unit) -> tuple[list[dict
         spans, speaker_warning = _split_speaker_turns(text)
         if speaker_warning:
             warnings.append(f"{document.doc_id}: {speaker_warning}")
+    elif unit == "incident":
+        return _segment_incidents(document, text)
     else:
         raise ValueError(f"Unknown unit {unit!r}.")
 
@@ -184,7 +260,10 @@ def segment_document(document: LoadedDocument, *, unit: Unit) -> tuple[list[dict
                 "unit": unit,
                 "coding_order": position,
                 "metadata": dict(document.metadata),
+                "question": "",
                 "skipped": False,
+                "coverage_status": "pending",
+                "exclusion_reason": "",
             }
         )
     return passages, warnings
@@ -206,18 +285,27 @@ def _empty_passage(document: LoadedDocument, unit: str) -> dict:
         "unit": unit,
         "coding_order": 0,
         "metadata": dict(document.metadata),
+        "question": "",
         "skipped": True,
+        "coverage_status": "excluded",
+        "exclusion_reason": exclusion_reason(document.text) or "empty",
     }
 
 
 def _mark_trivial(passages: list[dict], warnings: list[str]) -> None:
     skipped = 0
     for passage in passages:
-        passage["skipped"] = is_trivial_passage(passage.get("text") or "")
+        reason = exclusion_reason(passage.get("text") or "")
+        passage["skipped"] = reason is not None
+        passage["exclusion_reason"] = reason or ""
+        passage["coverage_status"] = "excluded" if reason else passage.get("coverage_status") or "pending"
         skipped += int(passage["skipped"])
     if skipped:
         noun = "passage" if skipped == 1 else "passages"
-        warnings.append(f"Skipped {skipped} empty or trivial {noun} before the model was called.")
+        warnings.append(
+            f"Retained {skipped} empty or non-answer {noun} with an exclusion reason. "
+            "They were not sent to the model."
+        )
 
 
 def _live(passages: list[dict], indices: list[int]) -> list[int]:
@@ -318,6 +406,133 @@ def _split_sentences(text: str) -> list[tuple[int, int]]:
         if piece_start < end:
             spans.append((piece_start, end))
     return spans
+
+
+def _segment_incidents(document: LoadedDocument, text: str) -> tuple[list[dict], list[str]]:
+    """Question plus full answer, then sentence-bounded incidents of about 150–800 characters.
+
+    A short answer stays whole. A long answer splits only on sentence boundaries
+    and never mid-answer. One sentence longer than the cap stays intact.
+    """
+    warnings: list[str] = []
+    pairs = _question_answer_pairs(text)
+    passages: list[dict] = []
+    for question, answer_start, answer_end in pairs:
+        pieces = _pack_incidents(text, answer_start, answer_end)
+        if not pieces and text[answer_start:answer_end].strip():
+            pieces = [(answer_start, answer_end)]
+        for start, end in pieces:
+            position = len(passages)
+            prev_text = passages[-1]["text"] if passages else ""
+            passages.append(
+                {
+                    "passage_id": f"{document.doc_id}-p{position:04d}",
+                    "doc_id": document.doc_id,
+                    "doc_name": document.name,
+                    "source": document.source,
+                    "position": position,
+                    "text": text[start:end],
+                    "start_offset": start,
+                    "end_offset": end,
+                    "prev_text": prev_text,
+                    "next_text": "",
+                    "unit": "incident",
+                    "coding_order": position,
+                    "metadata": dict(document.metadata),
+                    "question": question,
+                    "skipped": False,
+                    "coverage_status": "pending",
+                    "exclusion_reason": "",
+                }
+            )
+    for index, passage in enumerate(passages):
+        if index + 1 < len(passages):
+            passage["next_text"] = passages[index + 1]["text"]
+    if not passages and text.strip():
+        warnings.append(f"{document.doc_id}: incident segmentation found no answer text.")
+    return passages, warnings
+
+
+def _question_answer_pairs(text: str) -> list[tuple[str, int, int]]:
+    turns = _speaker_spans(text)
+    if not turns:
+        stripped = text.strip()
+        if not stripped:
+            return []
+        start = text.find(stripped)
+        return [("", start, start + len(stripped))]
+    pairs: list[tuple[str, int, int]] = []
+    index = 0
+    while index < len(turns):
+        speaker, start, end, body = turns[index]
+        if _QUESTION_SPEAKER.match(speaker):
+            question = body
+            index += 1
+            answer_start = None
+            answer_end = end
+            while index < len(turns) and not _QUESTION_SPEAKER.match(turns[index][0]):
+                if answer_start is None:
+                    answer_start = turns[index][1]
+                answer_end = turns[index][2]
+                index += 1
+            if answer_start is None:
+                continue
+            pairs.append((question, answer_start, answer_end))
+            continue
+        pairs.append(("", start, end))
+        index += 1
+    return pairs
+
+
+def _speaker_spans(text: str) -> list[tuple[str, int, int, str]]:
+    matches = list(_SPEAKER.finditer(text))
+    if len(matches) < 2:
+        return []
+    found = []
+    for position, match in enumerate(matches):
+        end = matches[position + 1].start() if position + 1 < len(matches) else len(text)
+        chunk_end = end
+        while chunk_end > match.end() and text[chunk_end - 1].isspace():
+            chunk_end -= 1
+        body_start = match.end()
+        speaker = match.group(1).strip()
+        if body_start < chunk_end:
+            found.append((speaker, match.start(), chunk_end, text[body_start:chunk_end].strip()))
+    return found
+
+
+def _pack_incidents(text: str, start: int, end: int) -> list[tuple[int, int]]:
+    region = text[start:end]
+    sentences = _split_sentences(region)
+    if not sentences:
+        stripped = region.strip()
+        if not stripped:
+            return []
+        local = region.find(stripped)
+        return [(start + local, start + local + len(stripped))]
+    absolute = [(start + span[0], start + span[1]) for span in sentences]
+    if sum(span[1] - span[0] for span in absolute) <= INCIDENT_TARGET:
+        return [(absolute[0][0], absolute[-1][1])]
+    groups: list[list[tuple[int, int]]] = []
+    current: list[tuple[int, int]] = []
+    current_len = 0
+    for span in absolute:
+        length = span[1] - span[0]
+        if current and current_len >= INCIDENT_FLOOR and current_len + length > INCIDENT_TARGET:
+            groups.append(current)
+            current = [span]
+            current_len = length
+            continue
+        if current and current_len + length > INCIDENT_CAP and current_len >= INCIDENT_FLOOR:
+            groups.append(current)
+            current = [span]
+            current_len = length
+            continue
+        current.append(span)
+        current_len += length
+    if current:
+        groups.append(current)
+    return [(group[0][0], group[-1][1]) for group in groups]
 
 
 def _split_speaker_turns(text: str) -> tuple[list[tuple[int, int]], str | None]:

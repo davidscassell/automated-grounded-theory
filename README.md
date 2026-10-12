@@ -1,6 +1,6 @@
 # automated_grounded_theory
 
-**Open coding**, then **focused coding**, in the grounded theory tradition (Glaser and Strauss 1967; Glaser 1978, 1992; Strauss and Corbin 1990/1998; Charmaz 2006/2014). By default the model reads every document in a seeded order, and every passage of that document in reading order, comparing each incident with the codebook earned so far. It does not decide that the data are saturated. How each step maps onto those sources is in [docs/methodology.md](docs/methodology.md). A short notebook with the same citations and the Taguette import steps is [docs/open_coding.ipynb](docs/open_coding.ipynb). A full walkthrough on a fictional employee survey, including an offline mode that needs no API key, is [examples/demo.ipynb](examples/demo.ipynb). The notebook writes its outputs to a temporary directory.
+**Open coding**, then **focused coding**, in the grounded theory tradition (Glaser and Strauss 1967; Glaser 1978, 1992; Strauss and Corbin 1990/1998; Charmaz 2006/2014). By default the model reads every document in a seeded order, and every passage of that document in reading order, comparing each incident with the codebook earned so far. It does not decide that the data are saturated. How each step maps onto those sources is in [docs/methodology.md](docs/methodology.md). The 0.6 design, including the 0.6.1 corrections, is in [docs/design.md](docs/design.md). A short notebook with the same citations and the Taguette import steps is [docs/open_coding.ipynb](docs/open_coding.ipynb). A full walkthrough on a fictional employee survey, including an offline mode that needs no API key, is [examples/demo.ipynb](examples/demo.ipynb). The notebook writes its outputs to a temporary directory.
 
 `build_themes` is the next round: it groups those open codes into themes. It does not do axial coding, selective coding, or theoretical sampling.
 
@@ -27,6 +27,8 @@ Coding uses a LangChain chat model. Install the extra for the provider you actua
 | `huggingface` | Hugging Face |
 | `checkpoint` | SQLite resume (`langgraph-checkpoint-sqlite`) |
 | `plots` | Theme prevalence chart (`matplotlib`) |
+| `viz` | Graph drawing (`grandalf`). Optional `pygraphviz` needs a Graphviz install and is not in the extra. |
+| `taguette` | The Taguette package (`taguette>=1.5`) for a caller who imports it. This package still does not write a Taguette SQLite project. |
 
 ```bash
 pip install "automated_grounded_theory[xai]"
@@ -62,9 +64,9 @@ result = open_code(
     sweep_model="xai:grok-4",
     seed=7,
     sweep_every=25,
-    unit="paragraph",
-    batch_size=8,
-    concurrency=2,
+    unit="incident",
+    batch_size=1,
+    concurrency=4,
     output_dir="coding_run",
     checkpoint_path="coding_run/checkpoints.sqlite",
 )
@@ -72,7 +74,7 @@ result = open_code(
 
 `model` is a `provider:model-name` string, passed to LangChain `init_chat_model`, or a `BaseChatModel` you built yourself. `sweep_model` defaults to the same model. A blank string is the same as omitting it. `embeddings` is optional. When it is omitted, merge candidates are lexical and the sweep is still a chat-model call. You only need a chat model to run.
 
-Models this package builds from a `provider:model` string get `timeout=120` seconds (`request_timeout`). A `BaseChatModel` you pass in is not modified; the same deadline still wraps each call. `request_timeout=0` waits with no deadline. Timeouts and connection errors are retried with full-jitter backoff, the same as rate limits. Only a rate limit lowers the concurrency ceiling.
+Models this package builds from a `provider:model` string get `timeout=120` seconds (`request_timeout`). A `BaseChatModel` you pass in is not modified; the same deadline still wraps each coding call. Sweep calls use `sweep_timeout` (300 seconds) when that is longer than the coding deadline. `request_timeout=0` waits with no deadline, and the sweep then waits with no deadline too. Timeouts and connection errors are retried with full-jitter backoff, the same as rate limits. Only a rate limit lowers the concurrency ceiling.
 
 ```python
 from langchain.chat_models import init_chat_model
@@ -85,13 +87,13 @@ result = open_code(corpus, context, model=coder, seed=7)
 
 A corpus item can be a mapping with `text` or `path`, optional `id` / `name`, and optional `metadata` (department, tenure, and anything else about the respondent). Metadata is copied onto each segment and into `highlights.csv`. It is not a code, and the model is told not to put it in labels or definitions.
 
-`unit` is `paragraph` (default), `sentence`, `line`, or `speaker_turn` (lines like `Name: ...`). Each passage keeps its document id, character offsets, and the neighboring passage. In document mode the seed shuffles documents and leaves passages in reading order. In wave mode the seed shuffles passages. `plan_coding` shows that order without calling a model. Empty passages and non-answers (`n/a`, `none`, punctuation) are kept in the passage list and are not sent to the model.
+`unit` defaults to `incident`: an interviewer question plus the full answer, split into incidents of about 150–800 characters on sentence boundaries, never mid-answer, and capped near 1,200 characters. `paragraph`, `sentence`, `line`, and `speaker_turn` remain available. Each incident keeps document id, character offsets, the question, and neighboring text. Empty rows and non-answers (`n/a`, `I don't know`) stay in the passage list with `exclusion_reason` and are not sent to the model. A quote that is not verbatim is kept and flagged (`quote_status`: exact, normalized_match, fuzzy_match, possibly_modified, unanchored).
 
 `review_mode` defaults to `document`. Documents are shuffled with the seed. Passages inside a document stay in reading order and are coded with that document's neighbors. The codebook is updated after the document (or after each passage when `batch_size` is 1). `review_mode="wave"` may code passages from several documents in one step against one frozen snapshot. That weakens constant comparison (Glaser and Strauss 1967): a later passage can be coded before an earlier one, and new codes are invisible to the rest of the wave. Use it only when you have accepted that tradeoff. `parallel_documents=True` is a second opt-in that gives each document its own codebook until a sweep. It is off by default.
 
-`batch_size` (default 8, meant to stay in the 5–10 range) is how many passages share one model call. Batches are packed in coding order by an approximate token budget (`token_budget`, characters/4) so the split is a function of the seed, not of which call returns first. `concurrency` (default 2) is the ceiling on in-flight calls. A 429 halves that ceiling and a streak of successes raises it again (AIMD). Retries use full-jitter backoff and honor `Retry-After`. A timeout or a dropped connection retries too, and does not halve the ceiling. The system prompt and research context stay a stable prefix so a provider can cache them; the codebook snapshot and the passages come after.
+`batch_size` defaults to 1, the reference condition. `4` is the next setting to compare; do not start at 8. Above 1, each round takes the next incident from a different document, in the seeded order, and does not hold two adjacent passages from one document unless that document is the only one left. The round shares one frozen snapshot. Before the commit, one comparison call aliases new codes from that round when they are the same concept, and leaves the others distinct. `concurrency` (default 4) caps in-flight calls on one shared limiter. A 429 halves that ceiling. Transport retries use full jitter. `Retry-After` cannot exceed `max_backoff`, and the slot is released during the wait. Schema repair (`REPAIR THIS OUTPUT`) is a separate single attempt and is not a transport retry. Cache keys include the snapshot id, definition revision, evidence revision, and policy version. Run metadata includes an in-flight timeline (`metrics.activity`). Coding calls use `request_timeout` (120 seconds). Sweep calls use `sweep_timeout` (300 seconds) when that is longer.
 
-`pipeline=True` (the default) runs synthesis of the passages just coded while the next document or wave is coded against the pre-merge snapshot. The merge map is applied when the sweep returns, in chunk order, and the surviving label is the lexicographically smaller code id. Set `pipeline=False` and `batch_size=1` for a fully sequential reading. Async entry points are `aopen_code`, `abuild_themes`, `aevaluate`, and `amulti_seed_stability`. The sync wrappers work inside a running event loop (a notebook) by using a worker thread.
+`pipeline=True` (the default) runs synthesis of the passages just coded while the next document or wave is coded against the pre-merge snapshot. The merge map is applied when the sweep returns, in chunk order, and the surviving label is the lexicographically smaller code id. Set `pipeline=False` and `batch_size=1` for a fully sequential reading. Async entry points are `aopen_code`, `abuild_themes`, `aevaluate`, and `amulti_seed_stability`. The sync wrappers reuse one background event loop and do not close HTTP clients the model still holds, so `build_themes` can follow `open_code` on the same model. Inside a notebook they still run on that loop rather than the notebook's.
 
 `parallel_documents=True` codes each document on its own codebook and merges them at sweeps. It is off by default, because passages then do not see each other's new codes until the next sweep. `concurrency` caps how many documents are coded in one wave.
 
@@ -113,13 +115,13 @@ For each passage the model says which code each incident indicates, and whether 
 
 A plain check then runs, with no model:
 
-- the quote must be found in the passage; the stored quote is that slice
+- a quote is anchored, never dropped: exact, normalized (whitespace, case, punctuation), fuzzy (small edits, with a similarity), possibly modified, or unanchored. `...` can match several spans. Search is the passage, then neighbors, then the document. Possibly modified and unanchored quotes are flagged and coding continues
 - empty and generic labels (`experience`, `theme`, `discussion`, ...) are dropped
 - an in-vivo flag is cleared when the label is not in the passage
 - a non-gerund label is kept and flagged, unless `require_gerund=True`
 - a new code with no nearest code, or a definition that repeats respondent metadata, is kept and flagged for review
 
-Code-management calls send Pydantic JSON (stable ids for passages, codes, hints, and themes) and return Pydantic decisions. Every decision carries `confidence` from 0 to 1 and a `rationale` of one to three sentences. A coding action, in-vivo flag, definition rewrite, theme assignment, or tension below `review_below` (default 0.5) is written to `review.json` and is not applied. A merge below `min_merge_confidence` (default 0.5) is not applied either. One sweep call proposes the merge, checks the rubric (same action, same object, same stance), and rewrites the survivor label and definition from the member quotes. A quote that does not fit is split back out. Near-duplicate labels with the same stance merge without a model call. A positive code is never merged with a negative code (`valence` on the code), and both valences are stored on the merge. Each pair is decided once per run, keyed by the sorted code ids. A later sweep revisits it only when a definition changes in substance (token overlap below 0.5). At most `max_merges_per_sweep` merges (default 12) are applied in one sweep; the rest wait on the review list. After the last document, a consolidation sweep reads the codebook again in sorted chunks. The saturation curve reports new codes before merges and the net change after merges. A new label whose content words mostly restate the research context is flagged for review. Pass `check_model` when you want a cheaper model to double-check quote fit and context leakage. `evaluate_run` reports the confidence distribution. `run_metadata.json` records seconds spent coding, sweeping, rewriting, and, from the later stages, building themes and evaluating. Taguette CSVs stay on Taguette's columns. Embeddings are still optional.
+Code-management calls send Pydantic JSON (stable ids for passages, codes, hints, and themes) and return Pydantic decisions. Every decision carries `confidence` from 0 to 1 and a `rationale` of one to three sentences. A coding action, in-vivo flag, definition rewrite, theme assignment, or tension below `review_below` (default 0.5) is written to `review.json` and is not applied. A merge below `min_merge_confidence` (default 0.5) is not applied either. One sweep call proposes the merge, checks the rubric (same action, same object, same stance), and rewrites the survivor label and definition from the member quotes. A quote that does not fit is split back out. Near-duplicate labels with the same stance merge without a model call. Valence is stored and is not a merge veto. Both valences stay on the decision. A chain of similar pairs is merged only when every pair in that component was judged. Each pair is decided once per run, keyed by the sorted code ids. A later sweep revisits it only when a definition changes in substance (token overlap below 0.5). At most `max_merges_per_sweep` merges (default 12) are applied in one sweep; the rest wait on the review list. After the last document, a consolidation sweep reads the codebook again in sorted chunks. The saturation curve reports new codes before merges and the net change after merges. A new label whose content words mostly restate the research context is flagged for review. Pass `check_model` when you want a cheaper model to double-check quote fit and context leakage. `evaluate_run` reports the confidence distribution. `run_metadata.json` records seconds spent coding, sweeping, rewriting, and, from the later stages, building themes and evaluating. Taguette CSVs stay on Taguette's columns. Embeddings are still optional.
 
 Every `sweep_every` passages (and once at the end) a sweep model compares codes with codes. The codebook is sorted alphabetically by label, then by definition, and sent in chunks of `sweep_chunk` (default 20) so later codes are not dropped and near-duplicate wording sits together. Chunks run concurrently and are reconciled by chunk index. The model reads every code in the chunk and proposes duplicate merges itself. Each merge needs a rationale. Token overlap is an optional hint. Embeddings, when you pass them, add further hints (cosine of label plus definition, default threshold 0.65) and never replace the lexical hints. If that embedding call fails, the hints are token overlap only. Merging works with no embeddings model. Each hint has a `pair_id`. The decision log has one row per hint: accepted, `model_rejected`, `model_omitted` when the model skipped it, or `chunk_skipped` when that chunk timed out. A merge the model proposes that was not a hint is logged as `model_proposed`. Rejections of pairs that were not hinted are ignored and counted in a warning. A sweep with no hints still asks the model to review the codebook, and says so in a warning. A chunk that times out or loses its connection is skipped with a warning. The rest of the run continues. The sweep model can sharpen definitions. It can flag an overloaded code. It does not split one, because that would reassign old segments without rereading them. Accepted merges become a union-find map whose root is the lexicographically smaller code id, then that map relabels segments. A response cache replays an identical prompt on a rerun. After each document the run stores a reflexivity note that the document was read in seeded order. A document memo is written only when that reading produced a substantive passage memo. The placeholder sentence about no property or dimension is not stored.
 
@@ -140,7 +142,9 @@ Every `sweep_every` passages (and once at the end) a sweep model compares codes 
 
 Taguette's importer (`taguette.import_codebook.list_tags`) looks for a column named `tag`, `name`, or `path`, plus an optional `description`. Other columns are ignored, so `taguette_codebook.csv` imports from Project info → Import codebook. The header matches Taguette's own codebook CSV export. A backslash in a path is the parent/child split (`interesting\places` in Taguette's tests and `.qdc` export). Backslashes inside a label are replaced so they do not add a level. Dots are kept.
 
-Taguette writes REFI-QDA `.qdc` and does not import it. `codebook.qdc` follows that export (`urn:QDA-XML:codebook:1.0`, `Code` with `guid`, `name`, `isCodable="true"`, and an empty `Sets`) and adds a `Description` child so other packages can read the definition. `highlights.csv` matches Taguette's highlight export shape (`id`, `document`, `tag`, `content`). Taguette does not import highlights.
+`get_graph("open_code")` and `get_graph("themes")` return the LangGraph builders. Coding and theme chunks fan out with `Send`. `draw_mermaid_png` sends the diagram to mermaid.ink. `pip install "automated_grounded_theory[viz]"` adds grandalf for `draw_ascii`. `pygraphviz` is optional and is not installed by that extra.
+
+Taguette writes REFI-QDA `.qdc` and does not import it. A future adapter that opens a Taguette SQLite project must pin the Taguette version it was tested against. This package does not ship that adapter. Codebook CSV export stays the supported Taguette path. `codebook.qdc` follows that export (`urn:QDA-XML:codebook:1.0`, `Code` with `guid`, `name`, `isCodable="true"`, and an empty `Sets`) and adds a `Description` child so other packages can read the definition. `highlights.csv` matches Taguette's highlight export shape (`id`, `document`, `tag`, `content`). Taguette does not import highlights.
 
 Prompt caching: the instructions and research context sit in a stable system prefix. The codebook and the passages stay in the user message, which changes every call. Anthropic also gets an explicit `cache_control` breakpoint. Providers that cache a repeated prefix on their own (including xAI and OpenAI, when that model supports it) see the same stable prefix. Set `prompt_cache=True` or `False` to force the explicit breakpoint on or off.
 
@@ -167,7 +171,7 @@ themes = build_themes(
 
 A small LangGraph calls the model, then checks the assignment. Every open code must be assigned, and every name must be a code from the codebook. Unknown names are dropped. A code named twice keeps the first theme. If anything is missing, the model is shown that list and called again (`validation_retries`, default 1). Codes still missing get one targeted reassignment call. Whatever that call does not place goes into `Ungrouped incidents`. A few leftovers do not raise `ThemeError`.
 
-After that assignment the model reviews the themes in alphabetical order and proposes duplicate groups, with a reason on each fold. Token overlap is an optional hint. Embeddings, when you pass them, are an extra hint and are not required. A fold that would put more than `max_theme_share` of the codes (default 0.30) in one theme is split. The list is not forced down to `max_themes`. If the review times out, hinted near-duplicates keep the wording grouping. Every hinted pair and every model-proposed pair is logged on `metadata["duplicate_decisions"]`. If one theme still holds more than the share limit, the result warns.
+After that assignment the model reviews the themes in alphabetical order and proposes duplicate groups, with a reason on each fold. Token overlap is an optional hint. A code may belong to more than one theme. `max_theme_share` (default 0.30) and `max_themes` are presentation budgets: they do not block a fold or drop a membership. Prevalence fields name their denominators (`denominator_passages`, `denominator_documents`, `denominator_respondents`) because overlapping memberships mean the percentages can sum past 100. Every hinted pair and every model-proposed pair is logged on `metadata["duplicate_decisions"]`. A theme over the presentation budget is noted, not split.
 
 Counts are computed from the coded segments, not by the model:
 
@@ -201,7 +205,7 @@ from automated_grounded_theory import evaluate_run
 metrics = evaluate_run("coding_run", context="context.md", log_path="run.log")
 ```
 
-The report includes coverage, codes per passage, verbatim-quote accuracy, gerund and in-vivo rates, label length, singleton share, redundant pairs, the saturation curve and the first batch whose new-code rate is under 10%, merges, memo stats, context-leakage, calls, and tokens per passage.
+The report includes coverage, codes per passage, verbatim-quote accuracy, quote-status rates (`quote_flag_rate` is the share flagged `possibly_modified` or `unanchored`), gerund and in-vivo rates, label length, singleton share, redundant pairs, the saturation curve and the first batch whose new-code rate is under 10%, merges, memo stats, context-leakage, calls, and tokens per passage.
 
 Pass `other_sources` (more output directories or results on the same corpus) for Chen et al. coverage, overlap, novelty, and divergence (arXiv:2411.12142). The same scores are in `chen_metrics`. Without `model`, clustering is lexical Jaccard at 0.5, not the paper's model-based merge, so the default stays offline.
 
@@ -224,13 +228,13 @@ The checks and the sweep exist because that JMIR tutorial found LLM coding weak 
 
 ## Speed
 
-`scripts/benchmark_review_modes.py` runs a fake coder that sleeps 0.05s per call on 6 documents × 4 passages (24 passages), seed 7, `sweep_every=8`. No API key. Numbers below are from that script in this environment.
+`scripts/benchmark_review_modes.py` runs a fake coder that sleeps 0.05s per call on 6 documents × 4 passages (24 passages), seed 7, `sweep_every=8`, `unit="paragraph"`. No API key. Measured on 0.6.0. 0.6.1 was not remeasured.
 
 | Mode | What it does | Seconds | Calls | Passages/s | Codes | Merges | Near-duplicate pairs left |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| sequential | `review_mode="document"`, `pipeline=False`, `batch_size=1`, `concurrency=1` | 1.588 | 28 | 15.11 | 3 | 3 | 0 |
-| document | `review_mode="document"`, background synthesis, `batch_size=4`, `concurrency=4` | 0.525 | 10 | 45.73 | 3 | 3 | 0 |
-| wave | `review_mode="wave"`, background synthesis, `batch_size=4`, `concurrency=4` | 0.315 | 9 | 76.19 | 3 | 1 | 0 |
+| sequential | `review_mode="document"`, `pipeline=False`, `batch_size=1`, `concurrency=1` | 1.690 | 28 | 14.20 | 3 | 3 | 0 |
+| document | `review_mode="document"`, background synthesis, `batch_size=4`, `concurrency=4` | 0.543 | 10 | 44.18 | 3 | 3 | 0 |
+| wave | `review_mode="wave"`, background synthesis, `batch_size=4`, `concurrency=4` | 0.307 | 9 | 78.20 | 3 | 1 | 0 |
 
 On this fake coder, exact repeated labels collapse when they are committed, so none of the three left a near-duplicate pair behind. Document mode kept the same final code count as the sequential reading and still ran a merge on each synthesis. Wave mode was the fastest and needed only one merge pass, because passages from different documents shared a snapshot. That speed is the constant-comparison tradeoff described above: later incidents in a document can be coded before earlier ones. Re-run the script after you change the delay or the corpus; do not treat these times as a provider benchmark.
 

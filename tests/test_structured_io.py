@@ -112,7 +112,17 @@ def test_low_confidence_merge_is_not_applied():
     high = apply_sweep(
         book,
         segments,
-        merges=[{"source": "packing bags up", "target": "packing bags", "confidence": 1.0, "rationale": "same"}],
+        merges=[{
+            "source": "packing bags up",
+            "target": "packing bags",
+            "confidence": 1.0,
+            "rationale": "same",
+            "same_action": True,
+            "same_object": True,
+            "contrast_checked": True,
+            "material_contrast": False,
+            "evidence_same": True,
+        }],
         candidates=[],
         min_merge_confidence=0.5,
     )
@@ -120,7 +130,7 @@ def test_low_confidence_merge_is_not_applied():
     assert high["codebook"][next(iter(high["codebook"]))]["definition"] in {"own", "other"}
 
 
-def test_opposite_valence_is_not_merged():
+def test_opposite_valence_does_not_block_a_shared_category():
     book = {
         "praising direct team": {
             "code": "praising direct team",
@@ -151,8 +161,10 @@ def test_opposite_valence_is_not_merged():
         candidates=[],
     )
     assert applied["accepted_merges"] == []
-    assert applied["rejected_merges"][0]["reason"] == "opposite_valence"
-    assert len(applied["codebook"]) == 2
+    assert applied["rejected_merges"][0]["reason"] == "aspects_differ"
+    assert applied["rejected_merges"][0]["source_valence"] == "negative"
+    assert applied["rejected_merges"][0]["target_valence"] == "positive"
+    assert "opposite" not in applied["rejected_merges"][0]["reason"]
 
 
 def test_recreated_code_reapplies_the_accepted_merge():
@@ -173,7 +185,17 @@ def test_recreated_code_reapplies_the_accepted_merge():
     first = apply_sweep(
         book,
         [_kept("wanting better pay"), _kept("wanting more pay")],
-        merges=[{"source": "wanting more pay", "target": "wanting better pay", "confidence": 0.9, "rationale": "same pay"}],
+        merges=[{
+            "source": "wanting more pay",
+            "target": "wanting better pay",
+            "confidence": 0.9,
+            "rationale": "same pay",
+            "same_action": True,
+            "same_object": True,
+            "contrast_checked": True,
+            "material_contrast": False,
+            "evidence_same": True,
+        }],
         candidates=[],
     )
     assert set(first["codebook"]) == {"wanting better pay"}
@@ -220,7 +242,17 @@ def test_retired_definition_does_not_replace_the_survivor():
     applied = apply_sweep(
         book,
         [_kept("packing bags"), _kept("packing bags up")],
-        merges=[{"source": "packing bags up", "target": "packing bags", "confidence": 1, "rationale": "same"}],
+        merges=[{
+            "source": "packing bags up",
+            "target": "packing bags",
+            "confidence": 1,
+            "rationale": "same",
+            "same_action": True,
+            "same_object": True,
+            "contrast_checked": True,
+            "material_contrast": False,
+            "evidence_same": True,
+        }],
         candidates=[],
         definitions=[{"code": "packing bags up", "definition": "Retired wording pasted onto the survivor."}],
     )

@@ -91,7 +91,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--delay", type=float, default=0.05, help="Seconds of simulated latency per model call")
     args = parser.parse_args()
-    context_kwargs = dict(sweep_every=8, temperature=0)
+    context_kwargs = dict(sweep_every=8, temperature=0, unit="paragraph")
     rows = [
         run_mode(
             "sequential",

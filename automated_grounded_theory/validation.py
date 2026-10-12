@@ -1,13 +1,18 @@
 """Deterministic checks on model output.
 
-Quotes are kept only when they can be located in the passage. The stored
-quote is the passage slice, so later exports stay verbatim even if the model
-wrapped a line or swapped a curly quote.
+A quote mismatch never drops a code. ``anchor_quote`` searches the passage,
+then the neighbor windows, then the document. It records ``quote_status`` as
+``exact``, ``normalized_match``, ``fuzzy_match``, ``possibly_modified``, or
+``unanchored``, plus the best source span when one is found. The stored quote
+is that source slice when a span exists, so exports stay tied to the text
+even if the model wrapped a line or swapped a curly quote.
 """
 
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Any
 
 GENERIC_CODES = frozenset(
@@ -83,8 +88,16 @@ _FOLD = str.maketrans(
         "\u201d": '"',
         "\u2013": "-",
         "\u2014": "-",
+        "\u2026": "...",
     }
 )
+# A near-copy (typo, missing letter, dropped function word) is a fuzzy match.
+# A real wording change is only possibly the same span, and is flagged.
+FUZZY_MATCH_MIN = 0.90
+POSSIBLY_MODIFIED_MIN = 0.60
+QUOTE_FLAG_STATUSES = frozenset({"possibly_modified", "unanchored"})
+_ELLIPSIS = re.compile(r"\.\.\.|…|\[(?:\.\.\.|…|\.\s\.\s\.)\]")
+_WORD = re.compile(r"[A-Za-z0-9']+")
 
 
 def code_key(label: str) -> str:
@@ -127,49 +140,432 @@ def in_vivo_supported(label: str, passage: str) -> bool:
     return flexible_contains(label, passage)
 
 
+@dataclass(frozen=True)
+class QuoteAnchor:
+    """Where a model quote sits in the source, and how sure that placement is."""
+
+    status: str
+    similarity: float | None
+    source: str
+    quote: str
+    model_quote: str
+    spans: tuple[tuple[int, int], ...] = ()
+    doc_spans: tuple[tuple[int, int], ...] = ()
+    flags: tuple[str, ...] = ()
+
+    @property
+    def doc_start(self) -> int | None:
+        if not self.doc_spans:
+            return None
+        return self.doc_spans[0][0]
+
+    @property
+    def doc_end(self) -> int | None:
+        if not self.doc_spans:
+            return None
+        return self.doc_spans[-1][1]
+
+
 def locate_quote(quote: str, passage: str) -> tuple[int, int] | None:
-    """Find ``quote`` in ``passage`` and return the verbatim span.
+    """Return one source span when the quote matches exactly or after normalization.
 
-    Search order: exact substring, whitespace-flexible token sequence, then
-    the same searches after folding curly quotes and dashes (those folds are
-    one character to one character, so indexes still refer to ``passage``).
+    Fuzzy, possibly-modified, and unanchored quotes return ``None``. Call
+    :func:`anchor_quote` when the code must be kept either way.
     """
-    if quote is None:
+    anchor = anchor_quote(quote, passage)
+    if anchor.status not in {"exact", "normalized_match"} or not anchor.spans:
         return None
-    cleaned = str(quote).strip()
-    if not cleaned:
-        return None
-    span = _locate(cleaned, passage)
-    if span is not None:
-        return _accept(passage, span)
-    folded_quote = cleaned.translate(_FOLD)
-    folded_passage = passage.translate(_FOLD)
-    span = _locate(folded_quote, folded_passage)
-    if span is None:
-        return None
-    return _accept(passage, span)
-
-
-def _locate(quote: str, passage: str) -> tuple[int, int] | None:
-    index = passage.find(quote)
-    if index >= 0:
-        return index, index + len(quote)
-    tokens = quote.split()
-    if not tokens:
-        return None
-    pattern = r"\s+".join(re.escape(token) for token in tokens)
-    match = re.search(pattern, passage)
-    if not match:
-        return None
-    return match.start(), match.end()
-
-
-def _accept(passage: str, span: tuple[int, int]) -> tuple[int, int] | None:
-    start, end = span
+    start = anchor.spans[0][0]
+    end = anchor.spans[-1][1]
     verbatim = passage[start:end]
     if len(verbatim.strip()) < 3 or not re.search(r"[A-Za-z]", verbatim):
         return None
     return start, end
+
+
+def anchor_quote(
+    quote: str,
+    passage: str,
+    *,
+    prev_text: str = "",
+    next_text: str = "",
+    document_text: str = "",
+    passage_start: int = 0,
+    passage_end: int | None = None,
+    prefer_offset: int | None = None,
+    occurrence: int | None = None,
+) -> QuoteAnchor:
+    """Anchor ``quote`` without ever rejecting it.
+
+    Search the passage, then the previous and next neighbor windows, then the
+    whole document. ``...`` and ``…`` split the quote into ordered spans.
+    Whitespace, case, and punctuation differences are ``normalized_match``.
+    A small edit is ``fuzzy_match`` and carries ``similarity``. A looser hit is
+    ``possibly_modified``. No usable hit is ``unanchored``.
+    """
+    model_quote = "" if quote is None else str(quote).strip()
+    end_offset = passage_start + len(passage) if passage_end is None else passage_end
+    regions: list[tuple[str, str, int | None, int | None]] = [
+        ("passage", passage or "", passage_start, prefer_offset),
+    ]
+    if prev_text:
+        origin = _region_origin(document_text, prev_text, passage_start, before=True)
+        regions.append(("neighbor", prev_text, origin, 0))
+    if next_text:
+        origin = _region_origin(document_text, next_text, end_offset, before=False)
+        regions.append(("neighbor", next_text, origin, 0))
+    if document_text:
+        regions.append(("document", document_text, 0, passage_start))
+
+    best: QuoteAnchor | None = None
+    for source, text, origin, bias in regions:
+        allow_fuzzy = best is None or best.status in QUOTE_FLAG_STATUSES
+        hit = _anchor_in(
+            model_quote,
+            text,
+            bias=bias,
+            allow_fuzzy=allow_fuzzy,
+            occurrence=occurrence,
+        )
+        if hit is None:
+            continue
+        anchored = _place(hit, source=source, origin=origin, haystack=text, model_quote=model_quote)
+        if best is None or _better(anchored, best):
+            best = anchored
+        if best.status in {"exact", "normalized_match"} and source in {"passage", "neighbor"}:
+            break
+    if best is not None:
+        return best
+    return QuoteAnchor(
+        status="unanchored",
+        similarity=None,
+        source="",
+        quote=model_quote,
+        model_quote=model_quote,
+    )
+
+
+def _better(left: QuoteAnchor, right: QuoteAnchor) -> bool:
+    rank = {
+        "exact": 4,
+        "normalized_match": 3,
+        "fuzzy_match": 2,
+        "possibly_modified": 1,
+        "unanchored": 0,
+    }
+    left_rank = rank.get(left.status, 0)
+    right_rank = rank.get(right.status, 0)
+    if left_rank != right_rank:
+        return left_rank > right_rank
+    return (left.similarity or 0) > (right.similarity or 0) + 1e-9
+
+
+def _region_origin(document: str, snippet: str, boundary: int, *, before: bool) -> int | None:
+    if not document or not snippet:
+        return None
+    if before:
+        index = document.rfind(snippet, 0, max(boundary, 0))
+    else:
+        index = document.find(snippet, max(boundary, 0))
+    if index < 0:
+        return None
+    return index
+
+
+def _place(hit: "_Hit", *, source: str, origin: int | None, haystack: str, model_quote: str) -> QuoteAnchor:
+    doc_spans: tuple[tuple[int, int], ...] = ()
+    if origin is not None and hit.spans:
+        doc_spans = tuple((origin + start, origin + end) for start, end in hit.spans)
+    return QuoteAnchor(
+        status=hit.status,
+        similarity=hit.similarity,
+        source=source,
+        quote=_render_quote(haystack, hit.spans, model_quote),
+        model_quote=model_quote,
+        spans=hit.spans,
+        doc_spans=doc_spans,
+        flags=hit.flags,
+    )
+
+
+def _render_quote(haystack: str, spans: tuple[tuple[int, int], ...], model_quote: str) -> str:
+    if not spans:
+        return model_quote
+    pieces = [haystack[start:end] for start, end in spans]
+    if len(pieces) == 1:
+        return pieces[0]
+    return " ... ".join(pieces)
+
+
+@dataclass(frozen=True)
+class _Hit:
+    status: str
+    similarity: float | None
+    spans: tuple[tuple[int, int], ...]
+    flags: tuple[str, ...] = ()
+
+
+def _anchor_in(
+    quote: str,
+    haystack: str,
+    *,
+    bias: int | None,
+    allow_fuzzy: bool,
+    occurrence: int | None = None,
+) -> _Hit | None:
+    if not quote or not haystack:
+        return None
+    parts = _quote_parts(quote)
+    if not parts:
+        return None
+    if len(parts) >= 2:
+        multi = _anchor_parts(parts, haystack)
+        if multi is not None:
+            return multi
+    target = parts[0] if len(parts) == 1 else " ".join(parts)
+    exact = _exact_span(target, haystack, bias=bias, occurrence=occurrence)
+    if exact is not None and _span_ok(haystack, exact[0]):
+        return _Hit("exact", 1.0, (exact[0],), exact[1])
+    normalized = _normalized_span(target, haystack, bias=bias)
+    if normalized is not None and _span_ok(haystack, normalized):
+        return _Hit("normalized_match", 1.0, (normalized,))
+    if not allow_fuzzy:
+        return None
+    fuzzy = _fuzzy_span(target, haystack, bias=bias if bias is not None else 0)
+    if fuzzy is None:
+        return None
+    ratio, start, end = fuzzy
+    if ratio >= FUZZY_MATCH_MIN:
+        status = "fuzzy_match"
+    elif ratio >= POSSIBLY_MODIFIED_MIN:
+        status = "possibly_modified"
+    else:
+        return None
+    if not _span_ok(haystack, (start, end)):
+        return None
+    return _Hit(status, round(ratio, 4), ((start, end),))
+
+
+def _quote_parts(quote: str) -> list[str]:
+    folded = str(quote).translate(_FOLD)
+    parts = []
+    for part in _ELLIPSIS.split(folded):
+        cleaned = re.sub(r"\s+", " ", part).strip(" \t\"'")
+        if cleaned and cleaned not in {"...", "…"}:
+            parts.append(cleaned)
+    return parts
+
+
+def _anchor_parts(parts: list[str], haystack: str) -> _Hit | None:
+    cursor = 0
+    spans: list[tuple[int, int]] = []
+    saw_normalized = False
+    for part in parts:
+        found = _match_part(part, haystack, cursor)
+        if found is None:
+            return None
+        status, span = found
+        if span[0] - cursor > 800 and cursor:
+            return None
+        if status == "normalized_match":
+            saw_normalized = True
+        spans.append(span)
+        cursor = span[1]
+    status = "normalized_match" if saw_normalized else "exact"
+    return _Hit(status, 1.0, tuple(spans))
+
+
+def _match_part(part: str, haystack: str, cursor: int) -> tuple[str, tuple[int, int]] | None:
+    window_end = min(len(haystack), cursor + 800 + len(part) + 80)
+    region = haystack[cursor:window_end]
+    exact = _exact_span(part, region, bias=None)
+    if exact is not None and _span_ok(region, exact[0]):
+        span = exact[0]
+        return "exact", (cursor + span[0], cursor + span[1])
+    normalized = _normalized_span(part, region, bias=None)
+    if normalized is not None and _span_ok(region, normalized):
+        return "normalized_match", (cursor + normalized[0], cursor + normalized[1])
+    return None
+
+
+def _exact_span(
+    quote: str,
+    haystack: str,
+    *,
+    bias: int | None,
+    occurrence: int | None = None,
+) -> tuple[tuple[int, int], tuple[str, ...]] | None:
+    cleaned = quote.strip()
+    if not cleaned:
+        return None
+    spans = []
+    start = 0
+    while True:
+        index = haystack.find(cleaned, start)
+        if index < 0:
+            break
+        spans.append((index, index + len(cleaned)))
+        start = index + max(1, len(cleaned))
+    if not spans:
+        return None
+    if occurrence is not None:
+        if occurrence < 0 or occurrence >= len(spans):
+            return None
+        return spans[occurrence], ()
+    # A repeated quote is not silently the first hit. Neighborhood bias picks
+    # one; with no neighborhood the span is kept and flagged.
+    if len(spans) > 1 and bias is None:
+        return spans[0], ("ambiguous_span",)
+    return _closest(spans, bias), ()
+
+
+def _normalized_span(quote: str, haystack: str, *, bias: int | None) -> tuple[int, int] | None:
+    word_hit = _word_span(quote, haystack, bias=bias)
+    if word_hit is not None:
+        return word_hit
+    needle, _needle_map = _normalize_with_map(quote)
+    folded, indexes = _normalize_with_map(haystack)
+    if not needle or not folded:
+        return None
+    spans = []
+    start = 0
+    while True:
+        index = folded.find(needle, start)
+        if index < 0:
+            break
+        origin = indexes[index]
+        finish = indexes[index + len(needle) - 1] + 1
+        finish = _extend_trailing(haystack, finish, quote)
+        if _on_word_boundary(haystack, origin, finish):
+            spans.append((origin, finish))
+        start = index + max(1, len(needle))
+    if not spans:
+        return None
+    return _closest(spans, bias)
+
+
+def _word_span(quote: str, haystack: str, *, bias: int | None) -> tuple[int, int] | None:
+    """Match case, whitespace, and punctuation, but not a prefix of a longer word."""
+    needle = _norm_tokens(quote)
+    hay_tokens = _token_spans(haystack)
+    if not needle or len(hay_tokens) < len(needle):
+        return None
+    spans = []
+    width = len(needle)
+    words = [item[2] for item in hay_tokens]
+    for index in range(len(words) - width + 1):
+        if words[index : index + width] != needle:
+            continue
+        start = hay_tokens[index][0]
+        finish = _extend_trailing(haystack, hay_tokens[index + width - 1][1], quote)
+        spans.append((start, finish))
+    if not spans:
+        return None
+    return _closest(spans, bias)
+
+
+def _on_word_boundary(haystack: str, start: int, end: int) -> bool:
+    if start > 0 and haystack[start - 1].isalnum():
+        return False
+    if end < len(haystack) and haystack[end].isalnum():
+        return False
+    return True
+
+
+def _closest(spans: list[tuple[int, int]], bias: int | None) -> tuple[int, int]:
+    if bias is None:
+        return spans[0]
+    return min(spans, key=lambda span: (abs(span[0] - bias), span[0]))
+
+
+def _extend_trailing(haystack: str, end: int, quote: str) -> int:
+    """Keep trailing punctuation the quote itself included."""
+    needed = []
+    for char in reversed(quote.strip()):
+        folded = char.translate(_FOLD)
+        if folded.isalnum() or folded == "'":
+            break
+        if folded.isspace():
+            continue
+        needed.append(folded)
+    needed.reverse()
+    index = end
+    for want in needed:
+        while index < len(haystack) and haystack[index].isspace():
+            index += 1
+        if index < len(haystack) and haystack[index].translate(_FOLD) == want:
+            index += 1
+        else:
+            break
+    return index
+
+
+def _normalize_with_map(text: str) -> tuple[str, list[int]]:
+    chars: list[str] = []
+    indexes: list[int] = []
+    for index, char in enumerate(text):
+        for folded in char.translate(_FOLD).casefold():
+            if folded.isalnum() or folded == "'":
+                chars.append(folded)
+                indexes.append(index)
+    return "".join(chars), indexes
+
+
+def _fuzzy_span(quote: str, haystack: str, *, bias: int) -> tuple[float, int, int] | None:
+    quote_tokens = _norm_tokens(quote)
+    hay_tokens = _token_spans(haystack)
+    if len(quote_tokens) < 2 or len("".join(quote_tokens)) < 8 or not hay_tokens:
+        return None
+    anchors = [token for token in quote_tokens if len(token) >= 4] or quote_tokens
+    positions: list[int] = []
+    for token in sorted(anchors, key=len, reverse=True):
+        positions = [index for index, item in enumerate(hay_tokens) if item[2] == token]
+        if positions:
+            break
+    if not positions:
+        return None
+    positions = positions[:30]
+    joined = " ".join(quote_tokens)
+    width = len(quote_tokens)
+    best: tuple[float, int, int] | None = None
+    for pos in positions:
+        for size in range(max(1, width - 2), width + 3):
+            first = max(0, pos - size + 1)
+            last_start = min(pos, len(hay_tokens) - size)
+            if last_start < first:
+                continue
+            for start_i in range(first, last_start + 1):
+                end_i = start_i + size
+                window = " ".join(hay_tokens[index][2] for index in range(start_i, end_i))
+                ratio = SequenceMatcher(None, window, joined).ratio()
+                start = hay_tokens[start_i][0]
+                end = hay_tokens[end_i - 1][1]
+                if best is None or ratio > best[0] + 1e-9 or (
+                    abs(ratio - best[0]) <= 1e-9 and abs(start - bias) < abs(best[1] - bias)
+                ):
+                    best = (ratio, start, end)
+    if best is None or best[0] < POSSIBLY_MODIFIED_MIN:
+        return None
+    return best
+
+
+def _norm_tokens(text: str) -> list[str]:
+    return [match.group(0).casefold() for match in _WORD.finditer(text.translate(_FOLD))]
+
+
+def _token_spans(text: str) -> list[tuple[int, int, str]]:
+    return [
+        (match.start(), match.end(), match.group(0).translate(_FOLD).casefold())
+        for match in _WORD.finditer(text)
+    ]
+
+
+def _span_ok(haystack: str, span: tuple[int, int]) -> bool:
+    start, end = span
+    if start < 0 or end > len(haystack) or end - start < 3:
+        return False
+    verbatim = haystack[start:end]
+    return re.search(r"[A-Za-z]", verbatim) is not None
 
 
 def assess_label(label: str, *, in_vivo: bool, passage: str, require_gerund: bool) -> tuple[bool, list[str], dict[str, Any]]:
@@ -209,6 +605,9 @@ _TRIVIAL_EXACT = frozenset(
         "nothing",
         "no comment",
         "no comments",
+        "i don't know",
+        "i dont know",
+        "idk",
         "-",
         "--",
         "---",
@@ -242,19 +641,40 @@ def substantive_memo(text: str) -> bool:
     return True
 
 
+_HEX_CODE_ID = re.compile(r"^[0-9a-f]{16}$")
+
+
+def is_code_id_text(label: str) -> bool:
+    """True when a label is a raw 16-character code id, not a human name."""
+    return bool(_HEX_CODE_ID.fullmatch(str(label or "").strip().casefold()))
+
+
 def is_trivial_passage(text: str) -> bool:
     """True when a passage has no incident worth a model call.
 
-    Empty comments, punctuation, and explicit non-answers are skipped.
-    A short but substantive reply such as "yes" is kept.
+    Empty comments, punctuation, and explicit non-answers are excluded.
+    A short but substantive reply such as "yes" is kept. The original row
+    stays in the corpus with :func:`exclusion_reason`.
+    """
+    return exclusion_reason(text) is not None
+
+
+def exclusion_reason(text: str) -> str | None:
+    """Why a row is kept but not sent to the model, or None when it is codable.
+
+    ``N/A`` and ``I don't know`` are exclusions under the default study policy.
+    They can be missingness or a real claim of uncertainty; the reason is stored
+    either way so a later policy can recode them.
     """
     stripped = (text or "").strip()
     if not stripped:
-        return True
+        return "empty"
     folded = re.sub(r"\s+", " ", stripped).casefold()
     if folded in _TRIVIAL_EXACT:
-        return True
-    return re.search(r"[A-Za-z0-9]", stripped) is None
+        return "non_answer"
+    if re.search(r"[A-Za-z0-9]", stripped) is None:
+        return "no_substantive_text"
+    return None
 
 
 _LEAK_STOP = frozenset(

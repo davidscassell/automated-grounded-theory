@@ -56,15 +56,15 @@ def open_code(
     seed: int | None = None,
     sweep_every: int = 25,
     sweep_model: BaseChatModel | str | None = None,
-    unit: str = "paragraph",
+    unit: str = "incident",
     embeddings: Embeddings | str | None = None,
     api_key: str | None = None,
     embeddings_api_key: str | None = None,
     temperature: float = 0.0,
     sweep_temperature: float | None = None,
     parallel_documents: bool = False,
-    batch_size: int = 8,
-    concurrency: int = 2,
+    batch_size: int = 1,
+    concurrency: int = 4,
     top_k_codes: int = 12,
     frequent_codes: int = 8,
     merge_threshold: float = 0.65,
@@ -102,6 +102,7 @@ def open_code(
     retry_backoff: float = 0.5,
     retry_max_backoff: float = 8.0,
     request_timeout: float = 120.0,
+    sweep_timeout: float = 300.0,
 ) -> OpenCodeResult:
     """Run first-round grounded-theory open coding over ``corpus``.
 
@@ -141,7 +142,8 @@ def open_code(
     failing the run.
 
     Models built from a ``provider:model`` string use ``request_timeout``
-    (120 seconds). Every call also has that deadline. Rate limits, timeouts,
+    (120 seconds). Coding calls use that deadline. Sweep calls use
+    ``sweep_timeout`` (300 seconds) when that is longer. Rate limits, timeouts,
     and connection errors retry with full-jitter backoff and honor
     ``Retry-After``. This wrapper works inside a running event loop.
     """
@@ -199,6 +201,7 @@ def open_code(
             retry_backoff=retry_backoff,
             retry_max_backoff=retry_max_backoff,
             request_timeout=request_timeout,
+            sweep_timeout=sweep_timeout,
         )
     )
 
@@ -211,15 +214,15 @@ async def aopen_code(
     seed: int | None = None,
     sweep_every: int = 25,
     sweep_model: BaseChatModel | str | None = None,
-    unit: str = "paragraph",
+    unit: str = "incident",
     embeddings: Embeddings | str | None = None,
     api_key: str | None = None,
     embeddings_api_key: str | None = None,
     temperature: float = 0.0,
     sweep_temperature: float | None = None,
     parallel_documents: bool = False,
-    batch_size: int = 8,
-    concurrency: int = 2,
+    batch_size: int = 1,
+    concurrency: int = 4,
     top_k_codes: int = 12,
     frequent_codes: int = 8,
     merge_threshold: float = 0.65,
@@ -257,6 +260,7 @@ async def aopen_code(
     retry_backoff: float = 0.5,
     retry_max_backoff: float = 8.0,
     request_timeout: float = 120.0,
+    sweep_timeout: float = 300.0,
     limiter: CallLimiter | None = None,
 ) -> OpenCodeResult:
     """Async form of :func:`open_code`."""
@@ -277,6 +281,7 @@ async def aopen_code(
         review_below=review_below,
         min_merge_confidence=min_merge_confidence,
         request_timeout=request_timeout,
+        sweep_timeout=sweep_timeout,
     )
     if max_merges_per_sweep < 1:
         raise ValueError("max_merges_per_sweep must be at least 1.")
@@ -413,6 +418,7 @@ async def aopen_code(
         sweep_model_name=sweep_name,
         prompt_log_path=str(prompt_log_path) if prompt_log_path else None,
         output_dir=str(output_dir) if output_dir else None,
+        sweep_timeout=sweep_timeout,
         limiter=limiter
         or CallLimiter(
             concurrency,
@@ -539,7 +545,7 @@ async def amulti_seed_stability(
     limiter = open_code_kwargs.pop("limiter", None)
     if limiter is None:
         limiter = CallLimiter(
-            int(open_code_kwargs.get("concurrency", 2)),
+            int(open_code_kwargs.get("concurrency", 4)),
             max_retries=int(open_code_kwargs.get("max_retries", 4)),
             backoff=float(open_code_kwargs.get("retry_backoff", 0.5)),
             max_backoff=float(open_code_kwargs.get("retry_max_backoff", 8.0)),
@@ -583,6 +589,7 @@ def _validate_params(
     review_mode: str,
     token_budget: int,
     request_timeout: float,
+    sweep_timeout: float = 300.0,
     review_below: float = 0.5,
     min_merge_confidence: float = 0.5,
 ) -> None:
@@ -596,8 +603,8 @@ def _validate_params(
         raise ValueError("sweep_chunk and embed_batch_size must be at least 1.")
     if max_retries < 0 or retry_backoff < 0:
         raise ValueError("max_retries and retry_backoff must be zero or more.")
-    if request_timeout < 0:
-        raise ValueError("request_timeout must be zero or more. Zero waits with no per-call deadline.")
+    if request_timeout < 0 or sweep_timeout < 0:
+        raise ValueError("request_timeout and sweep_timeout must be zero or more. Zero waits with no per-call deadline.")
     if review_mode not in {"document", "wave"}:
         raise ValueError("review_mode must be 'document' or 'wave'.")
     if not 0 <= review_below <= 1 or not 0 <= min_merge_confidence <= 1:

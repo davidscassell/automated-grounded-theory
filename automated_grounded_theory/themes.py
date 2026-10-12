@@ -12,10 +12,11 @@ import random
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Annotated, Any, Mapping, Sequence
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send
 from typing_extensions import TypedDict
 
 from automated_grounded_theory.async_support import (
@@ -186,10 +187,9 @@ def assign_codes(
                 if str(label).strip():
                     unknown.append(str(label).strip())
                 continue
-            if key in seen:
+            if key in seen and seen[key] != (name or key):
                 duplicates.append(by_key[key]["code"])
-                continue
-            seen[key] = name or key
+            seen[key] = seen.get(key) or name or key
             codes.append(str(by_key[key]["code"]))
         raw_themes.append(
             {
@@ -228,7 +228,8 @@ def assign_codes(
 def assignment_feedback(report: Mapping[str, list[str]]) -> str:
     lines = [
         "VALIDATION FAILED",
-        "Assign every open code to exactly one theme. Copy each CODE_LABEL exactly. Do not invent codes.",
+        "Assign every open code to at least one theme. A code may belong to more than one theme. "
+        "Copy each CODE_LABEL exactly. Do not invent codes.",
     ]
     if report.get("missing"):
         lines.append("These codes were not assigned:")
@@ -313,7 +314,7 @@ def themes_markdown(result: ThemeResult) -> str:
     lines = [
         "# Themes",
         "",
-        "Focused coding grouped the open codes into themes. Each code is assigned to exactly one theme. "
+        "Focused coding grouped the open codes into themes. A code may belong to more than one theme. "
         "Counts are computed from the coded segments, not by the model. A passage counts toward a theme "
         "when any of its segments carries a member code. A document counts when any of its passages does. "
         "Respondents come from metadata when a respondent field is present, and otherwise each document is "
@@ -401,6 +402,8 @@ def export_themes(result: ThemeResult, output_dir: str | Path, *, chart: bool = 
         "metadata": result.metadata,
     }
     _write_json(place("themes.json"), payload)
+    shown = list((result.metadata or {}).get("presentation_themes") or result.themes)
+    _write_json(place("presentation_themes.json"), shown)
     place("themes.md").write_text(themes_markdown(result), encoding="utf-8")
     _write_csv(
         place("themes.csv"),
@@ -447,7 +450,11 @@ def export_themes(result: ThemeResult, output_dir: str | Path, *, chart: bool = 
                 "Install the plots extra to draw it."
             )
         else:
-            _write_chart(place("theme_prevalence.png"), result.themes, plt)
+            _write_chart(
+                place("theme_prevalence.png"),
+                list((result.metadata or {}).get("presentation_themes") or result.themes),
+                plt,
+            )
     result.export_paths.update(paths)
     return paths
 
@@ -671,7 +678,7 @@ async def abuild_themes(
         warnings.append("Dropped names that are not open codes: " + "; ".join(final["unknown"]))
     if final.get("duplicates"):
         warnings.append(
-            "Some codes were named in more than one theme. The first assignment was kept: "
+            "Some codes sit in more than one theme. Memberships overlap, so percentages can too: "
             + "; ".join(final["duplicates"])
         )
     assigned, proposal, duplicate_decisions = await _fold_near_duplicates(
@@ -742,6 +749,7 @@ async def abuild_themes(
                 theme_chunk=theme_chunk,
             ),
             "duplicate_decisions": duplicate_decisions,
+            "presentation_themes": presentation_themes(themes),
             "stage_seconds": {"themes": round(time.perf_counter() - started, 4)},
         },
         warnings=warnings,
@@ -769,6 +777,106 @@ def reconcile_theme_proposals(parts: Sequence[tuple[int, Mapping[str, Any]]]) ->
     return {"themes": themes, "tensions": tensions, "negative_cases": negatives}
 
 
+def presentation_themes(themes: Sequence[Mapping[str, Any]]) -> list[dict]:
+    """Fold themes that share a content word. This is a reporting view only.
+
+    Analytic membership is unchanged. There is no theme quota and no share cap.
+    A theme that does not share a content word with another stays as it is.
+    """
+    rows = [dict(theme) for theme in themes if str(theme.get("name") or "").strip()]
+    if not rows:
+        return []
+    parent = list(range(len(rows)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        root_left, root_right = find(left), find(right)
+        if root_left == root_right:
+            return
+        if root_left < root_right:
+            parent[root_right] = root_left
+        else:
+            parent[root_left] = root_right
+
+    tokens = [_presentation_tokens(str(theme.get("name") or "")) for theme in rows]
+    for left in range(len(rows)):
+        for right in range(left + 1, len(rows)):
+            if tokens[left] and tokens[right] and tokens[left] & tokens[right]:
+                union(left, right)
+    groups: dict[int, list[int]] = {}
+    for index in range(len(rows)):
+        groups.setdefault(find(index), []).append(index)
+    folded = []
+    for indexes in (groups[key] for key in sorted(groups, key=lambda item: min(groups[item]))):
+        members = [rows[index] for index in indexes]
+        bundled = _bundle_themes(members)
+        bundled.update(_presentation_prevalence(members))
+        bundled["folded_from"] = [str(theme.get("name") or "") for theme in members]
+        bundled["presentation"] = True
+        folded.append(bundled)
+    return folded
+
+
+def _presentation_prevalence(members: Sequence[Mapping[str, Any]]) -> dict:
+    """Counts and shares for a reporting theme. A single theme keeps its own."""
+    keys = (
+        "n_passages",
+        "pct_passages",
+        "n_documents",
+        "pct_documents",
+        "n_comments",
+        "pct_comments",
+        "n_respondents",
+        "pct_respondents",
+        "denominator_passages",
+        "denominator_documents",
+        "denominator_respondents",
+        "membership",
+        "breakdowns",
+        "quotes",
+        "code_counts",
+    )
+    if len(members) == 1:
+        return {key: members[0][key] for key in keys if key in members[0]}
+    folded: dict = {}
+    for count_key, pct_key, denom_key in (
+        ("n_passages", "pct_passages", "denominator_passages"),
+        ("n_documents", "pct_documents", "denominator_documents"),
+        ("n_comments", "pct_comments", "denominator_documents"),
+        ("n_respondents", "pct_respondents", "denominator_respondents"),
+    ):
+        if not any(count_key in theme for theme in members):
+            continue
+        total = sum(int(theme.get(count_key) or 0) for theme in members)
+        folded[count_key] = total
+        denom = next((theme.get(denom_key) for theme in members if theme.get(denom_key)), None)
+        if denom:
+            folded[denom_key] = denom
+            folded[pct_key] = round(100.0 * total / int(denom), 1)
+        elif any(pct_key in theme for theme in members):
+            folded[pct_key] = round(sum(float(theme.get(pct_key) or 0) for theme in members), 1)
+    return folded
+
+
+def _presentation_tokens(name: str) -> set[str]:
+    import re
+
+    stop = {"a", "an", "the", "of", "to", "for", "and", "or", "in", "on", "with", "from"}
+    tokens = set()
+    for token in re.findall(r"[a-z0-9]+", name.casefold()):
+        if token in stop or len(token) < 3 or (token.endswith("ing") and len(token) > 5):
+            continue
+        if token.endswith("s") and len(token) > 4:
+            token = token[:-1]
+        tokens.add(token)
+    return tokens
+
+
 def collapse_themes(
     themes: Sequence[Mapping[str, Any]],
     *,
@@ -778,15 +886,14 @@ def collapse_themes(
     cap: bool = True,
     max_theme_share: float = 0.30,
 ) -> tuple[list[dict], dict[str, str], bool]:
-    """Fold themes only while they stay similar and none grows past ``max_theme_share``.
+    """Fold themes that are similar. ``max_theme_share`` is not an analytic cap.
 
     Similarity is cosine when ``vectors`` is aligned with ``themes``, otherwise
     token overlap of the name and definition. Pairs below ``near_threshold`` are
     not folded, including when more than ``max_themes`` themes remain.
-    ``max_themes`` is the prompt target, not a quota this function forces.
-    A fold that would put more than ``max_theme_share`` of the open codes in one
-    theme is skipped. ``cap`` is retained so older callers keep working; it no
-    longer merges dissimilar themes down to ``max_themes``.
+    ``max_themes`` is a presentation budget, not a quota this function forces.
+    ``max_theme_share`` is kept for callers and for a presentation note. It does
+    not block a fold. ``cap`` is retained so older callers keep working.
     """
     del cap, max_themes
     rows = [dict(theme) for theme in themes if str(theme.get("name") or "").strip()]
@@ -1084,15 +1191,13 @@ def _groups_from_confirmation(
     max_theme_share: float,
     min_merge_confidence: float = 0.5,
 ) -> list[list[int]]:
-    """Apply the model's theme groups. A group over the share cap is split.
+    """Apply the model's theme groups. Share is a presentation note, not a split.
 
     The model may combine themes that were not in the same hint. ``groups`` is
     unused except to keep the call stable for readers of the hint clusters.
     """
-    del groups
+    del groups, max_theme_share
     by_name = {str(row.get("name") or ""): index for index, row in enumerate(rows)}
-    sizes, total = _theme_sizes(rows)
-    limit = max_theme_share * total if max_theme_share > 0 else total
     placed: set[int] = set()
     confirmed: list[list[int]] = []
     for group in plan.get("themes") or []:
@@ -1109,10 +1214,7 @@ def _groups_from_confirmation(
         if len(indexes) > 1 and confidence < min_merge_confidence:
             confirmed.extend([[index] for index in indexes])
             continue
-        if sum(sizes[index] for index in indexes) > limit + 1e-9:
-            confirmed.extend([[index] for index in indexes])
-        else:
-            confirmed.append(indexes)
+        confirmed.append(indexes)
     for index in range(len(rows)):
         if index not in placed:
             confirmed.append([index])
@@ -1208,7 +1310,7 @@ def _theme_clusters(
     also_lexical: bool = False,
     embedding_threshold: float = 0.65,
 ) -> list[list[int]]:
-    """Greedy clusters. Never build a dominant theme.
+    """Greedy clusters. Similarity decides the fold. Share does not.
 
     With ``also_lexical``, a pair is eligible when token overlap is at least
     ``near_threshold`` or, when vectors exist, cosine is at least
@@ -1262,12 +1364,10 @@ def _theme_clusters(
                 continue
             if lexical >= near_threshold:
                 eligible.append((lexical, left, right))
-    limit = max_theme_share * total if max_theme_share > 0 else total
+    del max_theme_share, total
     for _value, left, right in sorted(eligible, key=lambda item: (-item[0], item[1], item[2])):
         root_left, root_right = find(left), find(right)
         if root_left == root_right:
-            continue
-        if sizes[root_left] + sizes[root_right] > limit + 1e-9:
             continue
         union(left, right)
 
@@ -1304,7 +1404,7 @@ def _themes_from_groups(
 
 
 def _dominance_warning(themes: Sequence[Mapping[str, Any]], max_theme_share: float) -> str | None:
-    """Warn when one theme holds more than the share limit on a real codebook."""
+    """Presentation note when one theme exceeds the display budget. Folds are not blocked."""
     counts = [len(list(theme.get("codes") or [])) for theme in themes]
     total = sum(counts)
     if total < 8 or not themes:
@@ -1318,7 +1418,8 @@ def _dominance_warning(themes: Sequence[Mapping[str, Any]], max_theme_share: flo
     ceiling = round(100 * max_theme_share)
     return (
         f"Theme {name!r} holds {count} of {total} open codes ({pct}%), "
-        f"above the {ceiling}% share limit. Folds that would concentrate more codes were blocked."
+        f"above the {ceiling}% presentation budget. The underlying memberships are unchanged. "
+        "Percentages can overlap because a code may sit in more than one theme."
     )
 
 
@@ -1357,6 +1458,53 @@ def _bundle_themes(
         "codes": codes,
         "confidence": min(confidences) if confidences else 1.0,
     }
+
+
+def _theme_part_reducer(left, right):
+    if isinstance(right, dict) and right.get("__reset__"):
+        return {}
+    merged = dict(left or {})
+    for key, value in (right or {}).items():
+        if key == "__reset__":
+            continue
+        merged[key] = value
+    return merged
+
+
+class ThemeFanState(TypedDict, total=False):
+    chunk_ids: list
+    parts: Annotated[dict, _theme_part_reducer]
+
+
+class ThemeWorkerInput(TypedDict, total=False):
+    chunk_index: int
+
+
+def build_theme_graph():
+    """Theme reporting graph. Chunk workers fan out with Send and join before validate."""
+
+    def prepare(state: ThemeFanState) -> dict:
+        return {"chunk_ids": list(state.get("chunk_ids") or []), "parts": {"__reset__": True}}
+
+    def route(state: ThemeFanState):
+        return [Send("theme_worker", {"chunk_index": index}) for index in (state.get("chunk_ids") or [])]
+
+    def theme_worker(state: ThemeFanState) -> dict:
+        index = int(state.get("chunk_index") or 0)
+        return {"parts": {index: {"chunk_index": index}}}
+
+    def validate(state: ThemeFanState) -> dict:
+        return {"parts": dict(state.get("parts") or {})}
+
+    builder = StateGraph(ThemeFanState)
+    builder.add_node("prepare", prepare)
+    builder.add_node("theme_worker", theme_worker, input_schema=ThemeWorkerInput)
+    builder.add_node("validate", validate)
+    builder.add_edge(START, "prepare")
+    builder.add_conditional_edges("prepare", route, ["theme_worker"])
+    builder.add_edge("theme_worker", "validate")
+    builder.add_edge("validate", END)
+    return builder
 
 
 def _compile_theme_graph(
@@ -1594,6 +1742,10 @@ def _one_theme(
         "pct_comments": _pct(n_documents, totals["n_documents"]),
         "n_respondents": n_respondents,
         "pct_respondents": _pct(n_respondents, totals["n_respondents"]),
+        "denominator_passages": totals["n_passages"],
+        "denominator_documents": totals["n_documents"],
+        "denominator_respondents": totals["n_respondents"],
+        "membership": "many_to_many",
         "confidence": bounded_unit(theme.get("confidence"), 1.0),
         "rationale": str(theme.get("rationale") or "").strip() or "These codes gather the same kind of incident.",
         "breakdowns": _breakdowns(passage_ids, passages_by_id),

@@ -261,7 +261,7 @@ def load_muse(root: str | Path, dataset: str) -> dict[str, Any]:
     documents = []
     for row in document_rows:
         text = _field(row, "transcript text", "text", "document_text")
-        doc_id = _field(row, "document", "doc_id", "id")
+        doc_id = normalize_doc_id(_field(row, "document", "doc_id", "id"))
         if text and doc_id:
             documents.append({"id": doc_id, "text": text})
     tags = []
@@ -269,7 +269,7 @@ def load_muse(root: str | Path, dataset: str) -> dict[str, Any]:
         label_id = _field(row, "label_id", "code_id")
         label = by_id.get(label_id, {}).get("label") or _field(row, "label", "code")
         excerpt = _field(row, "excerpt", "quote", "text")
-        doc_id = _field(row, "document", "doc_id")
+        doc_id = normalize_doc_id(_field(row, "document", "doc_id"))
         if excerpt and label:
             tags.append({"document": doc_id, "excerpt": excerpt, "label_id": label_id, "label": label})
     return {
@@ -395,8 +395,9 @@ def excerpt_label_pairs(
         best_label = ""
         best_score = 0.0
         for segment in segments:
-            doc_id = str(segment.get("doc_id") or "")
-            doc_name = str(segment.get("doc_name") or "")
+            doc_id = normalize_doc_id(segment.get("doc_id"))
+            doc_name = normalize_doc_id(segment.get("doc_name"))
+            document = normalize_doc_id(document)
             if document and document not in {doc_id, doc_name}:
                 continue
             score = _token_overlap(excerpt, str(segment.get("quote") or ""))
@@ -435,6 +436,169 @@ def binary_theme_kappa(
     return round(sum(scores) / len(scores), 4)
 
 
+def normalize_doc_id(value: Any) -> str:
+    """``'6'`` and ``'6.0'`` are the same document id. Other ids stay as text."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        number = float(text)
+    except ValueError:
+        return text
+    if number.is_integer():
+        return str(int(number))
+    return text
+
+
+def codes_tagged_in(tags: Sequence[Mapping[str, Any]], document_ids: Sequence[Any]) -> list[str]:
+    """Human labels that are actually applied in the coded documents."""
+    wanted = {normalize_doc_id(item) for item in document_ids if normalize_doc_id(item)}
+    labels: list[str] = []
+    seen: set[str] = set()
+    for tag in tags:
+        if wanted and normalize_doc_id(tag.get("document")) not in wanted:
+            continue
+        label = str(tag.get("label") or "").strip()
+        if label and label not in seen:
+            seen.add(label)
+            labels.append(label)
+    return labels
+
+
+def _span_overlap(left: tuple[int, int], right: tuple[int, int]) -> float:
+    start = max(left[0], right[0])
+    end = min(left[1], right[1])
+    if end <= start:
+        return 0.0
+    intersection = end - start
+    union = max(left[1], right[1]) - min(left[0], right[0])
+    if union <= 0:
+        return 0.0
+    iou = intersection / union
+    shorter = min(left[1] - left[0], right[1] - right[0])
+    containment = intersection / shorter if shorter else 0.0
+    return max(iou, containment)
+
+
+def excerpt_offset_hits(
+    tags: Sequence[Mapping[str, Any]],
+    segments: Sequence[Mapping[str, Any]],
+    alignments: Sequence[Mapping[str, Any]],
+    *,
+    documents: Sequence[Mapping[str, Any]] | None = None,
+    threshold: float = 0.3,
+) -> dict[str, Any]:
+    """A human excerpt is hit when an overlapping LLM span carries an aligned code."""
+    by_human: dict[str, set[str]] = {}
+    for row in alignments:
+        human = str(row.get("human_code") or "").strip()
+        grade = str(row.get("grade") or "full")
+        if grade == "none" or not human:
+            continue
+        for label in row.get("llm_codes") or [row.get("llm_code")]:
+            if str(label or "").strip():
+                by_human.setdefault(human, set()).add(str(label))
+    texts = {normalize_doc_id(item.get("id") or item.get("doc_id")): str(item.get("text") or "") for item in documents or []}
+    hits = 0
+    graded = []
+    for tag in tags:
+        doc_id = normalize_doc_id(tag.get("document"))
+        excerpt = str(tag.get("excerpt") or "")
+        label = str(tag.get("label") or "")
+        text = texts.get(doc_id, "")
+        start = text.find(excerpt) if excerpt and text else -1
+        human_span = (start, start + len(excerpt)) if start >= 0 else None
+        matched = False
+        for segment in segments:
+            if normalize_doc_id(segment.get("doc_id")) != doc_id and doc_id:
+                continue
+            if str(segment.get("code") or "") not in by_human.get(label, set()):
+                continue
+            if human_span is None or segment.get("doc_start") is None:
+                if _token_overlap(excerpt, str(segment.get("quote") or "")) >= threshold:
+                    matched = True
+                    break
+                continue
+            span = (int(segment["doc_start"]), int(segment["doc_end"]))
+            if _span_overlap(human_span, span) >= threshold:
+                matched = True
+                break
+        hits += int(matched)
+        graded.append({"document": doc_id, "label": label, "hit": matched})
+    total = len(tags)
+    return {
+        "excerpt_hits": hits,
+        "excerpt_total": total,
+        "excerpt_recall": round(hits / total, 4) if total else None,
+        "rows": graded,
+    }
+
+
+def unit_grid_agreement(
+    units: Sequence[Mapping[str, Any]],
+    *,
+    human_key: str = "human_codes",
+    model_key: str = "llm_codes",
+) -> dict[str, Any]:
+    """Per-code present/absent agreement on a fixed unit grid. The negative class is absence."""
+    labels = sorted(
+        {
+            str(label)
+            for unit in units
+            for label in list(unit.get(human_key) or []) + list(unit.get(model_key) or [])
+            if str(label).strip()
+        }
+    )
+    f1_scores = []
+    kappas = []
+    for label in labels:
+        left = ["yes" if label in (unit.get(human_key) or []) else "no" for unit in units]
+        right = ["yes" if label in (unit.get(model_key) or []) else "no" for unit in units]
+        true_pos = sum(item == "yes" and other == "yes" for item, other in zip(left, right))
+        false_pos = sum(item == "no" and other == "yes" for item, other in zip(left, right))
+        false_neg = sum(item == "yes" and other == "no" for item, other in zip(left, right))
+        precision = true_pos / (true_pos + false_pos) if true_pos + false_pos else 0.0
+        recall = true_pos / (true_pos + false_neg) if true_pos + false_neg else 0.0
+        f1_scores.append(0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall))
+        score = cohens_kappa(left, right)
+        if score is not None:
+            kappas.append(score)
+    return {
+        "codes": len(labels),
+        "units": len(units),
+        "macro_f1": round(sum(f1_scores) / len(f1_scores), 4) if f1_scores else None,
+        "macro_kappa": round(sum(kappas) / len(kappas), 4) if kappas else None,
+    }
+
+
+def audit_sample(rows: Sequence[Mapping[str, Any]], *, fraction: float = 0.2, seed: int = 0) -> list[dict]:
+    """A reproducible slice of alignment rows for hand review. Default is 20%."""
+    import random
+
+    ordered = [dict(row) for row in rows]
+    if not ordered or fraction <= 0:
+        return []
+    count = max(1, int(round(len(ordered) * fraction)))
+    rng = random.Random(seed)
+    picked = rng.sample(ordered, k=min(count, len(ordered)))
+    picked.sort(key=lambda row: (str(row.get("human_code") or ""), str(row.get("llm_code") or "")))
+    return picked
+
+
+def quote_and_coverage_rates(passages: Sequence[Mapping[str, Any]], segments: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Quote-flag rates and the share of passages left without a code."""
+    from automated_grounded_theory.evaluate import _quote_anchor_rates
+
+    eligible = [passage for passage in passages if not passage.get("skipped")]
+    coded_ids = {str(segment.get("passage_id") or "") for segment in segments}
+    uncoded = [passage for passage in eligible if str(passage.get("passage_id") or "") not in coded_ids]
+    rates = _quote_anchor_rates(segments)
+    rates["uncoded_share"] = round(len(uncoded) / len(eligible), 4) if eligible else 0.0
+    rates["eligible_passages"] = len(eligible)
+    rates["uncoded_passages"] = len(uncoded)
+    return rates
+
+
 async def amap_codes(
     model: Any,
     llm_codes: Sequence[Mapping[str, Any] | str],
@@ -443,13 +607,20 @@ async def amap_codes(
     limiter: Any = None,
     chunk_size: int = 40,
 ) -> list[dict[str, Any]]:
-    """Judge which human code each LLM code matches. Chunks run concurrently."""
+    """Judge which human code each LLM code matches. Chunks run concurrently.
+
+    A ``provider:model`` string is resolved with ``init_chat_model``. Passing the
+    string straight to structured output is what crashed the Muse scorer.
+    """
     import asyncio
 
     from automated_grounded_theory.async_support import CallLimiter, ainvoke_structured
+    from automated_grounded_theory.backends import resolve_chat_model
     from automated_grounded_theory.prompts import build_code_match_messages
     from automated_grounded_theory.schemas import CodeMatchBatch
 
+    if isinstance(model, str):
+        model = resolve_chat_model(model)
     prepared_human = [
         item if isinstance(item, Mapping) else {"code": str(item), "definition": "", "theme": ""}
         for item in human_codes

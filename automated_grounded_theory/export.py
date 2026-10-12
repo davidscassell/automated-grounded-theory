@@ -262,6 +262,10 @@ def export_result(result, directory: str | Path) -> dict[str, str]:
             "passage_id",
             "code",
             "quote",
+            "quote_status",
+            "quote_similarity",
+            "quote_source",
+            "model_quote",
             "doc_start",
             "doc_end",
             "in_vivo",
@@ -285,6 +289,10 @@ def export_result(result, directory: str | Path) -> dict[str, str]:
                 item.get("passage_id"),
                 item.get("code"),
                 item.get("quote"),
+                item.get("quote_status"),
+                item.get("quote_similarity"),
+                item.get("quote_source"),
+                item.get("model_quote"),
                 item.get("doc_start"),
                 item.get("doc_end"),
                 item.get("in_vivo"),
@@ -377,6 +385,15 @@ def export_result(result, directory: str | Path) -> dict[str, str]:
     metadata = dict(result.metadata)
     metadata["interrupted"] = result.interrupted
     metadata["saturation_note"] = result.saturation_report.get("note")
+    metrics = metadata.get("metrics") or {}
+    _write_json(
+        place("duplicate_rounds.json"),
+        {
+            "in_batch": list(metrics.get("in_batch_rounds") or []),
+            "cross_snapshot": list(metrics.get("duplicate_rounds") or []),
+        },
+    )
+    _write_json(place("lost_distinction_candidates.json"), list(metadata.get("lost_distinction_audit") or []))
     _write_json(place("run_metadata.json"), metadata)
     _write_json(place("run.json"), result.to_dict())
     return {name: str(path) for name, path in paths.items()}
