@@ -232,6 +232,22 @@ def _abort_inflight(keys: Sequence[tuple[str, str]], exc: BaseException) -> None
             _abort_future(_VECTOR_CACHE.inflight.pop(key, None), exc)
 
 
+def _release_inflight(keys: Sequence[tuple[str, str]], exc: BaseException) -> None:
+    """Fail unfinished calls. A query that already cached its vector is kept."""
+    with _VECTOR_CACHE.lock:
+        for key in keys:
+            future = _VECTOR_CACHE.inflight.get(key)
+            if future is None or future.done():
+                _VECTOR_CACHE.inflight.pop(key, None)
+                continue
+            cached = _VECTOR_CACHE.vectors.get(key)
+            _VECTOR_CACHE.inflight.pop(key, None)
+            if cached is not None:
+                future.set_result(list(cached))
+            else:
+                _abort_future(future, exc)
+
+
 def cached_embed_texts(
     embeddings,
     texts: Sequence[str],
@@ -330,7 +346,7 @@ async def cached_aembed_texts(
                     if future is not None and not future.done():
                         future.set_result(stored)
         except BaseException as exc:
-            _abort_inflight(mine_keys, exc)
+            _release_inflight(mine_keys, exc)
             raise
     for index, future in waiting:
         # shield: cancelling this waiter must not cancel the shared call.
@@ -514,19 +530,155 @@ def _rank_vectors(labels: Sequence[str], vectors: Sequence[Sequence[float]], que
     return [label for _, label in scored[:k]]
 
 
-async def _embed_batch(embeddings, batch: list[str], *, role: str) -> list[list[float]]:
-    """One embedding call. ``query`` uses the query API, same as ``rank``."""
-    if role == "query":
-        aembed_query = getattr(embeddings, "aembed_query", None)
-        if aembed_query is not None:
-            return [await aembed_query(text) for text in batch]
-        embed_query = getattr(embeddings, "embed_query", None)
-        if embed_query is not None:
-            return [await asyncio.to_thread(embed_query, text) for text in batch]
+def _cached_vector(embeddings, text: str, role: str) -> list[float] | None:
+    key = _content_key(embedding_model_id(embeddings), text, role)
+    with _VECTOR_CACHE.lock:
+        hit = _VECTOR_CACHE.vectors.get(key)
+        return list(hit) if hit is not None else None
+
+
+def _cache_vector(embeddings, text: str, role: str, vector: Sequence[float]) -> list[float]:
+    """Store one vector before the rest of the batch finishes."""
+    _check_vectors(embeddings, [vector])
+    key = _content_key(embedding_model_id(embeddings), text, role)
+    with _VECTOR_CACHE.lock:
+        return list(_store_vector(key, vector))
+
+
+def _batch_query_api(embeddings):
+    """A provider call that embeds many queries at once, or None.
+
+    ``aembed_queries`` / ``embed_queries`` take a list of strings and return
+    one vector per string. They are not the document API: a query vector and
+    a document vector of the same text stay distinct.
+    """
+    async_fn = getattr(embeddings, "aembed_queries", None)
+    if callable(async_fn):
+        return async_fn, False
+    sync_fn = getattr(embeddings, "embed_queries", None)
+    if callable(sync_fn):
+        return sync_fn, True
+    return None, False
+
+
+def _has_single_query_api(embeddings) -> bool:
+    return callable(getattr(embeddings, "aembed_query", None)) or callable(getattr(embeddings, "embed_query", None))
+
+
+async def _invoke_one_query(embeddings, text: str) -> list[float]:
+    aembed_query = getattr(embeddings, "aembed_query", None)
+    if callable(aembed_query):
+        return await aembed_query(text)
+    embed_query = getattr(embeddings, "embed_query", None)
+    if callable(embed_query):
+        return await asyncio.to_thread(embed_query, text)
+    raise TypeError("embeddings object has no query method")
+
+
+async def _embed_documents_batch(embeddings, batch: list[str]) -> list[list[float]]:
     embed = getattr(embeddings, "aembed_documents", None)
     if embed is None:
         return await asyncio.to_thread(embeddings.embed_documents, batch)
     return await embed(batch)
+
+
+async def _retry_embedding(limiter, embed):
+    """Timeout and retries for one embedding call. ``embed`` starts a new attempt."""
+    for attempt in range(limiter.max_retries + 1):
+        try:
+            if limiter.request_timeout and limiter.request_timeout > 0:
+                return await asyncio.wait_for(embed(), limiter.request_timeout)
+            return await embed()
+        except Exception as exc:
+            if attempt >= limiter.max_retries or not _transient(exc):
+                raise
+            if _rate_limit(exc):
+                limiter.rate_limit_retries += 1
+            else:
+                limiter.timeout_retries += 1
+            await asyncio.sleep(limiter._wait(attempt, exc))
+    raise RuntimeError("embedding retry loop exited without a result")
+
+
+def _uncached_unique(embeddings, texts: Sequence[str], role: str) -> list[str]:
+    missing: list[str] = []
+    seen: set[str] = set()
+    for text in texts:
+        if text in seen:
+            continue
+        seen.add(text)
+        if _cached_vector(embeddings, text, role) is None:
+            missing.append(text)
+    return missing
+
+
+async def _embed_query_batch(embeddings, texts: Sequence[str], *, batch_size: int, limiter) -> list[list[float]]:
+    """One provider call per chunk. Successes are cached before the next chunk."""
+    fn, sync = _batch_query_api(embeddings)
+    size = max(1, int(batch_size))
+    pending = _uncached_unique(embeddings, texts, "query")
+    chunks = [pending[start : start + size] for start in range(0, len(pending), size)]
+
+    async def one(chunk: list[str]) -> None:
+        async with limiter.embed_semaphore:
+            # A previous chunk, or a concurrent caller, may have filled these.
+            needed = [text for text in chunk if _cached_vector(embeddings, text, "query") is None]
+            if not needed:
+                return
+
+            async def attempt() -> None:
+                current = [text for text in needed if _cached_vector(embeddings, text, "query") is None]
+                if not current:
+                    return
+                if sync:
+                    vectors = await asyncio.to_thread(fn, current)
+                else:
+                    vectors = await fn(current)
+                if len(vectors) != len(current):
+                    raise RuntimeError("embedding model returned a different number of vectors than texts")
+                _check_vectors(embeddings, vectors)
+                for text, vector in zip(current, vectors):
+                    _cache_vector(embeddings, text, "query", vector)
+
+            await _retry_embedding(limiter, attempt)
+
+    if chunks:
+        await asyncio.gather(*(one(chunk) for chunk in chunks))
+    cached = [_cached_vector(embeddings, text, "query") for text in texts]
+    if any(vector is None for vector in cached):
+        raise RuntimeError("embedding cache missed a query it had claimed")
+    return [list(vector) for vector in cached if vector is not None]
+
+
+async def _embed_queries_one_by_one(embeddings, texts: Sequence[str], limiter) -> list[list[float]]:
+    """Each query takes one semaphore slot, one timeout, and its own retries.
+
+    A query that returns is cached before the others finish, so a retry of a
+    sibling does not embed it again.
+    """
+    unique = _uncached_unique(embeddings, texts, "query")
+
+    async def one(text: str) -> None:
+        if _cached_vector(embeddings, text, "query") is not None:
+            return
+        async with limiter.embed_semaphore:
+            if _cached_vector(embeddings, text, "query") is not None:
+                return
+
+            async def attempt() -> None:
+                if _cached_vector(embeddings, text, "query") is not None:
+                    return
+                vector = await _invoke_one_query(embeddings, text)
+                _cache_vector(embeddings, text, "query", vector)
+
+            await _retry_embedding(limiter, attempt)
+
+    if unique:
+        await asyncio.gather(*(one(text) for text in unique))
+    cached = [_cached_vector(embeddings, text, "query") for text in texts]
+    if any(vector is None for vector in cached):
+        raise RuntimeError("embedding cache missed a query it had claimed")
+    return [list(vector) for vector in cached if vector is not None]
 
 
 async def aembed_texts(
@@ -537,39 +689,32 @@ async def aembed_texts(
     limiter,
     role: str = "document",
 ) -> list[list[float]]:
-    """Embed ``texts`` in batches under the embedding semaphore.
+    """Embed ``texts`` under the shared embedding semaphore.
 
-    ``role="query"`` uses ``aembed_query`` or ``embed_query``, the same call
-    ``EmbeddingCodeRetriever.rank`` makes for a passage. Document role uses
-    ``aembed_documents`` when the object has it. Timeouts, connection errors,
-    and rate limits retry with the limiter's backoff. The wait yields the
-    event loop; it does not run the client on the loop thread.
+    ``role="query"`` uses the provider's batch query API when it has one
+    (``aembed_queries`` or ``embed_queries``). Otherwise each query is its own
+    call, with its own timeout and retries, and only as many run at once as
+    the semaphore allows. A finished query is cached immediately. Document
+    role uses ``aembed_documents`` for the whole batch. The same text is not
+    embedded twice. Timeouts, connection errors, and rate limits retry with
+    the limiter's backoff. The wait yields the event loop.
     """
     if not texts:
         return []
+    if role == "query" and (_batch_query_api(embeddings)[0] is not None or _has_single_query_api(embeddings)):
+        if _batch_query_api(embeddings)[0] is not None:
+            return await _embed_query_batch(embeddings, list(texts), batch_size=batch_size, limiter=limiter)
+        return await _embed_queries_one_by_one(embeddings, list(texts), limiter)
     size = max(1, int(batch_size))
     batches = [list(texts[start : start + size]) for start in range(0, len(texts), size)]
 
     async def one(batch: list[str]) -> list[list[float]]:
         async with limiter.embed_semaphore:
-            for attempt in range(limiter.max_retries + 1):
-                try:
 
-                    async def _embed():
-                        return await _embed_batch(embeddings, batch, role=role)
+            async def embed():
+                return await _embed_documents_batch(embeddings, batch)
 
-                    if limiter.request_timeout and limiter.request_timeout > 0:
-                        return await asyncio.wait_for(_embed(), limiter.request_timeout)
-                    return await _embed()
-                except Exception as exc:
-                    if attempt >= limiter.max_retries or not _transient(exc):
-                        raise
-                    if _rate_limit(exc):
-                        limiter.rate_limit_retries += 1
-                    else:
-                        limiter.timeout_retries += 1
-                    await asyncio.sleep(limiter._wait(attempt, exc))
-        raise RuntimeError("embedding retry loop exited without a result")
+            return await _retry_embedding(limiter, embed)
 
     groups = await asyncio.gather(*(one(batch) for batch in batches))
     return [vector for group in groups for vector in group]

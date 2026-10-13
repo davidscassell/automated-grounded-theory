@@ -41,7 +41,7 @@ Code ids stored on new codes are a hash of the normalized label, so the same spe
 
 ## Speed and quality on a fake model
 
-`scripts/benchmark_review_modes.py` sleeps 0.05 seconds per call. Corpus: 6 documents, 4 passages each (24 passages), seed 7, `sweep_every=8`, `unit="paragraph"`. The paragraph unit keeps each blank-line block as its own passage; the study default `unit="incident"` would pack these short documents. No API key. Measured on 0.6.0 in this environment. 0.6.1 was not remeasured. On 0.6.0, `concurrency` widened the frozen window. From 0.6.4 it does not: only `passages_per_codebook_update` does. The sequential row is the procedure `strict_sequential_settings()` now names.
+`scripts/benchmark_review_modes.py` sleeps 0.05 seconds per call. Corpus: 6 documents, 4 passages each (24 passages), seed 7, `sweep_every=8`, `unit="paragraph"`. The paragraph unit keeps each blank-line block as its own passage; the study default `unit="incident"` would pack these short documents. No API key. An embedding-latency row sleeps on each embedding call and ranks those passages as queries. `--embedding-delay 0` skips it. Measured on 0.6.0 in this environment. 0.6.1 was not remeasured. On 0.6.0, `concurrency` widened the frozen window. From 0.6.4 it does not: only `passages_per_codebook_update` does. The sequential row is the procedure `strict_sequential_settings()` now names.
 
 | Mode | Seconds | Calls | Passages/s | Codes | Merges | Near-duplicate pairs left |
 | --- | --- | --- | --- | --- | --- | --- |

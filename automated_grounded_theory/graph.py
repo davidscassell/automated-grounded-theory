@@ -766,14 +766,6 @@ def _code_node(runtime: RunConfig):
     return code_passage
 
 
-class _RankMiss(Exception):
-    """The sync packer needs rankings that have not been retrieved yet."""
-
-    def __init__(self, texts: Sequence[str]) -> None:
-        self.texts = [str(text) for text in texts]
-        super().__init__(f"rankings missing for {len(self.texts)} texts")
-
-
 def _ranking_snapshot(entries: Sequence[Mapping[str, Any]]) -> str:
     payload = "\0".join(code_text(entry) for entry in entries)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -793,9 +785,10 @@ async def _pack_jobs(
 ) -> list[tuple]:
     """Pack passage indexes so each request, plus reserved output, fits the budget.
 
-    Rankings are retrieved once, asynchronously, for this codebook snapshot
-    and then reused while the packer measures slices. The packer itself stays
-    synchronous and does not call the embedding client.
+    Full passages are ranked once before packing. A passage that does not fit
+    is split on whitespace to the end. Candidate slices are not ranked one by
+    one, and the packer is not restarted. The slices that packing actually
+    keeps are ranked together afterwards.
     """
     if not indices:
         return []
@@ -806,24 +799,17 @@ async def _pack_jobs(
     names = [str(passage.get("passage_id") or "") for passage in state["passages"]]
     reserve = reserved_output_tokens(1, max_codes_per_passage=runtime.max_codes_per_passage)
     measure = _coding_measure(runtime, state, doc_id, token_budget)
-    batches = None
-    for _ in range(64):
-        try:
-            batches, _warnings = pack_indices(
-                indices,
-                texts,
-                batch_size=per_request,
-                token_budget=token_budget,
-                names=names,
-                tokenizer=resolve_tokenizer(runtime.coder),
-                reserved_output=reserve,
-                measure=measure,
-            )
-            break
-        except _RankMiss as miss:
-            await _ensure_rankings(runtime, miss.texts, entries)
-    if batches is None:
-        raise RuntimeError("coding planner could not rank passage slices")
+    batches, _warnings = pack_indices(
+        indices,
+        texts,
+        batch_size=per_request,
+        token_budget=token_budget,
+        names=names,
+        tokenizer=resolve_tokenizer(runtime.coder),
+        reserved_output=reserve,
+        measure=measure,
+    )
+    await _ensure_rankings(runtime, _finalized_slice_texts(batches, texts), entries)
     jobs = []
     for batch in batches:
         if not batch.indices:
@@ -831,6 +817,20 @@ async def _pack_jobs(
         slices = [list(span) for span in batch.slices] if batch.slices else None
         jobs.append((doc_id, list(batch.indices), {"slices": slices, "warning": batch.warning}))
     return jobs
+
+
+def _finalized_slice_texts(batches: Sequence, texts: Sequence[str]) -> list[str]:
+    """Passage slices packing kept. Probes from the search are not included."""
+    found: list[str] = []
+    for batch in batches:
+        if not batch.slices or len(batch.indices) != 1:
+            continue
+        index = batch.indices[0]
+        source = texts[index] if 0 <= index < len(texts) else ""
+        for span in batch.slices:
+            start, end = int(span[0]), int(span[1])
+            found.append(source[start:end])
+    return found
 
 
 def _embedding_fallback_note(exc: BaseException) -> str:
@@ -1098,7 +1098,11 @@ def _coding_measure(runtime: RunConfig, state: CodingState, doc_id: str | None, 
     def labels_for(text: str) -> list[str]:
         cached = _cached_labels(runtime, snapshot, text, k)
         if cached is None:
-            raise _RankMiss([text])
+            # A candidate slice has no ranking yet. One passage trims retrieved
+            # codes until the request fits, so the slice fits exactly when it
+            # fits with nothing retrieved. The empty ranking lets the splitter
+            # finish. ``_pack_jobs`` ranks the slices that were kept.
+            return []
         return cached
 
     def cost_for(
