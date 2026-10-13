@@ -9,6 +9,7 @@ merges, and near-duplicate pairs (label Jaccard >= 0.5) left after synthesis.
 
     python scripts/benchmark_review_modes.py
     python scripts/benchmark_review_modes.py --embedding-delay 0.03
+    python scripts/benchmark_review_modes.py --unique-passages
 """
 
 from __future__ import annotations
@@ -79,8 +80,12 @@ class SlowEmbeddings(Embeddings):
             self.in_flight -= 1
 
 
-def corpus(documents: int = 6, passages: int = 4) -> list[dict]:
-    """Repeated incidents so synthesis has duplicates to merge."""
+def corpus(documents: int = 6, passages: int = 4, *, unique: bool = False) -> list[dict]:
+    """Repeated incidents so synthesis has duplicates to merge.
+
+    ``unique=True`` gives every passage its own text. The default reuses four
+    stems, so an embedding row mostly hits the query cache.
+    """
     stems = [
         "I spent the morning packing my suitcase before the train.",
         "Packing bags up with boxes took all night and I was not done.",
@@ -89,7 +94,12 @@ def corpus(documents: int = 6, passages: int = 4) -> list[dict]:
     ]
     rows = []
     for doc_index in range(documents):
-        paragraphs = [stems[offset % len(stems)] for offset in range(passages)]
+        paragraphs = []
+        for offset in range(passages):
+            text = stems[offset % len(stems)]
+            if unique:
+                text = f"{text} Document {doc_index} passage {offset}."
+            paragraphs.append(text)
         rows.append({"id": f"doc{doc_index:02d}", "name": f"Doc {doc_index}", "text": "\n\n".join(paragraphs)})
     return rows
 
@@ -158,6 +168,11 @@ def main() -> None:
         default=None,
         help="Seconds of simulated latency per embedding call. Defaults to --delay. Pass 0 to skip that row.",
     )
+    parser.add_argument(
+        "--unique-passages",
+        action="store_true",
+        help="Embedding row: a distinct query text per passage, instead of four reused stems.",
+    )
     args = parser.parse_args()
     embedding_delay = args.delay if args.embedding_delay is None else args.embedding_delay
     context_kwargs = dict(sweep_every=8, temperature=0, unit="paragraph")
@@ -191,18 +206,20 @@ def main() -> None:
         ),
     ]
     if embedding_delay > 0:
-        rows.append(
-            run_mode(
-                "embedding",
-                delay=args.delay,
-                embeddings=SlowEmbeddings(embedding_delay),
-                review_mode="wave",
-                pipeline=True,
-                batch_size=4,
-                concurrency=4,
-                **context_kwargs,
-            )
+        embedding = run_mode(
+            "embedding",
+            delay=args.delay,
+            embeddings=SlowEmbeddings(embedding_delay),
+            rows=corpus(unique=True) if args.unique_passages else None,
+            review_mode="wave",
+            pipeline=True,
+            batch_size=4,
+            concurrency=4,
+            **context_kwargs,
         )
+        if args.unique_passages:
+            embedding["unique_passages"] = True
+        rows.append(embedding)
     print(json.dumps(rows, indent=2))
 
 

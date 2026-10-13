@@ -1,4 +1,4 @@
-# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, and 0.6.9)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, and 0.6.10)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
 Status: steps 1 and 2 of the v0.6 plan. Category development, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
@@ -222,6 +222,14 @@ Query embeddings are not one sequential list under a single batch timeout. Each 
 
 `policy_version` is `0.6.9`.
 
-## 18. Out of scope
+## 18. Corrections in 0.6.10
+
+Query batches no longer use `asyncio.gather` for a group of provider calls. Gather raises the first error and leaves the other calls running; the cache handler then removed their in-flight entries, and the next request for that text started a second provider call. The one-by-one path and the batch-query path wait for every sibling before that error is released, and they do not clear an entry whose task is still running. A sibling another caller is waiting on is not cancelled with the owner. It keeps running and keeps its entry.
+
+`scripts/benchmark_review_modes.py --unique-passages` makes the embedding row's passage texts distinct. The default corpus reuses four stems (4 query calls). With the flag, `--delay 0.05` embeds 20 queries, peak 4, in 1.019 seconds (23.55 passages/s). The reused row on the same settings embeds 4 queries, peak 3, in 0.887 seconds (27.07 passages/s).
+
+`policy_version` is `0.6.10`.
+
+## 19. Out of scope
 
 Category feedback, focused recoding of earlier negatives, relationship hypotheses, sampling briefs, and a Taguette project-file adapter. See the v0.6 plan steps 3–5.

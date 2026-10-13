@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.10
+
+- A failed query no longer drops in-flight cache entries for queries that are still running. `asyncio.gather` raised on the first error and left the other tasks going; the handler then removed their entries, so the next request started a second provider call. The one-by-one path and the batch-query path now wait until those siblings have finished before releasing ownership. An entry a task still owns is not cleared. A sibling another caller is already waiting on keeps running, and keeps its entry, when this caller is cancelled. After the failure returns, that group has nothing left running. An immediate request for a sibling that was still in flight does not embed it again.
+- `scripts/benchmark_review_modes.py --unique-passages` gives the embedding row a distinct query text per passage. The default corpus reuses four stems, so that row embeds four queries. With the flag, the same 24 passages make 20 query calls: passages ranked before any code exists are not embedded, and the rest do not collapse in the cache. `--delay 0.05`:
+
+  | embedding row | seconds | calls | passages/s | queries | peak |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | four reused stems | 0.887 | 11 | 27.07 | 4 | 3 |
+  | `--unique-passages` | 1.019 | 11 | 23.55 | 20 | 4 |
+
+- `policy_version` is `0.6.10`.
+
 ## 0.6.9
 
 - A passage that does not fit in `token_budget` is split on whitespace without restarting the packer for each candidate slice. The splitter finalizes the slices, then those slices are ranked together. One paragraph of about 11,000 characters with `unit="paragraph"` and `token_budget=4000` completes, and so does a 100,000-character paragraph. The run used to raise `coding planner could not rank passage slices` after 64 restarts.
