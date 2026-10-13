@@ -202,50 +202,89 @@ _RUN_SCOPE: ContextVar[str | None] = ContextVar("embedding_run_scope", default=N
 _BACKGROUND_TASKS: set[asyncio.Future] = set()
 
 
+class _UnsetType:
+    pass
+
+
+_UNSET = _UnsetType()
+
+
 class _VectorCache:
     """Process-wide canonical vectors and a bounded codebook snapshot index.
 
     Concurrent callers that ask for the same text share one embedding call.
-    Snapshots point at those vectors by content hash. Retention is an LRU cap
-    plus an optional run scope that drops its snapshots when the run ends.
+    Snapshots point at those vectors by content hash. Snapshot retention is an
+    LRU cap plus an optional run scope that drops its snapshots when the run
+    ends. Canonical vectors are unbounded unless ``vector_limit`` or
+    ``vector_bytes`` is set. Those caps are also LRU. A vector a retained
+    snapshot still points at is not evicted.
     """
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.vectors: dict[tuple[str, str], tuple[float, ...]] = {}
+        self.vectors: OrderedDict[tuple[str, str], tuple[float, ...]] = OrderedDict()
+        self.vector_bytes_used = 0
         self.inflight: dict[tuple[str, str], _Inflight] = {}
         self.snapshots: OrderedDict[tuple[str, str], tuple[tuple[str, str], ...]] = OrderedDict()
         self.snapshot_owners: dict[tuple[str, str], set[str]] = {}
         self.snapshot_inflight: dict[tuple[str, str], asyncio.Future] = {}
         self.snapshot_limit = DEFAULT_SNAPSHOT_LIMIT
+        self.vector_limit: int | None = None
+        self.vector_bytes: int | None = None
+        self.pinned: set[tuple[str, str]] = set()
 
 
 _VECTOR_CACHE = _VectorCache()
 
 
-def configure_embedding_cache(*, snapshot_limit: int | None = None) -> None:
-    """Set how many codebook snapshots the process retains.
+def _vector_payload_bytes(vector: Sequence[float]) -> int:
+    """Float payload of one vector. Eight bytes per dimension, not object overhead."""
+    return 8 * len(vector)
 
-    Vectors stay canonical and are not copied into each snapshot. ``snapshot_limit``
-    is the LRU cap. A run can also call :func:`embedding_run_scope` to drop the
-    snapshots it created when the run finishes.
+
+def configure_embedding_cache(
+    *,
+    snapshot_limit: Any = _UNSET,
+    vector_limit: Any = _UNSET,
+    vector_bytes: Any = _UNSET,
+) -> None:
+    """Set snapshot and optional canonical-vector retention.
+
+    Vectors stay canonical and are not copied into each snapshot.
+    ``snapshot_limit`` is the snapshot LRU cap. ``vector_limit`` is how many
+    canonical vectors to keep. ``vector_bytes`` is their float-payload budget
+    (8 bytes per dimension). Either vector cap may be ``None`` to leave that
+    bound open. A vector referenced by a retained snapshot is not evicted.
+    A run can also call :func:`embedding_run_scope` to drop the snapshots it
+    created when the run finishes. Vectors are not dropped with those snapshots.
     """
-    if snapshot_limit is None:
-        return
-    if int(snapshot_limit) < 1:
-        raise ValueError("snapshot_limit must be at least 1.")
     with _VECTOR_CACHE.lock:
-        _VECTOR_CACHE.snapshot_limit = int(snapshot_limit)
-        _evict_snapshots()
+        if snapshot_limit is not _UNSET:
+            if snapshot_limit is None or int(snapshot_limit) < 1:
+                raise ValueError("snapshot_limit must be at least 1.")
+            _VECTOR_CACHE.snapshot_limit = int(snapshot_limit)
+            _evict_snapshots()
+        if vector_limit is not _UNSET:
+            if vector_limit is not None and int(vector_limit) < 1:
+                raise ValueError("vector_limit must be at least 1, or None for no count cap.")
+            _VECTOR_CACHE.vector_limit = None if vector_limit is None else int(vector_limit)
+        if vector_bytes is not _UNSET:
+            if vector_bytes is not None and int(vector_bytes) < 1:
+                raise ValueError("vector_bytes must be at least 1, or None for no byte cap.")
+            _VECTOR_CACHE.vector_bytes = None if vector_bytes is None else int(vector_bytes)
+        _evict_vectors()
 
 
-def embedding_cache_stats() -> dict[str, int]:
+def embedding_cache_stats() -> dict[str, int | None]:
     """Canonical vector count and how many snapshots are retained."""
     with _VECTOR_CACHE.lock:
         return {
             "vectors": len(_VECTOR_CACHE.vectors),
             "snapshots": len(_VECTOR_CACHE.snapshots),
             "snapshot_limit": _VECTOR_CACHE.snapshot_limit,
+            "vector_limit": _VECTOR_CACHE.vector_limit,
+            "vector_bytes": _VECTOR_CACHE.vector_bytes,
+            "vector_bytes_used": _VECTOR_CACHE.vector_bytes_used,
         }
 
 
@@ -308,7 +347,7 @@ def _touch_snapshot(snap: tuple[str, str]) -> None:
 
 
 def _materialize(refs: Sequence[tuple[str, str]]) -> list[list[float]]:
-    return [list(_VECTOR_CACHE.vectors[key]) for key in refs]
+    return [list(_lookup_vector(key) or _VECTOR_CACHE.vectors[key]) for key in refs]
 
 
 def _require_vectors(result: Sequence[list[float] | None]) -> list[list[float]]:
@@ -321,8 +360,63 @@ def clear_embedding_cache() -> None:
     """Drop cached vectors. In-flight calls are left to finish."""
     with _VECTOR_CACHE.lock:
         _VECTOR_CACHE.vectors.clear()
+        _VECTOR_CACHE.vector_bytes_used = 0
+        _VECTOR_CACHE.pinned.clear()
         _VECTOR_CACHE.snapshots.clear()
         _VECTOR_CACHE.snapshot_owners.clear()
+
+
+def _referenced_vector_keys() -> set[tuple[str, str]]:
+    used: set[tuple[str, str]] = set()
+    for refs in _VECTOR_CACHE.snapshots.values():
+        used.update(refs)
+    return used
+
+
+def _evict_vectors() -> None:
+    """Drop least-recently-used vectors past the optional count or byte cap.
+
+    Vectors a retained snapshot still references stay. If every remaining
+    vector is referenced, the cap is left overfull rather than breaking a snapshot.
+    """
+    limit = _VECTOR_CACHE.vector_limit
+    byte_cap = _VECTOR_CACHE.vector_bytes
+    if limit is None and byte_cap is None:
+        return
+    protected = _referenced_vector_keys() | set(_VECTOR_CACHE.pinned)
+
+    def over() -> bool:
+        if limit is not None and len(_VECTOR_CACHE.vectors) > limit:
+            return True
+        if byte_cap is not None and _VECTOR_CACHE.vector_bytes_used > byte_cap:
+            return True
+        return False
+
+    while over():
+        removed = False
+        for key in list(_VECTOR_CACHE.vectors):
+            if key in protected:
+                continue
+            vector = _VECTOR_CACHE.vectors.pop(key)
+            _VECTOR_CACHE.vector_bytes_used -= _vector_payload_bytes(vector)
+            removed = True
+            break
+        if not removed:
+            break
+
+
+def _touch_vector(key: tuple[str, str]) -> None:
+    if key in _VECTOR_CACHE.vectors:
+        _VECTOR_CACHE.vectors.move_to_end(key)
+
+
+def _lookup_vector(key: tuple[str, str]) -> tuple[float, ...] | None:
+    """Return a cached vector and mark it recently used. Caller holds the lock."""
+    hit = _VECTOR_CACHE.vectors.get(key)
+    if hit is None:
+        return None
+    _VECTOR_CACHE.vectors.move_to_end(key)
+    return hit
 
 
 def _store_vector(key: tuple[str, str], vector: Sequence[float]) -> list[float]:
@@ -331,6 +425,11 @@ def _store_vector(key: tuple[str, str], vector: Sequence[float]) -> list[float]:
     if existing is None:
         existing = tuple(float(item) for item in vector)
         _VECTOR_CACHE.vectors[key] = existing
+        _VECTOR_CACHE.vector_bytes_used += _vector_payload_bytes(existing)
+        _evict_vectors()
+    else:
+        _VECTOR_CACHE.vectors.move_to_end(key)
+        existing = _VECTOR_CACHE.vectors[key]
     return list(existing)
 
 
@@ -560,7 +659,7 @@ def cached_embed_texts(
     seen: set[tuple[str, str]] = set()
     with _VECTOR_CACHE.lock:
         for index, key in enumerate(keys):
-            hit = _VECTOR_CACHE.vectors.get(key)
+            hit = _lookup_vector(key)
             if hit is not None:
                 result[index] = hit
             elif key not in seen:
@@ -578,7 +677,7 @@ def cached_embed_texts(
     with _VECTOR_CACHE.lock:
         for index, key in enumerate(keys):
             if result[index] is None:
-                result[index] = list(_VECTOR_CACHE.vectors[key])
+                result[index] = list(_lookup_vector(key) or ())
     return _require_vectors(result)
 
 
@@ -605,7 +704,7 @@ async def cached_aembed_texts(
     try:
         with _VECTOR_CACHE.lock:
             for index, key in enumerate(keys):
-                hit = _VECTOR_CACHE.vectors.get(key)
+                hit = _lookup_vector(key)
                 if hit is not None:
                     result[index] = hit
                     continue
@@ -649,7 +748,7 @@ async def cached_aembed_texts(
         with _VECTOR_CACHE.lock:
             for index, key in enumerate(keys):
                 if result[index] is None:
-                    result[index] = list(_VECTOR_CACHE.vectors[key])
+                    result[index] = list(_lookup_vector(key) or ())
         return _require_vectors(result)
     finally:
         # Including waiters whose futures were never awaited, such as a joined
@@ -694,25 +793,107 @@ async def shared_codebook_vectors(
     if not owner:
         shared = await asyncio.shield(waiter)
         return [list(vector) for vector in shared]
-    try:
-        vectors = await cached_aembed_texts(
-            embeddings,
-            texts,
-            batch_size=batch_size,
-            limiter=limiter,
-        )
-    except BaseException as exc:
-        with _VECTOR_CACHE.lock:
-            _VECTOR_CACHE.snapshot_inflight.pop(snap, None)
-        _abort_future(waiter, exc)
-        raise
     with _VECTOR_CACHE.lock:
-        _remember_snapshot(snap, refs)
-        _VECTOR_CACHE.snapshot_inflight.pop(snap, None)
-        materialized = _materialize(refs)
-    if not waiter.done():
-        waiter.set_result(materialized)
-    return materialized if vectors else []
+        # Keep this snapshot's vectors through the embed. The cap must not drop
+        # one of them before the snapshot exists to protect it.
+        _VECTOR_CACHE.pinned.update(refs)
+    try:
+        try:
+            vectors = await cached_aembed_texts(
+                embeddings,
+                texts,
+                batch_size=batch_size,
+                limiter=limiter,
+            )
+        except BaseException as exc:
+            with _VECTOR_CACHE.lock:
+                _VECTOR_CACHE.snapshot_inflight.pop(snap, None)
+            _abort_future(waiter, exc)
+            raise
+        with _VECTOR_CACHE.lock:
+            _remember_snapshot(snap, refs)
+            _VECTOR_CACHE.snapshot_inflight.pop(snap, None)
+            materialized = _materialize(refs)
+        if not waiter.done():
+            waiter.set_result(materialized)
+        return materialized if vectors else []
+    finally:
+        with _VECTOR_CACHE.lock:
+            _VECTOR_CACHE.pinned.difference_update(refs)
+            _evict_vectors()
+
+
+def assignment_ident(item: Mapping) -> str:
+    """Stable id for one assignment. ``segment_id`` wins when the codebook stored one."""
+    segment_id = str(item.get("segment_id") or "").strip()
+    if segment_id:
+        return segment_id
+    start = "" if item.get("doc_start") is None else str(item.get("doc_start"))
+    end = "" if item.get("doc_end") is None else str(item.get("doc_end"))
+    return "|".join(
+        (
+            str(item.get("passage_id") or ""),
+            str(item.get("doc_id") or ""),
+            start,
+            end,
+            str(item.get("quote") or ""),
+        )
+    )
+
+
+def evidence_rows(entry: Mapping) -> list[Mapping]:
+    """Full evidence history. Assignments win over the example list."""
+    source = entry.get("assignments")
+    if not source:
+        source = entry.get("examples") or []
+    rows: list[Mapping] = []
+    seen: set[str] = set()
+    for item in source:
+        if isinstance(item, str):
+            item = {"quote": item}
+        if not isinstance(item, Mapping):
+            continue
+        if not str(item.get("quote") or "").strip():
+            continue
+        ident = assignment_ident(item)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        rows.append(item)
+    return rows
+
+
+def assignment_ids(entry: Mapping) -> list[str]:
+    """Ids of every assignment currently stored on ``entry``, in order."""
+    return [assignment_ident(item) for item in evidence_rows(entry)]
+
+
+def record_review(entry: dict, fingerprint: str, seen_ids: Sequence[str] | None = None) -> None:
+    """Remember the fingerprint and the assignment ids this review saw.
+
+    ``seen_ids`` is the evidence that was on the code when the review was
+    built. Later assignments are "since the last review" and are not truncated
+    out of the next prompt.
+    """
+    ids = [str(item) for item in (seen_ids if seen_ids is not None else assignment_ids(entry))]
+    entry["reviewed_revision"] = fingerprint
+    entry["reviewed_assignment_ids"] = list(ids)
+    history = []
+    for item in entry.get("reviews_seen") or []:
+        if isinstance(item, Mapping):
+            history.append({"fingerprint": str(item.get("fingerprint") or ""), "assignment_ids": list(item.get("assignment_ids") or [])})
+    history.append({"fingerprint": fingerprint, "assignment_ids": list(ids)})
+    entry["reviews_seen"] = history
+
+
+def _reviewed_ids(entry: Mapping) -> set[str] | None:
+    """Ids the last review saw, or None when this code has not been reviewed."""
+    if "reviewed_assignment_ids" in entry:
+        return {str(item) for item in (entry.get("reviewed_assignment_ids") or [])}
+    seen = entry.get("reviews_seen") or []
+    if seen and isinstance(seen[-1], Mapping) and "assignment_ids" in seen[-1]:
+        return {str(item) for item in (seen[-1].get("assignment_ids") or [])}
+    return None
 
 
 def assignment_digest(entry: Mapping) -> str:
@@ -747,53 +928,93 @@ def assignment_digest(entry: Mapping) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
 
 
-def select_prompt_examples(entry: Mapping, *, limit: int = 3) -> list[dict]:
-    """A bounded, diverse example set for prompts. Not the review digest.
+def _example_marker(item: Mapping) -> tuple[str, str, str]:
+    start = "" if item.get("doc_start") is None else str(item.get("doc_start"))
+    return (str(item.get("passage_id") or ""), str(item.get("quote") or ""), start)
 
-    Prefer a different passage, then a different document, then fill in the
-    original order. Fewer examples than ``limit`` keeps that order.
+
+def _diverse_examples(pool: Sequence[Mapping], room: int, chosen: Sequence[Mapping]) -> list[dict]:
+    """Fill ``room`` slots: documents, then contrasting quotes, then passage order.
+
+    Document diversity runs before a passage-order fill. Otherwise the first
+    document's passages take every slot and a later document never appears.
     """
-    examples = [
-        item
-        for item in (entry.get("examples") or [])
-        if isinstance(item, Mapping) and str(item.get("quote") or "").strip()
-    ]
-    cap = max(0, int(limit))
-    if cap == 0 or not examples:
+    if room <= 0:
         return []
-    if len(examples) <= cap:
-        return [dict(item) for item in examples]
-    chosen: list[dict] = []
-    seen_passages: set[str] = set()
-    for item in examples:
-        if len(chosen) >= cap:
-            break
-        passage = str(item.get("passage_id") or "")
-        if passage and passage in seen_passages:
-            continue
-        chosen.append(dict(item))
-        if passage:
-            seen_passages.add(passage)
-    seen = {(str(item.get("passage_id") or ""), str(item.get("quote") or "")) for item in chosen}
+    added: list[dict] = []
+    seen = {_example_marker(item) for item in chosen}
     seen_docs = {str(item.get("doc_id") or "") for item in chosen if item.get("doc_id")}
-    for item in examples:
-        if len(chosen) >= cap:
-            break
-        doc = str(item.get("doc_id") or "")
-        marker = (str(item.get("passage_id") or ""), str(item.get("quote") or ""))
-        if marker in seen or not doc or doc in seen_docs:
-            continue
-        chosen.append(dict(item))
-        seen.add(marker)
-        seen_docs.add(doc)
-    for item in examples:
-        if len(chosen) >= cap:
-            break
-        marker = (str(item.get("passage_id") or ""), str(item.get("quote") or ""))
+
+    def take(item: Mapping) -> bool:
+        if len(added) >= room:
+            return False
+        marker = _example_marker(item)
         if marker in seen:
-            continue
-        chosen.append(dict(item))
+            return False
+        added.append(dict(item))
         seen.add(marker)
+        doc = str(item.get("doc_id") or "")
+        if doc:
+            seen_docs.add(doc)
+        return True
+
+    for item in pool:
+        if len(added) >= room:
+            return added
+        doc = str(item.get("doc_id") or "")
+        if not doc or doc in seen_docs:
+            continue
+        take(item)
+    if len(added) >= room:
+        return added
+
+    def contrast(item: Mapping) -> float:
+        quote = str(item.get("quote") or "")
+        bases = list(chosen) + added
+        if not bases:
+            return 0.0
+        return min(jaccard(quote, str(other.get("quote") or "")) for other in bases)
+
+    ranked = sorted(enumerate(pool), key=lambda pair: (contrast(pair[1]), pair[0]))
+    for _index, item in ranked:
+        if len(added) >= room:
+            return added
+        take(item)
+    for item in pool:
+        if len(added) >= room:
+            break
+        take(item)
+    return added
+
+
+def select_prompt_examples(entry: Mapping, *, limit: int = 3) -> list[dict]:
+    """A bounded example set for prompts. Not the review digest.
+
+    Evidence added since the last review is always included, even when that
+    is more than ``limit``. The last review's assignment ids are
+    ``reviewed_assignment_ids`` (and each review is appended to
+    ``reviews_seen``). Representative and contrasting quotes from the rest of
+    the history fill up to ``limit``: one new document at a time, then quotes
+    that overlap the chosen set the least, then passage order. Document
+    diversity runs before that passage-order fill.
+    """
+    rows = evidence_rows(entry)
+    cap = max(0, int(limit))
+    if cap == 0 or not rows:
+        return []
+    reviewed = _reviewed_ids(entry)
+    if reviewed is None:
+        fresh: list[Mapping] = []
+        pool = rows
+    else:
+        fresh = [item for item in rows if assignment_ident(item) not in reviewed]
+        pool = [item for item in rows if assignment_ident(item) in reviewed]
+    if len(rows) <= cap and not fresh:
+        return [dict(item) for item in rows]
+    chosen = [dict(item) for item in fresh]
+    if len(chosen) >= cap:
+        return chosen
+    chosen.extend(_diverse_examples(pool, cap - len(chosen), chosen))
     return chosen
 
 
@@ -922,7 +1143,7 @@ def _rank_vectors(labels: Sequence[str], vectors: Sequence[Sequence[float]], que
 def _cached_vector(embeddings, text: str, role: str) -> list[float] | None:
     key = _content_key(embedding_model_id(embeddings), text, role)
     with _VECTOR_CACHE.lock:
-        hit = _VECTOR_CACHE.vectors.get(key)
+        hit = _lookup_vector(key)
         return list(hit) if hit is not None else None
 
 

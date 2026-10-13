@@ -1,4 +1,4 @@
-# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, and 0.6.11)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, and 0.6.12)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
 Status: steps 1 and 2 of the v0.6 plan. Category development, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
@@ -250,6 +250,22 @@ The review fingerprint covers every assignment. Prompt examples are a separate d
 
 `policy_version` is `0.6.11`.
 
-## 20. Out of scope
+## 20. Corrections in 0.6.12
+
+Resume distinguishes two kinds of manifest change. Research-context wording, model settings, and performance settings (concurrency, batch size, token budget, rate limits) may continue with `allow_changes` or `continuation`. The continuation event stores the old and new values. Corpus identity and the segmentation plan are not continuable: `corpus_hash`, `unit`, `seed`, `review_mode`, and `parallel_documents`. Those fields already determined the passages stored on the checkpoint. `allow_changes` still raises `CheckpointMigrationRequired`. Start a new run. There is no procedure that inserts a document into a queue that was already segmented.
+
+The model block of the manifest is the instances that will run, not only the `temperature=` argument. `chat_model_settings` and `embedding_model_settings` read model id, provider, temperature, `top_p`, max tokens, embedding dimensions, endpoint, and deployment. Names that look like keys, tokens, or secrets are omitted, and `model_kwargs` is passed through `redact`. Metadata stores those values, so a coder constructed with `temperature=1` is not recorded as `0.0`.
+
+Prompt examples are chosen from the full assignment list. `_apply_counts` no longer stops at eight. When a sweep reviews a code it stores `reviewed_assignment_ids` and appends that list to `reviews_seen`. The next prompt includes every assignment added since then, then fills up to the requested limit with one example per remaining document, then quotes that overlap the chosen set the least, then passage order. Document diversity runs before that passage-order fill.
+
+Quote attribution overlaps each matched span with each passage. The bounding box from the first span to the last is not used, so a long passage that only occupies the gap is not selected. Several overlapped passages are `attribution="multi"` and coverage counts the code on each of them. No overlapped passage is `attribution="unresolved"`: `attributed_passage_id` stays empty, and coverage, agreement, and the Adjusted Rand index do not place the code on the passage that was being coded. The `evidence_outside_passage` flag still keeps the code.
+
+Muse `unit_grid_from_annotations` places an excerpt by exact match, then by whitespace collapsed to a single space with offsets mapped back to the original text. Repeated excerpts use `occurrence` or `order` (0-based) or `offset` / `start` / `start_offset` / `char_start`. Without one of those, the excerpt is `ambiguous` and is not aligned. `alignment_coverage` is aligned annotations divided by annotations considered. A passage touched by an unaligned or ambiguous annotation is an unknown unit and is excluded from the grid. Coverage below `ALIGNMENT_COVERAGE_MIN` (0.8) returns `available` false and `reason` `alignment_coverage_below_threshold` instead of a score.
+
+`configure_embedding_cache(vector_limit=..., vector_bytes=...)` is an optional LRU over canonical vectors. `vector_bytes` is 8 bytes times the number of dimensions. Vectors referenced by a retained snapshot are kept even when that leaves the cache over the cap. Both limits default to none. `commit_passage` still copies the codebook dict and shallow-detaches every entry: the sweep mutates definitions in place on the new state, and those objects must not be the ones stored in the previous checkpoint. The segment list is a new list; unchanged segment dicts stay shared. Counts on an append-only commit extend the entry's assignment list instead of scanning every segment. `sync_counts`, used when a merge or split moves assignments, still scans.
+
+`policy_version` is `0.6.12`.
+
+## 21. Out of scope
 
 Category feedback, focused recoding of earlier negatives, relationship hypotheses, sampling briefs, and a Taguette project-file adapter. See the v0.6 plan steps 3–5.

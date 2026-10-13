@@ -241,6 +241,7 @@ The checks and the sweep exist because that JMIR tutorial found LLM coding weak 
 | sequential | `review_mode="document"`, `pipeline=False`, `batch_size=1`, `concurrency=1` | 1.659 | 28 | 14.47 | 3 | 3 | 0 |
 | document | `review_mode="document"`, background synthesis, `batch_size=4`, `concurrency=4` | 0.563 | 10 | 42.66 | 3 | 1 | 0 |
 | wave | `review_mode="wave"`, background synthesis, `batch_size=4`, `concurrency=4` | 0.593 | 11 | 40.47 | 3 | 1 | 0 |
+| wave with unique-text embeddings | simulated; `review_mode="wave"`, distinct passage text, embedding calls sleep 0.05s (`--unique-passages`) | 0.998 | 11 | 24.06 | 3 | 1 | 0 |
 
 On this fake coder, exact repeated labels collapse when they are committed, so none of the three left a near-duplicate pair behind. Document and wave each kept the sequential code count and recorded one merge. On this 0.05s sleep they took about the same time. The older 0.6.0 table, which showed wave much faster, was also simulated and is not this run. Wave mode still codes passages from different documents against one snapshot, so a later incident in a document can be coded before an earlier one. Re-run the script after you change the delay or the corpus. These times are simulated, not a provider benchmark.
 

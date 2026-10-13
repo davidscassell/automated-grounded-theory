@@ -33,7 +33,7 @@ from automated_grounded_theory.prompts import build_judge_messages
 from automated_grounded_theory.retrieval import jaccard
 from automated_grounded_theory.schemas import SameCodeJudgment
 from automated_grounded_theory.clustering import adjusted_rand_index
-from automated_grounded_theory.validation import code_key
+from automated_grounded_theory.validation import attributed_passage_ids, code_key
 
 _STOP = set(
     "a an the of and or to in on for with by as is are be from that this their its "
@@ -344,25 +344,48 @@ def _run_segments(run: Any) -> list[Mapping[str, Any]]:
     return [item for item in (getattr(run, "segments", []) or []) if isinstance(item, Mapping)]
 
 
-def assignment_passage_id(segment: Mapping[str, Any]) -> str:
-    """Passage that holds the evidence. Counts use this, not the coded passage.
+def assignment_passage_ids(segment: Mapping[str, Any]) -> list[str]:
+    """Passages that hold the evidence. Counts use these, not the coded passage.
 
-    ``attributed_passage_id`` is the passage the quote sits in. It matches
-    ``passage_id`` when the quote was inside the passage being coded.
+    One passage is the usual case. A discontinuous quote that overlaps several
+    passages is counted on each of them. An unresolved attribution is counted
+    on none: the passage that was being coded is not a fallback.
     """
+    return attributed_passage_ids(segment)
+
+
+def assignment_passage_id(segment: Mapping[str, Any]) -> str:
+    """The one passage that holds the evidence, or empty when that is not unique.
+
+    ``attributed_passage_id`` matches ``passage_id`` when the quote was inside
+    the passage being coded. Multi-passage and unresolved quotes return an
+    empty string. Use :func:`assignment_passage_ids` to count every passage.
+    """
+    ids = assignment_passage_ids(segment)
+    if len(ids) == 1:
+        return ids[0]
+    if ids:
+        return ""
+    status = str(segment.get("attribution") or "")
+    if status in {"multi", "unresolved"}:
+        return ""
     attributed = segment.get("attributed_passage_id")
     if attributed:
         return str(attributed)
-    return str(segment.get("passage_id") or "")
+    if status == "":
+        return str(segment.get("passage_id") or "")
+    return ""
 
 
 def _passage_code_sets(run: Any) -> dict[str, set[str]]:
     grouped: dict[str, set[str]] = {}
     for segment in _run_segments(run):
-        passage_id = assignment_passage_id(segment)
         code = str(segment.get("code") or "")
-        if passage_id and code:
-            grouped.setdefault(passage_id, set()).add(code)
+        if not code:
+            continue
+        for passage_id in assignment_passage_ids(segment):
+            if passage_id:
+                grouped.setdefault(passage_id, set()).add(code)
     return grouped
 
 
@@ -570,10 +593,11 @@ def aligned_assignment_agreement(
 def _passage_labels(run: Any) -> dict[str, str]:
     grouped: dict[str, list[str]] = {}
     for segment in _run_segments(run):
-        passage_id = assignment_passage_id(segment)
-        if not passage_id:
-            continue
-        grouped.setdefault(passage_id, []).append(str(segment.get("code") or ""))
+        label = str(segment.get("code") or "")
+        for passage_id in assignment_passage_ids(segment):
+            if not passage_id:
+                continue
+            grouped.setdefault(passage_id, []).append(label)
     return {passage_id: "|".join(sorted(labels)) for passage_id, labels in grouped.items()}
 
 
@@ -698,14 +722,24 @@ def _score(run: Mapping[str, Any], context_text: str) -> dict:
         "total_codes": len(codebook),
         "segments": len(segments),
     }
-    counts = collections.Counter(assignment_passage_id(segment) for segment in segments)
+    counts: collections.Counter[str] = collections.Counter()
+    unresolved = 0
+    for segment in segments:
+        ids = assignment_passage_ids(segment)
+        if not ids:
+            unresolved += 1
+            continue
+        for passage_id in ids:
+            counts[passage_id] += 1
     per_passage = [counts.get(passage_id, 0) for passage_id in passage_text] or [0]
     metrics["codes_per_passage_mean"] = round(statistics.mean(per_passage), 3) if passage_text else 0.0
     metrics["codes_per_passage_median"] = statistics.median(per_passage) if passage_text else 0.0
     metrics["coverage_pct"] = round(100 * sum(count > 0 for count in per_passage) / len(per_passage), 1) if passage_text else 0.0
+    metrics["unresolved_attributions"] = unresolved
     if segments:
         verbatim = sum(
-            str(segment.get("quote") or "") in passage_text.get(assignment_passage_id(segment), "") for segment in segments
+            any(str(segment.get("quote") or "") in passage_text.get(passage_id, "") for passage_id in assignment_passage_ids(segment))
+            for segment in segments
         )
         metrics["verbatim_quote_pct"] = round(100 * verbatim / len(segments), 1)
     else:
