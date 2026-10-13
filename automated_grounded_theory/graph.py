@@ -1849,9 +1849,9 @@ def _validate_node(runtime: RunConfig):
                 )
             coverage = str(coding.get("coverage_status") or "")
             coded_here = [
-                item
-                for item in interpreted["accepted"]
-                if str(item.get("attributed_passage_id") or passage.get("passage_id") or "")
+                row
+                for row in interpreted["accepted"]
+                if str(row.get("attributed_passage_id") or passage.get("passage_id") or "")
                 == str(passage.get("passage_id") or "")
             ]
             if coverage == "failed":
@@ -1861,10 +1861,10 @@ def _validate_node(runtime: RunConfig):
             else:
                 passage["coverage_status"] = "context_only"
             passages_by_id = {
-                str(item.get("passage_id") or ""): item for item in (state.get("passages") or [])
+                str(row.get("passage_id") or ""): row for row in (state.get("passages") or [])
             }
-            for item in interpreted["accepted"]:
-                attributed = str(item.get("attributed_passage_id") or "")
+            for row in interpreted["accepted"]:
+                attributed = str(row.get("attributed_passage_id") or "")
                 other = passages_by_id.get(attributed)
                 if other is None or other is passage:
                     continue
