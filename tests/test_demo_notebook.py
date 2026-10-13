@@ -76,7 +76,8 @@ def test_demo_notebook_runs_offline(tmp_path):
                     chunks.append(data[key])
     rendered = "\n".join(chunks)
     assert "review_mode document" in rendered
-    assert "passages 150" in rendered
+    # short_turn_chars (default 60) merges filler turns such as "Other: Thanks for asking."
+    assert "passages 100" in rendered
     assert "coverage_pct" in rendered
     assert "mean Jaccard 1.0" in rendered
     assert "taguette_codebook.csv" in rendered
