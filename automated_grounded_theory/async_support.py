@@ -120,21 +120,26 @@ class CallLimiter:
         *,
         timeout: float | None = None,
         reserved_output: int | None = None,
+        use_cache: bool = True,
     ):
         """``await runnable.ainvoke(payload)`` under the AIMD cap, with rate-limit retries.
 
         ``timeout`` overrides ``request_timeout`` for this call. ``None`` keeps
         the limiter default. ``0`` waits with no deadline. ``reserved_output``
         is added to the estimated input when the token bucket reserves a call.
+        ``use_cache=False`` skips the response cache, so a retry of the same
+        prompt calls the model again.
         """
         key = cache_key(payload, **(self.cache_context or {}))
-        cached = self.cache.get(key)
-        if cached is not None:
-            self.cache_hits += 1
-            return cached
+        if use_cache:
+            cached = self.cache.get(key)
+            if cached is not None:
+                self.cache_hits += 1
+                return cached
         estimate = self._estimate(payload, reserved_output)
         result = await self._retry(lambda: self._attempt(runnable, payload, timeout=timeout, estimate=estimate))
-        self.cache[key] = result
+        if use_cache:
+            self.cache[key] = result
         return result
 
     async def abatch(
@@ -847,6 +852,7 @@ async def ainvoke_structured(
     tokenizer=None,
     passage_id: str = "",
     on_overflow: Callable[[OversizedRequest], None] | None = None,
+    use_cache: bool = True,
 ) -> tuple[tuple[dict, dict], list]:
     """Invoke ``schema`` once, then repair a single malformed output.
 
@@ -870,6 +876,8 @@ async def ainvoke_structured(
         extra["timeout"] = timeout
     if reserved_output is not None:
         extra["reserved_output"] = reserved_output
+    if not use_cache:
+        extra["use_cache"] = False
     reserved = 0 if reserved_output is None else max(0, int(reserved_output))
     budget = None if token_budget is None else max(1, int(token_budget))
     sent = list(messages)

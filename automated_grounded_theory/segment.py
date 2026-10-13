@@ -133,6 +133,7 @@ class CodingPlan:
     branch_queues: dict[str, list[int]] = field(default_factory=dict)
     parallel: bool = False
     uncovered_answers: list[dict] = field(default_factory=list)
+    attached_preambles: list[dict] = field(default_factory=list)
 
 
 def interleave_document_queue(passages: Sequence[Mapping], queue: Sequence[int], batch_size: int) -> list[int]:
@@ -255,6 +256,7 @@ def plan_coding(
             warnings=warnings,
             parallel=parallel_documents,
             uncovered_answers=_collect_uncovered(passages),
+            attached_preambles=_collect_preambles(passages),
         )
 
     rng = random.Random(seed)
@@ -280,6 +282,7 @@ def plan_coding(
             branch_queues={doc_id: _live(passages, indices) for doc_id, indices in branch_queues.items()},
             parallel=True,
             uncovered_answers=_collect_uncovered(passages),
+            attached_preambles=_collect_preambles(passages),
         )
 
     if review_mode == "document":
@@ -307,6 +310,7 @@ def plan_coding(
         branch_queues={},
         parallel=False,
         uncovered_answers=_collect_uncovered(passages),
+        attached_preambles=_collect_preambles(passages),
     )
 
 
@@ -372,6 +376,7 @@ def segment_document(
             limit=int(short_turn_chars),
             answers_only=True,
         )
+        _attach_leading_preamble(text, passages, warnings, document.doc_id)
     return passages, warnings
 
 
@@ -568,6 +573,7 @@ def _segment_incidents(
         limit=int(short_turn_chars),
         answers_only=False,
     )
+    _attach_leading_preamble(text, passages, warnings, document.doc_id)
     gap = _uncovered_answer_text(text, pairs, passages)
     if gap:
         warnings.append(
@@ -672,11 +678,6 @@ def _split_speaker_turns(text: str) -> tuple[list[tuple[int, int]], str | None]:
             "no speaker turns found (expected lines like 'Name: ...'); fell back to paragraphs"
         )
     spans: list[tuple[int, int]] = []
-    if matches[0].start() > 0 and text[: matches[0].start()].strip():
-        preamble = text[: matches[0].start()]
-        leading = len(preamble) - len(preamble.lstrip())
-        trailing = len(preamble) - len(preamble.rstrip())
-        spans.append((leading, len(preamble) - trailing))
     for position, match in enumerate(matches):
         end = matches[position + 1].start() if position + 1 < len(matches) else len(text)
         chunk_end = end
@@ -690,17 +691,37 @@ def _split_speaker_turns(text: str) -> tuple[list[tuple[int, int]], str | None]:
 class _SpeakerHit:
     """One speaker label. ``start`` is the label, not the indent before it."""
 
-    def __init__(self, match: re.Match[str]) -> None:
+    def __init__(self, match: re.Match[str], *, label_start: int | None = None, label: str | None = None) -> None:
         self._match = match
+        self._label_start = label_start
+        self._label = label
 
     def start(self) -> int:
+        if self._label_start is not None:
+            return self._label_start
         return self._match.start(1)
 
     def end(self) -> int:
         return self._match.end()
 
     def group(self, index: int) -> str:
+        if index == 1 and self._label is not None:
+            return self._label
         return self._match.group(index)
+
+
+def _line_speaker_hit(match: re.Match[str]) -> _SpeakerHit:
+    """If a line-start label ends in a known role, keep only that word.
+
+    ``download the results   Interviewer:`` is the role ``Interviewer``. The
+    words before it stay on the previous turn.
+    """
+    label = match.group(1)
+    words = label.split()
+    if len(words) >= 2 and words[-1].casefold() in _KNOWN_SPEAKER_LABELS and label.endswith(words[-1]):
+        last = words[-1]
+        return _SpeakerHit(match, label_start=match.start(1) + len(label) - len(last), label=last)
+    return _SpeakerHit(match)
 
 
 def _speaker_matches(text: str) -> list[_SpeakerHit]:
@@ -708,12 +729,13 @@ def _speaker_matches(text: str) -> list[_SpeakerHit]:
 
     A mid-line label has to follow sentence punctuation. That keeps ``best.
     Interviewer:`` and `` Participant:`` without splitting on ``Note:`` or
-    ``I said:``.
+    ``I said:``. A line-start label whose last word is a known role matches
+    only that word, so ``download the results   Interviewer:`` is ``Interviewer``.
     """
-    line_matches = list(_SPEAKER_LINE.finditer(text))
-    seen = {match.group(1).strip().casefold() for match in line_matches}
-    covered = [(match.start(), match.end()) for match in line_matches]
-    found = [_SpeakerHit(match) for match in line_matches]
+    line_hits = [_line_speaker_hit(match) for match in _SPEAKER_LINE.finditer(text)]
+    seen = {hit.group(1).strip().casefold() for hit in line_hits}
+    covered = [(hit.start(), hit.end()) for hit in line_hits]
+    found = list(line_hits)
     for match in _SPEAKER_MID.finditer(text):
         if any(start <= match.start(1) < end for start, end in covered):
             continue
@@ -850,6 +872,66 @@ def _relink_passages(passages: Sequence[dict]) -> None:
     for index, passage in enumerate(passages):
         passage["prev_text"] = passages[index - 1]["text"] if index else ""
         passage["next_text"] = passages[index + 1]["text"] if index + 1 < len(passages) else ""
+
+
+def _attach_leading_preamble(text: str, passages: list[dict], warnings: list[str], doc_id: str) -> None:
+    """Pull text before the first speaker label into the earliest passage.
+
+    ``Participant 02`` ahead of ``Institution:`` is the example. The characters
+    stay in that passage. A warning and ``attached_preamble_text`` record it
+    the same way uncovered answer text is recorded.
+    """
+    matches = _speaker_matches(text)
+    if not matches or not passages:
+        return
+    boundary = matches[0].start()
+    prefix = text[:boundary]
+    if boundary <= 0 or not prefix.strip():
+        return
+    lead = len(prefix) - len(prefix.lstrip())
+    if any(int(item.get("start_offset") or 0) <= lead and int(item.get("end_offset") or 0) >= boundary for item in passages):
+        return
+    host = None
+    for passage in passages:
+        start = int(passage.get("start_offset") or 0)
+        if start >= boundary and not text[boundary:start].strip():
+            host = passage
+            break
+    if host is None:
+        host = min(passages, key=lambda item: int(item.get("start_offset") or 0))
+    start = int(host.get("start_offset") or 0)
+    end = int(host.get("end_offset") or 0)
+    if lead >= start:
+        return
+    host["start_offset"] = lead
+    host["end_offset"] = max(end, lead)
+    host["text"] = text[lead : int(host["end_offset"])]
+    snippet = prefix.strip()
+    warnings.append(
+        f"{doc_id}: {len(snippet)} characters before the first speaker label "
+        "were attached to the first passage."
+    )
+    for passage in passages:
+        metadata = dict(passage.get("metadata") or {})
+        metadata["attached_preamble_chars"] = len(snippet)
+        metadata["attached_preamble_text"] = snippet
+        passage["metadata"] = metadata
+    _relink_passages(passages)
+
+
+def _collect_preambles(passages: Sequence[Mapping]) -> list[dict]:
+    found: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for passage in passages:
+        metadata = passage.get("metadata") or {}
+        gap = str(metadata.get("attached_preamble_text") or "")
+        doc_id = str(passage.get("doc_id") or "")
+        marker = (doc_id, gap)
+        if not gap or marker in seen:
+            continue
+        seen.add(marker)
+        found.append({"doc_id": doc_id, "chars": len(gap), "text": gap})
+    return found
 
 
 def _uncovered_answer_text(

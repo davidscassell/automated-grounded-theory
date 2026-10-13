@@ -853,6 +853,9 @@ def _segmentation_metadata(metadata: Mapping[str, Any], plan) -> dict:
     uncovered = [dict(item) for item in (getattr(plan, "uncovered_answers", None) or [])]
     if uncovered:
         updated["uncovered_answers"] = uncovered
+    preambles = [dict(item) for item in (getattr(plan, "attached_preambles", None) or [])]
+    if preambles:
+        updated["attached_preambles"] = preambles
     return updated
 
 
@@ -1804,7 +1807,15 @@ async def _retry_missing_slots(
             )
             logger.warning("%s", note)
             _remember_note(runtime, note)
-            alone_parsed = await _request_coding(runtime, [passage], entries, [ranks[index]], feedback, budget)
+            alone_parsed = await _request_coding(
+                runtime,
+                [passage],
+                entries,
+                [ranks[index]],
+                feedback,
+                budget,
+                use_cache=False,
+            )
             alone = _align_batch(alone_parsed, [passage])
             if alone and not alone[0].get("missing_slot"):
                 recovered = dict(alone[0])
@@ -1838,6 +1849,8 @@ async def _request_coding(
     ranks: Sequence[Sequence[str]],
     feedback: Mapping[str, str] | None,
     budget: int,
+    *,
+    use_cache: bool = True,
 ) -> dict:
     messages = _fit_coding_messages(runtime, subset, entries, ranks, feedback, budget)
     passage_ids = ",".join(str(passage.get("passage_id")) for passage in subset)
@@ -1857,6 +1870,7 @@ async def _request_coding(
             max_codes_per_passage=runtime.max_codes_per_passage,
         ),
         token_budget=budget,
+        use_cache=use_cache,
     )
 
 
@@ -3386,6 +3400,7 @@ async def _ainvoke_structured(
     runtime: RunConfig,
     reserved_output: int | None = None,
     token_budget: int | None = None,
+    use_cache: bool = True,
 ) -> dict:
     timeout = None
     if kind in {"sweep", "merge_verify", "definition_rewrite", "quote_fit", "candidate_discovery"}:
@@ -3402,6 +3417,7 @@ async def _ainvoke_structured(
             tokenizer=resolve_tokenizer(model),
             passage_id=passage_id,
             on_overflow=_on_schema_overflow(runtime, passage_id),
+            use_cache=use_cache,
         )
     except Exception as exc:
         raise CodingError(f"{kind} failed for {passage_id}: {exc}") from exc

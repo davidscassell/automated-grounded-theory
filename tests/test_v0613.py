@@ -19,6 +19,7 @@ from automated_grounded_theory.retrieval import LexicalCodeRetriever
 from automated_grounded_theory.schemas import BatchCoding, CodeProposal
 from automated_grounded_theory.segment import (
     _collect_uncovered,
+    _speaker_matches,
     _uncovered_answer_text,
     plan_coding,
 )
@@ -182,10 +183,12 @@ def test_still_failed_passages_are_logged_and_listed(caplog):
     assert aligned[0]["coverage_status"] != "failed"
     assert aligned[1]["passage_id"] == "p2"
     assert aligned[1]["coverage_status"] == "failed"
-    # The batch call plus one solo call. The second solo retry is the same
-    # prompt, so the response cache replays it and the model is not called again.
-    assert coder.call_count == 2
-    assert runtime.limiter.cache_hits >= 1
+    # The batch call plus two solo calls. Retries bypass the response cache,
+    # so the second solo request reaches the model instead of replaying it.
+    assert coder.call_count == 3
+    assert runtime.limiter.cache_hits == 0
+    assert "attempt 1/2" in caplog.text
+    assert "attempt 2/2" in caplog.text
     assert runtime.failed_passage_ids == ["p2"]
     assert any("stayed failed" in note for note in runtime.notes)
     assert any(note.startswith("Coding replies left passages failed: p2") for note in runtime.notes)
@@ -348,6 +351,60 @@ def test_cross_passage_duplicate_merges_instead_of_double_counting():
         other,
     )
     assert len(third["segments"]) == 2
+
+
+EXACT_FALSE_LABEL = (
+    "Participant: It's a pain because you can't \n"
+    "download the results   Interviewer: Do you happen to recall which trials registry it was?\n"
+    "Participant: I usually search clinicaltrials.gov and the World Health Organization registry.\n"
+)
+
+
+def test_line_start_known_role_does_not_swallow_the_words_before_it():
+    assert "download the results   Interviewer:" in EXACT_FALSE_LABEL
+    labels = [(hit.group(1), hit.start()) for hit in _speaker_matches(EXACT_FALSE_LABEL)]
+    assert "download the results   Interviewer" not in [label for label, _start in labels]
+    interviewer = next(start for label, start in labels if label == "Interviewer")
+    assert EXACT_FALSE_LABEL[interviewer:interviewer + len("Interviewer:")] == "Interviewer:"
+    download = EXACT_FALSE_LABEL.index("download the results")
+    assert interviewer > download
+    plan = plan_coding([{"id": "2", "text": EXACT_FALSE_LABEL}], unit="incident", seed=1, short_turn_chars=0)
+    answer = next(passage for passage in plan.passages if "download the results" in passage["text"])
+    assert "which trials registry" not in answer["text"]
+    assert answer["start_offset"] <= download < answer["end_offset"]
+    recall = next(passage for passage in plan.passages if "clinicaltrials.gov" in passage["text"])
+    assert "Do you happen to recall which trials registry it was?" in recall["question"]
+    assert plan.uncovered_answers == []
+
+
+PREAMBLE = (
+    "Participant 02\n"
+    "Institution: Academic health sciences library\n"
+    "Interviewer: Where do you work now?\n"
+    "Participant: I work in the library stacks on the north side of the building every morning.\n"
+)
+
+
+def test_preamble_before_the_first_speaker_is_attached_and_warned():
+    plan = plan_coding([{"id": "2", "text": PREAMBLE}], unit="incident", seed=1, short_turn_chars=0)
+    assert plan.passages[0]["text"].startswith("Participant 02")
+    assert plan.passages[0]["start_offset"] == 0
+    assert "Participant 02" in plan.passages[0]["text"]
+    assert plan.uncovered_answers == []
+    assert plan.attached_preambles == [{"doc_id": "2", "chars": len("Participant 02"), "text": "Participant 02"}]
+    assert any("before the first speaker label" in warning for warning in plan.warnings)
+    assert plan.passages[0]["metadata"]["attached_preamble_text"] == "Participant 02"
+    covered = [False] * len(PREAMBLE)
+    for passage in plan.passages:
+        for index in range(passage["start_offset"], passage["end_offset"]):
+            covered[index] = True
+    missing = "".join(char for index, char in enumerate(PREAMBLE) if not char.isspace() and not covered[index])
+    assert missing == "Interviewer:Wheredoyouworknow?"
+    metadata = _segmentation_metadata(
+        {"unit": "incident", "seed": 1},
+        type("Plan", (), {"seed": 1, "passages": plan.passages, "uncovered_answers": [], "attached_preambles": plan.attached_preambles})(),
+    )
+    assert metadata["attached_preambles"] == plan.attached_preambles
 
 
 def test_document_prompt_codes_each_passage_and_quotes_only_the_target():
