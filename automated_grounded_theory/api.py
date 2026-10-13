@@ -253,11 +253,15 @@ def open_code(
     just supplied. The result metadata is those settings, including the
     temperature and other non-secret limits read from the instances.
 
-    Corpus identity and the segmentation plan (unit, seed, review mode, and
-    parallel documents) are not continuable. ``allow_changes`` still raises
-    ``CheckpointMigrationRequired``. Start a new run. There is no migration
-    that rebuilds the stored passages. Research-context wording, model and
-    temperature, and performance settings are the changes that may continue.
+    Corpus identity, ``unit``, and ``seed`` are not continuable. Those already
+    determined the stored passages and their order. ``allow_changes`` still
+    raises ``CheckpointMigrationRequired``. Start a new run. There is no
+    migration that rebuilds the stored passages. Research-context wording,
+    model and temperature, and performance settings may continue.
+    ``review_mode`` and ``parallel_documents`` are performance settings: they
+    do not change passage boundaries. Resume does not re-segment, so changing
+    either one records a continuation and leaves the stored passages, coding
+    order, queue, and branch queues as they were checkpointed.
 
     The saturation curve is reported and is not a stopping decision.
     ``passages_per_request`` passages share one model call (``batch_size`` is
@@ -772,14 +776,15 @@ _MANIFEST_MODEL = (
     "prompt_cache",
     "check_model",
 )
-# Already applied to the stored passages. allow_changes cannot rebuild them.
+# Already applied to the stored passages and their order. allow_changes cannot
+# rebuild them. review_mode and parallel_documents do not change passage
+# boundaries. Resume does not re-run segmentation, so those two are performance
+# settings and may continue.
 _STRUCTURAL_MANIFEST_PATHS = frozenset(
     {
         "corpus_hash",
         "procedure.unit",
         "procedure.seed",
-        "procedure.review_mode",
-        "procedure.parallel_documents",
     }
 )
 _MANIFEST_PROCEDURE = (

@@ -76,6 +76,21 @@ def test_segmentation_change_is_rejected_and_performance_change_continues():
     assert "procedure.unit" in raised.value.differences
     assert "start a new run" in str(raised.value).lower()
 
+    seeded = InMemorySaver()
+    seed_kwargs = _pause_kwargs(seeded, "seed-lock")
+    open_code(CORPUS, CONTEXT, model=FakeCoder(), **seed_kwargs)
+    with pytest.raises(CheckpointMigrationRequired) as raised:
+        open_code(
+            CORPUS,
+            CONTEXT,
+            model=FakeCoder(),
+            resume=True,
+            allow_changes=True,
+            **{**seed_kwargs, "seed": 9},
+        )
+    assert "procedure.seed" in raised.value.differences
+    assert "start a new run" in str(raised.value).lower()
+
     other = InMemorySaver()
     other_kwargs = _pause_kwargs(other, "speed")
     open_code(CORPUS, CONTEXT, model=FakeCoder(), concurrency=4, **other_kwargs)
@@ -95,7 +110,100 @@ def test_segmentation_change_is_rejected_and_performance_change_continues():
     assert {passage["doc_id"] for passage in continued.passages} == {"alex", "blair", "casey", "drew"}
 
 
-def test_instance_temperature_is_fingerprinted_and_recorded():
+_ORDERED = [
+    {"id": "a", "name": "A", "text": "Alpha one.\n\nAlpha two.\n\nAlpha three."},
+    {"id": "b", "name": "B", "text": "Beta one.\n\nBeta two.\n\nBeta three."},
+    {"id": "c", "name": "C", "text": "Gamma one.\n\nGamma two."},
+]
+
+
+def _stored_spans(passages) -> list[tuple]:
+    return [
+        (
+            passage["passage_id"],
+            passage["text"],
+            passage["start_offset"],
+            passage["end_offset"],
+            passage["coding_order"],
+        )
+        for passage in passages
+    ]
+
+
+def test_review_mode_change_continues_without_resegmenting():
+    saver = InMemorySaver()
+    kwargs = dict(
+        seed=7,
+        unit="paragraph",
+        sweep_every=2,
+        review_mode="document",
+        checkpointer=saver,
+        thread_id="review-mode",
+        interrupt_before_sweep=True,
+    )
+    paused = open_code(_ORDERED, CONTEXT, model=FakeCoder(), **kwargs)
+    assert len(paused.passages) > 2
+    with pytest.raises(CheckpointMismatch) as raised:
+        open_code(
+            _ORDERED,
+            CONTEXT,
+            model=FakeCoder(),
+            resume=True,
+            **{**kwargs, "review_mode": "wave"},
+        )
+    assert type(raised.value) is CheckpointMismatch
+    assert "procedure.review_mode" in raised.value.differences
+    with pytest.warns(UserWarning, match="changed checkpoint manifest"):
+        continued = open_code(
+            _ORDERED,
+            CONTEXT,
+            model=FakeCoder(),
+            resume=True,
+            allow_changes=True,
+            **{**kwargs, "review_mode": "wave", "interrupt_before_sweep": False},
+        )
+    diff = continued.metadata["continuations"][-1]["differences"]
+    assert diff["procedure.review_mode"] == {"old": "document", "new": "wave"}
+    assert continued.metadata["review_mode"] == "wave"
+    assert _stored_spans(continued.passages) == _stored_spans(paused.passages)
+
+
+def test_parallel_documents_change_continues_without_resegmenting():
+    saver = InMemorySaver()
+    kwargs = dict(
+        seed=7,
+        unit="paragraph",
+        sweep_every=2,
+        parallel_documents=False,
+        checkpointer=saver,
+        thread_id="parallel-docs",
+        interrupt_before_sweep=True,
+    )
+    paused = open_code(_ORDERED, CONTEXT, model=FakeCoder(), **kwargs)
+    with pytest.raises(CheckpointMismatch) as raised:
+        open_code(
+            _ORDERED,
+            CONTEXT,
+            model=FakeCoder(),
+            resume=True,
+            **{**kwargs, "parallel_documents": True},
+        )
+    assert type(raised.value) is CheckpointMismatch
+    assert "procedure.parallel_documents" in raised.value.differences
+    with pytest.warns(UserWarning, match="changed checkpoint manifest"):
+        continued = open_code(
+            _ORDERED,
+            CONTEXT,
+            model=FakeCoder(),
+            resume=True,
+            allow_changes=True,
+            **{**kwargs, "parallel_documents": True, "interrupt_before_sweep": False},
+        )
+    diff = continued.metadata["continuations"][-1]["differences"]
+    assert diff["procedure.parallel_documents"] == {"old": False, "new": True}
+    assert continued.metadata["parallel_documents"] is True
+    assert _stored_spans(continued.passages) == _stored_spans(paused.passages)
+
     cold = ConfigCoder(temperature=0, top_p=1, max_tokens=16, api_key="sk-secret")
     hot = ConfigCoder(temperature=1, top_p=0.2, max_tokens=32, api_key="sk-secret")
     settings = chat_model_settings(cold)
