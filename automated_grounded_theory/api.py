@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import uuid
 import warnings
 from pathlib import Path
@@ -25,17 +27,20 @@ from automated_grounded_theory.corpus import LoadedDocument, load_corpus
 from automated_grounded_theory.export import export_result
 from automated_grounded_theory.graph import CodingError, RunConfig, compile_graph, initial_state
 from automated_grounded_theory.prompts import CODING_SYSTEM, SWEEP_SYSTEM
+from automated_grounded_theory.records import POLICY_VERSION
 from automated_grounded_theory.results import OpenCodeResult, result_from_state
 from automated_grounded_theory.retrieval import (
     CodeRetriever,
     EmbeddingCodeRetriever,
     LexicalCodeRetriever,
+    embedding_run_scope,
 )
 from automated_grounded_theory.segment import UNITS, CodingPlan, plan_coding
 from automated_grounded_theory.stability import StabilityReport, compare_runs
 from automated_grounded_theory.version import __version__
 
 __all__ = [
+    "CheckpointMismatch",
     "CodingError",
     "CodingPlan",
     "OpenCodeResult",
@@ -223,6 +228,8 @@ def open_code(
     tokens_per_minute: float = 0,
     requests_per_minute: float = 0,
     allow_oversized: bool = False,
+    allow_changes: bool = False,
+    continuation: bool = False,
 ) -> OpenCodeResult:
     """Run first-round grounded-theory open coding over ``corpus``.
 
@@ -235,6 +242,12 @@ def open_code(
 
     ``context`` guides attention (research question, population, setting,
     sensitizing concepts). It is rejected if it contains preset codes.
+
+    ``resume=True`` continues a checkpoint. The run stores a manifest of the
+    corpus, context, model, procedure, and policy version. A mismatch raises
+    ``CheckpointMismatch`` unless ``allow_changes`` or ``continuation`` is true.
+    Either option records the old and new values, warns, and continues with the
+    settings just supplied. The result metadata is those settings.
 
     The saturation curve is reported and is not a stopping decision.
     ``passages_per_request`` passages share one model call (``batch_size`` is
@@ -355,6 +368,8 @@ def open_code(
             tokens_per_minute=tokens_per_minute,
             requests_per_minute=requests_per_minute,
             allow_oversized=allow_oversized,
+            allow_changes=allow_changes,
+            continuation=continuation,
         )
     )
 
@@ -423,6 +438,8 @@ async def aopen_code(
     tokens_per_minute: float = 0,
     requests_per_minute: float = 0,
     allow_oversized: bool = False,
+    allow_changes: bool = False,
+    continuation: bool = False,
     limiter: CallLimiter | None = None,
 ) -> OpenCodeResult:
     """Async form of :func:`open_code`."""
@@ -584,6 +601,7 @@ async def aopen_code(
         allow_oversized=allow_oversized,
         context=parsed_context,
     )
+    metadata["checkpoint_manifest"] = checkpoint_manifest(documents, metadata)
     runtime = RunConfig(
         coder=coder,
         sweeper=sweeper,
@@ -658,6 +676,7 @@ async def aopen_code(
                 recursion_limit=limit,
                 output_dir=output_dir,
                 resumable=True,
+                allow_changes=allow_changes or continuation,
             )
     saver = checkpointer if checkpointer is not None else _memory_saver()
     return await _execute(
@@ -671,7 +690,102 @@ async def aopen_code(
         recursion_limit=limit,
         output_dir=output_dir,
         resumable=resumable,
+        allow_changes=allow_changes or continuation,
     )
+
+
+class CheckpointMismatch(RuntimeError):
+    """Resume settings do not match the checkpoint manifest."""
+
+    def __init__(self, differences: dict[str, dict[str, Any]]) -> None:
+        self.differences = differences
+        fields = ", ".join(sorted(differences))
+        super().__init__(
+            "Checkpoint manifest does not match this resume "
+            f"({fields}). Pass allow_changes=True to continue and record a continuation event."
+        )
+
+
+def corpus_identity_hash(documents: Sequence[LoadedDocument]) -> str:
+    """Hash of document id, name, source, and text. Display metadata is not included."""
+    rows = [
+        {"doc_id": doc.doc_id, "name": doc.name, "source": doc.source, "text": doc.text}
+        for doc in documents
+    ]
+    rows.sort(key=lambda item: (item["doc_id"], item["name"], item["source"]))
+    raw = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+_MANIFEST_CONTEXT = ("research_question", "population", "setting", "sensitizing_concepts", "notes")
+_MANIFEST_MODEL = (
+    "model",
+    "sweep_model",
+    "embeddings",
+    "temperature",
+    "sweep_temperature",
+    "llm_seed",
+    "model_kwargs",
+    "sweep_model_kwargs",
+    "prompt_cache",
+    "check_model",
+)
+_MANIFEST_PROCEDURE = (
+    "seed",
+    "unit",
+    "sweep_every",
+    "parallel_documents",
+    "batch_size",
+    "concurrency",
+    "passages_per_request",
+    "max_concurrent_requests",
+    "passages_per_codebook_update",
+    "procedure",
+    "review_mode",
+    "review_below",
+    "min_merge_confidence",
+    "max_merges_per_sweep",
+    "pipeline",
+    "token_budget",
+    "full_audit_every",
+    "cross_chunk_limit",
+    "tokens_per_minute",
+    "requests_per_minute",
+    "allow_oversized",
+)
+
+
+def checkpoint_manifest(documents: Sequence[LoadedDocument], metadata: dict) -> dict[str, Any]:
+    """Corpus, context, model, procedure, and policy identity stored with the checkpoint."""
+    context = metadata.get("context") or {}
+    return {
+        "corpus_hash": corpus_identity_hash(documents),
+        "context": {key: context.get(key) for key in _MANIFEST_CONTEXT},
+        "model": {key: metadata.get(key) for key in _MANIFEST_MODEL},
+        "procedure": {
+            **{key: metadata.get(key) for key in _MANIFEST_PROCEDURE},
+            "params": dict(metadata.get("params") or {}),
+        },
+        "policy_version": POLICY_VERSION,
+    }
+
+
+def manifest_diff(saved: Any, current: Any) -> dict[str, dict[str, Any]]:
+    """Field paths whose saved and current manifest values differ."""
+    if not isinstance(saved, dict):
+        return {"checkpoint_manifest": {"old": saved, "new": current}}
+    differences: dict[str, dict[str, Any]] = {}
+
+    def walk(prefix: str, left: Any, right: Any) -> None:
+        if isinstance(left, dict) and isinstance(right, dict):
+            for key in sorted(set(left) | set(right), key=str):
+                walk(f"{prefix}.{key}" if prefix else str(key), left.get(key), right.get(key))
+            return
+        if left != right:
+            differences[prefix] = {"old": left, "new": right}
+
+    walk("", saved, current)
+    return differences
 
 
 async def _execute(
@@ -686,9 +800,41 @@ async def _execute(
     recursion_limit: int,
     output_dir: str | Path | None,
     resumable: bool,
+    allow_changes: bool = False,
 ) -> OpenCodeResult:
     graph = compile_graph(runtime, saver, interrupt_before_sweep=interrupt_before_sweep)
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": recursion_limit}
+    with embedding_run_scope(thread_id):
+        return await _execute_locked(
+            graph,
+            config,
+            runtime,
+            documents,
+            metadata,
+            thread_id=thread_id,
+            resume=resume,
+            recursion_limit=recursion_limit,
+            output_dir=output_dir,
+            resumable=resumable,
+            allow_changes=allow_changes,
+        )
+
+
+async def _execute_locked(
+    graph,
+    config: dict,
+    runtime: RunConfig,
+    documents: list[LoadedDocument],
+    metadata: dict,
+    *,
+    thread_id: str,
+    resume: bool,
+    recursion_limit: int,
+    output_dir: str | Path | None,
+    resumable: bool,
+    allow_changes: bool,
+) -> OpenCodeResult:
+    del runtime, recursion_limit
     snapshot = await graph.aget_state(config)
     has_state = bool(getattr(snapshot, "values", None))
     if resume:
@@ -696,8 +842,27 @@ async def _execute(
             raise RuntimeError(
                 f"No checkpoint was found for thread {thread_id!r}. Start a run before passing resume=True."
             )
+        saved_meta = dict(getattr(snapshot, "values", {}).get("metadata") or {})
+        differences = manifest_diff(saved_meta.get("checkpoint_manifest"), metadata.get("checkpoint_manifest"))
+        if differences:
+            if not allow_changes:
+                raise CheckpointMismatch(differences)
+            note = "Resuming with a changed checkpoint manifest: " + ", ".join(sorted(differences))
+            warnings.warn(note, UserWarning, stacklevel=2)
+            metadata = dict(metadata)
+            metadata["continuations"] = list(saved_meta.get("continuations") or []) + [
+                {"event": "continuation", "differences": differences}
+            ]
+            prior_warnings = list(getattr(snapshot, "values", {}).get("warnings") or [])
+            if note not in prior_warnings:
+                prior_warnings.append(note)
+            await graph.aupdate_state(config, {"metadata": metadata, "warnings": prior_warnings})
         if snapshot.next:
             state = await graph.ainvoke(None, config)
+        elif differences:
+            # The run had already finished. aupdate_state wrote the continuation
+            # onto a new checkpoint; the snapshot taken before that write is stale.
+            state = (await graph.aget_state(config)).values
         else:
             state = snapshot.values
     else:

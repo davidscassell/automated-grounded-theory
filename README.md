@@ -234,15 +234,15 @@ The checks and the sweep exist because that JMIR tutorial found LLM coding weak 
 
 ## Speed
 
-`scripts/benchmark_review_modes.py` runs a fake coder that sleeps 0.05s per call on 6 documents × 4 passages (24 passages), seed 7, `sweep_every=8`, `unit="paragraph"`. No API key. It also runs an embedding-latency row that sleeps on each embedding call and ranks passages through the query API. `--embedding-delay 0` skips that row. `--unique-passages` gives that row a distinct query text per passage instead of four reused stems. On 0.6.10 at `--delay 0.05`, the reused row embedded 4 queries (peak 3, 0.887s, 27.07 passages/s) and `--unique-passages` embedded 20 (peak 4, 1.019s, 23.55 passages/s). Measured on 0.6.0. 0.6.1 was not remeasured. On 0.6.0, `concurrency` widened the frozen window. From 0.6.4 only `passages_per_codebook_update` does that. The sequential row is what `strict_sequential_settings()` names.
+`scripts/benchmark_review_modes.py` runs a fake coder that sleeps 0.05s per call on 6 documents × 4 passages (24 passages), seed 7, `sweep_every=8`, `unit="paragraph"`. No API key. It also runs an embedding-latency row that sleeps on each embedding call and ranks passages through the query API. `--embedding-delay 0` skips that row. `--unique-passages` gives that row a distinct query text per passage instead of four reused stems. Every number in this section is simulated: the coder, and the embedding model on that row, sleep instead of calling a provider. Remeasured on 0.6.11 at `--delay 0.05`. The reused embedding row embedded 4 queries (peak 3, 0.845s, 28.40 passages/s). `--unique-passages` embedded 20 (peak 4, 0.998s, 24.06 passages/s). On 0.6.0, `concurrency` widened the frozen window. From 0.6.4 only `passages_per_codebook_update` does that. The sequential row is what `strict_sequential_settings()` names.
 
-| Mode | What it does | Seconds | Calls | Passages/s | Codes | Merges | Near-duplicate pairs left |
+| Mode | What it does | Seconds (simulated) | Calls | Passages/s | Codes | Merges | Near-duplicate pairs left |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| sequential | `review_mode="document"`, `pipeline=False`, `batch_size=1`, `concurrency=1` | 1.690 | 28 | 14.20 | 3 | 3 | 0 |
-| document | `review_mode="document"`, background synthesis, `batch_size=4`, `concurrency=4` | 0.543 | 10 | 44.18 | 3 | 3 | 0 |
-| wave | `review_mode="wave"`, background synthesis, `batch_size=4`, `concurrency=4` | 0.307 | 9 | 78.20 | 3 | 1 | 0 |
+| sequential | `review_mode="document"`, `pipeline=False`, `batch_size=1`, `concurrency=1` | 1.659 | 28 | 14.47 | 3 | 3 | 0 |
+| document | `review_mode="document"`, background synthesis, `batch_size=4`, `concurrency=4` | 0.563 | 10 | 42.66 | 3 | 1 | 0 |
+| wave | `review_mode="wave"`, background synthesis, `batch_size=4`, `concurrency=4` | 0.593 | 11 | 40.47 | 3 | 1 | 0 |
 
-On this fake coder, exact repeated labels collapse when they are committed, so none of the three left a near-duplicate pair behind. Document mode kept the same final code count as the sequential reading and still ran a merge on each synthesis. Wave mode was the fastest and needed only one merge pass, because passages from different documents shared a snapshot. That speed is the constant-comparison tradeoff described above: later incidents in a document can be coded before earlier ones. Re-run the script after you change the delay or the corpus; do not treat these times as a provider benchmark.
+On this fake coder, exact repeated labels collapse when they are committed, so none of the three left a near-duplicate pair behind. Document and wave each kept the sequential code count and recorded one merge. On this 0.05s sleep they took about the same time. The older 0.6.0 table, which showed wave much faster, was also simulated and is not this run. Wave mode still codes passages from different documents against one snapshot, so a later incident in a document can be coded before an earlier one. Re-run the script after you change the delay or the corpus. These times are simulated, not a provider benchmark.
 
 ## Benchmark
 

@@ -534,6 +534,103 @@ def excerpt_offset_hits(
     }
 
 
+def unit_grid_from_annotations(
+    passages: Sequence[Mapping[str, Any]],
+    segments: Sequence[Mapping[str, Any]],
+    tags: Sequence[Mapping[str, Any]],
+    mappings: Sequence[Mapping[str, Any]],
+    documents: Sequence[Mapping[str, Any]] | None = None,
+    *,
+    min_confidence: float = 0.5,
+) -> dict[str, Any]:
+    """Human labels from annotation spans, model labels through the reviewed mapping.
+
+    The metric is unavailable when no reviewed mapping aligns a model label to
+    a human label, or when tag excerpts cannot be placed on the documents.
+    An empty human side is not scored as absence against model positives.
+    """
+    accepted: dict[str, str] = {}
+    for row in mappings:
+        human = str(row.get("human_code") or "").strip()
+        model = str(row.get("llm_code") or "").strip()
+        grade = str(row.get("grade") or "")
+        if grade == "none" or not human or not model:
+            continue
+        if float(row.get("confidence") or 0) < min_confidence:
+            continue
+        accepted[model] = human
+    unavailable = {
+        "available": False,
+        "reason": "alignment_unavailable",
+        "codes": 0,
+        "units": 0,
+        "macro_f1": None,
+        "macro_kappa": None,
+    }
+    if not accepted:
+        return unavailable
+    texts = {
+        normalize_doc_id(item.get("id") or item.get("doc_id")): str(item.get("text") or "")
+        for item in documents or []
+    }
+    located_tags: list[dict[str, Any]] = []
+    for tag in tags:
+        doc_id = normalize_doc_id(tag.get("document"))
+        excerpt = str(tag.get("excerpt") or "")
+        label = str(tag.get("label") or "").strip()
+        text = texts.get(doc_id, "")
+        if not excerpt or not label or not text:
+            continue
+        start = text.find(excerpt)
+        if start < 0:
+            continue
+        located_tags.append(
+            {
+                "document": doc_id,
+                "label": label,
+                "start": start,
+                "end": start + len(excerpt),
+            }
+        )
+    if tags and not located_tags:
+        return {**unavailable, "reason": "span_alignment_unavailable"}
+    units = []
+    for passage in passages:
+        passage_id = str(passage.get("passage_id") or "")
+        doc_id = normalize_doc_id(passage.get("doc_id"))
+        start = passage.get("start_offset")
+        end = passage.get("end_offset")
+        human_codes: list[str] = []
+        if start is not None and end is not None:
+            window = (int(start), int(end))
+            for tag in located_tags:
+                if doc_id and tag["document"] != doc_id:
+                    continue
+                if _span_overlap(window, (tag["start"], tag["end"])) > 0:
+                    if tag["label"] not in human_codes:
+                        human_codes.append(tag["label"])
+        else:
+            text = str(passage.get("text") or "")
+            for tag in located_tags:
+                if doc_id and tag["document"] != doc_id:
+                    continue
+                excerpt = texts.get(tag["document"], "")[tag["start"] : tag["end"]]
+                if excerpt and excerpt in text and tag["label"] not in human_codes:
+                    human_codes.append(tag["label"])
+        model_codes: list[str] = []
+        for segment in segments:
+            if str(segment.get("passage_id") or "") != passage_id and passage_id:
+                continue
+            mapped = accepted.get(str(segment.get("code") or ""))
+            if mapped and mapped not in model_codes:
+                model_codes.append(mapped)
+        units.append({"unit_id": passage_id, "human_codes": human_codes, "llm_codes": model_codes})
+    grid = unit_grid_agreement(units)
+    grid["available"] = True
+    grid["reason"] = ""
+    return grid
+
+
 def unit_grid_agreement(
     units: Sequence[Mapping[str, Any]],
     *,
@@ -587,10 +684,10 @@ def audit_sample(rows: Sequence[Mapping[str, Any]], *, fraction: float = 0.2, se
 
 def quote_and_coverage_rates(passages: Sequence[Mapping[str, Any]], segments: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Quote-flag rates and the share of passages left without a code."""
-    from automated_grounded_theory.evaluate import _quote_anchor_rates
+    from automated_grounded_theory.evaluate import _quote_anchor_rates, assignment_passage_id
 
     eligible = [passage for passage in passages if not passage.get("skipped")]
-    coded_ids = {str(segment.get("passage_id") or "") for segment in segments}
+    coded_ids = {assignment_passage_id(segment) for segment in segments}
     uncoded = [passage for passage in eligible if str(passage.get("passage_id") or "") not in coded_ids]
     rates = _quote_anchor_rates(segments)
     rates["uncoded_share"] = round(len(uncoded) / len(eligible), 4) if eligible else 0.0

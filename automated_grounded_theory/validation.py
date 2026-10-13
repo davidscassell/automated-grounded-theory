@@ -5,7 +5,10 @@ then the neighbor windows, then the document. It records ``quote_status`` as
 ``exact``, ``normalized_match``, ``fuzzy_match``, ``possibly_modified``, or
 ``unanchored``, plus the best source span when one is found. The stored quote
 is that source slice when a span exists, so exports stay tied to the text
-even if the model wrapped a line or swapped a curly quote.
+even if the model wrapped a line or swapped a curly quote. A hit that sits
+wholly outside the passage being coded is still kept. That is a textual
+match, not an assignment to the passage under coding: the code is flagged
+``evidence_outside_passage`` and attributed to the passage that contains it.
 """
 
 from __future__ import annotations
@@ -13,7 +16,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 GENERIC_CODES = frozenset(
     {
@@ -298,6 +301,96 @@ def anchor_quote(
         quote=model_quote,
         model_quote=model_quote,
     )
+
+
+def _windows_overlap(start: int, end: int, left: int, right: int) -> bool:
+    return start < right and end > left
+
+
+def evidence_wholly_outside(
+    anchor: QuoteAnchor,
+    *,
+    passage_start: int,
+    passage_end: int,
+) -> bool:
+    """True when a located quote does not overlap the passage being coded.
+
+    Textual status (exact, neighbor, document) is separate from whether that
+    hit is evidence for this passage. An unanchored quote is not outside
+    evidence; it has no location. A hit that overlaps the passage window is
+    not wholly outside.
+    """
+    if anchor.status == "unanchored" or anchor.source == "passage":
+        return False
+    if anchor.source not in {"neighbor", "document"}:
+        return False
+    spans = [(int(start), int(end)) for start, end in anchor.doc_spans if end > start]
+    if not spans:
+        return True
+    return not any(_windows_overlap(start, end, passage_start, passage_end) for start, end in spans)
+
+
+def attribute_evidence_passage(
+    anchor: QuoteAnchor,
+    passages: Sequence[Mapping[str, Any]] | None,
+    *,
+    doc_id: str = "",
+    coded_passage_id: str = "",
+    passage_start: int = 0,
+    passage_end: int | None = None,
+) -> str:
+    """Passage id that contains ``anchor``, or the coded passage when it is inside.
+
+    Both ids are the caller's to record. This returns only the passage the
+    evidence belongs to. An outside quote with no containing passage returns
+    an empty string so it is not counted on the passage that was being coded.
+    """
+    end = passage_start if passage_end is None else passage_end
+    outside = evidence_wholly_outside(anchor, passage_start=passage_start, passage_end=end)
+    if not outside:
+        return coded_passage_id
+    spans = [(int(start), int(end)) for start, end in anchor.doc_spans if end > start]
+    found = _passage_containing(passages or (), spans, doc_id=doc_id, quote=anchor.quote)
+    return found or ""
+
+
+def _passage_containing(
+    passages: Sequence[Mapping[str, Any]],
+    spans: Sequence[tuple[int, int]],
+    *,
+    doc_id: str,
+    quote: str,
+) -> str:
+    candidates = []
+    for passage in passages:
+        if doc_id and str(passage.get("doc_id") or "") not in {"", doc_id}:
+            continue
+        candidates.append(passage)
+    if spans:
+        for passage in candidates:
+            start = int(passage.get("start_offset") or 0)
+            end = int(passage.get("end_offset") or 0)
+            if end > start and all(span_start >= start and span_end <= end for span_start, span_end in spans):
+                return str(passage.get("passage_id") or "")
+        best_id = ""
+        best_overlap = 0
+        box_start = min(start for start, _end in spans)
+        box_end = max(end for _start, end in spans)
+        for passage in candidates:
+            start = int(passage.get("start_offset") or 0)
+            end = int(passage.get("end_offset") or 0)
+            overlap = max(0, min(box_end, end) - max(box_start, start))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_id = str(passage.get("passage_id") or "")
+        if best_id:
+            return best_id
+    needle = (quote or "").strip()
+    if needle:
+        for passage in candidates:
+            if needle in str(passage.get("text") or ""):
+                return str(passage.get("passage_id") or "")
+    return ""
 
 
 def _better(left: QuoteAnchor, right: QuoteAnchor) -> bool:

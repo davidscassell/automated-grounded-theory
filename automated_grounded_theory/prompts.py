@@ -32,6 +32,7 @@ from automated_grounded_theory.schemas import (
     ThemeRequest,
     ThemeReviewRequest,
 )
+from automated_grounded_theory.retrieval import select_prompt_examples
 from automated_grounded_theory.validation import code_key
 
 STANCE_POLICY = (
@@ -218,7 +219,7 @@ def format_codebook(codes: Sequence[Mapping[str, Any]], *, omitted: int = 0) -> 
         if definition:
             lines.append(f"DEFINITION: {definition}")
         lines.append(f"COUNT: {entry.get('frequency', 0)}")
-        examples = entry.get("examples") or []
+        examples = select_prompt_examples(entry, limit=1)
         if examples:
             quote = clip(str(examples[0].get("quote", "")), 200)
             if quote:
@@ -276,7 +277,7 @@ def stable_code_id(entry: Mapping[str, Any]) -> str:
 
 def code_input(entry: Mapping[str, Any]) -> CodeInput:
     examples = []
-    for item in (entry.get("examples") or [])[:2]:
+    for item in select_prompt_examples(entry, limit=2):
         quote = clip(str(item.get("quote") or ""), 240)
         if not quote:
             continue
@@ -378,8 +379,11 @@ def format_sweep_codebook(codes: Sequence[Mapping[str, Any]]) -> str:
         lines.append(f"CODE_LABEL: {entry.get('code', '')}")
         lines.append(f"DEFINITION: {clip(str(entry.get('definition') or ''), 500)}")
         lines.append(f"COUNT: {entry.get('frequency', 0)}")
-        examples = entry.get("examples") or []
-        shown = [clip(str(item.get("quote", "")), 180) for item in examples[:3] if item.get("quote")]
+        shown = [
+            clip(str(item.get("quote", "")), 180)
+            for item in select_prompt_examples(entry, limit=3)
+            if item.get("quote")
+        ]
         if shown:
             lines.append("EXAMPLES: " + " || ".join(shown))
         lines.append("")
@@ -643,8 +647,7 @@ def format_theme_codebook(codes: Sequence[Mapping[str, Any]]) -> str:
         if definition:
             lines.append(f"DEFINITION: {definition}")
         lines.append(f"COUNT: {entry.get('frequency', 0)}")
-        examples = entry.get("examples") or []
-        for example in examples[:2]:
+        for example in select_prompt_examples(entry, limit=2):
             quote = clip(str(example.get("quote") or ""), 240)
             if not quote:
                 continue
@@ -795,8 +798,16 @@ def build_merge_check_messages(
                 target_definition=str(target.get("definition") or ""),
                 source_valence=str(source.get("valence") or ""),
                 target_valence=str(target.get("valence") or ""),
-                source_quotes=[str(item.get("quote") or "") for item in (source.get("examples") or [])[:3] if item.get("quote")],
-                target_quotes=[str(item.get("quote") or "") for item in (target.get("examples") or [])[:3] if item.get("quote")],
+                source_quotes=[
+                    str(item.get("quote") or "")
+                    for item in select_prompt_examples(source, limit=3)
+                    if item.get("quote")
+                ],
+                target_quotes=[
+                    str(item.get("quote") or "")
+                    for item in select_prompt_examples(target, limit=3)
+                    if item.get("quote")
+                ],
             )
         )
     request = MergeCheckRequest(

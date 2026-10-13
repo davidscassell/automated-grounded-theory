@@ -1,4 +1,4 @@
-# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, and 0.6.10)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, and 0.6.11)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
 Status: steps 1 and 2 of the v0.6 plan. Category development, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
@@ -230,6 +230,26 @@ Query batches no longer use `asyncio.gather` for a group of provider calls. Gath
 
 `policy_version` is `0.6.10`.
 
-## 19. Out of scope
+## 19. Corrections in 0.6.11
+
+Quote anchoring still searches the passage, then the neighbors, then the document, and still never drops a code. An exact hit is not automatically evidence for the passage being coded. A hit that does not overlap that passage is `evidence_outside_passage`, `needs_review`, and attributed to the passage that contains the span. The segment stores `coded_passage_id` and `attributed_passage_id`. Coverage, agreement, and assignment counts follow the attributed id. The outside flag is not a quote retry.
+
+A checkpoint stores a manifest: corpus hash (document id, name, source, and text), context, model config, procedure settings, and `policy_version`. Resume compares it with the call. The default is to raise `CheckpointMismatch`. `allow_changes` or `continuation` writes a continuation event with the old and new values, warns, and updates the checkpoint metadata to the settings that will actually run.
+
+Codebook snapshots point at canonical vectors keyed by content hash. The process keeps a bounded LRU of snapshots (default 8, `configure_embedding_cache`) and drops a run's snapshots at the end of `embedding_run_scope`. The vectors stay. One to fifty codes retain about fifty vectors.
+
+Query ownership now shields sibling settlement, not only the first wait, and detaches every registered waiter in an outer `finally`. Document batches publish each successful chunk before the group error, the same way queries do.
+
+Nominal Krippendorff alpha no longer returns 1 when fewer than two units are usable. `[[1, 0]]` is 0. No paired ratings is undefined (`alpha` null, `undefined` true). The aligned metric still omits jointly-absent cells.
+
+The Muse runner fills the unit grid from human excerpt spans and the reviewed code mapping. Without that alignment the agreement metric is unavailable.
+
+The review fingerprint covers every assignment. Prompt examples are a separate diverse sample of bounded size.
+
+`commit_passage` shallow-detaches codebook entries and shares segment dicts and history-event dicts. Counts update for the codes that commit touched. A later mutation still cannot rewrite the caller's book. Measured against 0.6.10, one commit on 400 codes and 3,200 segments dropped from about 43 ms to under 1 ms, and 800 successive new codes from about 11.4 s to about 0.9 s.
+
+`policy_version` is `0.6.11`.
+
+## 20. Out of scope
 
 Category feedback, focused recoding of earlier negatives, relationship hypotheses, sampling briefs, and a Taguette project-file adapter. See the v0.6 plan steps 3–5.
