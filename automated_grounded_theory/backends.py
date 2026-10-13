@@ -33,6 +33,184 @@ def describe_model(model: BaseChatModel | str) -> str:
     return class_name
 
 
+class _Missing:
+    pass
+
+
+_MISSING = _Missing()
+
+# Non-secret settings that change model output. Keys, tokens, and client
+# objects are not read. ``model_kwargs`` is copied through :func:`redact`.
+_CHAT_SETTING_FIELDS = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "max_tokens",
+    "max_completion_tokens",
+    "max_output_tokens",
+    "presence_penalty",
+    "frequency_penalty",
+    "seed",
+    "n",
+    "reasoning_effort",
+)
+_CHAT_FLOAT_FIELDS = frozenset({"temperature", "top_p", "presence_penalty", "frequency_penalty"})
+_CHAT_INT_FIELDS = frozenset(
+    {"top_k", "max_tokens", "max_completion_tokens", "max_output_tokens", "seed", "n"}
+)
+_EMBED_SETTING_FIELDS = (
+    "dimensions",
+    "embedding_dimensions",
+    "output_dimensionality",
+    "azure_endpoint",
+    "azure_deployment",
+    "deployment",
+    "deployment_name",
+    "base_url",
+    "openai_api_base",
+    "api_base",
+    "endpoint",
+    "api_version",
+    "openai_api_version",
+    "chunk_size",
+)
+
+
+def _declared_setting(obj: Any, name: str) -> Any:
+    """A setting the instance actually declares, or ``_MISSING``.
+
+    Parent classes expose many attributes. Only fields this class declares,
+    or values stored on the instance, are part of the fingerprint.
+    """
+    fields = getattr(type(obj), "model_fields", None)
+    declared = isinstance(fields, dict) and name in fields
+    stored = name in getattr(obj, "__dict__", {})
+    if not declared and not stored:
+        return _MISSING
+    try:
+        value = getattr(obj, name)
+    except Exception:
+        return _MISSING
+    if callable(value):
+        return _MISSING
+    return value
+
+
+def _provider_name(model: Any) -> str:
+    for name in ("model_provider", "provider"):
+        value = _declared_setting(model, name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    try:
+        llm_type = str(model._llm_type).strip()
+    except Exception:
+        llm_type = ""
+    if llm_type:
+        return llm_type
+    return type(model).__module__
+
+
+def _model_id(model: Any) -> str:
+    for name in ("model", "model_name", "model_id"):
+        value = _declared_setting(model, name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _clean_setting(name: str, value: Any) -> Any:
+    # Allowlisted names such as max_tokens contain the substring "token".
+    # Secrets are kept out by the allowlist, and model_kwargs goes through redact.
+    if name in _CHAT_FLOAT_FIELDS:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return _MISSING
+    if name in _CHAT_INT_FIELDS:
+        if isinstance(value, bool) or value is None:
+            return _MISSING
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return _MISSING
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return redact(value)
+    if isinstance(value, (list, tuple)):
+        return [_redact_value(item) for item in value]
+    return _MISSING
+
+
+def chat_model_settings(model: BaseChatModel | str | None) -> dict[str, Any]:
+    """Non-secret settings from the chat model that will actually run.
+
+    A ``BaseChatModel`` keeps the temperature and limits it was built with.
+    The ``temperature=`` argument of :func:`open_code` is not applied to an
+    instance, so the fingerprint reads the instance. Secrets are omitted.
+    """
+    if model is None:
+        return {}
+    if isinstance(model, str):
+        provider = model.split(":", 1)[0] if ":" in model else ""
+        return {"model": model, "provider": provider}
+    settings: dict[str, Any] = {
+        "class": type(model).__name__,
+        "provider": _provider_name(model),
+    }
+    model_id = _model_id(model)
+    if model_id:
+        settings["model"] = model_id
+    for name in _CHAT_SETTING_FIELDS:
+        value = _declared_setting(model, name)
+        if value is _MISSING or value is None or value == "":
+            continue
+        cleaned = _clean_setting(name, value)
+        if cleaned is _MISSING:
+            continue
+        settings[name] = cleaned
+    kwargs = _declared_setting(model, "model_kwargs")
+    if isinstance(kwargs, dict) and kwargs:
+        settings["model_kwargs"] = redact(kwargs)
+    return settings
+
+
+def embedding_model_settings(embeddings: Embeddings | str | None) -> dict[str, Any]:
+    """Non-secret settings from the embedding model that will actually run.
+
+    ``None`` is the lexical retriever. Dimensions, deployment, and endpoint
+    are included. API keys are not.
+    """
+    if embeddings is None:
+        return {"provider": "lexical", "model": "lexical"}
+    if isinstance(embeddings, str):
+        provider = embeddings.split(":", 1)[0] if ":" in embeddings else ""
+        return {"model": embeddings, "provider": provider}
+    settings: dict[str, Any] = {
+        "class": type(embeddings).__name__,
+        "provider": _provider_name(embeddings),
+    }
+    model_id = _model_id(embeddings)
+    if model_id:
+        settings["model"] = model_id
+    for name in _EMBED_SETTING_FIELDS:
+        value = _declared_setting(embeddings, name)
+        if value is _MISSING or value is None or value == "" or value == {}:
+            continue
+        cleaned = _clean_setting(name, value)
+        if cleaned is _MISSING:
+            continue
+        settings[name] = cleaned
+    kwargs = _declared_setting(embeddings, "model_kwargs")
+    if isinstance(kwargs, dict) and kwargs:
+        redacted = redact(kwargs)
+        settings["model_kwargs"] = redacted
+        for name in ("dimensions", "embedding_dimensions", "output_dimensionality"):
+            if name not in settings and name in redacted:
+                settings[name] = redacted[name]
+    return settings
+
+
 def prompt_cache_supported(model: BaseChatModel, model_name: str = "") -> bool:
     """Whether to attach an explicit cache breakpoint on the system prefix.
 

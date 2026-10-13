@@ -27,7 +27,7 @@ from automated_grounded_theory.validation import (
     label_restates_context,
     lenient_label_fields,
     anchor_quote,
-    attribute_evidence_passage,
+    attribute_evidence,
     evidence_wholly_outside,
     review_passage_flags,
     split_joined_label,
@@ -108,8 +108,9 @@ def _fallback_rationale(op: str, reason: str) -> str:
         "code_too_long": "The label is too long, so the code was kept and flagged for review.",
         "bundled_concepts": "The label bundles several concepts, so the code was kept and flagged for review.",
         "evidence_outside_passage": (
-            "The quote is outside the passage being coded, so the code was kept, flagged, "
-            "and attributed to the passage that contains the evidence."
+            "The quote is outside the passage being coded, so the code was kept and flagged. "
+            "One overlapping passage is the attribution. Spans in several passages stay on "
+            "each of those passages. An unresolved quote is not assigned to the passage that was coded."
         ),
     }.get(reason)
     if text:
@@ -823,9 +824,11 @@ def interpret_coding(
     A quote that cannot be anchored does not reject the code. The quote is
     flagged ``possibly_modified`` or ``unanchored`` and coding continues.
     ``quote_retries`` lists those flags so the caller can ask for a closer
-    quote once, then keep the code anyway. A quote located wholly outside
-    this passage is also kept. It is flagged ``evidence_outside_passage``
-    and attributed to the passage that contains it. That flag does not
+    quote once, then keep the code anyway.     A quote located wholly outside
+    this passage is also kept. It is flagged ``evidence_outside_passage``.
+    One passage that overlaps the matched spans is the attribution. Spans in
+    several passages stay on each of those passages. Unresolved attribution
+    does not fall back to the passage being coded. That flag does not
     retry or block coding.
 
     A semicolon-joined label is split first. Each piece is validated on its
@@ -895,7 +898,7 @@ def interpret_coding(
         verbatim = anchor.quote
         quote_flag = f"quote_{anchor.status}" if anchor.status in QUOTE_FLAG_STATUSES else ""
         outside = evidence_wholly_outside(anchor, passage_start=passage_start, passage_end=passage_end)
-        attributed_passage_id = attribute_evidence_passage(
+        attribution = attribute_evidence(
             anchor,
             passages,
             doc_id=str(passage.get("doc_id") or ""),
@@ -903,6 +906,8 @@ def interpret_coding(
             passage_start=passage_start,
             passage_end=passage_end,
         )
+        attributed_passage_id = attribution.primary
+        attributed_passage_ids = list(attribution.passage_ids)
         raw_action = str(proposal.get("action") or "").strip().casefold()
         action = _ACTION_ALIASES.get(raw_action)
         provisional_key = code_key(label)
@@ -1125,7 +1130,9 @@ def interpret_coding(
                 "needs_review": bool(review_flags),
                 "review_reasons": review_flags,
                 "coded_passage_id": passage_id,
-                "attributed_passage_id": attributed_passage_id or passage_id,
+                "attributed_passage_id": attributed_passage_id,
+                "attributed_passage_ids": attributed_passage_ids,
+                "attribution": attribution.status,
                 "evidence_outside_passage": outside,
             }
         )
@@ -1161,6 +1168,22 @@ def interpret_coding(
             ops.append(held_quote)
             review.append(held_quote)
         if "evidence_outside_passage" in review_flags:
+            if attribution.status == "multi":
+                outside_rationale = (
+                    "The quote matches spans in more than one passage "
+                    f"({', '.join(attributed_passage_ids)}). The code was kept and flagged. "
+                    "It is not attributed to the passage being coded."
+                )
+            elif attribution.status == "unresolved":
+                outside_rationale = (
+                    "The quote is outside this passage and could not be attributed. "
+                    "The code was kept and flagged. It was not assigned to the passage being coded."
+                )
+            else:
+                outside_rationale = (
+                    "The quote matches text outside this passage. The code was kept and "
+                    "attributed to the passage that contains the evidence."
+                )
             held_outside = _op(
                 op="assign_quote",
                 status="review",
@@ -1169,15 +1192,14 @@ def interpret_coding(
                     "passage_id": passage_id,
                     "coded_passage_id": passage_id,
                     "attributed_passage_id": attributed_passage_id,
+                    "attributed_passage_ids": attributed_passage_ids,
+                    "attribution": attribution.status,
                     "code_id": _code_id(key),
                     "doc_start": anchor.doc_start,
                     "doc_end": anchor.doc_end,
                 },
                 reason="evidence_outside_passage",
-                rationale=(
-                    "The quote matches text outside this passage. The code was kept and "
-                    "attributed to the passage that contains the evidence."
-                ),
+                rationale=outside_rationale,
             )
             ops.append(held_outside)
             review.append(held_outside)
@@ -1284,8 +1306,22 @@ def commit_passage(
     """Append segments for accepted codes. ``existing_keys`` tracks globally new labels.
 
     Unchanged codebook entries and existing segment dicts are shared with the
-    caller. A rename copies a segment dict before it rewrites the label.
-    Counts are recomputed only for codes this commit touches.
+    caller until this function copies what it is about to change. A rename
+    copies a segment dict before it rewrites the label. Counts are recomputed
+    only for codes this commit touches.
+
+    The codebook container is still a new dict, and every entry is still
+    shallow-detached. A later sweep edits definitions on the state this commit
+    returns. Those edits must not rewrite the checkpoint that holds the
+    previous entry objects, so the detach stays on every entry even when the
+    commit does not change that code. Nested history events stay shared.
+    The segment list is a new list; segment dicts that this commit does not
+    rewrite stay shared.
+
+    An append-only commit updates counts from the new segments plus the
+    assignment list already stored on the entry. It does not walk the whole
+    segment list. :func:`sync_counts` still scans every segment, because a
+    merge or a split moves assignments between codes.
     """
     book = {key: _detach_entry(entry) for key, entry in codebook.items()}
     new_segments = list(segments)
@@ -1295,6 +1331,7 @@ def commit_passage(
     known_before = set(existing_keys) if existing_keys is not None else set(book)
     new_codes = 0
     touched: set[str] = set()
+    appended: list[dict] = []
 
     memo_body = str(interpreted.get("memo") or "").strip()
     if memo_body and not substantive_memo(memo_body):
@@ -1335,6 +1372,7 @@ def commit_passage(
                 "frequency": 0,
                 "document_ids": [],
                 "examples": [],
+                "assignments": [],
                 "revision": 1,
                 "inclusion": "",
                 "exclusion": "",
@@ -1381,13 +1419,32 @@ def commit_passage(
         if span_key not in highlights:
             highlights[span_key] = _next(counters, "highlight", "h")
         coded_passage_id = str(passage.get("passage_id") or "")
-        attributed_passage_id = str(item.get("attributed_passage_id") or "") or coded_passage_id
+        attribution = str(item.get("attribution") or "")
+        attributed_ids = [str(value) for value in (item.get("attributed_passage_ids") or []) if str(value)]
+        if attribution in {"multi", "unresolved"}:
+            # Do not count the quote on the passage that was being coded.
+            attributed_passage_id = ""
+            passage_id_for_row = ""
+        elif attribution in {"inside", "single"}:
+            attributed_passage_id = str(item.get("attributed_passage_id") or "") or (
+                attributed_ids[0] if len(attributed_ids) == 1 else ""
+            )
+            passage_id_for_row = attributed_passage_id
+            if attributed_passage_id and attributed_passage_id not in attributed_ids:
+                attributed_ids = [attributed_passage_id]
+        else:
+            attributed_passage_id = str(item.get("attributed_passage_id") or "") or coded_passage_id
+            passage_id_for_row = attributed_passage_id
+            if not attributed_ids and attributed_passage_id:
+                attributed_ids = [attributed_passage_id]
         segment = {
             "segment_id": _next(counters, "segment", "s"),
             "highlight_id": highlights[span_key],
-            "passage_id": attributed_passage_id,
+            "passage_id": passage_id_for_row,
             "coded_passage_id": coded_passage_id,
             "attributed_passage_id": attributed_passage_id,
+            "attributed_passage_ids": attributed_ids,
+            "attribution": attribution,
             "doc_id": passage.get("doc_id"),
             "doc_name": passage.get("doc_name"),
             "code": book[key]["code"],
@@ -1418,9 +1475,10 @@ def commit_passage(
             "memo_id": memo_id,
         }
         new_segments.append(segment)
+        appended.append(segment)
         touched.add(key)
 
-    book = _refresh_counts(book, new_segments, touched)
+    book = _refresh_counts(book, new_segments, touched, added=appended)
     ops = []
     for op in interpreted.get("ops") or []:
         row = dict(op)
@@ -1470,6 +1528,9 @@ def _rename_code(codebook: dict[str, dict], segments: list[dict], old: str, new:
 _ENTRY_LISTS = (
     "history",
     "examples",
+    "assignments",
+    "reviewed_assignment_ids",
+    "reviews_seen",
     "document_ids",
     "review_reasons",
     "relation_hints",
@@ -1512,32 +1573,48 @@ def _assignment_digest(applications: Sequence[Mapping[str, Any]]) -> str:
     return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()[:16]
 
 
+def _assignment_row(item: Mapping[str, Any]) -> dict:
+    """One stored assignment. Every application is kept, not a prefix of eight."""
+    ids = [str(value) for value in (item.get("attributed_passage_ids") or []) if str(value)]
+    return {
+        "segment_id": str(item.get("segment_id") or ""),
+        "quote": item.get("quote"),
+        "doc_id": item.get("doc_id"),
+        "passage_id": item.get("passage_id"),
+        "coded_passage_id": item.get("coded_passage_id") or "",
+        "attributed_passage_id": item.get("attributed_passage_id") or "",
+        "attributed_passage_ids": ids,
+        "attribution": item.get("attribution") or "",
+        "doc_start": item.get("doc_start"),
+        "doc_end": item.get("doc_end"),
+        "quote_status": item.get("quote_status") or "",
+        "quote_similarity": item.get("quote_similarity"),
+        "confidence": item.get("confidence"),
+        "code_key": item.get("code_key") or "",
+    }
+
+
 def _apply_counts(entry: Mapping[str, Any], applications: Sequence[Mapping[str, Any]], key: str) -> dict:
-    """Frequency, documents, examples, and the full assignment digest for one code."""
+    """Frequency, documents, the full assignment list, and its digest.
+
+    ``assignments`` is every application, in order. ``examples`` is that same
+    history with duplicate passage/quote pairs removed, and it is not cut at
+    eight. Prompt selection reads ``assignments`` and keeps its own bound.
+    """
     updated = _detach_entry(entry)
     updated["key"] = key
     updated["frequency"] = len(applications)
     updated["document_ids"] = sorted({str(item.get("doc_id")) for item in applications if item.get("doc_id")})
+    assignments = [_assignment_row(item) for item in applications]
     examples = []
     seen_quotes: set[tuple] = set()
-    for item in applications:
-        marker = (item.get("passage_id"), item.get("quote"))
+    for item in assignments:
+        marker = (item.get("passage_id"), item.get("quote"), item.get("segment_id"))
         if marker in seen_quotes:
             continue
         seen_quotes.add(marker)
-        examples.append(
-            {
-                "quote": item.get("quote"),
-                "doc_id": item.get("doc_id"),
-                "passage_id": item.get("passage_id"),
-                "doc_start": item.get("doc_start"),
-                "doc_end": item.get("doc_end"),
-                "quote_status": item.get("quote_status") or "",
-                "quote_similarity": item.get("quote_similarity"),
-            }
-        )
-        if len(examples) >= 8:
-            break
+        examples.append(item)
+    updated["assignments"] = assignments
     updated["examples"] = examples
     updated["evidence_revision"] = _assignment_digest(applications)
     scores = []
@@ -1554,12 +1631,13 @@ def _apply_counts(entry: Mapping[str, Any], applications: Sequence[Mapping[str, 
     if applications and not updated.get("first_seen"):
         updated["first_seen"] = applications[0].get("passage_id")
     label = str(updated.get("code") or "")
+    evidence = assignments or examples
     if updated.get("in_vivo") and not any(
-        code_key(label) and label.casefold() in str(item.get("quote") or "").casefold() for item in examples
+        code_key(label) and label.casefold() in str(item.get("quote") or "").casefold() for item in evidence
     ):
         from automated_grounded_theory.validation import in_vivo_supported
 
-        updated["in_vivo"] = any(in_vivo_supported(label, str(item.get("quote") or "")) for item in examples)
+        updated["in_vivo"] = any(in_vivo_supported(label, str(item.get("quote") or "")) for item in evidence)
     return updated
 
 
@@ -1567,11 +1645,46 @@ def _segment_key(segment: Mapping[str, Any]) -> str:
     return str(segment.get("code_key") or code_key(str(segment.get("code") or "")))
 
 
-def _refresh_counts(book: dict[str, dict], segments: Sequence[Mapping[str, Any]], touched: set[str]) -> dict[str, dict]:
-    """Recompute counts for ``touched`` codes. Other entries stay shared."""
+def _refresh_counts(
+    book: dict[str, dict],
+    segments: Sequence[Mapping[str, Any]],
+    touched: set[str],
+    *,
+    added: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, dict]:
+    """Recompute counts for ``touched`` codes. Other entries stay shared.
+
+    ``added`` is the segments this commit appended. When every touched entry
+    already stores ``assignments``, those lists are extended and the rest of
+    ``segments`` is not scanned. A missing list falls back to a scan of the
+    touched codes. Merges use :func:`sync_counts`, which always scans.
+    """
     if not touched:
         return book
-    grouped: dict[str, list] = {key: [] for key in touched}
+    if added is not None and all("assignments" in book[key] for key in touched if key in book):
+        grouped: dict[str, list] = {key: [] for key in touched}
+        for segment in added:
+            key = _segment_key(segment)
+            if key in grouped:
+                grouped[key].append(segment)
+        for key in touched:
+            if key not in book:
+                continue
+            previous = [item for item in (book[key].get("assignments") or []) if isinstance(item, Mapping)]
+            known = {str(item.get("segment_id")) for item in previous if item.get("segment_id")}
+            extra = []
+            for segment in grouped.get(key) or []:
+                segment_id = str(segment.get("segment_id") or "")
+                if segment_id and segment_id in known:
+                    continue
+                extra.append(segment)
+            applications = previous + extra
+            if not applications:
+                book.pop(key, None)
+                continue
+            book[key] = _apply_counts(book[key], applications, key)
+        return book
+    grouped = {key: [] for key in touched}
     for segment in segments:
         key = _segment_key(segment)
         if key in grouped:

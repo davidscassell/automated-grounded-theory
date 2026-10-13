@@ -47,8 +47,8 @@ from automated_grounded_theory.schemas import CodeProposal, PassageCoding
 
 
 def test_version_is_0_6_11():
-    assert __version__ == "0.6.11"
-    assert POLICY_VERSION == "0.6.11"
+    assert __version__ == "0.6.12"
+    assert POLICY_VERSION == "0.6.12"
 
 
 def _coding(quote: str, label: str) -> dict:
@@ -677,7 +677,8 @@ def test_review_fingerprint_covers_every_example_and_prompts_stay_bounded():
         ],
         "k",
     )
-    assert len(eight["examples"]) == 8
-    assert eight["examples"] == nine["examples"]
+    assert len(eight["assignments"]) == 8
+    assert len(nine["assignments"]) == 9
+    assert nine["assignments"][-1]["quote"] == "quote 8"
     assert eight["evidence_revision"] != nine["evidence_revision"]
     assert review_fingerprint(eight) != review_fingerprint(nine)

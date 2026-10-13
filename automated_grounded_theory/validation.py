@@ -8,7 +8,11 @@ is that source slice when a span exists, so exports stay tied to the text
 even if the model wrapped a line or swapped a curly quote. A hit that sits
 wholly outside the passage being coded is still kept. That is a textual
 match, not an assignment to the passage under coding: the code is flagged
-``evidence_outside_passage`` and attributed to the passage that contains it.
+``evidence_outside_passage``. Attribution uses the actual matched spans, not
+the bounding interval between them. One overlapping passage is the
+attribution. Spans in several passages stay multi-attributed and the review
+flag stays. When the spans cannot be placed, attribution is unresolved and
+the coded passage is not used as a fallback.
 """
 
 from __future__ import annotations
@@ -330,6 +334,61 @@ def evidence_wholly_outside(
     return not any(_windows_overlap(start, end, passage_start, passage_end) for start, end in spans)
 
 
+@dataclass(frozen=True)
+class EvidenceAttribution:
+    """Where a located quote sits relative to the passage being coded.
+
+    ``inside`` overlaps the coded passage. ``single`` is wholly outside it
+    and the matched spans overlap one other passage. ``multi`` means those
+    spans overlap more than one passage; each of those passages is kept.
+    ``unresolved`` means the quote is outside the coded passage and the spans
+    do not land on a passage. ``passage_ids`` is empty in that case. The coded
+    passage is not filled in when attribution fails.
+    """
+
+    status: str
+    passage_ids: tuple[str, ...] = ()
+
+    @property
+    def primary(self) -> str:
+        """The one passage id, or empty when attribution is multi or unresolved."""
+        if self.status in {"inside", "single"} and len(self.passage_ids) == 1:
+            return self.passage_ids[0]
+        return ""
+
+
+def attribute_evidence(
+    anchor: QuoteAnchor,
+    passages: Sequence[Mapping[str, Any]] | None,
+    *,
+    doc_id: str = "",
+    coded_passage_id: str = "",
+    passage_start: int = 0,
+    passage_end: int | None = None,
+) -> EvidenceAttribution:
+    """Attribute ``anchor`` from the matched spans, not their bounding interval.
+
+    A discontinuous quote such as ``I resigned. ... I returned.`` overlaps the
+    two end passages. The long passage between them does not contain either
+    span, so it is not an attribution. Several passages stay ``multi``. No
+    passage stays ``unresolved``.
+    """
+    end = passage_start if passage_end is None else passage_end
+    outside = evidence_wholly_outside(anchor, passage_start=passage_start, passage_end=end)
+    if not outside:
+        return EvidenceAttribution("inside", (coded_passage_id,) if coded_passage_id else ())
+    spans = [(int(start), int(end)) for start, end in anchor.doc_spans if end > start]
+    found = _passages_overlapping(passages or (), spans, doc_id=doc_id)
+    if not found and not spans:
+        needle = _passage_containing(passages or (), (), doc_id=doc_id, quote=anchor.quote)
+        found = (needle,) if needle else ()
+    if len(found) == 1:
+        return EvidenceAttribution("single", found)
+    if len(found) > 1:
+        return EvidenceAttribution("multi", found)
+    return EvidenceAttribution("unresolved", ())
+
+
 def attribute_evidence_passage(
     anchor: QuoteAnchor,
     passages: Sequence[Mapping[str, Any]] | None,
@@ -339,19 +398,86 @@ def attribute_evidence_passage(
     passage_start: int = 0,
     passage_end: int | None = None,
 ) -> str:
-    """Passage id that contains ``anchor``, or the coded passage when it is inside.
+    """One passage id for ``anchor``, or empty when that would be a guess.
 
-    Both ids are the caller's to record. This returns only the passage the
-    evidence belongs to. An outside quote with no containing passage returns
-    an empty string so it is not counted on the passage that was being coded.
+    Inside the coded passage, this is the coded passage. A single outside
+    passage is that passage. Multi-passage and unresolved quotes return an
+    empty string. Callers record :attr:`EvidenceAttribution.passage_ids` and
+    must not substitute the coded passage for that empty string.
     """
-    end = passage_start if passage_end is None else passage_end
-    outside = evidence_wholly_outside(anchor, passage_start=passage_start, passage_end=end)
-    if not outside:
-        return coded_passage_id
-    spans = [(int(start), int(end)) for start, end in anchor.doc_spans if end > start]
-    found = _passage_containing(passages or (), spans, doc_id=doc_id, quote=anchor.quote)
-    return found or ""
+    return attribute_evidence(
+        anchor,
+        passages,
+        doc_id=doc_id,
+        coded_passage_id=coded_passage_id,
+        passage_start=passage_start,
+        passage_end=passage_end,
+    ).primary
+
+
+def attributed_passage_ids(row: Mapping[str, Any]) -> list[str]:
+    """Passages a segment or accepted code counts toward.
+
+    Multi-attribution returns every overlapped passage. Unresolved attribution
+    returns none, including when ``passage_id`` is still the passage that was
+    being coded. Older rows with no attribution status use the single
+    attributed id, then ``passage_id``.
+    """
+    status = str(row.get("attribution") or "")
+    raw = row.get("attributed_passage_ids")
+    ids = [str(item) for item in raw if str(item)] if isinstance(raw, (list, tuple)) else []
+    if status == "unresolved":
+        return []
+    if status == "multi":
+        return ids
+    single = str(row.get("attributed_passage_id") or "")
+    if single:
+        return [single]
+    if ids:
+        return ids
+    if status == "":
+        passage = str(row.get("passage_id") or "")
+        return [passage] if passage else []
+    return []
+
+
+def _passage_candidates(
+    passages: Sequence[Mapping[str, Any]],
+    *,
+    doc_id: str,
+) -> list[Mapping[str, Any]]:
+    candidates = []
+    for passage in passages:
+        if doc_id and str(passage.get("doc_id") or "") not in {"", doc_id}:
+            continue
+        candidates.append(passage)
+    return candidates
+
+
+def _span_overlap_width(span: tuple[int, int], start: int, end: int) -> int:
+    return max(0, min(span[1], end) - max(span[0], start))
+
+
+def _passages_overlapping(
+    passages: Sequence[Mapping[str, Any]],
+    spans: Sequence[tuple[int, int]],
+    *,
+    doc_id: str,
+) -> tuple[str, ...]:
+    """Passage ids whose text overlaps a matched span. The gap between spans does not count."""
+    if not spans:
+        return ()
+    found: list[str] = []
+    for passage in _passage_candidates(passages, doc_id=doc_id):
+        start = int(passage.get("start_offset") or 0)
+        end = int(passage.get("end_offset") or 0)
+        if end <= start:
+            continue
+        if any(_span_overlap_width(span, start, end) > 0 for span in spans):
+            passage_id = str(passage.get("passage_id") or "")
+            if passage_id and passage_id not in found:
+                found.append(passage_id)
+    return tuple(found)
 
 
 def _passage_containing(
@@ -361,33 +487,20 @@ def _passage_containing(
     doc_id: str,
     quote: str,
 ) -> str:
-    candidates = []
-    for passage in passages:
-        if doc_id and str(passage.get("doc_id") or "") not in {"", doc_id}:
-            continue
-        candidates.append(passage)
+    """One containing passage, or empty when the spans are split or unplaced.
+
+    Overlap is computed per matched span. The bounding interval from the first
+    span to the last is not a span, so a long passage that only fills the gap
+    is not chosen.
+    """
+    found = _passages_overlapping(passages, spans, doc_id=doc_id)
+    if len(found) == 1:
+        return found[0]
     if spans:
-        for passage in candidates:
-            start = int(passage.get("start_offset") or 0)
-            end = int(passage.get("end_offset") or 0)
-            if end > start and all(span_start >= start and span_end <= end for span_start, span_end in spans):
-                return str(passage.get("passage_id") or "")
-        best_id = ""
-        best_overlap = 0
-        box_start = min(start for start, _end in spans)
-        box_end = max(end for _start, end in spans)
-        for passage in candidates:
-            start = int(passage.get("start_offset") or 0)
-            end = int(passage.get("end_offset") or 0)
-            overlap = max(0, min(box_end, end) - max(box_start, start))
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_id = str(passage.get("passage_id") or "")
-        if best_id:
-            return best_id
+        return ""
     needle = (quote or "").strip()
     if needle:
-        for passage in candidates:
+        for passage in _passage_candidates(passages, doc_id=doc_id):
             if needle in str(passage.get("text") or ""):
                 return str(passage.get("passage_id") or "")
     return ""

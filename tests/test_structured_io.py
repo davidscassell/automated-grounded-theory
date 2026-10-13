@@ -205,16 +205,19 @@ def test_recreated_code_reapplies_the_accepted_merge():
         [{**first["accepted_merges"][0], "decision": "accept"}],
     )
     recreated = dict(first["codebook"])
-    # The accept was recorded against the pre-merge book, which had no examples.
-    # Replay stands only while that evidence is still the evidence that was judged.
+    # The accept was recorded against the pre-merge book, which had no examples
+    # and no assignments. Replay stands only while that evidence is still the
+    # evidence that was judged.
     survivor = dict(recreated["wanting better pay"])
     survivor["examples"] = []
+    survivor["assignments"] = []
     recreated["wanting better pay"] = survivor
     recreated["wanting more pay"] = {
         "code": "wanting more pay",
         "key": "wanting more pay",
         "definition": "Incidents of wanting more pay.",
         "examples": [],
+        "assignments": [],
         "history": [],
     }
     replay = replay_accepted_pairs(cache, recreated)

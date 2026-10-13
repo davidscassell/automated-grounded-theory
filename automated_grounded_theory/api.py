@@ -16,7 +16,9 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from automated_grounded_theory.async_support import CallLimiter, run_sync
 from automated_grounded_theory.batching import reserved_output_tokens
 from automated_grounded_theory.backends import (
+    chat_model_settings,
     describe_model,
+    embedding_model_settings,
     prompt_cache_supported,
     redact,
     resolve_chat_model,
@@ -244,10 +246,22 @@ def open_code(
     sensitizing concepts). It is rejected if it contains preset codes.
 
     ``resume=True`` continues a checkpoint. The run stores a manifest of the
-    corpus, context, model, procedure, and policy version. A mismatch raises
-    ``CheckpointMismatch`` unless ``allow_changes`` or ``continuation`` is true.
-    Either option records the old and new values, warns, and continues with the
-    settings just supplied. The result metadata is those settings.
+    corpus, context, the settings on the model and embedding instances, the
+    procedure, and policy version. A mismatch raises ``CheckpointMismatch``
+    unless ``allow_changes`` or ``continuation`` is true. Either option
+    records the old and new values, warns, and continues with the settings
+    just supplied. The result metadata is those settings, including the
+    temperature and other non-secret limits read from the instances.
+
+    Corpus identity, ``unit``, and ``seed`` are not continuable. Those already
+    determined the stored passages and their order. ``allow_changes`` still
+    raises ``CheckpointMigrationRequired``. Start a new run. There is no
+    migration that rebuilds the stored passages. Research-context wording,
+    model and temperature, and performance settings may continue.
+    ``review_mode`` and ``parallel_documents`` are performance settings: they
+    do not change passage boundaries. Resume does not re-segment, so changing
+    either one records a continuation and leaves the stored passages, coding
+    order, queue, and branch queues as they were checkpointed.
 
     The saturation curve is reported and is not a stopping decision.
     ``passages_per_request`` passages share one model call (``batch_size`` is
@@ -544,6 +558,15 @@ async def aopen_code(
         embeddings_name = "lexical"
     else:
         embeddings_name = type(embedding_model).__name__
+    coder_settings = chat_model_settings(coder)
+    sweeper_settings = chat_model_settings(sweeper)
+    embedding_settings = embedding_model_settings(embedding_model)
+    if "temperature" in coder_settings:
+        temperature = float(coder_settings["temperature"])
+    if "temperature" in sweeper_settings:
+        sweep_temperature = float(sweeper_settings["temperature"])
+    elif sweep_temperature is None:
+        sweep_temperature = temperature
 
     cache = prompt_cache
     if cache is None:
@@ -564,6 +587,9 @@ async def aopen_code(
         embeddings_name=embeddings_name,
         temperature=temperature,
         sweep_temperature=temperature if sweep_temperature is None else sweep_temperature,
+        model_settings=coder_settings,
+        sweep_model_settings=sweeper_settings,
+        embeddings_settings=embedding_settings,
         parallel_documents=parallel_documents,
         batch_size=batch_size,
         concurrency=concurrency,
@@ -706,6 +732,23 @@ class CheckpointMismatch(RuntimeError):
         )
 
 
+class CheckpointMigrationRequired(CheckpointMismatch):
+    """Corpus or segmentation changed. ``allow_changes`` does not migrate a run."""
+
+    def __init__(self, differences: dict[str, dict[str, Any]]) -> None:
+        self.differences = differences
+        fields = ", ".join(sorted(differences))
+        RuntimeError.__init__(
+            self,
+            "Cannot resume this checkpoint because the corpus or segmentation changed "
+            f"({fields}). Start a new run. There is no migration procedure yet.",
+        )
+
+
+def _structural_manifest_path(path: str) -> bool:
+    return path in _STRUCTURAL_MANIFEST_PATHS
+
+
 def corpus_identity_hash(documents: Sequence[LoadedDocument]) -> str:
     """Hash of document id, name, source, and text. Display metadata is not included."""
     rows = [
@@ -727,8 +770,22 @@ _MANIFEST_MODEL = (
     "llm_seed",
     "model_kwargs",
     "sweep_model_kwargs",
+    "model_settings",
+    "sweep_model_settings",
+    "embeddings_settings",
     "prompt_cache",
     "check_model",
+)
+# Already applied to the stored passages and their order. allow_changes cannot
+# rebuild them. review_mode and parallel_documents do not change passage
+# boundaries. Resume does not re-run segmentation, so those two are performance
+# settings and may continue.
+_STRUCTURAL_MANIFEST_PATHS = frozenset(
+    {
+        "corpus_hash",
+        "procedure.unit",
+        "procedure.seed",
+    }
 )
 _MANIFEST_PROCEDURE = (
     "seed",
@@ -845,6 +902,9 @@ async def _execute_locked(
         saved_meta = dict(getattr(snapshot, "values", {}).get("metadata") or {})
         differences = manifest_diff(saved_meta.get("checkpoint_manifest"), metadata.get("checkpoint_manifest"))
         if differences:
+            structural = {path: change for path, change in differences.items() if _structural_manifest_path(path)}
+            if structural:
+                raise CheckpointMigrationRequired(structural)
             if not allow_changes:
                 raise CheckpointMismatch(differences)
             note = "Resuming with a changed checkpoint manifest: " + ", ".join(sorted(differences))
@@ -1018,6 +1078,9 @@ def _metadata(**kwargs: Any) -> dict:
         "embeddings": kwargs["embeddings_name"],
         "temperature": kwargs["temperature"],
         "sweep_temperature": kwargs["sweep_temperature"],
+        "model_settings": dict(kwargs.get("model_settings") or {}),
+        "sweep_model_settings": dict(kwargs.get("sweep_model_settings") or {}),
+        "embeddings_settings": dict(kwargs.get("embeddings_settings") or {}),
         "parallel_documents": kwargs["parallel_documents"],
         "batch_size": kwargs["batch_size"],
         "concurrency": kwargs["concurrency"],

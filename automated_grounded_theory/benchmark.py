@@ -534,6 +534,129 @@ def excerpt_offset_hits(
     }
 
 
+# Below this share of annotations placed on the documents, agreement is not scored.
+# Whitespace-only differences still count as aligned. An excerpt that cannot be
+# placed, or a repeated excerpt with no occurrence or offset, does not.
+ALIGNMENT_COVERAGE_MIN = 0.8
+
+
+def _collapse_whitespace(text: str) -> tuple[str, list[int]]:
+    """Collapse internal whitespace to one space. Indexes point at original offsets.
+
+    Leading and trailing whitespace is dropped. A run of spaces maps back to
+    the first character of that run, so a match can be returned in the
+    original string without losing its position.
+    """
+    chars: list[str] = []
+    indexes: list[int] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        if text[index].isspace():
+            run = index
+            while index < length and text[index].isspace():
+                index += 1
+            if chars and index < length:
+                chars.append(" ")
+                indexes.append(run)
+            continue
+        chars.append(text[index])
+        indexes.append(index)
+        index += 1
+    return "".join(chars), indexes
+
+
+def _mapped_span(text: str, indexes: Sequence[int], start: int, end: int) -> tuple[int, int]:
+    origin = indexes[start]
+    last = indexes[end - 1]
+    finish = last + 1
+    if text[last].isspace():
+        while finish < len(text) and text[finish].isspace():
+            finish += 1
+    return origin, finish
+
+
+def _find_exact_spans(text: str, excerpt: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    while excerpt:
+        found = text.find(excerpt, cursor)
+        if found < 0:
+            break
+        spans.append((found, found + len(excerpt)))
+        cursor = found + max(1, len(excerpt))
+    return spans
+
+
+def _find_whitespace_spans(text: str, excerpt: str) -> list[tuple[int, int]]:
+    folded, indexes = _collapse_whitespace(text)
+    needle, _needle_index = _collapse_whitespace(excerpt)
+    if not needle or not folded:
+        return []
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    while True:
+        found = folded.find(needle, cursor)
+        if found < 0:
+            break
+        spans.append(_mapped_span(text, indexes, found, found + len(needle)))
+        cursor = found + max(1, len(needle))
+    return spans
+
+
+def _first_int(tag: Mapping[str, Any], names: Sequence[str]) -> int | None:
+    for name in names:
+        if name not in tag or tag.get(name) is None or tag.get(name) == "":
+            continue
+        try:
+            return int(tag.get(name))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _locate_excerpt(text: str, tag: Mapping[str, Any]) -> dict[str, Any]:
+    """Place one annotation. Whitespace is normalized. Repeats need an explicit choice.
+
+    ``occurrence`` or ``order`` is a 0-based index into the matches. ``offset``,
+    ``start``, ``start_offset``, or ``char_start`` selects the match that
+    contains that original offset. Several matches and none of those fields is
+    ``ambiguous``: the annotation is not aligned, and every candidate span is
+    returned so the passages they touch can be left unscored.
+    """
+    excerpt = str(tag.get("excerpt") or "")
+    exact = _find_exact_spans(text, excerpt) if excerpt and text else []
+    spans = exact or (_find_whitespace_spans(text, excerpt) if excerpt and text else [])
+    offset = _first_int(tag, ("offset", "start", "start_offset", "char_start"))
+    occurrence = _first_int(tag, ("occurrence", "order"))
+    if not spans:
+        return {"status": "unaligned", "span": None, "candidates": [], "offset": offset}
+    if offset is not None:
+        for start, end in spans:
+            if start == offset or start <= offset < end:
+                return {"status": "aligned", "span": (start, end), "candidates": spans, "offset": offset}
+        return {"status": "unaligned", "span": None, "candidates": spans, "offset": offset}
+    if occurrence is not None:
+        if 0 <= occurrence < len(spans):
+            return {"status": "aligned", "span": spans[occurrence], "candidates": spans, "offset": offset}
+        return {"status": "unaligned", "span": None, "candidates": spans, "offset": offset}
+    if len(spans) == 1:
+        return {"status": "aligned", "span": spans[0], "candidates": spans, "offset": offset}
+    return {"status": "ambiguous", "span": None, "candidates": spans, "offset": offset}
+
+
+def _passage_window(passage: Mapping[str, Any]) -> tuple[int, int] | None:
+    start = passage.get("start_offset")
+    end = passage.get("end_offset")
+    if start is None or end is None:
+        return None
+    return int(start), int(end)
+
+
+def _window_overlaps_span(window: tuple[int, int], span: tuple[int, int]) -> bool:
+    return _span_overlap(window, span) > 0
+
+
 def unit_grid_from_annotations(
     passages: Sequence[Mapping[str, Any]],
     segments: Sequence[Mapping[str, Any]],
@@ -548,6 +671,17 @@ def unit_grid_from_annotations(
     The metric is unavailable when no reviewed mapping aligns a model label to
     a human label, or when tag excerpts cannot be placed on the documents.
     An empty human side is not scored as absence against model positives.
+
+    Exact ``str.find`` is not the only placement. Whitespace is collapsed to a
+    single space and the match is mapped back to the original offsets, so an
+    extra space still aligns. A repeated excerpt uses ``occurrence`` or
+    ``order`` (0-based) or an ``offset`` / ``start`` / ``start_offset`` when
+    the annotation has one. Without that, the excerpt is ambiguous and is not
+    aligned. ``alignment_coverage`` is aligned annotations over the total.
+    A unit touched by an unaligned or ambiguous annotation is unknown and is
+    left out of the score. Coverage below :data:`ALIGNMENT_COVERAGE_MIN`
+    (0.8) makes the metric unavailable instead of turning those misses into
+    negatives.
     """
     accepted: dict[str, str] = {}
     for row in mappings:
@@ -566,6 +700,12 @@ def unit_grid_from_annotations(
         "units": 0,
         "macro_f1": None,
         "macro_kappa": None,
+        "alignment_aligned": 0,
+        "alignment_total": 0,
+        "alignment_coverage": None,
+        "alignment_ambiguous": 0,
+        "unknown_units": 0,
+        "alignment_coverage_min": ALIGNMENT_COVERAGE_MIN,
     }
     if not accepted:
         return unavailable
@@ -573,7 +713,8 @@ def unit_grid_from_annotations(
         normalize_doc_id(item.get("id") or item.get("doc_id")): str(item.get("text") or "")
         for item in documents or []
     }
-    located_tags: list[dict[str, Any]] = []
+    placements: list[dict[str, Any]] = []
+    considered = 0
     for tag in tags:
         doc_id = normalize_doc_id(tag.get("document"))
         excerpt = str(tag.get("excerpt") or "")
@@ -581,22 +722,57 @@ def unit_grid_from_annotations(
         text = texts.get(doc_id, "")
         if not excerpt or not label or not text:
             continue
-        start = text.find(excerpt)
-        if start < 0:
-            continue
-        located_tags.append(
-            {
-                "document": doc_id,
-                "label": label,
-                "start": start,
-                "end": start + len(excerpt),
-            }
-        )
-    if tags and not located_tags:
-        return {**unavailable, "reason": "span_alignment_unavailable"}
+        considered += 1
+        located = _locate_excerpt(text, tag)
+        placements.append({"document": doc_id, "label": label, **located})
+    aligned = [item for item in placements if item["status"] == "aligned" and item.get("span")]
+    ambiguous = sum(1 for item in placements if item["status"] == "ambiguous")
+    coverage = (len(aligned) / considered) if considered else None
+    report = {
+        "alignment_aligned": len(aligned),
+        "alignment_total": considered,
+        "alignment_coverage": None if coverage is None else round(coverage, 4),
+        "alignment_ambiguous": ambiguous,
+        "alignment_coverage_min": ALIGNMENT_COVERAGE_MIN,
+    }
+    if considered and not aligned:
+        return {**unavailable, **report, "reason": "span_alignment_unavailable"}
+    if coverage is not None and coverage < ALIGNMENT_COVERAGE_MIN:
+        return {**unavailable, **report, "reason": "alignment_coverage_below_threshold"}
+    unknown: set[str] = set()
+    for passage in passages:
+        passage_id = str(passage.get("passage_id") or "")
+        doc_id = normalize_doc_id(passage.get("doc_id"))
+        window = _passage_window(passage)
+        text = str(passage.get("text") or "")
+        for item in placements:
+            if item["status"] == "aligned":
+                continue
+            if doc_id and item["document"] != doc_id:
+                continue
+            touched = False
+            for span in item.get("candidates") or []:
+                if window is not None and _window_overlaps_span(window, span):
+                    touched = True
+                    break
+                excerpt = texts.get(item["document"], "")[span[0] : span[1]]
+                if window is None and excerpt and excerpt in text:
+                    touched = True
+                    break
+            offset = item.get("offset")
+            if not touched and offset is not None and window is not None and window[0] <= int(offset) < window[1]:
+                touched = True
+            if touched and passage_id:
+                unknown.add(passage_id)
+    located_tags = [
+        {"document": item["document"], "label": item["label"], "start": item["span"][0], "end": item["span"][1]}
+        for item in aligned
+    ]
     units = []
     for passage in passages:
         passage_id = str(passage.get("passage_id") or "")
+        if passage_id in unknown:
+            continue
         doc_id = normalize_doc_id(passage.get("doc_id"))
         start = passage.get("start_offset")
         end = passage.get("end_offset")
@@ -625,9 +801,13 @@ def unit_grid_from_annotations(
             if mapped and mapped not in model_codes:
                 model_codes.append(mapped)
         units.append({"unit_id": passage_id, "human_codes": human_codes, "llm_codes": model_codes})
+    if passages and not units:
+        return {**unavailable, **report, "unknown_units": len(unknown), "reason": "units_unknown"}
     grid = unit_grid_agreement(units)
     grid["available"] = True
     grid["reason"] = ""
+    grid.update(report)
+    grid["unknown_units"] = len(unknown)
     return grid
 
 
@@ -684,10 +864,10 @@ def audit_sample(rows: Sequence[Mapping[str, Any]], *, fraction: float = 0.2, se
 
 def quote_and_coverage_rates(passages: Sequence[Mapping[str, Any]], segments: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Quote-flag rates and the share of passages left without a code."""
-    from automated_grounded_theory.evaluate import _quote_anchor_rates, assignment_passage_id
+    from automated_grounded_theory.evaluate import _quote_anchor_rates, assignment_passage_ids
 
     eligible = [passage for passage in passages if not passage.get("skipped")]
-    coded_ids = {assignment_passage_id(segment) for segment in segments}
+    coded_ids = {passage_id for segment in segments for passage_id in assignment_passage_ids(segment)}
     uncoded = [passage for passage in eligible if str(passage.get("passage_id") or "") not in coded_ids]
     rates = _quote_anchor_rates(segments)
     rates["uncoded_share"] = round(len(uncoded) / len(eligible), 4) if eligible else 0.0

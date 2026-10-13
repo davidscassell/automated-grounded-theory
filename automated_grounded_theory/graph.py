@@ -87,14 +87,21 @@ from automated_grounded_theory.retrieval import (
     code_needs_review,
     code_text,
     comparison_order,
+    assignment_ids,
     full_audit_due,
     hint_pairs,
+    record_review,
     review_fingerprint,
     select_cross_chunk,
     select_prompt_codes,
     shared_codebook_vectors,
 )
-from automated_grounded_theory.validation import code_key, context_term_set, label_restates_context
+from automated_grounded_theory.validation import (
+    attributed_passage_ids,
+    code_key,
+    context_term_set,
+    label_restates_context,
+)
 from automated_grounded_theory.saturation import saturation_point
 from automated_grounded_theory.schemas import (
     BatchCoding,
@@ -1848,12 +1855,9 @@ def _validate_node(runtime: RunConfig):
                     }
                 )
             coverage = str(coding.get("coverage_status") or "")
-            coded_here = [
-                row
-                for row in interpreted["accepted"]
-                if str(row.get("attributed_passage_id") or passage.get("passage_id") or "")
-                == str(passage.get("passage_id") or "")
-            ]
+            coded_id = str(passage.get("passage_id") or "")
+            accepted_ids = [attributed_passage_ids(row) for row in interpreted["accepted"]]
+            coded_here = [row for row, ids in zip(interpreted["accepted"], accepted_ids) if coded_id and coded_id in ids]
             if coverage == "failed":
                 passage["coverage_status"] = "failed"
             elif coded_here:
@@ -1863,14 +1867,16 @@ def _validate_node(runtime: RunConfig):
             passages_by_id = {
                 str(row.get("passage_id") or ""): row for row in (state.get("passages") or [])
             }
-            for row in interpreted["accepted"]:
-                attributed = str(row.get("attributed_passage_id") or "")
-                other = passages_by_id.get(attributed)
-                if other is None or other is passage:
-                    continue
-                if other.get("coverage_status") in {"failed", "excluded"}:
-                    continue
-                other["coverage_status"] = "coded"
+            for ids in accepted_ids:
+                for attributed in ids:
+                    if attributed == coded_id:
+                        continue
+                    other = passages_by_id.get(attributed)
+                    if other is None or other is passage:
+                        continue
+                    if other.get("coverage_status") in {"failed", "excluded"}:
+                        continue
+                    other["coverage_status"] = "coded"
             if interpreted["rejections"]:
                 validation_log.append(
                     {
@@ -2212,9 +2218,10 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
         )
         applied["codebook"] = book
         applied["segments"] = rows
+        seen_ids = parsed.get("reviewed_assignment_ids") or {}
         for key, fingerprint in (parsed.get("reviewed_revisions") or {}).items():
             if key in applied["codebook"]:
-                applied["codebook"][key]["reviewed_revision"] = fingerprint
+                record_review(applied["codebook"][key], fingerprint, seen_ids.get(key))
         applied.setdefault("ops", []).extend(post_ops)
         applied.setdefault("review", []).extend(op for op in post_ops if op.get("status") == "review")
         if runtime.check_model is not None and applied["accepted_merges"] and quote_stats["quotes_checked"] == 0:
@@ -2884,6 +2891,7 @@ async def _sweep_chunks(
                     f"Sweep {sweep_index} skipped the model. No code was new or materially changed."
                 ],
                 "reviewed_revisions": {},
+                "reviewed_assignment_ids": {},
                 "audit": audit,
                 "codes_sent": 0,
             },
@@ -3069,6 +3077,7 @@ async def _sweep_chunks(
     confirmed.sort(key=lambda item: item[0])
     parts = []
     reviewed: dict[str, str] = {}
+    reviewed_ids: dict[str, list[str]] = {}
     for index, parsed, note, call in confirmed:
         if note:
             warnings.append(note)
@@ -3079,6 +3088,7 @@ async def _sweep_chunks(
                 key = code_key(str(entry.get("code") or ""))
                 if key:
                     reviewed[key] = review_fingerprint(entry)
+                    reviewed_ids[key] = assignment_ids(entry)
         parts.append(
             {
                 "chunk_index": index,
@@ -3095,6 +3105,7 @@ async def _sweep_chunks(
     reconciled["skipped_candidates"] = skipped_candidates
     reconciled["warnings"] = warnings
     reconciled["reviewed_revisions"] = reviewed
+    reconciled["reviewed_assignment_ids"] = reviewed_ids
     reconciled["audit"] = audit
     reconciled["codes_sent"] = len(due)
     return reconciled, candidates, len(chunks)
