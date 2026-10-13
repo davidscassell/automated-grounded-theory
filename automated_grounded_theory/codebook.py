@@ -27,6 +27,8 @@ from automated_grounded_theory.validation import (
     label_restates_context,
     lenient_label_fields,
     anchor_quote,
+    attribute_evidence_passage,
+    evidence_wholly_outside,
     review_passage_flags,
     split_joined_label,
     substantive_memo,
@@ -105,6 +107,10 @@ def _fallback_rationale(op: str, reason: str) -> str:
         "empty_code": "The label was empty, so the code was kept under a review flag instead of being dropped.",
         "code_too_long": "The label is too long, so the code was kept and flagged for review.",
         "bundled_concepts": "The label bundles several concepts, so the code was kept and flagged for review.",
+        "evidence_outside_passage": (
+            "The quote is outside the passage being coded, so the code was kept, flagged, "
+            "and attributed to the passage that contains the evidence."
+        ),
     }.get(reason)
     if text:
         return text
@@ -808,6 +814,7 @@ def interpret_coding(
     review_below: float = 0.5,
     context_terms: set[str] | None = None,
     document_text: str = "",
+    passages: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Validate one model response. Does not mutate the codebook.
 
@@ -816,7 +823,10 @@ def interpret_coding(
     A quote that cannot be anchored does not reject the code. The quote is
     flagged ``possibly_modified`` or ``unanchored`` and coding continues.
     ``quote_retries`` lists those flags so the caller can ask for a closer
-    quote once, then keep the code anyway.
+    quote once, then keep the code anyway. A quote located wholly outside
+    this passage is also kept. It is flagged ``evidence_outside_passage``
+    and attributed to the passage that contains it. That flag does not
+    retry or block coding.
 
     A semicolon-joined label is split first. Each piece is validated on its
     own, and a piece that matches an existing code is reused. An empty label,
@@ -871,17 +881,28 @@ def interpret_coding(
             else:
                 rejections.append({"code": label, "reason": "code_id_as_label", "quote": quote})
                 continue
+        passage_start = int(passage.get("start_offset") or 0)
+        passage_end = int(passage.get("end_offset") or 0) or (passage_start + len(passage_text))
         anchor = anchor_quote(
             quote,
             passage_text,
             prev_text=str(passage.get("prev_text") or ""),
             next_text=str(passage.get("next_text") or ""),
             document_text=str(passage.get("document_text") or document_text or ""),
-            passage_start=int(passage.get("start_offset") or 0),
-            passage_end=int(passage.get("end_offset") or 0) or None,
+            passage_start=passage_start,
+            passage_end=passage_end,
         )
         verbatim = anchor.quote
         quote_flag = f"quote_{anchor.status}" if anchor.status in QUOTE_FLAG_STATUSES else ""
+        outside = evidence_wholly_outside(anchor, passage_start=passage_start, passage_end=passage_end)
+        attributed_passage_id = attribute_evidence_passage(
+            anchor,
+            passages,
+            doc_id=str(passage.get("doc_id") or ""),
+            coded_passage_id=passage_id,
+            passage_start=passage_start,
+            passage_end=passage_end,
+        )
         raw_action = str(proposal.get("action") or "").strip().casefold()
         action = _ACTION_ALIASES.get(raw_action)
         provisional_key = code_key(label)
@@ -1006,6 +1027,8 @@ def interpret_coding(
         flags.extend(reasons)
         if quote_flag:
             flags.append(quote_flag)
+        if outside:
+            flags.append("evidence_outside_passage")
         review_flags = flags
         definition = str(proposal.get("definition") or "").strip()
         if action == "new" and not definition:
@@ -1101,6 +1124,9 @@ def interpret_coding(
                 "code_id": _code_id(key),
                 "needs_review": bool(review_flags),
                 "review_reasons": review_flags,
+                "coded_passage_id": passage_id,
+                "attributed_passage_id": attributed_passage_id or passage_id,
+                "evidence_outside_passage": outside,
             }
         )
         applied = _op(
@@ -1134,6 +1160,27 @@ def interpret_coding(
             held_quote["model_quote"] = anchor.model_quote
             ops.append(held_quote)
             review.append(held_quote)
+        if "evidence_outside_passage" in review_flags:
+            held_outside = _op(
+                op="assign_quote",
+                status="review",
+                confidence=confidence,
+                ids={
+                    "passage_id": passage_id,
+                    "coded_passage_id": passage_id,
+                    "attributed_passage_id": attributed_passage_id,
+                    "code_id": _code_id(key),
+                    "doc_start": anchor.doc_start,
+                    "doc_end": anchor.doc_end,
+                },
+                reason="evidence_outside_passage",
+                rationale=(
+                    "The quote matches text outside this passage. The code was kept and "
+                    "attributed to the passage that contains the evidence."
+                ),
+            )
+            ops.append(held_outside)
+            review.append(held_outside)
         if "context_restatement" in review_flags:
             held_context = _op(
                 op="create",
@@ -1234,14 +1281,20 @@ def commit_passage(
     existing_keys: set[str] | None = None,
     origin_snapshot_id: str = "",
 ) -> dict[str, Any]:
-    """Append segments for accepted codes. ``existing_keys`` tracks globally new labels."""
-    book = deepcopy(codebook)
-    new_segments = [dict(segment) for segment in segments]
+    """Append segments for accepted codes. ``existing_keys`` tracks globally new labels.
+
+    Unchanged codebook entries and existing segment dicts are shared with the
+    caller. A rename copies a segment dict before it rewrites the label.
+    Counts are recomputed only for codes this commit touches.
+    """
+    book = {key: _detach_entry(entry) for key, entry in codebook.items()}
+    new_segments = list(segments)
     new_memos = list(memos)
     highlights = dict(highlight_ids)
     counters = dict(counters)
     known_before = set(existing_keys) if existing_keys is not None else set(book)
     new_codes = 0
+    touched: set[str] = set()
 
     memo_body = str(interpreted.get("memo") or "").strip()
     if memo_body and not substantive_memo(memo_body):
@@ -1265,6 +1318,8 @@ def commit_passage(
         previous = item.get("previous_key")
         if previous and previous in book and previous != key:
             book = _rename_code(book, new_segments, previous, key, item["code"])
+            touched.add(previous)
+            touched.add(key)
         if key not in book:
             if key not in known_before:
                 new_codes += 1
@@ -1325,10 +1380,14 @@ def commit_passage(
             span_key = f"{passage.get('doc_id')}:{item['doc_start']}:{item['doc_end']}"
         if span_key not in highlights:
             highlights[span_key] = _next(counters, "highlight", "h")
+        coded_passage_id = str(passage.get("passage_id") or "")
+        attributed_passage_id = str(item.get("attributed_passage_id") or "") or coded_passage_id
         segment = {
             "segment_id": _next(counters, "segment", "s"),
             "highlight_id": highlights[span_key],
-            "passage_id": passage.get("passage_id"),
+            "passage_id": attributed_passage_id,
+            "coded_passage_id": coded_passage_id,
+            "attributed_passage_id": attributed_passage_id,
             "doc_id": passage.get("doc_id"),
             "doc_name": passage.get("doc_name"),
             "code": book[key]["code"],
@@ -1359,8 +1418,9 @@ def commit_passage(
             "memo_id": memo_id,
         }
         new_segments.append(segment)
+        touched.add(key)
 
-    book = sync_counts(book, new_segments)
+    book = _refresh_counts(book, new_segments, touched)
     ops = []
     for op in interpreted.get("ops") or []:
         row = dict(op)
@@ -1395,11 +1455,135 @@ def _rename_code(codebook: dict[str, dict], segments: list[dict], old: str, new:
         # The id stays with the concept. A new label is a new revision, not a new code.
         entry["revision"] = int(entry.get("revision") or 1) + 1
         book[new] = entry
+    for index, segment in enumerate(segments):
+        if segment.get("code_key") != old:
+            continue
+        # Share the caller's segment dict until a rename actually rewrites it.
+        segment = dict(segment)
+        segments[index] = segment
+        segment["code_key"] = new
+        segment["code"] = book[new]["code"] if new in book else display
+        segment["code_id"] = book[new].get("code_id") or _code_id(new)
+    return book
+
+
+_ENTRY_LISTS = (
+    "history",
+    "examples",
+    "document_ids",
+    "review_reasons",
+    "relation_hints",
+    "anchor_span_ids",
+    "contrast_span_ids",
+    "category_links",
+)
+
+
+def _detach_entry(entry: Mapping[str, Any]) -> dict:
+    """Shallow copy an entry and the lists a later commit or sweep appends to.
+
+    Nested history events stay shared. Those dicts are not edited in place.
+    """
+    copied = dict(entry)
+    for field in _ENTRY_LISTS:
+        value = copied.get(field)
+        if isinstance(value, list):
+            copied[field] = list(value)
+    return copied
+
+
+def _assignment_digest(applications: Sequence[Mapping[str, Any]]) -> str:
+    """Hash every assignment, not a prefix of the stored examples."""
+    rows = []
+    for item in applications:
+        rows.append(
+            "|".join(
+                (
+                    str(item.get("segment_id") or ""),
+                    str(item.get("passage_id") or ""),
+                    str(item.get("doc_id") or ""),
+                    "" if item.get("doc_start") is None else str(item.get("doc_start")),
+                    "" if item.get("doc_end") is None else str(item.get("doc_end")),
+                    str(item.get("quote") or ""),
+                    str(item.get("code_key") or ""),
+                )
+            )
+        )
+    return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()[:16]
+
+
+def _apply_counts(entry: Mapping[str, Any], applications: Sequence[Mapping[str, Any]], key: str) -> dict:
+    """Frequency, documents, examples, and the full assignment digest for one code."""
+    updated = _detach_entry(entry)
+    updated["key"] = key
+    updated["frequency"] = len(applications)
+    updated["document_ids"] = sorted({str(item.get("doc_id")) for item in applications if item.get("doc_id")})
+    examples = []
+    seen_quotes: set[tuple] = set()
+    for item in applications:
+        marker = (item.get("passage_id"), item.get("quote"))
+        if marker in seen_quotes:
+            continue
+        seen_quotes.add(marker)
+        examples.append(
+            {
+                "quote": item.get("quote"),
+                "doc_id": item.get("doc_id"),
+                "passage_id": item.get("passage_id"),
+                "doc_start": item.get("doc_start"),
+                "doc_end": item.get("doc_end"),
+                "quote_status": item.get("quote_status") or "",
+                "quote_similarity": item.get("quote_similarity"),
+            }
+        )
+        if len(examples) >= 8:
+            break
+    updated["examples"] = examples
+    updated["evidence_revision"] = _assignment_digest(applications)
+    scores = []
+    for item in applications:
+        if item.get("confidence") is None or item.get("confidence") == "":
+            continue
+        try:
+            scores.append(float(item["confidence"]))
+        except (TypeError, ValueError):
+            continue
+    if scores:
+        updated["confidence_mean"] = round(sum(scores) / len(scores), 4)
+        updated["confidence_min"] = min(scores)
+    if applications and not updated.get("first_seen"):
+        updated["first_seen"] = applications[0].get("passage_id")
+    label = str(updated.get("code") or "")
+    if updated.get("in_vivo") and not any(
+        code_key(label) and label.casefold() in str(item.get("quote") or "").casefold() for item in examples
+    ):
+        from automated_grounded_theory.validation import in_vivo_supported
+
+        updated["in_vivo"] = any(in_vivo_supported(label, str(item.get("quote") or "")) for item in examples)
+    return updated
+
+
+def _segment_key(segment: Mapping[str, Any]) -> str:
+    return str(segment.get("code_key") or code_key(str(segment.get("code") or "")))
+
+
+def _refresh_counts(book: dict[str, dict], segments: Sequence[Mapping[str, Any]], touched: set[str]) -> dict[str, dict]:
+    """Recompute counts for ``touched`` codes. Other entries stay shared."""
+    if not touched:
+        return book
+    grouped: dict[str, list] = {key: [] for key in touched}
     for segment in segments:
-        if segment.get("code_key") == old:
-            segment["code_key"] = new
-            segment["code"] = book[new]["code"] if new in book else display
-            segment["code_id"] = book[new].get("code_id") or _code_id(new)
+        key = _segment_key(segment)
+        if key in grouped:
+            grouped[key].append(segment)
+    for key in touched:
+        if key not in book:
+            continue
+        applications = grouped.get(key) or []
+        if not applications:
+            book.pop(key, None)
+            continue
+        book[key] = _apply_counts(book[key], applications, key)
     return book
 
 
@@ -1407,60 +1591,13 @@ def sync_counts(codebook: dict[str, dict], segments: list[dict]) -> dict[str, di
     """Rebuild frequency, documents, and examples from ``segments``."""
     grouped: dict[str, list[dict]] = {}
     for segment in segments:
-        key = segment.get("code_key") or code_key(str(segment.get("code") or ""))
-        grouped.setdefault(key, []).append(segment)
+        grouped.setdefault(_segment_key(segment), []).append(segment)
     synced: dict[str, dict] = {}
     for key, entry in codebook.items():
         applications = grouped.get(key) or []
         if not applications:
             continue
-        updated = deepcopy(entry)
-        updated["key"] = key
-        updated["frequency"] = len(applications)
-        updated["document_ids"] = sorted({str(item.get("doc_id")) for item in applications if item.get("doc_id")})
-        examples = []
-        seen_quotes: set[tuple] = set()
-        for item in applications:
-            marker = (item.get("passage_id"), item.get("quote"))
-            if marker in seen_quotes:
-                continue
-            seen_quotes.add(marker)
-            examples.append(
-                {
-                    "quote": item.get("quote"),
-                    "doc_id": item.get("doc_id"),
-                    "passage_id": item.get("passage_id"),
-                    "doc_start": item.get("doc_start"),
-                    "doc_end": item.get("doc_end"),
-                    "quote_status": item.get("quote_status") or "",
-                    "quote_similarity": item.get("quote_similarity"),
-                }
-            )
-            if len(examples) >= 8:
-                break
-        updated["examples"] = examples
-        scores = []
-        for item in applications:
-            if item.get("confidence") is None or item.get("confidence") == "":
-                continue
-            try:
-                scores.append(float(item["confidence"]))
-            except (TypeError, ValueError):
-                continue
-        if scores:
-            updated["confidence_mean"] = round(sum(scores) / len(scores), 4)
-            updated["confidence_min"] = min(scores)
-        if applications and not updated.get("first_seen"):
-            updated["first_seen"] = applications[0].get("passage_id")
-        label = str(updated.get("code") or "")
-        if updated.get("in_vivo") and not any(
-            code_key(label) and label.casefold() in str(item.get("quote") or "").casefold() for item in examples
-        ):
-            # Keep the flag only when some stored quote still contains the label.
-            from automated_grounded_theory.validation import in_vivo_supported
-
-            updated["in_vivo"] = any(in_vivo_supported(label, str(item.get("quote") or "")) for item in examples)
-        synced[key] = updated
+        synced[key] = _apply_counts(deepcopy(entry), applications, key)
     return synced
 
 

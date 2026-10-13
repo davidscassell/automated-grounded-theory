@@ -1804,6 +1804,7 @@ def _validate_node(runtime: RunConfig):
                 review_below=runtime.review_below,
                 context_terms=context_term_set(runtime.context),
                 document_text=_document_texts(state).get(str(passage.get("doc_id") or ""), ""),
+                passages=state.get("passages") or [],
             )
             kept_quotes = [
                 {
@@ -1847,12 +1848,29 @@ def _validate_node(runtime: RunConfig):
                     }
                 )
             coverage = str(coding.get("coverage_status") or "")
+            coded_here = [
+                item
+                for item in interpreted["accepted"]
+                if str(item.get("attributed_passage_id") or passage.get("passage_id") or "")
+                == str(passage.get("passage_id") or "")
+            ]
             if coverage == "failed":
                 passage["coverage_status"] = "failed"
-            elif interpreted["accepted"]:
+            elif coded_here:
                 passage["coverage_status"] = "coded"
             else:
                 passage["coverage_status"] = "context_only"
+            passages_by_id = {
+                str(item.get("passage_id") or ""): item for item in (state.get("passages") or [])
+            }
+            for item in interpreted["accepted"]:
+                attributed = str(item.get("attributed_passage_id") or "")
+                other = passages_by_id.get(attributed)
+                if other is None or other is passage:
+                    continue
+                if other.get("coverage_status") in {"failed", "excluded"}:
+                    continue
+                other["coverage_status"] = "coded"
             if interpreted["rejections"]:
                 validation_log.append(
                     {

@@ -17,6 +17,7 @@ import json
 import math
 import re
 import statistics
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -145,9 +146,11 @@ async def aevaluate(
             sum(item["mean_jaccard"] for item in agreements) / len(agreements),
             4,
         )
-        metrics["aligned_assignment_alpha"] = round(
-            sum(item["krippendorff_alpha"] for item in agreements) / len(agreements),
-            4,
+        alphas = [item["krippendorff_alpha"] for item in agreements]
+        undefined = any(item.get("krippendorff_alpha_undefined") or item["krippendorff_alpha"] is None for item in agreements)
+        metrics["aligned_assignment_alpha_undefined"] = undefined
+        metrics["aligned_assignment_alpha"] = (
+            None if undefined else round(sum(alphas) / len(alphas), 4)
         )
     if model is None:
         metrics["chen_metrics"] = chen_metrics(books) if len(books) >= 2 else _CHEN_NOTE
@@ -341,10 +344,22 @@ def _run_segments(run: Any) -> list[Mapping[str, Any]]:
     return [item for item in (getattr(run, "segments", []) or []) if isinstance(item, Mapping)]
 
 
+def assignment_passage_id(segment: Mapping[str, Any]) -> str:
+    """Passage that holds the evidence. Counts use this, not the coded passage.
+
+    ``attributed_passage_id`` is the passage the quote sits in. It matches
+    ``passage_id`` when the quote was inside the passage being coded.
+    """
+    attributed = segment.get("attributed_passage_id")
+    if attributed:
+        return str(attributed)
+    return str(segment.get("passage_id") or "")
+
+
 def _passage_code_sets(run: Any) -> dict[str, set[str]]:
     grouped: dict[str, set[str]] = {}
     for segment in _run_segments(run):
-        passage_id = str(segment.get("passage_id") or "")
+        passage_id = assignment_passage_id(segment)
         code = str(segment.get("code") or "")
         if passage_id and code:
             grouped.setdefault(passage_id, set()).add(code)
@@ -359,19 +374,38 @@ def _set_jaccard(left: set[str], right: set[str]) -> float:
     return len(left & right) / len(left | right)
 
 
-def nominal_krippendorff_alpha(units: Sequence[Sequence[Any]]) -> float:
+@dataclass(frozen=True)
+class NominalAlpha:
+    """Nominal Krippendorff alpha, or an explicit undefined result.
+
+    ``alpha`` is ``None`` when the statistic is not defined. ``undefined`` is
+    the flag for that case, with a short ``reason``.
+    """
+
+    alpha: float | None
+    undefined: bool
+    reason: str = ""
+
+
+def nominal_krippendorff_alpha(units: Sequence[Sequence[Any]]) -> NominalAlpha:
     """Nominal Krippendorff's alpha. ``None`` in a unit is a missing rating.
 
-    Returns 1 when there is no disagreement to explain, including a single
-    category with perfect agreement.
+    The value is computed whenever the coincidence table supports it, including
+    a single unit such as ``[[1, 0]]``. It is not defined, and is not reported
+    as 1, when there are no paired ratings or the coincidence total is too
+    small to estimate expected disagreement. Perfect agreement (observed and
+    expected disagreement both zero) is 1.
+
+    The aligned passage metric that calls this omits cells where both coders
+    left the code off. Those jointly-absent cells are not units.
     """
     observed: list[list[Any]] = []
     for unit in units:
         ratings = [value for value in unit if value is not None]
         if len(ratings) >= 2:
             observed.append(ratings)
-    if len(observed) < 2:
-        return 1.0
+    if not observed:
+        return NominalAlpha(None, True, "no_paired_ratings")
     categories = sorted({value for ratings in observed for value in ratings}, key=str)
     index = {category: position for position, category in enumerate(categories)}
     size = len(categories)
@@ -385,7 +419,7 @@ def nominal_krippendorff_alpha(units: Sequence[Sequence[Any]]) -> float:
                 coincidence[index[left]][index[right]] += 1.0 / (count - 1)
     total = sum(sum(row) for row in coincidence)
     if total <= 1:
-        return 1.0
+        return NominalAlpha(None, True, "insufficient_coincidence")
     observed_disagreement = 0.0
     for left in range(size):
         for right in range(size):
@@ -400,8 +434,10 @@ def nominal_krippendorff_alpha(units: Sequence[Sequence[Any]]) -> float:
                 expected += marginal[left] * marginal[right]
     expected /= total * (total - 1)
     if expected == 0:
-        return 1.0
-    return 1.0 - (observed_disagreement / expected)
+        if observed_disagreement == 0:
+            return NominalAlpha(1.0, False, "")
+        return NominalAlpha(None, True, "expected_disagreement_zero")
+    return NominalAlpha(1.0 - (observed_disagreement / expected), False, "")
 
 
 def _labels_match(left: str, right: str, *, align_threshold: float | None) -> bool:
@@ -447,7 +483,9 @@ def aligned_assignment_agreement(
 
     ``krippendorff_alpha`` is nominal alpha on the aligned passage-by-code
     matrix: each cell is whether that coder applied that code to that passage.
-    Cells where neither coder applied the code are omitted.
+    Cells where neither coder applied the code are omitted (joint absence is
+    not a unit). When alpha is not defined, the value is null and
+    ``krippendorff_alpha_undefined`` is true. It is not reported as 1.
 
     Unlike :func:`assignment_ari`, different singleton codes on every passage
     score low here. Adjusted Rand only asks whether passages were grouped
@@ -519,9 +557,11 @@ def aligned_assignment_agreement(
         for code in left_canon | right_canon:
             units.append((1 if code in left_canon else 0, 1 if code in right_canon else 0))
     mean = sum(scores) / len(scores) if scores else 1.0
+    alpha = nominal_krippendorff_alpha(units)
     return {
         "mean_jaccard": round(mean, 4),
-        "krippendorff_alpha": round(nominal_krippendorff_alpha(units), 4),
+        "krippendorff_alpha": None if alpha.undefined or alpha.alpha is None else round(alpha.alpha, 4),
+        "krippendorff_alpha_undefined": alpha.undefined,
         "passages": len(passages),
         "aligned_codes": len(aligned_roots),
     }
@@ -530,7 +570,7 @@ def aligned_assignment_agreement(
 def _passage_labels(run: Any) -> dict[str, str]:
     grouped: dict[str, list[str]] = {}
     for segment in _run_segments(run):
-        passage_id = str(segment.get("passage_id") or "")
+        passage_id = assignment_passage_id(segment)
         if not passage_id:
             continue
         grouped.setdefault(passage_id, []).append(str(segment.get("code") or ""))
@@ -658,14 +698,14 @@ def _score(run: Mapping[str, Any], context_text: str) -> dict:
         "total_codes": len(codebook),
         "segments": len(segments),
     }
-    counts = collections.Counter(segment.get("passage_id") for segment in segments)
+    counts = collections.Counter(assignment_passage_id(segment) for segment in segments)
     per_passage = [counts.get(passage_id, 0) for passage_id in passage_text] or [0]
     metrics["codes_per_passage_mean"] = round(statistics.mean(per_passage), 3) if passage_text else 0.0
     metrics["codes_per_passage_median"] = statistics.median(per_passage) if passage_text else 0.0
     metrics["coverage_pct"] = round(100 * sum(count > 0 for count in per_passage) / len(per_passage), 1) if passage_text else 0.0
     if segments:
         verbatim = sum(
-            str(segment.get("quote") or "") in passage_text.get(segment.get("passage_id"), "") for segment in segments
+            str(segment.get("quote") or "") in passage_text.get(assignment_passage_id(segment), "") for segment in segments
         )
         metrics["verbatim_quote_pct"] = round(100 * verbatim / len(segments), 1)
     else:

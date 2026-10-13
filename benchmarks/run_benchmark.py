@@ -58,7 +58,7 @@ from automated_grounded_theory.benchmark import (  # noqa: E402
     load_muse,
     quote_and_coverage_rates,
     report_from_mapping,
-    unit_grid_agreement,
+    unit_grid_from_annotations,
 )
 
 
@@ -200,15 +200,13 @@ def run_dataset(dataset: str, model: str, output: Path, limit: int | None) -> di
     report["excerpt_offsets"] = excerpt_offset_hits(tags, result.segments, mappings, documents=documents)
     report["excerpt_offsets"].pop("rows", None)
     report["quote_and_coverage"] = quote_and_coverage_rates(result.passages, result.segments)
-    units = []
-    by_passage: dict[str, dict] = {}
-    for passage in result.passages:
-        by_passage[str(passage.get("passage_id"))] = {
-            "unit_id": passage.get("passage_id"),
-            "human_codes": [],
-            "llm_codes": [segment.get("code") for segment in result.segments if segment.get("passage_id") == passage.get("passage_id")],
-        }
-    report["unit_agreement"] = unit_grid_agreement(list(by_passage.values()))
+    report["unit_agreement"] = unit_grid_from_annotations(
+        result.passages,
+        result.segments,
+        tags,
+        mappings,
+        documents,
+    )
     sample = audit_sample(mappings, fraction=0.2, seed=0)
     report["audit_sample_size"] = len(sample)
     (output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

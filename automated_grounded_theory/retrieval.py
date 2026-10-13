@@ -14,7 +14,10 @@ import math
 import re
 import sys
 import threading
-from typing import Any, Mapping, Protocol, Sequence
+from collections import OrderedDict
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Iterator, Mapping, Protocol, Sequence
 
 from automated_grounded_theory.validation import code_key
 
@@ -190,21 +193,122 @@ class _Inflight:
         self.task: asyncio.Task | None = None
 
 
+# How many codebook snapshots the process keeps. Each snapshot stores content
+# hashes, not its own copy of every vector. 1..N growing codebooks used to
+# retain 1+2+...+N vector lists.
+DEFAULT_SNAPSHOT_LIMIT = 8
+
+_RUN_SCOPE: ContextVar[str | None] = ContextVar("embedding_run_scope", default=None)
+_BACKGROUND_TASKS: set[asyncio.Future] = set()
+
+
 class _VectorCache:
-    """Process-wide vectors and one codebook snapshot index.
+    """Process-wide canonical vectors and a bounded codebook snapshot index.
 
     Concurrent callers that ask for the same text share one embedding call.
+    Snapshots point at those vectors by content hash. Retention is an LRU cap
+    plus an optional run scope that drops its snapshots when the run ends.
     """
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.vectors: dict[tuple[str, str], list[float]] = {}
+        self.vectors: dict[tuple[str, str], tuple[float, ...]] = {}
         self.inflight: dict[tuple[str, str], _Inflight] = {}
-        self.snapshots: dict[tuple[str, str], list[list[float]]] = {}
+        self.snapshots: OrderedDict[tuple[str, str], tuple[tuple[str, str], ...]] = OrderedDict()
+        self.snapshot_owners: dict[tuple[str, str], set[str]] = {}
         self.snapshot_inflight: dict[tuple[str, str], asyncio.Future] = {}
+        self.snapshot_limit = DEFAULT_SNAPSHOT_LIMIT
 
 
 _VECTOR_CACHE = _VectorCache()
+
+
+def configure_embedding_cache(*, snapshot_limit: int | None = None) -> None:
+    """Set how many codebook snapshots the process retains.
+
+    Vectors stay canonical and are not copied into each snapshot. ``snapshot_limit``
+    is the LRU cap. A run can also call :func:`embedding_run_scope` to drop the
+    snapshots it created when the run finishes.
+    """
+    if snapshot_limit is None:
+        return
+    if int(snapshot_limit) < 1:
+        raise ValueError("snapshot_limit must be at least 1.")
+    with _VECTOR_CACHE.lock:
+        _VECTOR_CACHE.snapshot_limit = int(snapshot_limit)
+        _evict_snapshots()
+
+
+def embedding_cache_stats() -> dict[str, int]:
+    """Canonical vector count and how many snapshots are retained."""
+    with _VECTOR_CACHE.lock:
+        return {
+            "vectors": len(_VECTOR_CACHE.vectors),
+            "snapshots": len(_VECTOR_CACHE.snapshots),
+            "snapshot_limit": _VECTOR_CACHE.snapshot_limit,
+        }
+
+
+@contextmanager
+def embedding_run_scope(run_id: str | None = None) -> Iterator[str]:
+    """Drop this run's codebook snapshots when the run ends. Vectors stay cached."""
+    ident = run_id or f"run-{threading.get_ident()}-{id(object())}"
+    token = _RUN_SCOPE.set(ident)
+    try:
+        yield ident
+    finally:
+        _RUN_SCOPE.reset(token)
+        with _VECTOR_CACHE.lock:
+            _drop_run_snapshots(ident)
+
+
+def _drop_run_snapshots(run_id: str) -> None:
+    stale: list[tuple[str, str]] = []
+    for key, owners in list(_VECTOR_CACHE.snapshot_owners.items()):
+        if run_id not in owners:
+            continue
+        owners.discard(run_id)
+        if not owners:
+            stale.append(key)
+    for key in stale:
+        _VECTOR_CACHE.snapshot_owners.pop(key, None)
+        _VECTOR_CACHE.snapshots.pop(key, None)
+
+
+def _evict_snapshots() -> None:
+    """Drop the oldest snapshots past the cap. An in-flight snapshot stays."""
+    limit = _VECTOR_CACHE.snapshot_limit
+    while len(_VECTOR_CACHE.snapshots) > limit:
+        removed = False
+        for key in list(_VECTOR_CACHE.snapshots):
+            if key in _VECTOR_CACHE.snapshot_inflight:
+                continue
+            _VECTOR_CACHE.snapshots.pop(key, None)
+            _VECTOR_CACHE.snapshot_owners.pop(key, None)
+            removed = True
+            break
+        if not removed:
+            break
+
+
+def _remember_snapshot(snap: tuple[str, str], refs: tuple[tuple[str, str], ...]) -> None:
+    _VECTOR_CACHE.snapshots[snap] = refs
+    _VECTOR_CACHE.snapshots.move_to_end(snap)
+    scope = _RUN_SCOPE.get()
+    if scope is not None:
+        _VECTOR_CACHE.snapshot_owners.setdefault(snap, set()).add(scope)
+    _evict_snapshots()
+
+
+def _touch_snapshot(snap: tuple[str, str]) -> None:
+    _VECTOR_CACHE.snapshots.move_to_end(snap)
+    scope = _RUN_SCOPE.get()
+    if scope is not None:
+        _VECTOR_CACHE.snapshot_owners.setdefault(snap, set()).add(scope)
+
+
+def _materialize(refs: Sequence[tuple[str, str]]) -> list[list[float]]:
+    return [list(_VECTOR_CACHE.vectors[key]) for key in refs]
 
 
 def _require_vectors(result: Sequence[list[float] | None]) -> list[list[float]]:
@@ -218,12 +322,16 @@ def clear_embedding_cache() -> None:
     with _VECTOR_CACHE.lock:
         _VECTOR_CACHE.vectors.clear()
         _VECTOR_CACHE.snapshots.clear()
+        _VECTOR_CACHE.snapshot_owners.clear()
 
 
 def _store_vector(key: tuple[str, str], vector: Sequence[float]) -> list[float]:
-    stored = [float(item) for item in vector]
-    _VECTOR_CACHE.vectors[key] = stored
-    return stored
+    """Store one immutable vector. A second store of the same key keeps the first."""
+    existing = _VECTOR_CACHE.vectors.get(key)
+    if existing is None:
+        existing = tuple(float(item) for item in vector)
+        _VECTOR_CACHE.vectors[key] = existing
+    return list(existing)
 
 
 def _abort_future(future: asyncio.Future | None, exc: BaseException) -> None:
@@ -334,6 +442,13 @@ def _consume_task(task: asyncio.Task) -> None:
     task.exception()
 
 
+def _retain(task: asyncio.Future) -> asyncio.Future:
+    """Keep a shielded task alive so the loop does not garbage-collect it."""
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
+
+
 def _first_task_error(pairs: Sequence[tuple[asyncio.Task, Sequence[tuple[str, str]]]]) -> BaseException | None:
     for task, _keys in pairs:
         if not task.done() or task.cancelled():
@@ -369,7 +484,11 @@ async def _settle_query_siblings(
             task.cancel()
         pending.append(task)
     if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
+        # Shield the gather and keep a reference. Cancelling the owner while
+        # this wait is in progress must not cancel a shared provider task,
+        # and dropping the gather future would cancel its children on collection.
+        gather = _retain(asyncio.gather(*pending, return_exceptions=True))
+        await asyncio.shield(gather)
     for task in pending:
         _consume_task(task)
 
@@ -392,18 +511,32 @@ async def _await_query_group(jobs: Sequence[tuple[Any, Sequence[tuple[str, str]]
         _assign_inflight_task(keys, task)
         pairs.append((task, keys))
     try:
-        await asyncio.wait([task for task, _keys in pairs], return_when=asyncio.FIRST_EXCEPTION)
+        try:
+            await asyncio.wait([task for task, _keys in pairs], return_when=asyncio.FIRST_EXCEPTION)
+        except asyncio.CancelledError:
+            await _settle_query_siblings(pairs, cancel_unshared=True)
+            raise
+        error = _first_task_error(pairs)
+        if error is None:
+            leftover = [task for task, _keys in pairs if not task.done()]
+            if leftover:
+                try:
+                    await asyncio.wait(leftover)
+                except asyncio.CancelledError:
+                    await _settle_query_siblings(pairs, cancel_unshared=True)
+                    raise
+            return
+        try:
+            await _settle_query_siblings(pairs, cancel_unshared=False)
+        except asyncio.CancelledError:
+            # Settlement was in progress. The shielded gather did not cancel
+            # shared tasks. Drop only the ones nobody else is waiting on.
+            await _settle_query_siblings(pairs, cancel_unshared=True)
+            raise
+        raise error
     except asyncio.CancelledError:
         await _settle_query_siblings(pairs, cancel_unshared=True)
         raise
-    error = _first_task_error(pairs)
-    if error is None:
-        leftover = [task for task, _keys in pairs if not task.done()]
-        if leftover:
-            await asyncio.wait(leftover)
-        return
-    await _settle_query_siblings(pairs, cancel_unshared=False)
-    raise error
 
 
 def cached_embed_texts(
@@ -467,57 +600,62 @@ async def cached_aembed_texts(
     mine_keys: list[tuple[str, str]] = []
     mine_texts: list[str] = []
     waiting: list[tuple[int, asyncio.Future, tuple[str, str]]] = []
+    registered: list[tuple[str, str]] = []
     claimed: set[tuple[str, str]] = set()
-    with _VECTOR_CACHE.lock:
-        for index, key in enumerate(keys):
-            hit = _VECTOR_CACHE.vectors.get(key)
-            if hit is not None:
-                result[index] = hit
-                continue
-            inflight = _VECTOR_CACHE.inflight.get(key)
-            if inflight is not None:
-                inflight.waiters += 1
-                waiting.append((index, inflight.future, key))
-                continue
-            if key in claimed:
-                continue
-            claimed.add(key)
-            future: asyncio.Future = loop.create_future()
-            _VECTOR_CACHE.inflight[key] = _Inflight(future)
-            mine_keys.append(key)
-            mine_texts.append(texts[index])
-    if mine_texts:
-        try:
-            embedded = await aembed_texts(
-                embeddings,
-                mine_texts,
-                batch_size=batch_size,
-                limiter=limiter,
-                role=role,
-            )
-            if len(embedded) != len(mine_texts):
-                raise RuntimeError("embedding model returned a different number of vectors than texts")
-            _check_vectors(embeddings, embedded)
-            with _VECTOR_CACHE.lock:
-                for key, vector in zip(mine_keys, embedded):
-                    stored = _store_vector(key, vector)
-                    flight = _VECTOR_CACHE.inflight.pop(key, None)
-                    if flight is not None and not flight.future.done():
-                        flight.future.set_result(stored)
-        except BaseException as exc:
-            _release_inflight(mine_keys, exc)
-            raise
-    for index, future, key in waiting:
-        try:
+    try:
+        with _VECTOR_CACHE.lock:
+            for index, key in enumerate(keys):
+                hit = _VECTOR_CACHE.vectors.get(key)
+                if hit is not None:
+                    result[index] = hit
+                    continue
+                inflight = _VECTOR_CACHE.inflight.get(key)
+                if inflight is not None:
+                    inflight.waiters += 1
+                    registered.append(key)
+                    waiting.append((index, inflight.future, key))
+                    continue
+                if key in claimed:
+                    continue
+                claimed.add(key)
+                future: asyncio.Future = loop.create_future()
+                _VECTOR_CACHE.inflight[key] = _Inflight(future)
+                mine_keys.append(key)
+                mine_texts.append(texts[index])
+        if mine_texts:
+            try:
+                embedded = await aembed_texts(
+                    embeddings,
+                    mine_texts,
+                    batch_size=batch_size,
+                    limiter=limiter,
+                    role=role,
+                )
+                if len(embedded) != len(mine_texts):
+                    raise RuntimeError("embedding model returned a different number of vectors than texts")
+                _check_vectors(embeddings, embedded)
+                with _VECTOR_CACHE.lock:
+                    for key, vector in zip(mine_keys, embedded):
+                        stored = _store_vector(key, vector)
+                        flight = _VECTOR_CACHE.inflight.pop(key, None)
+                        if flight is not None and not flight.future.done():
+                            flight.future.set_result(stored)
+            except BaseException as exc:
+                _release_inflight(mine_keys, exc)
+                raise
+        for index, future, _key in waiting:
             # shield: cancelling this waiter must not cancel the shared call.
             result[index] = list(await asyncio.shield(future))
-        finally:
+        with _VECTOR_CACHE.lock:
+            for index, key in enumerate(keys):
+                if result[index] is None:
+                    result[index] = list(_VECTOR_CACHE.vectors[key])
+        return _require_vectors(result)
+    finally:
+        # Including waiters whose futures were never awaited, such as a joined
+        # "slow" flight when a new "bad" text fails first.
+        for key in registered:
             _detach_waiter(key)
-    with _VECTOR_CACHE.lock:
-        for index, key in enumerate(keys):
-            if result[index] is None:
-                result[index] = list(_VECTOR_CACHE.vectors[key])
-    return _require_vectors(result)
 
 
 def _snapshot_key(model_id: str, texts: Sequence[str]) -> tuple[str, str]:
@@ -537,12 +675,15 @@ async def shared_codebook_vectors(
     A later snapshot re-embeds only the texts whose content changed.
     """
     texts = [code_text(entry) for entry in entries]
-    snap = _snapshot_key(embedding_model_id(embeddings), texts)
+    model_id = embedding_model_id(embeddings)
+    snap = _snapshot_key(model_id, texts)
+    refs = tuple(_content_key(model_id, text, "document") for text in texts)
     loop = asyncio.get_running_loop()
     with _VECTOR_CACHE.lock:
         cached = _VECTOR_CACHE.snapshots.get(snap)
         if cached is not None:
-            return [list(vector) for vector in cached]
+            _touch_snapshot(snap)
+            return _materialize(cached)
         waiter = _VECTOR_CACHE.snapshot_inflight.get(snap)
         if waiter is not None:
             owner = False
@@ -551,8 +692,8 @@ async def shared_codebook_vectors(
             _VECTOR_CACHE.snapshot_inflight[snap] = waiter
             owner = True
     if not owner:
-        vectors = await asyncio.shield(waiter)
-        return [list(vector) for vector in vectors]
+        shared = await asyncio.shield(waiter)
+        return [list(vector) for vector in shared]
     try:
         vectors = await cached_aembed_texts(
             embeddings,
@@ -566,23 +707,109 @@ async def shared_codebook_vectors(
         _abort_future(waiter, exc)
         raise
     with _VECTOR_CACHE.lock:
-        _VECTOR_CACHE.snapshots[snap] = vectors
+        _remember_snapshot(snap, refs)
         _VECTOR_CACHE.snapshot_inflight.pop(snap, None)
+        materialized = _materialize(refs)
     if not waiter.done():
-        waiter.set_result(vectors)
-    return [list(vector) for vector in vectors]
+        waiter.set_result(materialized)
+    return materialized if vectors else []
+
+
+def assignment_digest(entry: Mapping) -> str:
+    """Hash of every example and assignment. A fourth quote changes it.
+
+    This is the evidence revision used for review. It is not the example set
+    sent to a prompt. :func:`select_prompt_examples` chooses that bounded set.
+    """
+    rows = []
+    for item in list(entry.get("examples") or []) + list(entry.get("assignments") or []):
+        if isinstance(item, str):
+            rows.append(item)
+            continue
+        if not isinstance(item, Mapping):
+            continue
+        rows.append(
+            "|".join(
+                (
+                    str(item.get("segment_id") or ""),
+                    str(item.get("passage_id") or ""),
+                    str(item.get("doc_id") or ""),
+                    "" if item.get("doc_start") is None else str(item.get("doc_start")),
+                    "" if item.get("doc_end") is None else str(item.get("doc_end")),
+                    str(item.get("quote") or ""),
+                )
+            )
+        )
+    payload = {
+        "evidence_revision": str(entry.get("evidence_revision") or ""),
+        "rows": rows,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+
+
+def select_prompt_examples(entry: Mapping, *, limit: int = 3) -> list[dict]:
+    """A bounded, diverse example set for prompts. Not the review digest.
+
+    Prefer a different passage, then a different document, then fill in the
+    original order. Fewer examples than ``limit`` keeps that order.
+    """
+    examples = [
+        item
+        for item in (entry.get("examples") or [])
+        if isinstance(item, Mapping) and str(item.get("quote") or "").strip()
+    ]
+    cap = max(0, int(limit))
+    if cap == 0 or not examples:
+        return []
+    if len(examples) <= cap:
+        return [dict(item) for item in examples]
+    chosen: list[dict] = []
+    seen_passages: set[str] = set()
+    for item in examples:
+        if len(chosen) >= cap:
+            break
+        passage = str(item.get("passage_id") or "")
+        if passage and passage in seen_passages:
+            continue
+        chosen.append(dict(item))
+        if passage:
+            seen_passages.add(passage)
+    seen = {(str(item.get("passage_id") or ""), str(item.get("quote") or "")) for item in chosen}
+    seen_docs = {str(item.get("doc_id") or "") for item in chosen if item.get("doc_id")}
+    for item in examples:
+        if len(chosen) >= cap:
+            break
+        doc = str(item.get("doc_id") or "")
+        marker = (str(item.get("passage_id") or ""), str(item.get("quote") or ""))
+        if marker in seen or not doc or doc in seen_docs:
+            continue
+        chosen.append(dict(item))
+        seen.add(marker)
+        seen_docs.add(doc)
+    for item in examples:
+        if len(chosen) >= cap:
+            break
+        marker = (str(item.get("passage_id") or ""), str(item.get("quote") or ""))
+        if marker in seen:
+            continue
+        chosen.append(dict(item))
+        seen.add(marker)
+    return chosen
 
 
 def review_fingerprint(entry: Mapping) -> str:
-    """Revision token for a code. Label, definition, revision, and example quotes.
+    """Revision token for a code. Label, definition, revision, and all evidence.
 
-    Frequency does not change it. A sweep stores this on ``reviewed_revision``.
+    Frequency does not change it. The digest covers every example and
+    assignment, plus ``evidence_revision`` when the codebook stored one.
+    A sweep stores this on ``reviewed_revision``. Prompt examples are chosen
+    separately and do not define this token.
     """
     payload = {
         "revision": int(entry.get("revision") or 1),
         "label": str(entry.get("code") or entry.get("label") or ""),
         "definition": str(entry.get("definition") or ""),
-        "examples": [str(item.get("quote") or "") for item in (entry.get("examples") or [])[:3]],
+        "evidence": assignment_digest(entry),
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
     return f"{payload['revision']}:{digest}"
@@ -893,19 +1120,67 @@ async def aembed_texts(
         if _batch_query_api(embeddings)[0] is not None:
             return await _embed_query_batch(embeddings, list(texts), batch_size=batch_size, limiter=limiter)
         return await _embed_queries_one_by_one(embeddings, list(texts), limiter)
+    return await _embed_document_batches(
+        embeddings,
+        list(texts),
+        batch_size=batch_size,
+        limiter=limiter,
+        role=role,
+    )
+
+
+async def _embed_document_batches(
+    embeddings,
+    texts: Sequence[str],
+    *,
+    batch_size: int,
+    limiter,
+    role: str,
+) -> list[list[float]]:
+    """One provider call per document chunk. Successes are cached before the next chunk.
+
+    Same ownership as the query path: a failed chunk does not drop a sibling
+    that is still embedding, and a later request for that sibling is a cache hit.
+    """
     size = max(1, int(batch_size))
-    batches = [list(texts[start : start + size]) for start in range(0, len(texts), size)]
+    pending = _uncached_unique(embeddings, texts, role)
+    chunks = [pending[start : start + size] for start in range(0, len(pending), size)]
+    model = embedding_model_id(embeddings)
 
-    async def one(batch: list[str]) -> list[list[float]]:
-        async with limiter.embed_semaphore:
+    async def one(chunk: list[str], keys: list[tuple[str, str]]) -> None:
+        try:
+            async with limiter.embed_semaphore:
+                needed = [text for text in chunk if _cached_vector(embeddings, text, role) is None]
+                if not needed:
+                    return
 
-            async def embed():
-                return await _embed_documents_batch(embeddings, batch)
+                async def attempt() -> None:
+                    current = [text for text in needed if _cached_vector(embeddings, text, role) is None]
+                    if not current:
+                        return
+                    vectors = await _embed_documents_batch(embeddings, current)
+                    if len(vectors) != len(current):
+                        raise RuntimeError("embedding model returned a different number of vectors than texts")
+                    _check_vectors(embeddings, vectors)
+                    for text, vector in zip(current, vectors):
+                        _cache_vector(embeddings, text, role, vector)
 
-            return await _retry_embedding(limiter, embed)
+                await _retry_embedding(limiter, attempt)
+        finally:
+            exc = sys.exception()
+            for key in keys:
+                _finish_flight(key, exc)
 
-    groups = await asyncio.gather(*(one(batch) for batch in batches))
-    return [vector for group in groups for vector in group]
+    if chunks:
+        jobs = []
+        for chunk in chunks:
+            keys = [_content_key(model, text, role) for text in chunk]
+            jobs.append((one(chunk, keys), keys))
+        await _await_query_group(jobs)
+    cached = [_cached_vector(embeddings, text, role) for text in texts]
+    if any(vector is None for vector in cached):
+        raise RuntimeError("embedding cache missed a text it had claimed")
+    return [list(vector) for vector in cached if vector is not None]
 
 
 def _rate_limit(exc: BaseException) -> bool:
