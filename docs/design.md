@@ -1,4 +1,4 @@
-# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, and 0.6.7)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, and 0.6.8)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
 Status: steps 1 and 2 of the v0.6 plan. Category development, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
@@ -202,6 +202,16 @@ Sweep chunks do not repeat the global label index. `cross_chunk` is a bounded ne
 
 From 160 to 640 codes the 0.6.7 column grows 4.02x. From 20 to 1280 it grows 78.5x. The repeated-index column grows 10.85x from 160 to 640. `scripts/benchmark_sweep_payload.py` rebuilds the table. `policy_version` is `0.6.7`.
 
-## 16. Out of scope
+## 16. Corrections in 0.6.8
+
+Retrieval for a coding round happens once per passage and codebook snapshot, on the async embedding path. The planner used to call `rank()` on the event loop, which embedded the passage as a query and bypassed the embedding semaphore, retries, and timeout. Coding then embedded the same passage as a document. Both paths now embed a passage as a query, and the rankings are reused for budgeting and for the coding call.
+
+Validation feedback is capped. A retry shortens that note before it drops codes. Coding, the validation retry, and schema repair are measured immediately before the provider call. A request that is still over `token_budget` is logged and flagged, and it is not sent.
+
+A sweep requests a decision only for pairs whose definitions and examples are both in the request. The neighborhood stays at `cross_chunk_limit` (default 8). Remaining hinted partners are sent in further bounded comparison requests, so a pair is not dropped and is not decided without its partner's evidence.
+
+`policy_version` is `0.6.8`.
+
+## 17. Out of scope
 
 Category feedback, focused recoding of earlier negatives, relationship hypotheses, sampling briefs, and a Taguette project-file adapter. See the v0.6 plan steps 3–5.

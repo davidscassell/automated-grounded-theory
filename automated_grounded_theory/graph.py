@@ -8,6 +8,7 @@ an interrupt or a crash.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import threading
@@ -34,7 +35,12 @@ from automated_grounded_theory.records import (
     select_committable,
 )
 
-from automated_grounded_theory.async_support import ainvoke_structured, is_transient, sweep_deadline
+from automated_grounded_theory.async_support import (
+    OversizedRequest,
+    ainvoke_structured,
+    is_transient,
+    sweep_deadline,
+)
 from automated_grounded_theory.batching import (
     count_message_tokens,
     pack_indices,
@@ -78,6 +84,7 @@ from automated_grounded_theory.retrieval import (
     EmbeddingCodeRetriever,
     LexicalCodeRetriever,
     code_needs_review,
+    code_text,
     comparison_order,
     full_audit_due,
     hint_pairs,
@@ -187,6 +194,8 @@ class RunConfig:
     limiter: Any = None
     prompt_records: list = field(default_factory=list)
     notes: list = field(default_factory=list)
+    _rankings: dict = field(default_factory=dict)
+    _oversized_passages: set = field(default_factory=set)
     _log_lock: threading.Lock | None = None
 
     def __post_init__(self) -> None:
@@ -311,6 +320,7 @@ class WorkerInput(TypedDict, total=False):
     worker_indices: list
     worker_passages: list
     worker_slices: list
+    worker_warning: str
     worker_codebook: dict
     worker_documents: dict
 
@@ -402,6 +412,7 @@ def _route_round(state: CodingState):
                     "worker_doc_id": doc_id,
                     "worker_indices": indices,
                     "worker_slices": job.get("slices"),
+                    "worker_warning": str(job.get("warning") or ""),
                     "worker_passages": [state["passages"][index] for index in indices],
                     "worker_codebook": deepcopy(_book_for(state, doc_id)),
                     "worker_documents": documents,
@@ -440,10 +451,10 @@ def _route_after_sweep(state: CodingState) -> str:
 
 
 def _prepare_round(runtime: RunConfig):
-    def prepare_round(state: CodingState) -> dict:
+    async def prepare_round(state: CodingState) -> dict:
         version = int(state.get("snapshot_version") or 0) + 1
         frozen = freeze_snapshot(state, version=version)
-        jobs = _wave(state, runtime)
+        jobs = await _wave(state, runtime)
         packaged = []
         warnings = list(state.get("warnings") or [])
         for index, (doc_id, indices, meta) in enumerate(jobs):
@@ -455,6 +466,7 @@ def _prepare_round(runtime: RunConfig):
                     "doc_id": doc_id,
                     "indices": list(indices),
                     "slices": (meta or {}).get("slices"),
+                    "warning": warning,
                     "job_id": f"{frozen['snapshot_id']}-j{index:03d}",
                 }
             )
@@ -482,6 +494,7 @@ def _code_worker(runtime: RunConfig):
             "policy_version": state.get("worker_policy_version") or POLICY_VERSION,
         }
         book = dict(state.get("worker_codebook") or {})
+        _note_sent_alone(runtime, str(state.get("worker_warning") or ""), passages)
         bucket: list[dict] = []
         push = getattr(runtime.limiter, "push_accounting", None)
         token = push(bucket) if push is not None else None
@@ -739,7 +752,7 @@ def _segment_node(state: CodingState) -> dict:
 def _code_node(runtime: RunConfig):
     async def code_passage(state: CodingState) -> dict:
         started = time.perf_counter()
-        jobs = _wave(state, runtime)
+        jobs = await _wave(state, runtime)
         if not jobs:
             update: dict = {"pending": []}
         else:
@@ -753,7 +766,24 @@ def _code_node(runtime: RunConfig):
     return code_passage
 
 
-def _pack_jobs(
+class _RankMiss(Exception):
+    """The sync packer needs rankings that have not been retrieved yet."""
+
+    def __init__(self, texts: Sequence[str]) -> None:
+        self.texts = [str(text) for text in texts]
+        super().__init__(f"rankings missing for {len(self.texts)} texts")
+
+
+def _ranking_snapshot(entries: Sequence[Mapping[str, Any]]) -> str:
+    payload = "\0".join(code_text(entry) for entry in entries)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _ranking_key(snapshot: str, text: str, k: int) -> tuple:
+    return (snapshot, text, int(k))
+
+
+async def _pack_jobs(
     state: CodingState,
     runtime: RunConfig,
     indices: Sequence[int],
@@ -761,22 +791,39 @@ def _pack_jobs(
     per_request: int,
     doc_id: str | None,
 ) -> list[tuple]:
-    """Pack passage indexes so each request, plus reserved output, fits the budget."""
+    """Pack passage indexes so each request, plus reserved output, fits the budget.
+
+    Rankings are retrieved once, asynchronously, for this codebook snapshot
+    and then reused while the packer measures slices. The packer itself stays
+    synchronous and does not call the embedding client.
+    """
     if not indices:
         return []
+    entries = list(_book_for(state, doc_id).values())
+    passage_texts = [str(state["passages"][index].get("text") or "") for index in indices]
+    await _ensure_rankings(runtime, passage_texts, entries)
     texts = [str(passage.get("text") or "") for passage in state["passages"]]
     names = [str(passage.get("passage_id") or "") for passage in state["passages"]]
     reserve = reserved_output_tokens(1, max_codes_per_passage=runtime.max_codes_per_passage)
-    batches, _warnings = pack_indices(
-        indices,
-        texts,
-        batch_size=per_request,
-        token_budget=token_budget,
-        names=names,
-        tokenizer=resolve_tokenizer(runtime.coder),
-        reserved_output=reserve,
-        measure=_coding_measure(runtime, state, doc_id, token_budget),
-    )
+    measure = _coding_measure(runtime, state, doc_id, token_budget)
+    batches = None
+    for _ in range(64):
+        try:
+            batches, _warnings = pack_indices(
+                indices,
+                texts,
+                batch_size=per_request,
+                token_budget=token_budget,
+                names=names,
+                tokenizer=resolve_tokenizer(runtime.coder),
+                reserved_output=reserve,
+                measure=measure,
+            )
+            break
+        except _RankMiss as miss:
+            await _ensure_rankings(runtime, miss.texts, entries)
+    if batches is None:
+        raise RuntimeError("coding planner could not rank passage slices")
     jobs = []
     for batch in batches:
         if not batch.indices:
@@ -795,18 +842,70 @@ def _remember_note(runtime: RunConfig, note: str) -> None:
         runtime.notes.append(note)
 
 
-def _rank_labels(runtime: RunConfig, text: str, entries: Sequence[Mapping[str, Any]]) -> list[str]:
-    rank = getattr(runtime.retriever, "rank", None)
-    if rank is None or runtime.top_k_codes <= 0 or not entries:
-        return []
-    try:
-        labels = rank(text, entries, k=runtime.top_k_codes) or []
-    except Exception as exc:
-        if not isinstance(runtime.retriever, EmbeddingCodeRetriever) or not is_transient(exc):
-            raise
-        _remember_note(runtime, _embedding_fallback_note(exc))
-        labels = LexicalCodeRetriever().rank(text, entries, k=runtime.top_k_codes) or []
-    return [str(label) for label in labels if str(label)]
+def _cached_labels(runtime: RunConfig, snapshot: str, text: str, k: int) -> list[str] | None:
+    cached = runtime._rankings.get(_ranking_key(snapshot, text, k))
+    if cached is None:
+        return None
+    return list(cached)
+
+
+async def _rank_texts(
+    runtime: RunConfig,
+    texts: Sequence[str],
+    entries: Sequence[Mapping[str, Any]],
+    k: int,
+) -> list[list[str]]:
+    """Rank ``texts`` without blocking the event loop on an embedding client."""
+    if k <= 0 or not entries:
+        return [[] for _ in texts]
+    if isinstance(runtime.retriever, EmbeddingCodeRetriever):
+        try:
+            ranked = await runtime.retriever.arank_many(
+                list(texts),
+                entries,
+                k=k,
+                limiter=runtime.limiter,
+                batch_size=runtime.embed_batch_size,
+            )
+        except Exception as exc:
+            if not is_transient(exc):
+                raise
+            _remember_note(runtime, _embedding_fallback_note(exc))
+            lexical = LexicalCodeRetriever()
+            ranked = [lexical.rank(text, entries, k=k) for text in texts]
+    else:
+        rank = getattr(runtime.retriever, "rank", None)
+        if rank is None:
+            return [[] for _ in texts]
+        ranked = [rank(text, entries, k=k) or [] for text in texts]
+    return [[str(label) for label in labels if str(label)] for labels in ranked]
+
+
+async def _ensure_rankings(
+    runtime: RunConfig,
+    texts: Sequence[str],
+    entries: Sequence[Mapping[str, Any]],
+) -> None:
+    """Retrieve each missing passage once for this codebook snapshot.
+
+    Planning and coding share ``runtime._rankings``. A later call with the
+    same passage text and the same code texts does not embed again.
+    """
+    k = max(0, int(runtime.top_k_codes))
+    snapshot = _ranking_snapshot(entries)
+    missing: list[str] = []
+    seen: set[str] = set()
+    for text in texts:
+        if text in seen:
+            continue
+        seen.add(text)
+        if _cached_labels(runtime, snapshot, text, k) is None:
+            missing.append(text)
+    if not missing:
+        return
+    ranked = await _rank_texts(runtime, missing, entries, k)
+    for text, labels in zip(missing, ranked):
+        runtime._rankings[_ranking_key(snapshot, text, k)] = list(labels)
 
 
 def _union_labels(per_passage: Sequence[Sequence[str]]) -> list[str]:
@@ -819,6 +918,22 @@ def _union_labels(per_passage: Sequence[Sequence[str]]) -> list[str]:
                 seen.add(key)
                 ranked.append(label)
     return ranked
+
+
+def _scoped_feedback(
+    feedback: Mapping[str, str] | None,
+    passages: Sequence[Mapping[str, Any]],
+) -> dict[str, str] | None:
+    """Feedback for these passages only. Other passages are a different request."""
+    if not feedback:
+        return None
+    ids = {str(passage.get("passage_id") or "") for passage in passages}
+    scoped = {
+        str(key): str(value)
+        for key, value in feedback.items()
+        if str(key) in ids and str(value or "").strip()
+    }
+    return scoped or None
 
 
 def _coding_messages_for(
@@ -835,7 +950,7 @@ def _coding_messages_for(
         omitted_codes=omitted,
         passages=passages,
         neighbor_chars=runtime.neighbor_chars,
-        feedback=feedback,
+        feedback=_scoped_feedback(feedback, passages),
         prompt_cache=runtime.prompt_cache,
         nearest=per_passage,
     )
@@ -856,6 +971,25 @@ def _view_for(
     return select_prompt_codes(entries, _union_labels(per_passage), frequent_limit=frequent_codes)
 
 
+def _feedback_chars(feedback: Mapping[str, str] | None) -> int:
+    if not feedback:
+        return 0
+    return sum(len(str(value or "")) for value in feedback.values())
+
+
+def _halve_feedback(feedback: Mapping[str, str] | None) -> dict[str, str]:
+    """Drop or halve each note. An empty result means nothing more can be cut."""
+    if not feedback:
+        return {}
+    shrunk: dict[str, str] = {}
+    for key, value in feedback.items():
+        text = str(value or "")
+        if len(text) <= 160:
+            continue
+        shrunk[str(key)] = text[: max(160, len(text) // 2)]
+    return shrunk
+
+
 def _fit_coding_messages(
     runtime: RunConfig,
     passages: Sequence[Mapping[str, Any]],
@@ -864,22 +998,42 @@ def _fit_coding_messages(
     feedback: Mapping[str, str] | None,
     budget: int,
 ) -> list:
-    """Assemble the real request, then drop trailing codes until it fits."""
+    """Assemble the real request, then drop codes and shorten feedback until it fits.
+
+    An empty codebook view is not success. Validation feedback can still leave
+    the request over ``budget``. The caller checks the returned messages and
+    does not send them when they are still over.
+    """
     view, omitted = _view_for(entries, per_passage, runtime.frequent_codes)
     full = len(view)
-    while True:
+    feedback_now = dict(_scoped_feedback(feedback, passages) or {})
+    original_feedback = _feedback_chars(feedback_now)
+    trimmed_codes = False
+    for _ in range(max(full, 1) + 40):
         extra = full - len(view)
-        messages = _coding_messages_for(runtime, passages, per_passage, feedback, view, omitted + extra)
-        if _coding_request_cost(runtime, messages, len(passages)) <= budget or not view:
-            if extra:
+        messages = _coding_messages_for(runtime, passages, per_passage, feedback_now or None, view, omitted + extra)
+        if _coding_request_cost(runtime, messages, len(passages)) <= budget:
+            if trimmed_codes:
                 note = (
                     f"Trimmed the coding context from {full} codes to {len(view)} "
                     f"to fit token_budget ({budget})."
                 )
-                if note not in runtime.notes:
-                    runtime.notes.append(note)
+                _remember_note(runtime, note)
+            if _feedback_chars(feedback_now) < original_feedback:
+                _remember_note(runtime, f"Shortened validation feedback to fit token_budget ({budget}).")
             return messages
-        view = view[:-1]
+        # Feedback is what a validation retry adds. Shorten it before dropping
+        # codes that already fit on the attempt without that note.
+        nxt = _halve_feedback(feedback_now)
+        if _feedback_chars(nxt) < _feedback_chars(feedback_now):
+            feedback_now = nxt
+            continue
+        if view:
+            view = view[:-1]
+            trimmed_codes = True
+            continue
+        return messages
+    return messages
 
 
 def _passage_groups(
@@ -936,15 +1090,15 @@ def _coding_measure(runtime: RunConfig, state: CodingState, doc_id: str | None, 
     """
     tokenizer = resolve_tokenizer(runtime.coder)
     entries = list(_book_for(state, doc_id).values())
-    ranked_cache: dict[str, list[str]] = {}
+    snapshot = _ranking_snapshot(entries)
+    k = max(0, int(runtime.top_k_codes))
     reserve = reserved_output_tokens(1, max_codes_per_passage=runtime.max_codes_per_passage)
     budget = max(1, int(token_budget))
 
     def labels_for(text: str) -> list[str]:
-        cached = ranked_cache.get(text)
+        cached = _cached_labels(runtime, snapshot, text, k)
         if cached is None:
-            cached = _rank_labels(runtime, text, entries)
-            ranked_cache[text] = cached
+            raise _RankMiss([text])
         return cached
 
     def cost_for(
@@ -1063,7 +1217,7 @@ def _coding_schedule(metadata: Mapping[str, Any], runtime: RunConfig) -> tuple[i
     return per_request, commit_every, concurrent
 
 
-def _wave(
+async def _wave(
     state: CodingState,
     runtime: RunConfig,
     *,
@@ -1110,7 +1264,7 @@ def _wave(
             if take <= 0:
                 break
             indices = queue[:take]
-            jobs.extend(_pack_jobs(state, runtime, indices, token_budget, per_request, doc_id))
+            jobs.extend(await _pack_jobs(state, runtime, indices, token_budget, per_request, doc_id))
             used += take
             documents += 1
         return jobs
@@ -1139,7 +1293,7 @@ def _wave(
     else:
         take = min(room, commit_every, len(queue) - index)
         indices = queue[index : index + take]
-    return _pack_jobs(state, runtime, indices, token_budget, per_request, None)
+    return await _pack_jobs(state, runtime, indices, token_budget, per_request, None)
 
 
 async def _pending_rows(runtime: RunConfig, state: CodingState, jobs: list[tuple]) -> list[dict]:
@@ -1149,6 +1303,7 @@ async def _pending_rows(runtime: RunConfig, state: CodingState, jobs: list[tuple
         warning = str((meta or {}).get("warning") or "")
         if warning and warning not in runtime.notes:
             runtime.notes.append(warning)
+        _note_sent_alone(runtime, warning, [state["passages"][index] for index in indices])
         book = _book_for(state, doc_id)
         coded = await _code_indexed(
             runtime,
@@ -1428,28 +1583,63 @@ async def _rank_passages(
     passages: Sequence[Mapping[str, Any]],
     entries: Sequence[Mapping[str, Any]],
 ) -> list[list[str]]:
-    if isinstance(runtime.retriever, EmbeddingCodeRetriever):
-        try:
-            return await runtime.retriever.arank_many(
-                [str(passage.get("text") or "") for passage in passages],
-                entries,
-                k=runtime.top_k_codes,
-                limiter=runtime.limiter,
-                batch_size=runtime.embed_batch_size,
-            )
-        except Exception as exc:
-            if not is_transient(exc):
-                raise
-            _remember_note(runtime, _embedding_fallback_note(exc))
-            lexical = LexicalCodeRetriever()
-            return [
-                lexical.rank(str(passage.get("text") or ""), entries, k=runtime.top_k_codes)
-                for passage in passages
-            ]
-    return [
-        runtime.retriever.rank(str(passage.get("text") or ""), entries, k=runtime.top_k_codes)
-        for passage in passages
-    ]
+    """Rankings for these passages. A planning pass for this snapshot is reused."""
+    texts = [str(passage.get("text") or "") for passage in passages]
+    await _ensure_rankings(runtime, texts, entries)
+    snapshot = _ranking_snapshot(entries)
+    k = max(0, int(runtime.top_k_codes))
+    return [list(_cached_labels(runtime, snapshot, text, k) or []) for text in texts]
+
+
+def _note_sent_alone(runtime: RunConfig, warning: str, passages: Sequence[Mapping[str, Any]]) -> None:
+    """Remember passages the planner could not split and already flagged."""
+    if "sent alone" not in warning:
+        return
+    for passage in passages:
+        passage_id = str(passage.get("passage_id") or "")
+        if passage_id and passage_id in warning:
+            runtime._oversized_passages.add(passage_id)
+
+
+def _packer_already_flagged(runtime: RunConfig, passages: Sequence[Mapping[str, Any]]) -> bool:
+    """True when the planner already warned that these passages cannot be split.
+
+    That warning is the explicit flag for a request the fixed schema makes
+    larger than ``token_budget``. The call is still sent. Every other overflow
+    is not.
+    """
+    ids = [str(passage.get("passage_id") or "") for passage in passages]
+    flagged = runtime._oversized_passages
+    return bool(ids) and all(passage_id and passage_id in flagged for passage_id in ids)
+
+
+def _overflow_note(passage_ids: str, cost: int, budget: int) -> str:
+    return (
+        f"Coding request for {passage_ids} is {cost} estimated tokens, "
+        f"over token_budget ({budget}). The overflow was flagged and the request was not sent."
+    )
+
+
+def _unsent_coding(passage: Mapping[str, Any]) -> dict:
+    return {
+        "passage_id": str(passage.get("passage_id") or ""),
+        "codes": [],
+        "memo": "",
+        "low_confidence": True,
+        "coverage_status": "failed",
+        "overflow": True,
+    }
+
+
+def _is_overflow(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, OversizedRequest):
+            return True
+        current = current.__cause__
+    return False
 
 
 async def _invoke_coding(
@@ -1476,20 +1666,39 @@ async def _invoke_coding(
         ranks = [per_passage[index] for index in group]
         messages = _fit_coding_messages(runtime, subset, entries, ranks, feedback, budget)
         passage_ids = ",".join(str(passage.get("passage_id")) for passage in subset)
-        parsed = await _ainvoke_structured(
-            runtime.coder,
-            BatchCoding,
-            messages,
-            kind="code_passage",
-            model_name=runtime.model_name,
-            passage_id=passage_ids,
-            runtime=runtime,
-            reserved_output=reserved_output_tokens(
-                len(subset),
-                max_codes_per_passage=runtime.max_codes_per_passage,
-            ),
-            token_budget=budget,
-        )
+        cost = _coding_request_cost(runtime, messages, len(subset))
+        if cost > budget and not _packer_already_flagged(runtime, subset):
+            note = _overflow_note(passage_ids, cost, budget)
+            _remember_note(runtime, note)
+            logger.warning("%s", note)
+            aligned.extend(_unsent_coding(passage) for passage in subset)
+            continue
+        if cost > budget:
+            _remember_note(
+                runtime,
+                f"Coding request for {passage_ids} is {cost} estimated tokens, "
+                f"over token_budget ({budget}). It could not be reduced further and was flagged.",
+            )
+        try:
+            parsed = await _ainvoke_structured(
+                runtime.coder,
+                BatchCoding,
+                messages,
+                kind="code_passage",
+                model_name=runtime.model_name,
+                passage_id=passage_ids,
+                runtime=runtime,
+                reserved_output=reserved_output_tokens(
+                    len(subset),
+                    max_codes_per_passage=runtime.max_codes_per_passage,
+                ),
+                token_budget=budget,
+            )
+        except CodingError as exc:
+            if not _is_overflow(exc):
+                raise
+            aligned.extend(_unsent_coding(passage) for passage in subset)
+            continue
         aligned.extend(_align_batch(parsed, subset))
     return aligned
 
@@ -1849,7 +2058,7 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
         # Overlap needs a free slot. At concurrency 1 the coding task takes the
         # only slot and the sweep waits with nothing of its own in flight.
         if runtime.pipeline and _remaining(state) and int(runtime.concurrency) > 1:
-            jobs = _wave(state, runtime, upcoming=True)
+            jobs = await _wave(state, runtime, upcoming=True)
             if jobs:
                 code_task = asyncio.create_task(_pending_rows(runtime, state, jobs))
         codes = comparison_order(list(codebook.values()))
@@ -2734,29 +2943,56 @@ async def _sweep_chunks(
             "The model still reviews the codebook and may propose duplicate merges."
         )
     skipped_candidates: list[dict] = []
+    calls: list[dict] = []
+    span = max(len(chunks), 1)
+    for owner, chunk in enumerate(chunks, start=1):
+        planned, leftover = _plan_chunk_requests(
+            codes,
+            chunk,
+            vectors,
+            per_chunk_candidates[owner - 1],
+            limit=runtime.cross_chunk_limit,
+            embedding_threshold=runtime.merge_threshold,
+            lexical_threshold=runtime.lexical_merge_threshold,
+        )
+        if leftover:
+            warnings.append(
+                f"Sweep {sweep_index} could not show evidence for {len(leftover)} hinted pairs "
+                f"in chunk {owner}. They were not sent for a decision."
+            )
+        for part, item in enumerate(planned):
+            order = owner if item["primary"] else owner + part * span * 1000
+            calls.append({**item, "owner": owner, "part": part, "order": order, "chunk": chunk})
 
-    async def confirm(index: int, chunk: list) -> tuple[int, dict, str | None]:
-        passage_id = f"sweep-{sweep_index}" if len(chunks) == 1 else f"sweep-{sweep_index}-chunk-{index:04d}"
+    async def confirm(call: dict) -> tuple:
+        owner = int(call["owner"])
+        if call["primary"]:
+            passage_id = (
+                f"sweep-{sweep_index}" if len(chunks) == 1 else f"sweep-{sweep_index}-chunk-{owner:04d}"
+            )
+        else:
+            passage_id = f"sweep-{sweep_index}-chunk-{owner:04d}-compare-{int(call['part']):04d}"
         messages = build_sweep_messages(
             context=runtime.context,
-            codes=chunk,
-            candidates=per_chunk_candidates[index - 1],
+            codes=call["local"],
+            candidates=call["hints"],
             prompt_cache=runtime.prompt_cache,
             all_codes=codes,
-            cross_chunk=_cross_chunk_for(
-                codes,
-                chunk,
-                vectors,
-                per_chunk_candidates[index - 1],
-                limit=runtime.cross_chunk_limit,
-                embedding_threshold=runtime.merge_threshold,
-                lexical_threshold=runtime.lexical_merge_threshold,
-            ),
-            chunk_index=index,
+            cross_chunk=call["cross"],
+            chunk_index=owner,
             chunk_count=len(chunks),
             consolidation=consolidation,
             audit=audit,
         )
+        empty = {
+            "merges": [],
+            "rejections": [],
+            "definitions": [],
+            "overloaded_codes": [],
+            "relation_hints": [],
+            "integrative_memo": "",
+            "reflexive_memo": "",
+        }
         try:
             payload = await _ainvoke_structured(
                 runtime.sweeper,
@@ -2767,35 +3003,28 @@ async def _sweep_chunks(
                 passage_id=passage_id,
                 runtime=runtime,
             )
-            return index, payload, None
+            return call["order"], payload, None, call
         except CodingError as exc:
             if not is_transient(exc):
                 raise
+            label = "chunk" if call["primary"] else "comparison"
             note = (
-                f"Sweep {sweep_index} chunk {index} of {len(chunks)} was skipped after a "
+                f"Sweep {sweep_index} {label} {owner} of {len(chunks)} was skipped after a "
                 f"timeout or connection error: {exc}"
             )
-            return index, {
-                "merges": [],
-                "rejections": [],
-                "definitions": [],
-                "overloaded_codes": [],
-                "relation_hints": [],
-                "integrative_memo": "",
-                "reflexive_memo": "",
-            }, note
+            return call["order"], empty, note, call
 
-    confirmed = await asyncio.gather(*(confirm(index, chunk) for index, chunk in enumerate(chunks, start=1)))
+    confirmed = await asyncio.gather(*(confirm(call) for call in calls))
     confirmed.sort(key=lambda item: item[0])
     parts = []
     reviewed: dict[str, str] = {}
-    for index, parsed, note in confirmed:
+    for index, parsed, note, call in confirmed:
         if note:
             warnings.append(note)
-            for candidate in per_chunk_candidates[index - 1]:
+            for candidate in call["hints"]:
                 skipped_candidates.append({**candidate, "rationale": note})
-        else:
-            for entry in chunks[index - 1]:
+        elif call["primary"]:
+            for entry in call["chunk"]:
                 key = code_key(str(entry.get("code") or ""))
                 if key:
                     reviewed[key] = review_fingerprint(entry)
@@ -2818,6 +3047,91 @@ async def _sweep_chunks(
     reconciled["audit"] = audit
     reconciled["codes_sent"] = len(due)
     return reconciled, candidates, len(chunks)
+
+
+def _evidence_keys(entries: Sequence[Mapping[str, Any]]) -> set[str]:
+    keys = set()
+    for entry in entries:
+        key = code_key(str(entry.get("code") or ""))
+        if key:
+            keys.add(key)
+    return keys
+
+
+def _partition_hints(hints: Sequence[Mapping[str, Any]], evidence: set[str]) -> tuple[list, list]:
+    """Hints whose both codes are in ``evidence``, and the ones that are not."""
+    ready: list = []
+    deferred: list = []
+    for hint in hints:
+        source = code_key(str(hint.get("source") or ""))
+        target = code_key(str(hint.get("target") or ""))
+        if source and target and source in evidence and target in evidence:
+            ready.append(hint)
+        else:
+            deferred.append(hint)
+    return ready, deferred
+
+
+def _locals_for(chunk: Sequence[Mapping[str, Any]], hints: Sequence[Mapping[str, Any]]) -> list:
+    """Chunk codes that are an endpoint of ``hints``. The follow-up stays bounded."""
+    needed: set[str] = set()
+    for hint in hints:
+        needed.add(code_key(str(hint.get("source") or "")))
+        needed.add(code_key(str(hint.get("target") or "")))
+    chosen = [entry for entry in chunk if code_key(str(entry.get("code") or "")) in needed]
+    return chosen or list(chunk)
+
+
+def _plan_chunk_requests(
+    codes: list,
+    chunk: list,
+    vectors,
+    hints: list,
+    *,
+    limit: int,
+    embedding_threshold: float,
+    lexical_threshold: float,
+) -> tuple[list[dict], list]:
+    """One sweep of ``chunk``, then further bounded comparisons for deferred hints.
+
+    A hint is sent only when both codes' evidence is in that request. Partners
+    that do not fit in ``limit`` are queued onto the next request. Hints that
+    still have nowhere to go (a limit of zero, or a label that is not in the
+    book) are returned as leftovers and are not sent.
+    """
+    remaining = list(hints)
+    planned: list[dict] = []
+    primary = True
+    while True:
+        cross = _cross_chunk_for(
+            codes,
+            chunk,
+            vectors,
+            remaining,
+            limit=limit,
+            embedding_threshold=embedding_threshold,
+            lexical_threshold=lexical_threshold,
+        )
+        evidence = _evidence_keys(chunk) | _evidence_keys(cross)
+        ready, deferred = _partition_hints(remaining, evidence)
+        local = list(chunk) if primary else _locals_for(chunk, ready)
+        # Follow-ups send only the local endpoints. Re-check against that set
+        # so a hint is never asked for without both definitions in the request.
+        sent = _evidence_keys(local) | _evidence_keys(cross)
+        ready, held = _partition_hints(ready, sent)
+        deferred = held + deferred
+        if primary:
+            planned.append({"local": local, "cross": list(cross), "hints": ready, "primary": True})
+            primary = False
+        elif ready:
+            planned.append({"local": local, "cross": list(cross), "hints": ready, "primary": False})
+        else:
+            return planned, deferred
+        if not deferred:
+            return planned, []
+        if len(deferred) >= len(remaining):
+            return planned, deferred
+        remaining = deferred
 
 
 def _cross_chunk_for(
@@ -2892,6 +3206,8 @@ async def _ainvoke_structured(
             tokenizer=resolve_tokenizer(model),
         )
     except Exception as exc:
+        if _is_overflow(exc):
+            _remember_note(runtime, str(exc))
         raise CodingError(f"{kind} failed for {passage_id}: {exc}") from exc
     _append_prompt_log(
         runtime,

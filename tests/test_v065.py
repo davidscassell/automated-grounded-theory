@@ -267,13 +267,17 @@ async def _arank_many_cache():
     await retriever.arank_many(passages, codes, k=2, limiter=limiter)
     first = list(embeddings.documents)
     assert first.count(code_text(codes[0])) == 1
+    assert sorted(embeddings.queries) == sorted(passages)
     embeddings.documents.clear()
+    embeddings.queries.clear()
     await retriever.arank_many(passages, codes, k=2, limiter=limiter)
     assert embeddings.documents == []
+    assert embeddings.queries == []
 
     changed = [dict(codes[0], definition="changed definition text"), *codes[1:]]
     await retriever.arank_many(passages, changed, k=2, limiter=limiter)
     assert embeddings.documents == [code_text(changed[0])]
+    assert embeddings.queries == []
 
     clear_embedding_cache()
     concurrent = _CountingEmbeddings("arank-concurrent")
@@ -282,8 +286,8 @@ async def _arank_many_cache():
         retriever.arank_many(passages, codes, k=2, limiter=CallLimiter(4, max_retries=0, backoff=0)),
         retriever.arank_many(passages, codes, k=2, limiter=CallLimiter(4, max_retries=0, backoff=0)),
     )
-    expected = [code_text(entry) for entry in codes] + passages
-    assert sorted(concurrent.documents) == sorted(expected)
+    assert sorted(concurrent.documents) == sorted(code_text(entry) for entry in codes)
+    assert sorted(concurrent.queries) == sorted(passages)
 
     clear_embedding_cache()
     flaky = _CountingEmbeddings("arank-flaky")

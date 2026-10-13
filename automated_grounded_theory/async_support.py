@@ -17,10 +17,13 @@ import contextvars
 import functools
 import hashlib
 import json
+import logging
 import random
 import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
+
+logger = logging.getLogger("automated_grounded_theory")
 
 class CallLimiter:
     """Cap in-flight work, adapt on 429, and retry transient failures with full-jitter backoff.
@@ -536,6 +539,19 @@ class OversizedReservation(ValueError):
     """A rate-limit reservation is larger than the bucket can ever hold."""
 
 
+class OversizedRequest(RuntimeError):
+    """A model call is still over ``token_budget`` after fitting.
+
+    The call was not sent. ``estimated`` and ``budget`` are the counts the
+    check compared.
+    """
+
+    def __init__(self, message: str, *, estimated: int, budget: int) -> None:
+        super().__init__(message)
+        self.estimated = int(estimated)
+        self.budget = int(budget)
+
+
 def is_timeout(exc: BaseException) -> bool:
     """True for deadline and provider read-timeout errors."""
     if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
@@ -783,6 +799,23 @@ def sweep_deadline(request_timeout: float, sweep_timeout: float) -> float:
     return max(coding, sweep)
 
 
+def _refuse_oversized(messages, schema, tokenizer, *, budget: int | None, reserved: int, kind: str) -> None:
+    """Last check before a provider call. Over-budget requests are not sent."""
+    if budget is None:
+        return
+    from automated_grounded_theory.batching import request_input_tokens
+
+    estimated = request_input_tokens(messages, schema, tokenizer) + max(0, int(reserved))
+    if estimated <= int(budget):
+        return
+    message = (
+        f"{kind[0].upper() + kind[1:]} is {estimated} estimated tokens, over token_budget ({budget}). "
+        "The overflow was flagged and the request was not sent."
+    )
+    logger.warning("%s", message)
+    raise OversizedRequest(message, estimated=estimated, budget=int(budget))
+
+
 async def ainvoke_structured(
     model,
     schema,
@@ -807,15 +840,22 @@ async def ainvoke_structured(
     """
     from langchain_core.messages import HumanMessage
 
+    from automated_grounded_theory.batching import request_input_tokens, shrink_repair_messages
+
     runnable = structured_runnable(model, schema)
     extra: dict[str, Any] = {}
     if timeout is not None:
         extra["timeout"] = timeout
     if reserved_output is not None:
         extra["reserved_output"] = reserved_output
-    result = await limiter.ainvoke(runnable, list(messages), **extra)
+    reserved = 0 if reserved_output is None else max(0, int(reserved_output))
+    budget = None if token_budget is None else max(1, int(token_budget))
+    sent = list(messages)
+    # The coding caller measures this payload and either fits it or flags it.
+    # The repair below is a second invocation and is checked on its own.
+    result = await limiter.ainvoke(runnable, sent, **extra)
     try:
-        return parse_structured(result, schema), list(messages)
+        return parse_structured(result, schema), sent
     except ValueError as first:
         failed_usage = usage_from_result(result)
         repair = list(messages) + [
@@ -827,12 +867,10 @@ async def ainvoke_structured(
                 )
             )
         ]
-        if token_budget is not None:
-            from automated_grounded_theory.batching import shrink_repair_messages
-
-            reserved = 0 if reserved_output is None else max(0, int(reserved_output))
-            ceiling = max(1, int(token_budget) - reserved)
+        if budget is not None:
+            ceiling = max(1, budget - reserved)
             repair = shrink_repair_messages(repair, schema, ceiling, tokenizer)
+        _refuse_oversized(repair, schema, tokenizer, budget=budget, reserved=reserved, kind="schema repair")
         try:
             limiter.schema_repairs = int(getattr(limiter, "schema_repairs", 0) or 0) + 1
             repaired = await limiter.ainvoke(runnable, repair, **extra)

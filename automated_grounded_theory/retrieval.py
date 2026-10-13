@@ -318,6 +318,7 @@ async def cached_aembed_texts(
                 mine_texts,
                 batch_size=batch_size,
                 limiter=limiter,
+                role=role,
             )
             if len(embedded) != len(mine_texts):
                 raise RuntimeError("embedding model returned a different number of vectors than texts")
@@ -494,11 +495,15 @@ class EmbeddingCodeRetriever:
             limiter=limiter,
             batch_size=batch_size,
         )
+        # Passages are queries, matching ``rank``. A query vector and a document
+        # vector of the same text do not share a cache entry, so using one role
+        # here and the other in ``rank`` embeds the passage twice.
         queries = await cached_aembed_texts(
             self.embeddings,
             list(passages),
             batch_size=batch_size,
             limiter=limiter,
+            role="query",
         )
         return [_rank_vectors(labels, vectors, query, k) for query in queries]
 
@@ -509,10 +514,36 @@ def _rank_vectors(labels: Sequence[str], vectors: Sequence[Sequence[float]], que
     return [label for _, label in scored[:k]]
 
 
-async def aembed_texts(embeddings, texts: Sequence[str], *, batch_size: int, limiter) -> list[list[float]]:
-    """Embed ``texts`` in batches. Uses ``aembed_documents`` when the object has it.
+async def _embed_batch(embeddings, batch: list[str], *, role: str) -> list[list[float]]:
+    """One embedding call. ``query`` uses the query API, same as ``rank``."""
+    if role == "query":
+        aembed_query = getattr(embeddings, "aembed_query", None)
+        if aembed_query is not None:
+            return [await aembed_query(text) for text in batch]
+        embed_query = getattr(embeddings, "embed_query", None)
+        if embed_query is not None:
+            return [await asyncio.to_thread(embed_query, text) for text in batch]
+    embed = getattr(embeddings, "aembed_documents", None)
+    if embed is None:
+        return await asyncio.to_thread(embeddings.embed_documents, batch)
+    return await embed(batch)
 
-    Timeouts, connection errors, and rate limits retry with the limiter's backoff.
+
+async def aembed_texts(
+    embeddings,
+    texts: Sequence[str],
+    *,
+    batch_size: int,
+    limiter,
+    role: str = "document",
+) -> list[list[float]]:
+    """Embed ``texts`` in batches under the embedding semaphore.
+
+    ``role="query"`` uses ``aembed_query`` or ``embed_query``, the same call
+    ``EmbeddingCodeRetriever.rank`` makes for a passage. Document role uses
+    ``aembed_documents`` when the object has it. Timeouts, connection errors,
+    and rate limits retry with the limiter's backoff. The wait yields the
+    event loop; it does not run the client on the loop thread.
     """
     if not texts:
         return []
@@ -523,12 +554,9 @@ async def aembed_texts(embeddings, texts: Sequence[str], *, batch_size: int, lim
         async with limiter.embed_semaphore:
             for attempt in range(limiter.max_retries + 1):
                 try:
-                    embed = getattr(embeddings, "aembed_documents", None)
 
                     async def _embed():
-                        if embed is None:
-                            return await asyncio.to_thread(embeddings.embed_documents, batch)
-                        return await embed(batch)
+                        return await _embed_batch(embeddings, batch, role=role)
 
                     if limiter.request_timeout and limiter.request_timeout > 0:
                         return await asyncio.wait_for(_embed(), limiter.request_timeout)

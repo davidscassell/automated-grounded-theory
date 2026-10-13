@@ -262,6 +262,8 @@ def open_code(
     to ``model``. Sweep chunks default to 20 codes, sorted alphabetically by
     label and then by definition. A chunk carries full evidence for its own
     codes and for a bounded neighborhood of similar codes from other chunks.
+    A hinted pair is sent only when both codes' evidence is in that request.
+    Pairs past the neighborhood go into further bounded comparison requests.
     It does not repeat an index of the whole book. One compact label-only
     discovery call names candidates across the book. Sweeps after the first
     review only new or changed codes, and every ``full_audit_every`` sweeps
@@ -270,7 +272,9 @@ def open_code(
     ``token_budget`` (default 6000) bounds the request that will be sent:
     retrieved codes, the JSON schema, a short repair allowance, and reserved
     output. A batch that does not fit is repacked, and retrieved codes are
-    trimmed. A reservation larger than ``tokens_per_minute`` or
+    trimmed. Validation feedback is bounded and shortened until the retry
+    fits. A coding call or a schema repair that is still over the budget is
+    flagged and not sent. A reservation larger than ``tokens_per_minute`` or
     ``requests_per_minute`` raises ``OversizedReservation``.
     ``allow_oversized=True`` waits for a full bucket and then drains it.
     Token overlap, and embeddings when you pass
