@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import re
+import sys
 import threading
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -173,6 +174,22 @@ def _content_key(model_id: str, text: str, role: str) -> tuple[str, str]:
     return (f"{model_id}:{role}", digest)
 
 
+class _Inflight:
+    """One shared embedding call.
+
+    ``waiters`` counts callers that attached to this future after the owner
+    claimed it. ``task`` is the provider call. Releasing the cache entry while
+    that task is still running lets a later request start a second call.
+    """
+
+    __slots__ = ("future", "waiters", "task")
+
+    def __init__(self, future: asyncio.Future) -> None:
+        self.future = future
+        self.waiters = 0
+        self.task: asyncio.Task | None = None
+
+
 class _VectorCache:
     """Process-wide vectors and one codebook snapshot index.
 
@@ -182,7 +199,7 @@ class _VectorCache:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.vectors: dict[tuple[str, str], list[float]] = {}
-        self.inflight: dict[tuple[str, str], asyncio.Future] = {}
+        self.inflight: dict[tuple[str, str], _Inflight] = {}
         self.snapshots: dict[tuple[str, str], list[list[float]]] = {}
         self.snapshot_inflight: dict[tuple[str, str], asyncio.Future] = {}
 
@@ -229,23 +246,164 @@ def _silence_future(future: asyncio.Future) -> None:
 def _abort_inflight(keys: Sequence[tuple[str, str]], exc: BaseException) -> None:
     with _VECTOR_CACHE.lock:
         for key in keys:
-            _abort_future(_VECTOR_CACHE.inflight.pop(key, None), exc)
+            flight = _VECTOR_CACHE.inflight.pop(key, None)
+            if flight is not None:
+                _abort_future(flight.future, exc)
 
 
 def _release_inflight(keys: Sequence[tuple[str, str]], exc: BaseException) -> None:
-    """Fail unfinished calls. A query that already cached its vector is kept."""
+    """Fail unfinished calls. A query that already cached its vector is kept.
+
+    An entry whose provider task is still running stays. Clearing it while the
+    task continues lets the next request start a second call. A sibling that
+    another caller is waiting on is that case: the task keeps the entry and
+    publishes the vector when it returns.
+    """
     with _VECTOR_CACHE.lock:
         for key in keys:
-            future = _VECTOR_CACHE.inflight.get(key)
-            if future is None or future.done():
+            flight = _VECTOR_CACHE.inflight.get(key)
+            if flight is None or flight.future.done():
                 _VECTOR_CACHE.inflight.pop(key, None)
+                continue
+            if flight.task is not None and not flight.task.done():
                 continue
             cached = _VECTOR_CACHE.vectors.get(key)
             _VECTOR_CACHE.inflight.pop(key, None)
             if cached is not None:
-                future.set_result(list(cached))
+                flight.future.set_result(list(cached))
             else:
-                _abort_future(future, exc)
+                _abort_future(flight.future, exc)
+
+
+def _assign_inflight_task(keys: Sequence[tuple[str, str]], task: asyncio.Task) -> None:
+    with _VECTOR_CACHE.lock:
+        for key in keys:
+            flight = _VECTOR_CACHE.inflight.get(key)
+            if flight is not None and flight.task is None:
+                flight.task = task
+
+
+def _detach_waiter(key: tuple[str, str]) -> None:
+    with _VECTOR_CACHE.lock:
+        flight = _VECTOR_CACHE.inflight.get(key)
+        if flight is not None and flight.waiters > 0:
+            flight.waiters -= 1
+
+
+def _shared_with_other_waiters(keys: Sequence[tuple[str, str]]) -> bool:
+    """True when another caller is already waiting on one of these entries."""
+    with _VECTOR_CACHE.lock:
+        for key in keys:
+            flight = _VECTOR_CACHE.inflight.get(key)
+            if flight is not None and flight.waiters > 0:
+                return True
+    return False
+
+
+def _finish_flight(key: tuple[str, str], exc: BaseException | None) -> None:
+    """Publish the outcome of the task that owns ``key``, if it still does.
+
+    Success is the cached vector. A failure unblocks waiters when this task
+    still holds the entry, which is what happens when the group left a shared
+    sibling running.
+    """
+    task = asyncio.current_task()
+    with _VECTOR_CACHE.lock:
+        flight = _VECTOR_CACHE.inflight.get(key)
+        if flight is None:
+            return
+        if flight.task is not None and task is not None and flight.task is not task:
+            return
+        if flight.future.done():
+            _VECTOR_CACHE.inflight.pop(key, None)
+            return
+        cached = _VECTOR_CACHE.vectors.get(key)
+        if cached is not None:
+            _VECTOR_CACHE.inflight.pop(key, None)
+            flight.future.set_result(list(cached))
+            return
+        if exc is None:
+            return
+        _VECTOR_CACHE.inflight.pop(key, None)
+        _abort_future(flight.future, exc)
+
+
+def _consume_task(task: asyncio.Task) -> None:
+    if not task.done() or task.cancelled():
+        return
+    task.exception()
+
+
+def _first_task_error(pairs: Sequence[tuple[asyncio.Task, Sequence[tuple[str, str]]]]) -> BaseException | None:
+    for task, _keys in pairs:
+        if not task.done() or task.cancelled():
+            continue
+        exc = task.exception()
+        if exc is not None:
+            return exc
+    return None
+
+
+async def _settle_query_siblings(
+    pairs: Sequence[tuple[asyncio.Task, Sequence[tuple[str, str]]]],
+    *,
+    cancel_unshared: bool,
+) -> None:
+    """Wait out sibling provider calls before the group error is released.
+
+    ``cancel_unshared`` is for the caller's own cancellation. Siblings nobody
+    else is waiting on are cancelled and awaited, so they are not still running
+    when the cancellation returns. A sibling another caller already shielded
+    keeps running and keeps its entry. A provider failure does not cancel
+    siblings: their calls are awaited, and a success stays in the vector cache.
+    """
+    pending: list[asyncio.Task] = []
+    for task, keys in pairs:
+        if task.done():
+            _consume_task(task)
+            continue
+        if cancel_unshared and _shared_with_other_waiters(keys):
+            task.add_done_callback(_consume_task)
+            continue
+        if cancel_unshared:
+            task.cancel()
+        pending.append(task)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    for task in pending:
+        _consume_task(task)
+
+
+async def _await_query_group(jobs: Sequence[tuple[Any, Sequence[tuple[str, str]]]]) -> None:
+    """Run query tasks. A failure does not abandon the others.
+
+    ``asyncio.gather`` propagates the first exception and leaves unfinished
+    siblings running. The cache handler then removed their entries, so the next
+    request for a sibling started a second provider call. Exclusive siblings
+    are finished (awaited, or cancelled when this caller itself is cancelled)
+    before that error propagates. Cache ownership is released only after those
+    tasks are done.
+    """
+    if not jobs:
+        return
+    pairs: list[tuple[asyncio.Task, Sequence[tuple[str, str]]]] = []
+    for coro, keys in jobs:
+        task = asyncio.create_task(coro)
+        _assign_inflight_task(keys, task)
+        pairs.append((task, keys))
+    try:
+        await asyncio.wait([task for task, _keys in pairs], return_when=asyncio.FIRST_EXCEPTION)
+    except asyncio.CancelledError:
+        await _settle_query_siblings(pairs, cancel_unshared=True)
+        raise
+    error = _first_task_error(pairs)
+    if error is None:
+        leftover = [task for task, _keys in pairs if not task.done()]
+        if leftover:
+            await asyncio.wait(leftover)
+        return
+    await _settle_query_siblings(pairs, cancel_unshared=False)
+    raise error
 
 
 def cached_embed_texts(
@@ -308,7 +466,7 @@ async def cached_aembed_texts(
     result: list[list[float] | None] = [None] * len(texts)
     mine_keys: list[tuple[str, str]] = []
     mine_texts: list[str] = []
-    waiting: list[tuple[int, asyncio.Future]] = []
+    waiting: list[tuple[int, asyncio.Future, tuple[str, str]]] = []
     claimed: set[tuple[str, str]] = set()
     with _VECTOR_CACHE.lock:
         for index, key in enumerate(keys):
@@ -318,13 +476,14 @@ async def cached_aembed_texts(
                 continue
             inflight = _VECTOR_CACHE.inflight.get(key)
             if inflight is not None:
-                waiting.append((index, inflight))
+                inflight.waiters += 1
+                waiting.append((index, inflight.future, key))
                 continue
             if key in claimed:
                 continue
             claimed.add(key)
             future: asyncio.Future = loop.create_future()
-            _VECTOR_CACHE.inflight[key] = future
+            _VECTOR_CACHE.inflight[key] = _Inflight(future)
             mine_keys.append(key)
             mine_texts.append(texts[index])
     if mine_texts:
@@ -342,15 +501,18 @@ async def cached_aembed_texts(
             with _VECTOR_CACHE.lock:
                 for key, vector in zip(mine_keys, embedded):
                     stored = _store_vector(key, vector)
-                    future = _VECTOR_CACHE.inflight.pop(key, None)
-                    if future is not None and not future.done():
-                        future.set_result(stored)
+                    flight = _VECTOR_CACHE.inflight.pop(key, None)
+                    if flight is not None and not flight.future.done():
+                        flight.future.set_result(stored)
         except BaseException as exc:
             _release_inflight(mine_keys, exc)
             raise
-    for index, future in waiting:
-        # shield: cancelling this waiter must not cancel the shared call.
-        result[index] = list(await asyncio.shield(future))
+    for index, future, key in waiting:
+        try:
+            # shield: cancelling this waiter must not cancel the shared call.
+            result[index] = list(await asyncio.shield(future))
+        finally:
+            _detach_waiter(key)
     with _VECTOR_CACHE.lock:
         for index, key in enumerate(keys):
             if result[index] is None:
@@ -613,37 +775,52 @@ def _uncached_unique(embeddings, texts: Sequence[str], role: str) -> list[str]:
 
 
 async def _embed_query_batch(embeddings, texts: Sequence[str], *, batch_size: int, limiter) -> list[list[float]]:
-    """One provider call per chunk. Successes are cached before the next chunk."""
+    """One provider call per chunk. Successes are cached before the next chunk.
+
+    Chunks are siblings. If one chunk exhausts its retries, the others are
+    awaited before the error propagates, so their cache entries are not dropped
+    while those calls are still running.
+    """
     fn, sync = _batch_query_api(embeddings)
     size = max(1, int(batch_size))
     pending = _uncached_unique(embeddings, texts, "query")
     chunks = [pending[start : start + size] for start in range(0, len(pending), size)]
+    model = embedding_model_id(embeddings)
 
-    async def one(chunk: list[str]) -> None:
-        async with limiter.embed_semaphore:
-            # A previous chunk, or a concurrent caller, may have filled these.
-            needed = [text for text in chunk if _cached_vector(embeddings, text, "query") is None]
-            if not needed:
-                return
-
-            async def attempt() -> None:
-                current = [text for text in needed if _cached_vector(embeddings, text, "query") is None]
-                if not current:
+    async def one(chunk: list[str], keys: list[tuple[str, str]]) -> None:
+        try:
+            async with limiter.embed_semaphore:
+                # A previous chunk, or a concurrent caller, may have filled these.
+                needed = [text for text in chunk if _cached_vector(embeddings, text, "query") is None]
+                if not needed:
                     return
-                if sync:
-                    vectors = await asyncio.to_thread(fn, current)
-                else:
-                    vectors = await fn(current)
-                if len(vectors) != len(current):
-                    raise RuntimeError("embedding model returned a different number of vectors than texts")
-                _check_vectors(embeddings, vectors)
-                for text, vector in zip(current, vectors):
-                    _cache_vector(embeddings, text, "query", vector)
 
-            await _retry_embedding(limiter, attempt)
+                async def attempt() -> None:
+                    current = [text for text in needed if _cached_vector(embeddings, text, "query") is None]
+                    if not current:
+                        return
+                    if sync:
+                        vectors = await asyncio.to_thread(fn, current)
+                    else:
+                        vectors = await fn(current)
+                    if len(vectors) != len(current):
+                        raise RuntimeError("embedding model returned a different number of vectors than texts")
+                    _check_vectors(embeddings, vectors)
+                    for text, vector in zip(current, vectors):
+                        _cache_vector(embeddings, text, "query", vector)
+
+                await _retry_embedding(limiter, attempt)
+        finally:
+            exc = sys.exception()
+            for key in keys:
+                _finish_flight(key, exc)
 
     if chunks:
-        await asyncio.gather(*(one(chunk) for chunk in chunks))
+        jobs = []
+        for chunk in chunks:
+            keys = [_content_key(model, text, "query") for text in chunk]
+            jobs.append((one(chunk, keys), keys))
+        await _await_query_group(jobs)
     cached = [_cached_vector(embeddings, text, "query") for text in texts]
     if any(vector is None for vector in cached):
         raise RuntimeError("embedding cache missed a query it had claimed")
@@ -654,27 +831,38 @@ async def _embed_queries_one_by_one(embeddings, texts: Sequence[str], limiter) -
     """Each query takes one semaphore slot, one timeout, and its own retries.
 
     A query that returns is cached before the others finish, so a retry of a
-    sibling does not embed it again.
+    sibling does not embed it again. If one query exhausts its retries, the
+    others are awaited before that error propagates. Their in-flight entries
+    stay until those tasks finish, and a sibling another caller is waiting on
+    is not cancelled when this caller is cancelled.
     """
     unique = _uncached_unique(embeddings, texts, "query")
+    model = embedding_model_id(embeddings)
 
-    async def one(text: str) -> None:
-        if _cached_vector(embeddings, text, "query") is not None:
-            return
-        async with limiter.embed_semaphore:
+    async def one(text: str, key: tuple[str, str]) -> None:
+        try:
             if _cached_vector(embeddings, text, "query") is not None:
                 return
-
-            async def attempt() -> None:
+            async with limiter.embed_semaphore:
                 if _cached_vector(embeddings, text, "query") is not None:
                     return
-                vector = await _invoke_one_query(embeddings, text)
-                _cache_vector(embeddings, text, "query", vector)
 
-            await _retry_embedding(limiter, attempt)
+                async def attempt() -> None:
+                    if _cached_vector(embeddings, text, "query") is not None:
+                        return
+                    vector = await _invoke_one_query(embeddings, text)
+                    _cache_vector(embeddings, text, "query", vector)
+
+                await _retry_embedding(limiter, attempt)
+        finally:
+            _finish_flight(key, sys.exception())
 
     if unique:
-        await asyncio.gather(*(one(text) for text in unique))
+        jobs = []
+        for text in unique:
+            key = _content_key(model, text, "query")
+            jobs.append((one(text, key), [key]))
+        await _await_query_group(jobs)
     cached = [_cached_vector(embeddings, text, "query") for text in texts]
     if any(vector is None for vector in cached):
         raise RuntimeError("embedding cache missed a query it had claimed")
