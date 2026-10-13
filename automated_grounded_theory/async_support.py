@@ -542,14 +542,25 @@ class OversizedReservation(ValueError):
 class OversizedRequest(RuntimeError):
     """A model call is still over ``token_budget`` after fitting.
 
-    The call was not sent. ``estimated`` and ``budget`` are the counts the
-    check compared.
+    The call is sent anyway. ``estimated`` and ``budget`` are the counts the
+    check compared. Callers record an ``oversized_request`` flag.
     """
 
     def __init__(self, message: str, *, estimated: int, budget: int) -> None:
         super().__init__(message)
         self.estimated = int(estimated)
         self.budget = int(budget)
+
+
+def oversized_request_message(kind: str, estimated: int, budget: int, passage_id: str = "") -> str:
+    """Warning text for a request that is still over ``token_budget``."""
+    label = {"coding": "Coding request", "schema_repair": "Schema repair"}.get(kind, kind)
+    target = f" for {passage_id}" if passage_id else ""
+    return (
+        f"{label}{target} is {int(estimated)} estimated tokens, "
+        f"over token_budget ({int(budget)}). "
+        "The overflow was flagged and the request was sent."
+    )
 
 
 def is_timeout(exc: BaseException) -> bool:
@@ -799,21 +810,29 @@ def sweep_deadline(request_timeout: float, sweep_timeout: float) -> float:
     return max(coding, sweep)
 
 
-def _refuse_oversized(messages, schema, tokenizer, *, budget: int | None, reserved: int, kind: str) -> None:
-    """Last check before a provider call. Over-budget requests are not sent."""
+def _request_overflow(
+    messages,
+    schema,
+    tokenizer,
+    *,
+    budget: int | None,
+    reserved: int,
+    kind: str,
+    passage_id: str = "",
+) -> OversizedRequest | None:
+    """Last measurement before a provider call.
+
+    A request that is still over ``budget`` is flagged and still sent.
+    """
     if budget is None:
-        return
+        return None
     from automated_grounded_theory.batching import request_input_tokens
 
     estimated = request_input_tokens(messages, schema, tokenizer) + max(0, int(reserved))
     if estimated <= int(budget):
-        return
-    message = (
-        f"{kind[0].upper() + kind[1:]} is {estimated} estimated tokens, over token_budget ({budget}). "
-        "The overflow was flagged and the request was not sent."
-    )
-    logger.warning("%s", message)
-    raise OversizedRequest(message, estimated=estimated, budget=int(budget))
+        return None
+    message = oversized_request_message(kind, estimated, int(budget), passage_id)
+    return OversizedRequest(message, estimated=estimated, budget=int(budget))
 
 
 async def ainvoke_structured(
@@ -826,6 +845,8 @@ async def ainvoke_structured(
     reserved_output: int | None = None,
     token_budget: int | None = None,
     tokenizer=None,
+    passage_id: str = "",
+    on_overflow: Callable[[OversizedRequest], None] | None = None,
 ) -> tuple[tuple[dict, dict], list]:
     """Invoke ``schema`` once, then repair a single malformed output.
 
@@ -836,7 +857,8 @@ async def ainvoke_structured(
 
     When ``token_budget`` is set, the repair request is measured again,
     including the schema, and the repair note is shortened until the input
-    plus ``reserved_output`` fits that budget.
+    plus ``reserved_output`` fits that budget. A repair that is still over
+    the budget is logged, reported to ``on_overflow``, and sent.
     """
     from langchain_core.messages import HumanMessage
 
@@ -851,7 +873,7 @@ async def ainvoke_structured(
     reserved = 0 if reserved_output is None else max(0, int(reserved_output))
     budget = None if token_budget is None else max(1, int(token_budget))
     sent = list(messages)
-    # The coding caller measures this payload and either fits it or flags it.
+    # The coding caller measures this payload and flags it when it is still over.
     # The repair below is a second invocation and is checked on its own.
     result = await limiter.ainvoke(runnable, sent, **extra)
     try:
@@ -870,7 +892,19 @@ async def ainvoke_structured(
         if budget is not None:
             ceiling = max(1, budget - reserved)
             repair = shrink_repair_messages(repair, schema, ceiling, tokenizer)
-        _refuse_oversized(repair, schema, tokenizer, budget=budget, reserved=reserved, kind="schema repair")
+        overflow = _request_overflow(
+            repair,
+            schema,
+            tokenizer,
+            budget=budget,
+            reserved=reserved,
+            kind="schema_repair",
+            passage_id=passage_id,
+        )
+        if overflow is not None:
+            logger.warning("%s", overflow)
+            if on_overflow is not None:
+                on_overflow(overflow)
         try:
             limiter.schema_repairs = int(getattr(limiter, "schema_repairs", 0) or 0) + 1
             repaired = await limiter.ainvoke(runnable, repair, **extra)

@@ -3,7 +3,7 @@
 ## 0.6.8
 
 - Code retrieval for a coding round is one async call per passage and codebook snapshot. Planning and coding share that ranking. Embedding calls go through the embedding semaphore, with the same retries and timeout as other embedding work, and they do not block the event loop. A passage is embedded as a query in both the sync and async retrievers, so it is not embedded a second time as a document.
-- Validation feedback is capped, and a retry shortens it before dropping codes that already fit. A coding call, a validation retry, and a schema repair are measured again immediately before they are sent. A request that is still over `token_budget` is flagged in the run warnings and is not sent.
+- Validation feedback is capped, and a retry shortens it before dropping codes that already fit. A coding call, a validation retry, and a schema repair are measured again immediately before they are sent. A request that is still over `token_budget` after that trimming is sent. The run logs a warning and records an `oversized_request` flag on the run metadata and the review list, with the passage id and the estimated size.
 - A sweep hint is sent only when both codes' definitions and examples are in that request. Partners that do not fit in the bounded neighborhood (`cross_chunk_limit`, default 8) are queued onto further bounded comparison requests. None of those pairs are dropped, and none are decided without the partner's evidence.
 - `policy_version` is `0.6.8`.
 

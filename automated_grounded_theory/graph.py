@@ -39,6 +39,7 @@ from automated_grounded_theory.async_support import (
     OversizedRequest,
     ainvoke_structured,
     is_transient,
+    oversized_request_message,
     sweep_deadline,
 )
 from automated_grounded_theory.batching import (
@@ -194,8 +195,8 @@ class RunConfig:
     limiter: Any = None
     prompt_records: list = field(default_factory=list)
     notes: list = field(default_factory=list)
+    oversized_requests: list = field(default_factory=list)
     _rankings: dict = field(default_factory=dict)
-    _oversized_passages: set = field(default_factory=set)
     _log_lock: threading.Lock | None = None
 
     def __post_init__(self) -> None:
@@ -494,7 +495,6 @@ def _code_worker(runtime: RunConfig):
             "policy_version": state.get("worker_policy_version") or POLICY_VERSION,
         }
         book = dict(state.get("worker_codebook") or {})
-        _note_sent_alone(runtime, str(state.get("worker_warning") or ""), passages)
         bucket: list[dict] = []
         push = getattr(runtime.limiter, "push_accounting", None)
         token = push(bucket) if push is not None else None
@@ -1001,8 +1001,8 @@ def _fit_coding_messages(
     """Assemble the real request, then drop codes and shorten feedback until it fits.
 
     An empty codebook view is not success. Validation feedback can still leave
-    the request over ``budget``. The caller checks the returned messages and
-    does not send them when they are still over.
+    the request over ``budget``. The caller sends those messages, logs a
+    warning, and records an ``oversized_request`` flag.
     """
     view, omitted = _view_for(entries, per_passage, runtime.frequent_codes)
     full = len(view)
@@ -1303,7 +1303,6 @@ async def _pending_rows(runtime: RunConfig, state: CodingState, jobs: list[tuple
         warning = str((meta or {}).get("warning") or "")
         if warning and warning not in runtime.notes:
             runtime.notes.append(warning)
-        _note_sent_alone(runtime, warning, [state["passages"][index] for index in indices])
         book = _book_for(state, doc_id)
         coded = await _code_indexed(
             runtime,
@@ -1591,55 +1590,87 @@ async def _rank_passages(
     return [list(_cached_labels(runtime, snapshot, text, k) or []) for text in texts]
 
 
-def _note_sent_alone(runtime: RunConfig, warning: str, passages: Sequence[Mapping[str, Any]]) -> None:
-    """Remember passages the planner could not split and already flagged."""
-    if "sent alone" not in warning:
-        return
-    for passage in passages:
-        passage_id = str(passage.get("passage_id") or "")
-        if passage_id and passage_id in warning:
-            runtime._oversized_passages.add(passage_id)
+def _passage_ids(passages: Sequence[Mapping[str, Any]] | Sequence[str]) -> list[str]:
+    ids: list[str] = []
+    for item in passages:
+        if isinstance(item, str):
+            ids.extend(part for part in item.split(",") if part)
+        else:
+            passage_id = str(item.get("passage_id") or "")
+            if passage_id:
+                ids.append(passage_id)
+    return ids
 
 
-def _packer_already_flagged(runtime: RunConfig, passages: Sequence[Mapping[str, Any]]) -> bool:
-    """True when the planner already warned that these passages cannot be split.
-
-    That warning is the explicit flag for a request the fixed schema makes
-    larger than ``token_budget``. The call is still sent. Every other overflow
-    is not.
-    """
-    ids = [str(passage.get("passage_id") or "") for passage in passages]
-    flagged = runtime._oversized_passages
-    return bool(ids) and all(passage_id and passage_id in flagged for passage_id in ids)
-
-
-def _overflow_note(passage_ids: str, cost: int, budget: int) -> str:
-    return (
-        f"Coding request for {passage_ids} is {cost} estimated tokens, "
-        f"over token_budget ({budget}). The overflow was flagged and the request was not sent."
-    )
-
-
-def _unsent_coding(passage: Mapping[str, Any]) -> dict:
-    return {
-        "passage_id": str(passage.get("passage_id") or ""),
-        "codes": [],
-        "memo": "",
-        "low_confidence": True,
-        "coverage_status": "failed",
-        "overflow": True,
-    }
+def _record_oversized(
+    runtime: RunConfig,
+    passages: Sequence[Mapping[str, Any]] | Sequence[str],
+    estimated: int,
+    budget: int,
+    *,
+    kind: str,
+    log: bool = True,
+) -> None:
+    """Warn and store one ``oversized_request`` flag per passage. The call is still sent."""
+    ids = _passage_ids(passages) or ["unknown"]
+    note = oversized_request_message(kind, estimated, budget, ",".join(ids))
+    _remember_note(runtime, note)
+    if log:
+        logger.warning("%s", note)
+    for passage_id in ids:
+        row = {
+            "flag": "oversized_request",
+            "passage_id": passage_id,
+            "estimated": int(estimated),
+            "budget": int(budget),
+            "kind": kind,
+        }
+        if row not in runtime.oversized_requests:
+            runtime.oversized_requests.append(row)
 
 
-def _is_overflow(exc: BaseException) -> bool:
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if isinstance(current, OversizedRequest):
-            return True
-        current = current.__cause__
-    return False
+def _attach_oversized(
+    runtime: RunConfig,
+    state: Mapping[str, Any],
+    review: list,
+) -> tuple[dict | None, list]:
+    """Copy flags into run metadata and the review list. Coding is not dropped."""
+    rows = [dict(item) for item in runtime.oversized_requests]
+    runtime.oversized_requests.clear()
+    if not rows:
+        return None, review
+    metadata = dict(state.get("metadata") or {})
+    stored = [dict(item) for item in (metadata.get("oversized_requests") or [])]
+    review = list(review)
+    for row in rows:
+        stored.append(row)
+        review.append(
+            {
+                "status": "review",
+                "reason": "oversized_request",
+                "flag": "oversized_request",
+                "passage_id": row["passage_id"],
+                "estimated": row["estimated"],
+                "budget": row["budget"],
+                "kind": row.get("kind") or "coding",
+            }
+        )
+    metadata["oversized_requests"] = stored
+    return metadata, review
+
+
+def _on_schema_overflow(runtime: RunConfig, passage_id: str):
+    def _record(flag: OversizedRequest) -> None:
+        _record_oversized(
+            runtime,
+            [passage_id] if passage_id else [],
+            flag.estimated,
+            flag.budget,
+            kind="schema_repair",
+            log=False,
+        )
+
+    return _record
 
 
 async def _invoke_coding(
@@ -1667,38 +1698,22 @@ async def _invoke_coding(
         messages = _fit_coding_messages(runtime, subset, entries, ranks, feedback, budget)
         passage_ids = ",".join(str(passage.get("passage_id")) for passage in subset)
         cost = _coding_request_cost(runtime, messages, len(subset))
-        if cost > budget and not _packer_already_flagged(runtime, subset):
-            note = _overflow_note(passage_ids, cost, budget)
-            _remember_note(runtime, note)
-            logger.warning("%s", note)
-            aligned.extend(_unsent_coding(passage) for passage in subset)
-            continue
         if cost > budget:
-            _remember_note(
-                runtime,
-                f"Coding request for {passage_ids} is {cost} estimated tokens, "
-                f"over token_budget ({budget}). It could not be reduced further and was flagged.",
-            )
-        try:
-            parsed = await _ainvoke_structured(
-                runtime.coder,
-                BatchCoding,
-                messages,
-                kind="code_passage",
-                model_name=runtime.model_name,
-                passage_id=passage_ids,
-                runtime=runtime,
-                reserved_output=reserved_output_tokens(
-                    len(subset),
-                    max_codes_per_passage=runtime.max_codes_per_passage,
-                ),
-                token_budget=budget,
-            )
-        except CodingError as exc:
-            if not _is_overflow(exc):
-                raise
-            aligned.extend(_unsent_coding(passage) for passage in subset)
-            continue
+            _record_oversized(runtime, subset, cost, budget, kind="coding")
+        parsed = await _ainvoke_structured(
+            runtime.coder,
+            BatchCoding,
+            messages,
+            kind="code_passage",
+            model_name=runtime.model_name,
+            passage_id=passage_ids,
+            runtime=runtime,
+            reserved_output=reserved_output_tokens(
+                len(subset),
+                max_codes_per_passage=runtime.max_codes_per_passage,
+            ),
+            token_budget=budget,
+        )
         aligned.extend(_align_batch(parsed, subset))
     return aligned
 
@@ -1879,12 +1894,13 @@ def _validate_node(runtime: RunConfig):
         _append_reading_notes(memos, counters, pending_sorted, state)
         notes = list(runtime.notes)
         runtime.notes.clear()
+        metadata, review = _attach_oversized(runtime, state, review)
 
         if state.get("parallel"):
             codebook = union_codebooks(list(branch_books.values()))
             codebook = _resync(codebook, segments)
 
-        return {
+        returned = {
             "codebook": codebook,
             "segments": segments,
             "memos": memos,
@@ -1904,6 +1920,9 @@ def _validate_node(runtime: RunConfig):
             "warnings": list(state.get("warnings") or []) + notes,
             "passages": state.get("passages") or [],
         }
+        if metadata is not None:
+            returned["metadata"] = metadata
+        return returned
 
     runtime._commit = validate_passage
     return validate_passage
@@ -2204,7 +2223,12 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
             rejections=list(parsed.get("rejections") or []),
             skipped=list(parsed.get("skipped_candidates") or []),
         )
-        warnings = list(state.get("warnings") or []) + list(parsed.get("warnings") or []) + list(runtime.notes)
+        base_warnings = list(state.get("warnings") or [])
+        if overlap_state is not None:
+            for warning in overlap_state.get("warnings") or []:
+                if warning not in base_warnings:
+                    base_warnings.append(warning)
+        warnings = base_warnings + list(parsed.get("warnings") or []) + list(runtime.notes)
         runtime.notes.clear()
         ignored = list(applied.get("ignored_decisions") or [])
         if ignored:
@@ -2288,6 +2312,7 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
         carried = overlap_state if overlap_state is not None else state
         ops = list(carried.get("ops") or [])
         review = list(carried.get("review") or [])
+        oversized_metadata, review = _attach_oversized(runtime, carried, review)
         for op in applied.get("ops") or []:
             op = dict(op)
             if not op.get("op_id"):
@@ -2340,6 +2365,10 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
             quote_stats.get("merges_later_split") or 0
         )
         update["metrics"] = metrics
+        if oversized_metadata is not None:
+            update["metadata"] = oversized_metadata
+        elif overlap_state is not None and overlap_state.get("metadata"):
+            update["metadata"] = overlap_state["metadata"]
         if overlap_state is not None:
             coded_before = int(state.get("passages_since_sweep") or 0)
             new_before = int(state.get("new_codes_since_sweep") or 0)
@@ -3204,10 +3233,10 @@ async def _ainvoke_structured(
             reserved_output=reserved_output,
             token_budget=token_budget,
             tokenizer=resolve_tokenizer(model),
+            passage_id=passage_id,
+            on_overflow=_on_schema_overflow(runtime, passage_id),
         )
     except Exception as exc:
-        if _is_overflow(exc):
-            _remember_note(runtime, str(exc))
         raise CodingError(f"{kind} failed for {passage_id}: {exc}") from exc
     _append_prompt_log(
         runtime,

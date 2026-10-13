@@ -274,7 +274,9 @@ def open_code(
     output. A batch that does not fit is repacked, and retrieved codes are
     trimmed. Validation feedback is bounded and shortened until the retry
     fits. A coding call or a schema repair that is still over the budget is
-    flagged and not sent. A reservation larger than ``tokens_per_minute`` or
+    sent, with a warning and an ``oversized_request`` flag (passage id and
+    estimated size) on the run metadata and the review list. A reservation
+    larger than ``tokens_per_minute`` or
     ``requests_per_minute`` raises ``OversizedReservation``.
     ``allow_oversized=True`` waits for a full bucket and then drains it.
     Token overlap, and embeddings when you pass

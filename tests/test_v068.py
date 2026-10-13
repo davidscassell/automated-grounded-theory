@@ -9,17 +9,20 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableLambda
 
-from automated_grounded_theory.async_support import CallLimiter, OversizedRequest, ainvoke_structured
+from automated_grounded_theory import open_code
+from automated_grounded_theory.async_support import CallLimiter, ainvoke_structured
 from automated_grounded_theory.batching import request_input_tokens
 from automated_grounded_theory.context import ResearchContext
 from automated_grounded_theory.graph import (
     RunConfig,
+    _attach_oversized,
     _coding_messages_for,
     _coding_request_cost,
     _invoke_coding,
     _sweep_chunks,
     _wave,
 )
+from automated_grounded_theory.results import result_from_state
 from automated_grounded_theory.prompts import extract_payload, message_text, validation_feedback
 from automated_grounded_theory.records import POLICY_VERSION
 from automated_grounded_theory.retrieval import (
@@ -173,7 +176,7 @@ def _grow_feedback(runtime, passage, per_passage, view, omitted) -> str:
         feedback += "x" * 400
 
 
-def test_validation_feedback_retry_is_not_sent_oversized():
+def test_validation_feedback_is_shortened_when_the_retry_can_fit():
     context = ResearchContext(research_question="What is happening?")
     entry = {
         "code": "packing bags",
@@ -202,11 +205,9 @@ def test_validation_feedback_retry_is_not_sent_oversized():
         pipeline=False,
         limiter=CallLimiter(1, max_retries=0, backoff=0, request_timeout=5),
     )
-    bare = _coding_messages_for(runtime, [passages[0]], per_passage, None, [entry], 0)
-    assert _coding_request_cost(runtime, bare, 1) <= 6000
-    feedback = _grow_feedback(runtime, passages[0], per_passage, [entry], 0)
+    feedback = "quote_not_verbatim " + ("x" * 20000)
     oversized = _coding_messages_for(runtime, [passages[0]], per_passage, {"p1": feedback}, [entry], 0)
-    assert _coding_request_cost(runtime, oversized, 1) >= 13031
+    assert _coding_request_cost(runtime, oversized, 1) > 6000
 
     aligned = asyncio.run(_invoke_coding(runtime, passages, codebook, {"p1": feedback}))
     assert len(aligned) == 2
@@ -215,6 +216,7 @@ def test_validation_feedback_retry_is_not_sent_oversized():
     assert len(sent) == 2
     assert any("Repacked" in note for note in runtime.notes)
     assert any("Shortened validation feedback" in note for note in runtime.notes)
+    assert runtime.oversized_requests == []
     for record in sent:
         messages = _messages_from_log(record)
         assert _coding_request_cost(runtime, messages, 1) <= 6000
@@ -224,34 +226,102 @@ def test_validation_feedback_retry_is_not_sent_oversized():
     assert any(row.get("label") == "packing bags" for row in packed.get("codebook") or [])
 
 
-def test_request_that_cannot_fit_is_flagged_and_not_sent():
+def test_validation_feedback_retry_over_budget_is_sent_and_flagged():
+    """The 13,031-vs-6,000 retry is sent, warned, and flagged."""
     context = ResearchContext(research_question="What is happening?")
-    passage = {"passage_id": "p-huge", "text": "word " * 20000, "doc_id": "d1"}
+    entry = {
+        "code": "packing bags",
+        "definition": "putting clothes in a bag",
+        "frequency": 2,
+        "examples": [{"quote": "I was packing bags."}],
+    }
+    passage = {"passage_id": "p1", "text": "word " * 12000, "doc_id": "d1"}
+    codebook = {entry["code"]: entry}
+    retriever = LexicalCodeRetriever()
+    per_passage = [retriever.rank(passage["text"], [entry], k=4)]
     coder = FakeCoder()
     runtime = RunConfig(
         coder=coder,
         sweeper=FakeCoder(),
-        retriever=LexicalCodeRetriever(),
+        retriever=retriever,
         embeddings=None,
         context=context,
         prompt_cache=False,
         top_k_codes=4,
         frequent_codes=0,
         token_budget=6000,
-        validation_retries=0,
+        validation_retries=1,
         pipeline=False,
         limiter=CallLimiter(1, max_retries=0, backoff=0, request_timeout=5),
     )
-    aligned = asyncio.run(_invoke_coding(runtime, [passage], {}, None))
-    assert coder.call_count == 0
-    assert aligned[0]["coverage_status"] == "failed"
-    assert aligned[0]["overflow"] is True
-    assert runtime.prompt_records == []
-    note = " ".join(runtime.notes)
-    assert "flagged" in note
-    assert "not sent" in note
-    assert "6000" in note
-    assert any(int(token) > 6000 for token in note.split() if token.isdigit())
+    feedback = _grow_feedback(runtime, passage, per_passage, [entry], 0)
+    oversized = _coding_messages_for(runtime, [passage], per_passage, {"p1": feedback}, [entry], 0)
+    assert _coding_request_cost(runtime, oversized, 1) >= 13031
+
+    aligned = asyncio.run(_invoke_coding(runtime, [passage], codebook, {"p1": feedback}))
+    assert coder.call_count >= 1
+    assert aligned[0]["passage_id"] == "p1"
+    assert aligned[0].get("coverage_status") != "failed"
+    sent = [record for record in runtime.prompt_records if record["kind"] == "code_passage"]
+    assert len(sent) == 1
+    sent_cost = _coding_request_cost(runtime, _messages_from_log(sent[0]), 1)
+    assert sent_cost >= 13031
+    assert any("flagged" in note and "sent" in note for note in runtime.notes)
+    flag = runtime.oversized_requests[0]
+    assert flag["flag"] == "oversized_request"
+    assert flag["passage_id"] == "p1"
+    assert flag["estimated"] >= 13031
+    assert flag["estimated"] == sent_cost
+    assert flag["budget"] == 6000
+    metadata, review = _attach_oversized(runtime, {"metadata": {"seed": 1}}, [])
+    result = result_from_state(
+        {
+            "metadata": metadata,
+            "review": review,
+            "warnings": list(runtime.notes),
+            "passages": [],
+            "documents": [],
+            "segments": [],
+            "codebook": {},
+        },
+        interrupted=False,
+        thread_id="",
+        resumable=False,
+    )
+    recorded = result.metadata["oversized_requests"][0]
+    assert recorded["passage_id"] == "p1"
+    assert recorded["estimated"] >= 13031
+    assert result.review[0]["flag"] == "oversized_request"
+    assert result.review[0]["passage_id"] == "p1"
+    assert result.review[0]["estimated"] >= 13031
+
+
+def test_oversized_coding_is_sent_and_recorded_on_the_run():
+    result = open_code(
+        ["I spent the morning packing my suitcase."],
+        "What is happening?",
+        model=FakeCoder(),
+        seed=1,
+        token_budget=200,
+        sweep_every=100,
+        pipeline=False,
+        concurrency=1,
+    )
+    assert result.segments
+    flags = result.metadata["oversized_requests"]
+    assert flags
+    passage_ids = {str(item.get("passage_id") or "") for item in result.passages}
+    assert flags[0]["flag"] == "oversized_request"
+    assert flags[0]["passage_id"] in passage_ids
+    assert flags[0]["estimated"] > 200
+    assert flags[0]["budget"] == 200
+    assert any(
+        item.get("flag") == "oversized_request"
+        and item.get("passage_id") == flags[0]["passage_id"]
+        and item.get("estimated") == flags[0]["estimated"]
+        for item in result.review
+    )
+    assert any("flagged" in warning and "sent" in warning for warning in result.warnings)
 
 
 def test_validation_feedback_is_bounded():
@@ -264,10 +334,11 @@ def test_validation_feedback_is_bounded():
     assert "omitted" in text
 
 
-def test_schema_repair_over_budget_is_flagged_and_not_sent(caplog):
+def test_schema_repair_over_budget_is_sent_and_flagged(caplog):
     messages = [SystemMessage(content="Code the passage."), HumanMessage(content='{"passages":[]}')]
     budget = request_input_tokens(messages, PassageCoding)
     calls = {"n": 0}
+    flagged = []
 
     class Model:
         def with_structured_output(self, schema, **kwargs):
@@ -285,8 +356,11 @@ def test_schema_repair_over_budget_is_flagged_and_not_sent(caplog):
         async def ainvoke(self, runnable, payload, **kwargs):
             return runnable.invoke(payload)
 
+    def _capture(flag):
+        flagged.append(flag)
+
     with caplog.at_level(logging.WARNING, logger="automated_grounded_theory"):
-        with pytest.raises(OversizedRequest, match="not sent") as caught:
+        with pytest.raises(ValueError):
             asyncio.run(
                 ainvoke_structured(
                     Model(),
@@ -295,11 +369,15 @@ def test_schema_repair_over_budget_is_flagged_and_not_sent(caplog):
                     Limiter(),
                     token_budget=budget,
                     reserved_output=0,
+                    passage_id="p-repair",
+                    on_overflow=_capture,
                 )
             )
-    assert calls["n"] == 1
-    assert caught.value.estimated > caught.value.budget
+    assert calls["n"] == 2
+    assert flagged[0].estimated > flagged[0].budget
+    assert "p-repair" in str(flagged[0])
     assert "flagged" in caplog.text
+    assert "sent" in caplog.text
 
 
 class _DecideSweeper(FakeCoder):
