@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.9
+
+- A passage that does not fit in `token_budget` is split on whitespace without restarting the packer for each candidate slice. The splitter finalizes the slices, then those slices are ranked together. One paragraph of about 11,000 characters with `unit="paragraph"` and `token_budget=4000` completes, and so does a 100,000-character paragraph. The run used to raise `coding planner could not rank passage slices` after 64 restarts.
+- Query embeddings take one slot on the shared embedding semaphore, with one timeout and one retry budget each. A query that succeeds is cached immediately, so a later retry does not embed it again. Providers that implement `aembed_queries` or `embed_queries` are called with the whole chunk. Four queries of 30 ms under a 75 ms timeout all finish, and each text is embedded once.
+- `scripts/benchmark_review_modes.py` adds an embedding-latency row. It sleeps on each embedding call and sends passage text through the query API. `--embedding-delay 0` skips that row.
+- `policy_version` is `0.6.9`.
+
 ## 0.6.8
 
 - Code retrieval for a coding round is one async call per passage and codebook snapshot. Planning and coding share that ranking. Embedding calls go through the embedding semaphore, with the same retries and timeout as other embedding work, and they do not block the event loop. A passage is embedded as a query in both the sync and async retrievers, so it is not embedded a second time as a document.

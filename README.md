@@ -234,7 +234,7 @@ The checks and the sweep exist because that JMIR tutorial found LLM coding weak 
 
 ## Speed
 
-`scripts/benchmark_review_modes.py` runs a fake coder that sleeps 0.05s per call on 6 documents × 4 passages (24 passages), seed 7, `sweep_every=8`, `unit="paragraph"`. No API key. Measured on 0.6.0. 0.6.1 was not remeasured. On 0.6.0, `concurrency` widened the frozen window. From 0.6.4 only `passages_per_codebook_update` does that. The sequential row is what `strict_sequential_settings()` names.
+`scripts/benchmark_review_modes.py` runs a fake coder that sleeps 0.05s per call on 6 documents × 4 passages (24 passages), seed 7, `sweep_every=8`, `unit="paragraph"`. No API key. It also runs an embedding-latency row that sleeps on each embedding call and ranks passages through the query API. `--embedding-delay 0` skips that row. Measured on 0.6.0. 0.6.1 was not remeasured. On 0.6.0, `concurrency` widened the frozen window. From 0.6.4 only `passages_per_codebook_update` does that. The sequential row is what `strict_sequential_settings()` names.
 
 | Mode | What it does | Seconds | Calls | Passages/s | Codes | Merges | Near-duplicate pairs left |
 | --- | --- | --- | --- | --- | --- | --- | --- |

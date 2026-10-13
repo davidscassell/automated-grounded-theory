@@ -1,4 +1,4 @@
-# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, and 0.6.8)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, and 0.6.9)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
 Status: steps 1 and 2 of the v0.6 plan. Category development, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
@@ -212,6 +212,16 @@ A sweep requests a decision only for pairs whose definitions and examples are bo
 
 `policy_version` is `0.6.8`.
 
-## 17. Out of scope
+## 17. Corrections in 0.6.9
+
+Oversized passages are split to completion. The packer used to stop at the first slice that had no ranking, embed that slice, and start the whole pack again. After 64 restarts it raised `coding planner could not rank passage slices` even when each restart had ranked another slice. Candidate slices are measured without that round trip. The slices that are kept are ranked once, together.
+
+Query embeddings are not one sequential list under a single batch timeout. Each query uses the shared embedding semaphore, its own timeout, and its own retries. A success is written to the vector cache before the rest of the batch finishes, so a retry does not embed it again. `aembed_queries` or `embed_queries`, when the provider has one, embeds the chunk in one call.
+
+`scripts/benchmark_review_modes.py` runs an embedding-latency row unless `--embedding-delay 0`. That row sleeps on embedding calls and ranks passages as queries.
+
+`policy_version` is `0.6.9`.
+
+## 18. Out of scope
 
 Category feedback, focused recoding of earlier negatives, relationship hypotheses, sampling briefs, and a Taguette project-file adapter. See the v0.6 plan steps 3–5.

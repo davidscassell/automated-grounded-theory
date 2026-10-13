@@ -2,10 +2,13 @@
 """Compare sequential, document, and wave review on a fake model with latency.
 
 No API key. The coder sleeps on each call so wall time reflects concurrency
-rather than a provider. Quality proxies are the final code count, accepted
+rather than a provider. The embedding-latency row also sleeps on each
+embedding call and ranks passages through the query API, so query concurrency
+is part of the timing. Quality proxies are the final code count, accepted
 merges, and near-duplicate pairs (label Jaccard >= 0.5) left after synthesis.
 
     python scripts/benchmark_review_modes.py
+    python scripts/benchmark_review_modes.py --embedding-delay 0.03
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ import asyncio
 import json
 import time
 
+from langchain_core.embeddings import Embeddings
 from langchain_core.runnables import RunnableLambda
 
 from automated_grounded_theory import open_code
@@ -35,6 +39,44 @@ class SlowCoder(FakeCoder):
             return parent.invoke(messages)
 
         return RunnableLambda(_call)
+
+
+class SlowEmbeddings(Embeddings):
+    """Embeddings that sleep. Queries use the async query API, one text at a time."""
+
+    def __init__(self, delay: float) -> None:
+        self.delay = delay
+        self.model = "benchmark-slow-embeddings"
+        self.dimensions = 4
+        self.queries: list[str] = []
+        self.documents: list[str] = []
+        self.in_flight = 0
+        self.peak = 0
+
+    def embed_documents(self, texts):
+        time.sleep(self.delay)
+        self.documents.extend(list(texts))
+        return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+    def embed_query(self, text):
+        time.sleep(self.delay)
+        self.queries.append(text)
+        return [0.0, 1.0, 0.0, 0.0]
+
+    async def aembed_documents(self, texts):
+        await asyncio.sleep(self.delay)
+        self.documents.extend(list(texts))
+        return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+    async def aembed_query(self, text):
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        self.queries.append(text)
+        try:
+            await asyncio.sleep(self.delay)
+            return [0.0, 1.0, 0.0, 0.0]
+        finally:
+            self.in_flight -= 1
 
 
 def corpus(documents: int = 6, passages: int = 4) -> list[dict]:
@@ -66,31 +108,58 @@ def _merges(result) -> int:
     return sum(len(entry.get("accepted_merges") or []) for entry in result.sweep_log)
 
 
-def run_mode(name: str, *, delay: float, **kwargs) -> dict:
+def run_mode(
+    name: str,
+    *,
+    delay: float,
+    embeddings=None,
+    documents: int = 6,
+    passages: int = 4,
+    rows: list | None = None,
+    **kwargs,
+) -> dict:
     coder = SlowCoder()
     coder.delay = delay
     started = time.perf_counter()
-    result = open_code(corpus(), "How do people leave?", model=coder, seed=7, **kwargs)
+    result = open_code(
+        rows if rows is not None else corpus(documents, passages),
+        "How do people leave?",
+        model=coder,
+        seed=7,
+        embeddings=embeddings,
+        **kwargs,
+    )
     elapsed = time.perf_counter() - started
-    passages = len(result.passages)
-    return {
+    passage_count = len(result.passages)
+    row = {
         "mode": name,
         "seconds": round(elapsed, 3),
         "calls": coder.call_count,
-        "passages": passages,
-        "passages_per_second": round(passages / elapsed, 2) if elapsed else 0,
+        "passages": passage_count,
+        "passages_per_second": round(passage_count / elapsed, 2) if elapsed else 0,
         "codes": len(result.codebook),
         "merges": _merges(result),
         "near_duplicate_pairs": _duplicates(result.codebook),
         "review_mode": result.metadata.get("review_mode"),
         "pipeline": kwargs.get("pipeline"),
     }
+    if embeddings is not None:
+        row["embedding_queries"] = len(getattr(embeddings, "queries", []) or [])
+        row["embedding_query_peak"] = int(getattr(embeddings, "peak", 0) or 0)
+    return row
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--delay", type=float, default=0.05, help="Seconds of simulated latency per model call")
+    parser.add_argument(
+        "--embedding-delay",
+        type=float,
+        default=None,
+        help="Seconds of simulated latency per embedding call. Defaults to --delay. Pass 0 to skip that row.",
+    )
     args = parser.parse_args()
+    embedding_delay = args.delay if args.embedding_delay is None else args.embedding_delay
     context_kwargs = dict(sweep_every=8, temperature=0, unit="paragraph")
     rows = [
         run_mode(
@@ -121,6 +190,19 @@ def main() -> None:
             **context_kwargs,
         ),
     ]
+    if embedding_delay > 0:
+        rows.append(
+            run_mode(
+                "embedding",
+                delay=args.delay,
+                embeddings=SlowEmbeddings(embedding_delay),
+                review_mode="wave",
+                pipeline=True,
+                batch_size=4,
+                concurrency=4,
+                **context_kwargs,
+            )
+        )
     print(json.dumps(rows, indent=2))
 
 
