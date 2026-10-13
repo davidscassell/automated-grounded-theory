@@ -179,6 +179,16 @@ def test_backoff_releases_the_slot_and_retry_after_is_capped():
 
     order = []
     runnable = Once()
+    in_backoff = asyncio.Event()
+    release_backoff = asyncio.Event()
+
+    async def sleep(seconds):
+        # Hold the retry here no matter what full-jitter drew. The slot must
+        # already be free, or ``other`` cannot finish before this returns.
+        in_backoff.set()
+        await release_backoff.wait()
+
+    limiter._sleep_override = sleep
 
     async def call(payload):
         result = await limiter.ainvoke(runnable, payload)
@@ -187,12 +197,15 @@ def test_backoff_releases_the_slot_and_retry_after_is_capped():
 
     async def main():
         first = asyncio.create_task(call("flaky"))
-        await asyncio.sleep(0.01)
+        await asyncio.wait_for(in_backoff.wait(), timeout=1)
         second = asyncio.create_task(call("other"))
-        await asyncio.gather(first, second)
+        await asyncio.wait_for(second, timeout=1)
+        assert order == ["other"]
+        release_backoff.set()
+        await asyncio.wait_for(first, timeout=1)
 
     asyncio.run(main())
-    assert order.index("other") < order.index("flaky")
+    assert order == ["other", "flaky"]
     report = limiter.activity_report()
     sleeps = [event for event in report["events"] if event.get("kind") == "idle_sleep"]
     assert sleeps

@@ -865,6 +865,11 @@ _LABEL_FEEDBACK = {
 }
 
 
+# A retry that pastes every quote can dwarf the passage. The fitter may
+# shorten this further; the cap stops the unbounded case at the source.
+_FEEDBACK_CHAR_CAP = 2000
+
+
 def validation_feedback(rejections: Sequence[Mapping[str, Any]]) -> str:
     lines = [
         "The previous coding was checked against the passage, its neighbors, and the document.",
@@ -893,7 +898,11 @@ def validation_feedback(rejections: Sequence[Mapping[str, Any]]) -> str:
             "A rejected label mostly restates the research context. "
             "Reword it from the participant's words in the passage."
         )
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    if len(text) <= _FEEDBACK_CHAR_CAP:
+        return text
+    clipped = text[:_FEEDBACK_CHAR_CAP].rstrip()
+    return clipped + "\nFurther validation notes were omitted so the retry stays within the token budget."
 
 
 def _system_message(text: str, *, prompt_cache: bool) -> SystemMessage:

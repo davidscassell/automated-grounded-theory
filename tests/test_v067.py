@@ -41,7 +41,7 @@ DISTRUST = "not trusting managers to share information"
 
 
 def test_version_is_0_6_7():
-    assert __version__ == "0.6.7"
+    assert __version__ == "0.6.8"
 
 
 def test_oversized_token_reservation_fails_instead_of_waiting():
@@ -370,7 +370,7 @@ def test_assembled_coding_request_stays_within_budget():
         limiter=CallLimiter(1, max_retries=0, backoff=0, request_timeout=5),
     )
     state = {"passages": passages, "codebook": codebook, "parallel": False}
-    jobs = _pack_jobs(state, runtime, [0, 1, 2, 3], budget, 4, None)
+    jobs = asyncio.run(_pack_jobs(state, runtime, [0, 1, 2, 3], budget, 4, None))
     assert jobs
     assert all(len(job[1]) < 4 for job in jobs)
 
