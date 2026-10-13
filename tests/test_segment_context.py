@@ -37,7 +37,11 @@ def test_sentence_keeps_abbreviation():
 
 
 def test_speaker_turns():
-    text = "Alex: I packed my suitcase before dawn.\nIt took all morning.\n\nSam: I was crying at the station.\n"
+    text = (
+        "Alex: I packed my suitcase before dawn and stayed with it until the light changed.\n"
+        "It took all morning.\n\n"
+        "Sam: I was crying at the station until the train left and the platform emptied.\n"
+    )
     plan = plan_coding([text], unit="speaker_turn", seed=0)
     assert len(plan.passages) == 2
     assert plan.passages[0]["text"].startswith("Alex:")

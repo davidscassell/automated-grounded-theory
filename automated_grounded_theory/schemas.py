@@ -61,9 +61,9 @@ class CodeProposal(_LLMModel):
     )
     quote: str = Field(
         description=(
-            "Copy the participant's words. Prefer an exact span of the passage. "
-            "If the incident continues in the previous or next context, copy from there. "
-            "Use ... only to skip words you are not quoting. Do not paraphrase."
+            "Copy the participant's words from the target passage only. "
+            "Do not quote the previous context, the following context, or another passage. "
+            "Use ... only to skip words inside that passage. Do not paraphrase."
         )
     )
     in_vivo: bool = Field(
@@ -121,7 +121,10 @@ class PassageCoding(_LLMModel):
     passage_id: str = Field(default="", description="The passage_id from the prompt. Copy it exactly.")
     codes: list[CodeProposal] = Field(
         default_factory=list,
-        description="One code per distinct incident. Empty when nothing is codable.",
+        description=(
+            "One code per distinct incident in this passage only. "
+            "Do not write a code that spans several passages. Empty when nothing is codable."
+        ),
     )
     memo: str = Field(
         default="",

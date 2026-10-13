@@ -28,6 +28,7 @@ from automated_grounded_theory.validation import (
     lenient_label_fields,
     anchor_quote,
     attribute_evidence,
+    attributed_passage_ids,
     evidence_wholly_outside,
     review_passage_flags,
     split_joined_label,
@@ -816,6 +817,7 @@ def interpret_coding(
     context_terms: set[str] | None = None,
     document_text: str = "",
     passages: Sequence[Mapping[str, Any]] | None = None,
+    request_passages: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Validate one model response. Does not mutate the codebook.
 
@@ -874,6 +876,7 @@ def interpret_coding(
         proposals = proposals[:max_codes]
 
     known = {code_key(str(entry.get("code") or entry.get("key") or "")): entry for entry in codebook.values()}
+    same_request = list(request_passages) if request_passages is not None else _request_passages(payload, passages)
 
     for proposal in proposals:
         label = str(proposal.get("code") or "")
@@ -894,6 +897,8 @@ def interpret_coding(
             document_text=str(passage.get("document_text") or document_text or ""),
             passage_start=passage_start,
             passage_end=passage_end,
+            request_passages=same_request,
+            exclude_passage_id=passage_id,
         )
         verbatim = anchor.quote
         quote_flag = f"quote_{anchor.status}" if anchor.status in QUOTE_FLAG_STATUSES else ""
@@ -1474,6 +1479,20 @@ def commit_passage(
             "review_reasons": list(item["review_reasons"]),
             "memo_id": memo_id,
         }
+        targets = [pid for pid in attributed_ids if pid]
+        if passage_id_for_row and passage_id_for_row not in targets:
+            targets.append(passage_id_for_row)
+        duplicate_at = None
+        if _is_cross_passage(item, coded_passage_id, targets):
+            duplicate_at = _find_same_evidence(new_segments, key, str(item.get("quote") or ""), targets)
+        if duplicate_at is not None:
+            new_segments[duplicate_at] = _merge_cross_passage(
+                new_segments[duplicate_at],
+                coded_passage_id=coded_passage_id,
+                targets=targets,
+                item=item,
+            )
+            continue
         new_segments.append(segment)
         appended.append(segment)
         touched.add(key)
@@ -1493,6 +1512,96 @@ def commit_passage(
         "new_codes": new_codes,
         "ops": ops,
     }
+
+
+def _request_passages(
+    payload: Mapping[str, Any],
+    passages: Sequence[Mapping[str, Any]] | None,
+) -> list[Mapping[str, Any]]:
+    """Passages that shared the model request, when the coding recorded their ids."""
+    ids = [str(item) for item in (payload.get("request_passage_ids") or []) if str(item)]
+    if not ids or not passages:
+        return []
+    wanted = set(ids)
+    return [item for item in passages if str(item.get("passage_id") or "") in wanted]
+
+
+def _norm_quote(quote: Any) -> str:
+    return re.sub(r"\s+", " ", str(quote or "").strip()).casefold()
+
+
+def _is_cross_passage(item: Mapping[str, Any], coded_passage_id: str, targets: Sequence[str]) -> bool:
+    """True when this quote is evidence for a passage other than the one being coded."""
+    if not targets:
+        return False
+    if item.get("evidence_outside_passage"):
+        return True
+    return coded_passage_id not in targets
+
+
+def _find_same_evidence(
+    segments: Sequence[Mapping[str, Any]],
+    key: str,
+    quote: str,
+    targets: Sequence[str],
+) -> int | None:
+    needle = _norm_quote(quote)
+    if not needle:
+        return None
+    wanted = {str(item) for item in targets if str(item)}
+    for index, segment in enumerate(segments):
+        if _segment_key(segment) != key:
+            continue
+        if _norm_quote(segment.get("quote")) != needle and _norm_quote(segment.get("model_quote")) != needle:
+            continue
+        covered = set(attributed_passage_ids(segment))
+        passage_id = str(segment.get("passage_id") or "")
+        if passage_id:
+            covered.add(passage_id)
+        if covered & wanted:
+            return index
+    return None
+
+
+def _merge_cross_passage(
+    segment: Mapping[str, Any],
+    *,
+    coded_passage_id: str,
+    targets: Sequence[str],
+    item: Mapping[str, Any],
+) -> dict:
+    """Keep one segment. Record the passage that was being coded on its provenance."""
+    updated = dict(segment)
+    provenance = dict(updated.get("provenance") or {})
+    coded_ids = [str(value) for value in (provenance.get("coded_passage_ids") or []) if str(value)]
+    original = str(updated.get("coded_passage_id") or "")
+    if original and original not in coded_ids:
+        coded_ids.append(original)
+    if coded_passage_id and coded_passage_id not in coded_ids:
+        coded_ids.append(coded_passage_id)
+    provenance["coded_passage_ids"] = coded_ids
+    updated["provenance"] = provenance
+    current = [str(value) for value in (updated.get("attributed_passage_ids") or []) if str(value)]
+    if not current:
+        single = str(updated.get("attributed_passage_id") or updated.get("passage_id") or "")
+        if single:
+            current = [single]
+    for target in targets:
+        if target and target not in current:
+            current.append(target)
+    updated["attributed_passage_ids"] = current
+    if len(current) == 1:
+        updated["attributed_passage_id"] = current[0]
+        if not updated.get("passage_id"):
+            updated["passage_id"] = current[0]
+    elif len(current) > 1 and str(updated.get("attribution") or "") == "multi":
+        updated["attributed_passage_id"] = ""
+    reasons = list(updated.get("review_reasons") or [])
+    if item.get("evidence_outside_passage") and "evidence_outside_passage" not in reasons:
+        reasons.append("evidence_outside_passage")
+    updated["review_reasons"] = reasons
+    updated["needs_review"] = bool(reasons)
+    return updated
 
 
 def _rename_code(codebook: dict[str, dict], segments: list[dict], old: str, new: str, display: str) -> dict[str, dict]:

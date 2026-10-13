@@ -187,6 +187,15 @@ def result_from_state(
         "code_versions": len(records["code_versions"]),
     }
     metadata["code_versions"] = records["code_versions"]
+    failed_ids = [
+        str(item.get("passage_id") or "")
+        for item in passages
+        if item.get("coverage_status") == "failed" and str(item.get("passage_id") or "")
+    ]
+    metadata["failed_passages"] = failed_ids
+    summary = dict(metadata.get("summary") or {})
+    summary["failed_passages"] = failed_ids
+    metadata["summary"] = summary
     metadata["coverage"] = [
         {
             "incident_id": item["incident_id"],

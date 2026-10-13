@@ -175,6 +175,7 @@ def open_code(
     sweep_every: int = 25,
     sweep_model: BaseChatModel | str | None = None,
     unit: str = "incident",
+    short_turn_chars: int = 60,
     embeddings: Embeddings | str | None = None,
     api_key: str | None = None,
     embeddings_api_key: str | None = None,
@@ -282,6 +283,14 @@ def open_code(
     order and every passage of that document in reading order, then updates
     the codebook. ``review_mode='wave'`` may code passages from several
     documents in one step. That is faster and weakens constant comparison.
+    The coding prompt tells the model to code each passage separately and to
+    quote only the target passage, not the surrounding context.
+
+    ``short_turn_chars`` (default 60) merges a very short speaker turn, such as
+    ``Participant: Ovid.``, into the adjacent answer during segmentation. The
+    text is kept. Set it to 0 to leave every turn as its own passage. That
+    changes passage boundaries, so it applies to a new run. Resume does not
+    re-segment.
 
     When ``pipeline`` is true, synthesis of the passages just coded runs while
     the next document or wave is coded against the pre-merge snapshot. The
@@ -327,6 +336,7 @@ def open_code(
             sweep_every=sweep_every,
             sweep_model=sweep_model,
             unit=unit,
+            short_turn_chars=short_turn_chars,
             embeddings=embeddings,
             api_key=api_key,
             embeddings_api_key=embeddings_api_key,
@@ -397,6 +407,7 @@ async def aopen_code(
     sweep_every: int = 25,
     sweep_model: BaseChatModel | str | None = None,
     unit: str = "incident",
+    short_turn_chars: int = 60,
     embeddings: Embeddings | str | None = None,
     api_key: str | None = None,
     embeddings_api_key: str | None = None,
@@ -505,6 +516,8 @@ async def aopen_code(
         raise ValueError("max_merges_per_sweep must be at least 1.")
     if tokens_per_minute < 0 or requests_per_minute < 0:
         raise ValueError("tokens_per_minute and requests_per_minute must be zero or more.")
+    if int(short_turn_chars) < 0:
+        raise ValueError("short_turn_chars must be zero or more.")
     parsed_context = parse_context(context)
     documents = load_corpus(corpus)
     coder = resolve_chat_model(
@@ -581,6 +594,7 @@ async def aopen_code(
         version=__version__,
         seed=seed,
         unit=unit,
+        short_turn_chars=int(short_turn_chars),
         sweep_every=sweep_every,
         model_name=model_name,
         sweep_name=sweep_name,
@@ -790,6 +804,7 @@ _STRUCTURAL_MANIFEST_PATHS = frozenset(
 _MANIFEST_PROCEDURE = (
     "seed",
     "unit",
+    "short_turn_chars",
     "sweep_every",
     "parallel_documents",
     "batch_size",
@@ -1072,6 +1087,7 @@ def _metadata(**kwargs: Any) -> dict:
         "protocol": "open-coding-1",
         "seed": kwargs["seed"],
         "unit": kwargs["unit"],
+        "short_turn_chars": int(kwargs.get("short_turn_chars", 60)),
         "sweep_every": kwargs["sweep_every"],
         "model": kwargs["model_name"],
         "sweep_model": kwargs["sweep_name"],
@@ -1119,6 +1135,7 @@ def _metadata(**kwargs: Any) -> dict:
             "neighbor_chars": kwargs["neighbor_chars"],
             "validation_retries": kwargs["validation_retries"],
             "require_gerund": kwargs["require_gerund"],
+            "short_turn_chars": int(kwargs.get("short_turn_chars", 60)),
             "retriever": kwargs["retriever"],
             "parallel_documents": kwargs["parallel_documents"],
             "batch_size": kwargs["batch_size"],
