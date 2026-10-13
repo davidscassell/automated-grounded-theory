@@ -1,7 +1,10 @@
 """Deterministic checks on model output.
 
 A quote mismatch never drops a code. ``anchor_quote`` searches the passage,
-then the neighbor windows, then the document. It records ``quote_status`` as
+then the neighbor windows, then the document. Before it declares a quote
+unanchored it also searches the other passages in the same request. A hit
+there is kept, flagged ``evidence_outside_passage``, and attributed to that
+passage, the same way a neighbor hit is. It records ``quote_status`` as
 ``exact``, ``normalized_match``, ``fuzzy_match``, ``possibly_modified``, or
 ``unanchored``, plus the best source span when one is found. The stored quote
 is that source slice when a span exists, so exports stay tied to the text
@@ -214,6 +217,7 @@ class QuoteAnchor:
     spans: tuple[tuple[int, int], ...] = ()
     doc_spans: tuple[tuple[int, int], ...] = ()
     flags: tuple[str, ...] = ()
+    located_passage_id: str = ""
 
     @property
     def doc_start(self) -> int | None:
@@ -256,11 +260,16 @@ def anchor_quote(
     passage_end: int | None = None,
     prefer_offset: int | None = None,
     occurrence: int | None = None,
+    request_passages: Sequence[Mapping[str, Any]] | None = None,
+    exclude_passage_id: str = "",
 ) -> QuoteAnchor:
     """Anchor ``quote`` without ever rejecting it.
 
     Search the passage, then the previous and next neighbor windows, then the
-    whole document. ``...`` and ``…`` split the quote into ordered spans.
+    whole document. If that still finds nothing, search the other passages in
+    the same request. A hit there is source ``request``: it is kept, flagged
+    like a neighbor (``evidence_outside_passage``), and attributed to that
+    passage. ``...`` and ``…`` split the quote into ordered spans.
     Whitespace, case, and punctuation differences are ``normalized_match``.
     A small edit is ``fuzzy_match`` and carries ``similarity``. A looser hit is
     ``possibly_modified``. No usable hit is ``unanchored``.
@@ -298,6 +307,13 @@ def anchor_quote(
             break
     if best is not None:
         return best
+    requested = _anchor_in_request(
+        model_quote,
+        request_passages,
+        exclude_passage_id=exclude_passage_id,
+    )
+    if requested is not None:
+        return requested
     return QuoteAnchor(
         status="unanchored",
         similarity=None,
@@ -326,6 +342,8 @@ def evidence_wholly_outside(
     """
     if anchor.status == "unanchored" or anchor.source == "passage":
         return False
+    if anchor.source == "request":
+        return True
     if anchor.source not in {"neighbor", "document"}:
         return False
     spans = [(int(start), int(end)) for start, end in anchor.doc_spans if end > start]
@@ -377,6 +395,8 @@ def attribute_evidence(
     outside = evidence_wholly_outside(anchor, passage_start=passage_start, passage_end=end)
     if not outside:
         return EvidenceAttribution("inside", (coded_passage_id,) if coded_passage_id else ())
+    if anchor.source == "request" and anchor.located_passage_id:
+        return EvidenceAttribution("single", (anchor.located_passage_id,))
     spans = [(int(start), int(end)) for start, end in anchor.doc_spans if end > start]
     found = _passages_overlapping(passages or (), spans, doc_id=doc_id)
     if not found and not spans:
@@ -533,7 +553,15 @@ def _region_origin(document: str, snippet: str, boundary: int, *, before: bool) 
     return index
 
 
-def _place(hit: "_Hit", *, source: str, origin: int | None, haystack: str, model_quote: str) -> QuoteAnchor:
+def _place(
+    hit: "_Hit",
+    *,
+    source: str,
+    origin: int | None,
+    haystack: str,
+    model_quote: str,
+    located_passage_id: str = "",
+) -> QuoteAnchor:
     doc_spans: tuple[tuple[int, int], ...] = ()
     if origin is not None and hit.spans:
         doc_spans = tuple((origin + start, origin + end) for start, end in hit.spans)
@@ -546,7 +574,43 @@ def _place(hit: "_Hit", *, source: str, origin: int | None, haystack: str, model
         spans=hit.spans,
         doc_spans=doc_spans,
         flags=hit.flags,
+        located_passage_id=located_passage_id,
     )
+
+
+def _anchor_in_request(
+    quote: str,
+    passages: Sequence[Mapping[str, Any]] | None,
+    *,
+    exclude_passage_id: str,
+) -> QuoteAnchor | None:
+    """Last resort before ``unanchored``: the other passages in this request."""
+    best: QuoteAnchor | None = None
+    for other in passages or ():
+        other_id = str(other.get("passage_id") or "")
+        if exclude_passage_id and other_id == exclude_passage_id:
+            continue
+        other_text = str(other.get("text") or "")
+        if not other_text:
+            continue
+        hit = _anchor_in(quote, other_text, bias=0, allow_fuzzy=True)
+        if hit is None:
+            continue
+        origin_raw = other.get("start_offset")
+        origin = int(origin_raw) if origin_raw is not None and origin_raw != "" else 0
+        anchored = _place(
+            hit,
+            source="request",
+            origin=origin,
+            haystack=other_text,
+            model_quote=quote,
+            located_passage_id=other_id,
+        )
+        if best is None or _better(anchored, best):
+            best = anchored
+        if best.status in {"exact", "normalized_match"}:
+            break
+    return best
 
 
 def _render_quote(haystack: str, spans: tuple[tuple[int, int], ...], model_quote: str) -> str:

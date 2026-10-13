@@ -176,6 +176,7 @@ class RunConfig:
     neighbor_chars: int = 400
     long_passage_chars: int = 2000
     validation_retries: int = 1
+    missing_slot_retries: int = 2
     require_gerund: bool = False
     candidate_limit: int = 30
     batch_size: int = 1
@@ -203,6 +204,7 @@ class RunConfig:
     prompt_records: list = field(default_factory=list)
     notes: list = field(default_factory=list)
     oversized_requests: list = field(default_factory=list)
+    failed_passage_ids: list = field(default_factory=list)
     _rankings: dict = field(default_factory=dict)
     _log_lock: threading.Lock | None = None
 
@@ -734,6 +736,7 @@ def _segment_node(state: CodingState) -> dict:
         seed=metadata["seed"],
         parallel_documents=bool(metadata.get("parallel_documents")),
         review_mode=str(metadata.get("review_mode") or "document"),
+        short_turn_chars=int(metadata.get("short_turn_chars", 60) or 0),
     )
     branch_codebooks = {doc_id: {} for doc_id in plan.branch_queues} if plan.parallel else {}
     queue = list(plan.queue)
@@ -752,7 +755,7 @@ def _segment_node(state: CodingState) -> dict:
         "branch_queues": plan.branch_queues,
         "branch_codebooks": branch_codebooks,
         "warnings": list(state.get("warnings") or []) + list(plan.warnings),
-        "metadata": {**metadata, "seed": plan.seed, "passage_count": len(plan.passages)},
+        "metadata": _segmentation_metadata(metadata, plan),
     }
 
 
@@ -842,6 +845,32 @@ def _finalized_slice_texts(batches: Sequence, texts: Sequence[str]) -> list[str]
 
 def _embedding_fallback_note(exc: BaseException) -> str:
     return f"Code retrieval embeddings failed ({exc}). Nearest codes used label overlap instead."
+
+
+def _segmentation_metadata(metadata: Mapping[str, Any], plan) -> dict:
+    """Seed, passage count, and any answer text that segmentation left uncovered."""
+    updated = {**metadata, "seed": plan.seed, "passage_count": len(plan.passages)}
+    uncovered = [dict(item) for item in (getattr(plan, "uncovered_answers", None) or [])]
+    if uncovered:
+        updated["uncovered_answers"] = uncovered
+    return updated
+
+
+def _attach_failed_passages(
+    runtime: RunConfig,
+    state: Mapping[str, Any],
+    metadata: dict | None,
+) -> dict | None:
+    """List passages that stayed failed after single-passage retries."""
+    ids = [str(item) for item in runtime.failed_passage_ids if str(item)]
+    if not ids:
+        return metadata
+    base = dict(metadata if metadata is not None else (state.get("metadata") or {}))
+    base["failed_passages"] = ids
+    summary = dict(base.get("summary") or {})
+    summary["failed_passages"] = ids
+    base["summary"] = summary
+    return base
 
 
 def _remember_note(runtime: RunConfig, note: str) -> None:
@@ -1527,6 +1556,7 @@ async def _code_batch(
                 review_below=runtime.review_below,
                 context_terms=context_term_set(runtime.context),
                 document_text=(documents or {}).get(str(passage.get("doc_id") or ""), ""),
+                passages=passages,
             )
             coding = _coding_payload(coding)
             coding["codes"] = list(interpreted.get("expanded_codes") or coding.get("codes") or [])
@@ -1725,8 +1755,109 @@ async def _invoke_coding(
             ),
             token_budget=budget,
         )
-        aligned.extend(_align_batch(parsed, subset))
+        aligned.extend(
+            await _finish_batch(runtime, subset, entries, ranks, feedback, budget, parsed)
+        )
     return aligned
+
+
+async def _finish_batch(
+    runtime: RunConfig,
+    subset: list[dict],
+    entries: Sequence[Mapping[str, Any]],
+    ranks: Sequence[Sequence[str]],
+    feedback: Mapping[str, str] | None,
+    budget: int,
+    parsed: dict,
+) -> list[dict]:
+    """Align a reply, then re-request any passage the reply left out."""
+    aligned = _align_batch(parsed, subset)
+    ids = [str(passage.get("passage_id") or "") for passage in subset]
+    for item in aligned:
+        item["request_passage_ids"] = list(ids)
+    return await _retry_missing_slots(runtime, subset, aligned, entries, ranks, feedback, budget)
+
+
+async def _retry_missing_slots(
+    runtime: RunConfig,
+    subset: list[dict],
+    aligned: list[dict],
+    entries: Sequence[Mapping[str, Any]],
+    ranks: Sequence[Sequence[str]],
+    feedback: Mapping[str, str] | None,
+    budget: int,
+) -> list[dict]:
+    """A passage missing from a batch reply is requested alone, with a bounded number of tries."""
+    retries = max(0, int(getattr(runtime, "missing_slot_retries", 2) or 0))
+    items = [dict(item) for item in aligned]
+    still_failed: list[str] = []
+    for index, passage in enumerate(subset):
+        if not items[index].get("missing_slot"):
+            items[index].pop("missing_slot", None)
+            continue
+        passage_id = str(passage.get("passage_id") or "")
+        recovered = None
+        for attempt in range(1, retries + 1):
+            note = (
+                f"Passage {passage_id} was missing from a coding reply. "
+                f"Requesting it alone (attempt {attempt}/{retries})."
+            )
+            logger.warning("%s", note)
+            _remember_note(runtime, note)
+            alone_parsed = await _request_coding(runtime, [passage], entries, [ranks[index]], feedback, budget)
+            alone = _align_batch(alone_parsed, [passage])
+            if alone and not alone[0].get("missing_slot"):
+                recovered = dict(alone[0])
+                recovered["request_passage_ids"] = [passage_id]
+                recovered.pop("missing_slot", None)
+                break
+        if recovered is None:
+            fail = (
+                f"Passage {passage_id} stayed failed after {retries} single-passage "
+                "retries of a missing coding reply."
+            )
+            logger.warning("%s", fail)
+            _remember_note(runtime, fail)
+            if passage_id and passage_id not in runtime.failed_passage_ids:
+                runtime.failed_passage_ids.append(passage_id)
+            items[index].pop("missing_slot", None)
+            still_failed.append(passage_id)
+            continue
+        items[index] = recovered
+    if still_failed:
+        summary = "Coding replies left passages failed: " + ", ".join(still_failed) + "."
+        logger.warning("%s", summary)
+        _remember_note(runtime, summary)
+    return items
+
+
+async def _request_coding(
+    runtime: RunConfig,
+    subset: list[dict],
+    entries: Sequence[Mapping[str, Any]],
+    ranks: Sequence[Sequence[str]],
+    feedback: Mapping[str, str] | None,
+    budget: int,
+) -> dict:
+    messages = _fit_coding_messages(runtime, subset, entries, ranks, feedback, budget)
+    passage_ids = ",".join(str(passage.get("passage_id")) for passage in subset)
+    cost = _coding_request_cost(runtime, messages, len(subset))
+    if cost > budget:
+        _record_oversized(runtime, subset, cost, budget, kind="coding")
+    return await _ainvoke_structured(
+        runtime.coder,
+        BatchCoding,
+        messages,
+        kind="code_passage",
+        model_name=runtime.model_name,
+        passage_id=passage_ids,
+        runtime=runtime,
+        reserved_output=reserved_output_tokens(
+            len(subset),
+            max_codes_per_passage=runtime.max_codes_per_passage,
+        ),
+        token_budget=budget,
+    )
 
 
 def _align_batch(payload: dict, passages: list[dict]) -> list[dict]:
@@ -1749,11 +1880,13 @@ def _align_batch(payload: dict, passages: list[dict]) -> list[dict]:
                 "memo": "",
                 "low_confidence": True,
                 "coverage_status": "failed",
+                "missing_slot": True,
             }
         else:
             item = dict(item)
         if failed:
             item["coverage_status"] = "failed"
+            item["missing_slot"] = True
         elif item.get("codes"):
             item["coverage_status"] = item.get("coverage_status") or "coded"
         else:
@@ -1923,6 +2056,7 @@ def _validate_node(runtime: RunConfig):
         notes = list(runtime.notes)
         runtime.notes.clear()
         metadata, review = _attach_oversized(runtime, state, review)
+        metadata = _attach_failed_passages(runtime, state, metadata)
 
         if state.get("parallel"):
             codebook = union_codebooks(list(branch_books.values()))

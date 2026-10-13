@@ -1,4 +1,4 @@
-# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, and 0.6.12)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, and 0.6.13)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
 Status: steps 1 and 2 of the v0.6 plan. Category development, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
@@ -268,6 +268,22 @@ Muse `unit_grid_from_annotations` places an excerpt by exact match, then by whit
 
 `policy_version` is `0.6.12`.
 
-## 21. Out of scope
+## 21. Corrections in 0.6.13
+
+Speaker labels match at the start of a line after optional indentation. A label also matches in the middle of a line when it follows sentence punctuation and the label is short or already known (`Interviewer`, `Participant`, and the other role names, or a label already used at the start of a line). ` Participant:` and `best.   Interviewer:` are separate turns. A line-start label is words without sentence punctuation, so the words before that mid-line label are not swallowed into it. `Note:` after a period is not a speaker. Answer characters that still sit in no passage produce a warning and `metadata.uncovered_answers` (`doc_id`, `chars`, and the text).
+
+A coding reply that omits a passage is not left failed. That passage is requested alone, up to `missing_slot_retries` (default 2). Each attempt is logged. Ids that stay failed are `metadata.summary.failed_passages` and a warning that names them.
+
+`anchor_quote` searches the other passages in the same request before it returns `unanchored`. The hit is source `request`. It is kept and flagged `evidence_outside_passage`, and attribution is that passage. The quote policy is unchanged: flag, never drop, never block coding.
+
+If the attributed passage already has that code and that quote, the commit does not append a second segment. `provenance.coded_passage_ids` lists every passage whose coding produced the quote, including the one being coded. Coverage counts the quote once. The coding prompt says to quote only the target passage, not the context around it.
+
+`short_turn_chars` (default 60) merges a short speaker turn into the adjacent answer. `Participant: Ovid.` is the example. The merged passage is one slice of the source, so the characters between the turns stay in the passage. Zero disables the merge. Segmentation changes, which a new run picks up. Resume does not re-segment, so a checkpoint keeps the passages it stored.
+
+The coding prompt, which document mode uses, tells the model to code each passage separately and not to write one code spanning several passages.
+
+`policy_version` is `0.6.13`.
+
+## 22. Out of scope
 
 Category feedback, focused recoding of earlier negatives, relationship hypotheses, sampling briefs, and a Taguette project-file adapter. See the v0.6 plan steps 3–5.

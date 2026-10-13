@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.13
+
+- Speaker labels are recognized after leading whitespace and, for a short or known label, after a sentence boundary in the middle of a line. A RAND-style transcript (` Participant:` and `best.   Interviewer:`) no longer folds the participant's answer into the interviewer question, which left that answer out of every passage. Answer text that still falls outside every passage is warned and stored on the run metadata as `uncovered_answers`.
+- A passage missing from a batch coding reply is requested again on its own, up to two times. Each retry is logged. Passages that stay failed are listed on the run summary (`summary.failed_passages`) and in the warnings.
+- Before a quote is declared unanchored, the other passages in the same request are searched. A hit is kept, flagged `evidence_outside_passage`, and attributed to the passage that contains it, the same way a neighbor quote is.
+- When that cross-passage quote and code are already on the attributed passage, the new segment is merged into the existing one. The passage that was being coded is recorded on `provenance.coded_passage_ids`, so coverage is not counted twice. The coding prompt tells the model to quote only the target passage, not the previous context, the following context, or another passage.
+- A speaker turn of at most `short_turn_chars` (default 60, for example `Participant: Ovid.`) is merged into the adjacent answer passage during segmentation. The text is not skipped and not dropped. Set `short_turn_chars` to 0 to keep every turn as its own passage. This changes passage boundaries for a new run. Resume does not re-segment.
+- The document-mode coding prompt tells the model to code each passage separately and not to write one code that spans several passages.
+- `policy_version` is `0.6.13`.
+
 ## 0.6.12
 
 - Resuming a checkpoint still allows a continuation for changes that affect only the work left to do: research-context wording, the model and its temperature, and performance settings. Those write a continuation event. `review_mode` and `parallel_documents` are performance settings. They do not change how passages are segmented: the same corpus, unit, and seed produce the same passage ids, text, and offsets. Resume does not re-segment, so changing either one records a continuation and leaves the stored passages, coding order, queue, and branch queues as checkpointed. `review_mode` is still read when the next batch is taken from that stored queue. `parallel_documents` does not rebuild branch queues. Corpus identity, `unit`, and `seed` are rejected even with `allow_changes=True`. The error tells you to start a new run. There is no migration procedure yet. Adding a document and resuming no longer rewrites the manifest hash while the stored passages stay the original four.

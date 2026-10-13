@@ -25,6 +25,69 @@ _QUESTION_SPEAKER = re.compile(
     r"^(interviewer|moderator|question|q)\b",
     re.IGNORECASE,
 )
+# A whole turn at or under this length is a filler (for example "Participant: Ovid.").
+# It is merged into the adjacent answer. Zero keeps every turn as its own passage.
+SHORT_TURN_CHARS = 60
+_KNOWN_SPEAKER_LABELS = frozenset(
+    {
+        "interviewer",
+        "moderator",
+        "question",
+        "q",
+        "participant",
+        "respondent",
+        "interviewee",
+        "subject",
+        "facilitator",
+        "speaker",
+    }
+)
+# Mid-line colons that are not speakers. A label already used at the start of a
+# line is still accepted, so a person named one of these is not blocked.
+_MIDLINE_SPEAKER_BLOCKLIST = frozenset(
+    {
+        "note",
+        "notes",
+        "warning",
+        "example",
+        "eg",
+        "ie",
+        "ps",
+        "re",
+        "fig",
+        "figure",
+        "table",
+        "chapter",
+        "section",
+        "abstract",
+        "summary",
+        "time",
+        "date",
+        "ratio",
+        "source",
+        "result",
+        "results",
+        "update",
+        "important",
+        "caveat",
+        "and",
+        "but",
+        "or",
+        "the",
+        "then",
+        "so",
+        "if",
+        "when",
+        "that",
+        "this",
+        "well",
+        "yes",
+        "no",
+        "oh",
+        "okay",
+        "ok",
+    }
+)
 
 # Titles and a few Latin abbreviations. The sentence splitter does not try to
 # solve "U.S.A." or similar chains.
@@ -46,7 +109,17 @@ _ABBREVIATIONS = frozenset(
         "i.e",
     }
 )
-_SPEAKER = re.compile(r"(?m)^([A-Za-z][\w .'\-]{0,40}):[ \t]+")
+# Line start, after optional indent. Words only, so "best.   Interviewer:"
+# is not one label. A period inside the label is what used to swallow the
+# next speaker.
+_SPEAKER_LINE = re.compile(
+    r"(?m)^[ \t]*([A-Za-z][\w'\-]{0,30}(?:[ \t]+[A-Za-z][\w'\-]{0,30}){0,3}):[ \t]+"
+)
+# Mid-line only after a sentence boundary, and only for a short or known label.
+_SPEAKER_MID = re.compile(
+    r"(?<=[.!?])[ \t]+([A-Za-z][\w'\-]{0,30}(?:[ \t]+[A-Za-z][\w'\-]{0,30}){0,2}):[ \t]+"
+)
+_SPEAKER = _SPEAKER_LINE
 
 
 @dataclass
@@ -59,6 +132,7 @@ class CodingPlan:
     queue: list[int] = field(default_factory=list)
     branch_queues: dict[str, list[int]] = field(default_factory=dict)
     parallel: bool = False
+    uncovered_answers: list[dict] = field(default_factory=list)
 
 
 def interleave_document_queue(passages: Sequence[Mapping], queue: Sequence[int], batch_size: int) -> list[int]:
@@ -135,6 +209,7 @@ def plan_coding(
     seed: int | None = None,
     parallel_documents: bool = False,
     review_mode: str = "document",
+    short_turn_chars: int = SHORT_TURN_CHARS,
 ) -> CodingPlan:
     """Segment ``corpus`` and return passages in the order a run would code them.
 
@@ -145,9 +220,16 @@ def plan_coding(
     document's passages in reading order. ``review_mode='wave'`` shuffles
     passages across documents. That weakens constant comparison, because a
     later passage in a document can be coded before an earlier one.
+
+    ``short_turn_chars`` (default 60) merges a very short speaker turn, such as
+    ``Participant: Ovid.``, into the adjacent answer passage. The turn is not
+    skipped and its text is not dropped. Zero leaves every turn as its own
+    passage. This changes passage boundaries for a new run.
     """
     if unit not in UNITS:
         raise ValueError(f"unit must be one of {', '.join(UNITS)}. Got {unit!r}.")
+    if int(short_turn_chars) < 0:
+        raise ValueError("short_turn_chars must be zero or more.")
     if review_mode not in {"document", "wave"}:
         raise ValueError(f"review_mode must be 'document' or 'wave'. Got {review_mode!r}.")
     if seed is None:
@@ -156,14 +238,24 @@ def plan_coding(
     warnings: list[str] = []
     passages: list[dict] = []
     for document in documents:
-        pieces, piece_warnings = segment_document(document, unit=unit)
+        pieces, piece_warnings = segment_document(
+            document,
+            unit=unit,
+            short_turn_chars=int(short_turn_chars),
+        )
         warnings.extend(piece_warnings)
         if not pieces:
             pieces = [_empty_passage(document, unit)]
         passages.extend(pieces)
     if not passages:
         warnings.append("No passages were produced from the corpus.")
-        return CodingPlan(passages=[], seed=seed, warnings=warnings, parallel=parallel_documents)
+        return CodingPlan(
+            passages=[],
+            seed=seed,
+            warnings=warnings,
+            parallel=parallel_documents,
+            uncovered_answers=_collect_uncovered(passages),
+        )
 
     rng = random.Random(seed)
     if parallel_documents:
@@ -187,6 +279,7 @@ def plan_coding(
             queue=_live(passages, queue),
             branch_queues={doc_id: _live(passages, indices) for doc_id, indices in branch_queues.items()},
             parallel=True,
+            uncovered_answers=_collect_uncovered(passages),
         )
 
     if review_mode == "document":
@@ -213,10 +306,16 @@ def plan_coding(
         queue=_live(passages, queue),
         branch_queues={},
         parallel=False,
+        uncovered_answers=_collect_uncovered(passages),
     )
 
 
-def segment_document(document: LoadedDocument, *, unit: Unit) -> tuple[list[dict], list[str]]:
+def segment_document(
+    document: LoadedDocument,
+    *,
+    unit: Unit,
+    short_turn_chars: int = SHORT_TURN_CHARS,
+) -> tuple[list[dict], list[str]]:
     """Split one document. Offsets refer to ``document.text``."""
     text = normalize_newlines(document.text)
     warnings: list[str] = []
@@ -231,7 +330,7 @@ def segment_document(document: LoadedDocument, *, unit: Unit) -> tuple[list[dict
         if speaker_warning:
             warnings.append(f"{document.doc_id}: {speaker_warning}")
     elif unit == "incident":
-        return _segment_incidents(document, text)
+        return _segment_incidents(document, text, short_turn_chars=short_turn_chars)
     else:
         raise ValueError(f"Unknown unit {unit!r}.")
 
@@ -265,6 +364,13 @@ def segment_document(document: LoadedDocument, *, unit: Unit) -> tuple[list[dict
                 "coverage_status": "pending",
                 "exclusion_reason": "",
             }
+        )
+    if unit == "speaker_turn" and passages:
+        passages = _absorb_short_passages(
+            text,
+            passages,
+            limit=int(short_turn_chars),
+            answers_only=True,
         )
     return passages, warnings
 
@@ -408,11 +514,22 @@ def _split_sentences(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _segment_incidents(document: LoadedDocument, text: str) -> tuple[list[dict], list[str]]:
+def _segment_incidents(
+    document: LoadedDocument,
+    text: str,
+    *,
+    short_turn_chars: int = SHORT_TURN_CHARS,
+) -> tuple[list[dict], list[str]]:
     """Question plus full answer, then sentence-bounded incidents of about 150–800 characters.
 
     A short answer stays whole. A long answer splits only on sentence boundaries
     and never mid-answer. One sentence longer than the cap stays intact.
+
+    A speaker turn whose text is at most ``short_turn_chars`` (default 60,
+    for example ``Participant: Ovid.``) is merged into the adjacent answer
+    passage. It is not skipped and its characters stay in that passage. Zero
+    disables the merge. New runs pick up the new boundaries; a checkpoint does
+    not re-segment.
     """
     warnings: list[str] = []
     pairs = _question_answer_pairs(text)
@@ -445,9 +562,22 @@ def _segment_incidents(document: LoadedDocument, text: str) -> tuple[list[dict],
                     "exclusion_reason": "",
                 }
             )
-    for index, passage in enumerate(passages):
-        if index + 1 < len(passages):
-            passage["next_text"] = passages[index + 1]["text"]
+    passages = _absorb_short_passages(
+        text,
+        passages,
+        limit=int(short_turn_chars),
+        answers_only=False,
+    )
+    gap = _uncovered_answer_text(text, pairs, passages)
+    if gap:
+        warnings.append(
+            f"{document.doc_id}: {len(gap)} characters of answer text fell outside every passage."
+        )
+        for passage in passages:
+            metadata = dict(passage.get("metadata") or {})
+            metadata["uncovered_answer_chars"] = len(gap)
+            metadata["uncovered_answer_text"] = gap
+            passage["metadata"] = metadata
     if not passages and text.strip():
         warnings.append(f"{document.doc_id}: incident segmentation found no answer text.")
     return passages, warnings
@@ -485,7 +615,7 @@ def _question_answer_pairs(text: str) -> list[tuple[str, int, int]]:
 
 
 def _speaker_spans(text: str) -> list[tuple[str, int, int, str]]:
-    matches = list(_SPEAKER.finditer(text))
+    matches = _speaker_matches(text)
     if len(matches) < 2:
         return []
     found = []
@@ -536,7 +666,7 @@ def _pack_incidents(text: str, start: int, end: int) -> list[tuple[int, int]]:
 
 
 def _split_speaker_turns(text: str) -> tuple[list[tuple[int, int]], str | None]:
-    matches = list(_SPEAKER.finditer(text))
+    matches = _speaker_matches(text)
     if not matches:
         return _split_paragraphs(text), (
             "no speaker turns found (expected lines like 'Name: ...'); fell back to paragraphs"
@@ -555,3 +685,216 @@ def _split_speaker_turns(text: str) -> tuple[list[tuple[int, int]], str | None]:
         if match.start() < chunk_end:
             spans.append((match.start(), chunk_end))
     return spans, None
+
+
+class _SpeakerHit:
+    """One speaker label. ``start`` is the label, not the indent before it."""
+
+    def __init__(self, match: re.Match[str]) -> None:
+        self._match = match
+
+    def start(self) -> int:
+        return self._match.start(1)
+
+    def end(self) -> int:
+        return self._match.end()
+
+    def group(self, index: int) -> str:
+        return self._match.group(index)
+
+
+def _speaker_matches(text: str) -> list[_SpeakerHit]:
+    """Speaker labels at line start (indent allowed) and short or known labels mid-line.
+
+    A mid-line label has to follow sentence punctuation. That keeps ``best.
+    Interviewer:`` and `` Participant:`` without splitting on ``Note:`` or
+    ``I said:``.
+    """
+    line_matches = list(_SPEAKER_LINE.finditer(text))
+    seen = {match.group(1).strip().casefold() for match in line_matches}
+    covered = [(match.start(), match.end()) for match in line_matches]
+    found = [_SpeakerHit(match) for match in line_matches]
+    for match in _SPEAKER_MID.finditer(text):
+        if any(start <= match.start(1) < end for start, end in covered):
+            continue
+        label = match.group(1).strip()
+        if not _midline_label_ok(label, seen):
+            continue
+        found.append(_SpeakerHit(match))
+        covered.append((match.start(), match.end()))
+    found.sort(key=lambda item: item.start())
+    kept: list[_SpeakerHit] = []
+    last_end = -1
+    for match in found:
+        if match.start() < last_end:
+            continue
+        kept.append(match)
+        last_end = match.end()
+    return kept
+
+
+def _midline_label_ok(label: str, seen: set[str]) -> bool:
+    key = label.strip().casefold()
+    if not key:
+        return False
+    if key in _KNOWN_SPEAKER_LABELS or key in seen:
+        return True
+    words = label.split()
+    short = 2 <= len(label) <= 24 and 1 <= len(words) <= 2 and all(word[:1].isupper() for word in words)
+    if not short or key in _MIDLINE_SPEAKER_BLOCKLIST:
+        return False
+    return True
+
+
+def _passage_is_question(passage: Mapping) -> bool:
+    chunk = str(passage.get("text") or "").lstrip()
+    match = re.match(r"([A-Za-z][\w .'\-]{0,40}):", chunk)
+    if not match:
+        return False
+    return _QUESTION_SPEAKER.match(match.group(1).strip()) is not None
+
+
+def _absorb_short_passages(
+    text: str,
+    passages: list[dict],
+    *,
+    limit: int,
+    answers_only: bool,
+) -> list[dict]:
+    """Fold a short turn into the adjacent answer. Never drop its characters.
+
+    ``limit`` of zero leaves the passages as they are. The merged passage is
+    one slice of ``text``, so characters between the two turns stay in that
+    slice. A question that was only stored on the short turn is kept on the
+    surviving passage's question field.
+    """
+    if limit <= 0 or len(passages) < 2:
+        _relink_passages(passages)
+        return passages
+
+    def is_answer(passage: Mapping) -> bool:
+        if not answers_only:
+            return True
+        return not _passage_is_question(passage)
+
+    def is_short(passage: Mapping) -> bool:
+        return len(str(passage.get("text") or "").strip()) <= limit
+
+    remaining = [dict(passage) for passage in passages]
+    index = 0
+    changed = False
+    while index < len(remaining):
+        passage = remaining[index]
+        if not is_short(passage) or not is_answer(passage):
+            index += 1
+            continue
+        target = _adjacent_answer(remaining, index, is_answer)
+        if target is None:
+            index += 1
+            continue
+        _extend_passage(text, target, passage)
+        del remaining[index]
+        changed = True
+    if changed:
+        _reindex_passages(remaining)
+    else:
+        _relink_passages(passages)
+        return passages
+    return remaining
+
+
+def _adjacent_answer(passages: Sequence[Mapping], index: int, is_answer) -> dict | None:
+    for cursor in range(index - 1, -1, -1):
+        if is_answer(passages[cursor]):
+            return passages[cursor]
+    for cursor in range(index + 1, len(passages)):
+        if is_answer(passages[cursor]):
+            return passages[cursor]
+    return None
+
+
+def _extend_passage(text: str, target: dict, extra: Mapping) -> None:
+    start = min(int(target.get("start_offset") or 0), int(extra.get("start_offset") or 0))
+    end = max(int(target.get("end_offset") or 0), int(extra.get("end_offset") or 0))
+    target["start_offset"] = start
+    target["end_offset"] = end
+    target["text"] = text[start:end]
+    extra_question = str(extra.get("question") or "").strip()
+    target_question = str(target.get("question") or "").strip()
+    if extra_question and extra_question not in target_question:
+        target["question"] = f"{extra_question}\n{target_question}".strip()
+    metadata = dict(target.get("metadata") or {})
+    merged = [dict(item) for item in (metadata.get("merged_passage_offsets") or []) if isinstance(item, Mapping)]
+    merged.append(
+        {
+            "start": int(extra.get("start_offset") or 0),
+            "end": int(extra.get("end_offset") or 0),
+            "passage_id": str(extra.get("passage_id") or ""),
+        }
+    )
+    metadata["merged_passage_offsets"] = merged
+    metadata["merged_short_turn"] = True
+    target["metadata"] = metadata
+
+
+def _reindex_passages(passages: list[dict]) -> None:
+    for index, passage in enumerate(passages):
+        doc_id = str(passage.get("doc_id") or "")
+        passage["position"] = index
+        passage["passage_id"] = f"{doc_id}-p{index:04d}"
+        passage["coding_order"] = index
+    _relink_passages(passages)
+
+
+def _relink_passages(passages: Sequence[dict]) -> None:
+    for index, passage in enumerate(passages):
+        passage["prev_text"] = passages[index - 1]["text"] if index else ""
+        passage["next_text"] = passages[index + 1]["text"] if index + 1 < len(passages) else ""
+
+
+def _uncovered_answer_text(
+    text: str,
+    pairs: Sequence[tuple[str, int, int]],
+    passages: Sequence[Mapping],
+) -> str:
+    """Answer characters that sit in no passage. Whitespace between slices does not count."""
+    if not text or not pairs:
+        return ""
+    covered = [False] * len(text)
+    for passage in passages:
+        start = max(0, int(passage.get("start_offset") or 0))
+        end = min(len(text), int(passage.get("end_offset") or 0))
+        for index in range(start, end):
+            covered[index] = True
+    regions: list[str] = []
+    for _question, start, end in pairs:
+        buf_start = None
+        left = max(0, start)
+        right = min(len(text), end)
+        for index in range(left, right):
+            if covered[index]:
+                if buf_start is not None:
+                    regions.append(text[buf_start:index])
+                    buf_start = None
+                continue
+            if buf_start is None:
+                buf_start = index
+        if buf_start is not None:
+            regions.append(text[buf_start:right])
+    kept = [region.strip() for region in regions if region.strip()]
+    return "\n".join(kept)
+
+
+def _collect_uncovered(passages: Sequence[Mapping]) -> list[dict]:
+    found: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for passage in passages:
+        metadata = passage.get("metadata") or {}
+        gap = str(metadata.get("uncovered_answer_text") or "")
+        doc_id = str(passage.get("doc_id") or "")
+        marker = (doc_id, gap)
+        if not gap or marker in seen:
+            continue
+        seen.add(marker)
+        found.append({"doc_id": doc_id, "chars": len(gap), "text": gap})
+    return found

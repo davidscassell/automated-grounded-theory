@@ -99,9 +99,9 @@ words are the participant's. A label that could have been written from the conte
 alone, without this passage, is a leak. Do not write it. Do not quote or cite the \
 context in a memo.
 
-Quotes should be copied from the participant's words. Prefer the passage. If the \
-incident continues in the previous or next context, copy from there instead of \
-paraphrasing. Use ... only for words you skip. Do not invent wording.
+Quotes must be copied from the participant's words in the target passage. \
+Do not quote the previous context, the following context, or another passage. \
+Use ... only for words you skip inside that passage. Do not invent wording.
 
 Do not use generic labels such as "experience", "discussion", "theme", or "response".
 
@@ -113,8 +113,10 @@ that the book had no close code), a property or dimension this incident varies, 
 one emerging question the next passage could answer. Do not write a sentence that \
 only says no property was recorded.
 
+Code each passage separately. Do not write one code that spans several passages. \
 If several passages are in the user message, return one passages item for every \
-passage_id. A missing passage_id is a failed slot, not an empty coding."""
+passage_id, and keep each code inside the passage it cites. A missing passage_id \
+is a failed slot, not an empty coding."""
 
 SWEEP_SYSTEM = """You are comparing codes with codes during open coding.
 
