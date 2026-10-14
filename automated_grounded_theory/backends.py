@@ -234,6 +234,60 @@ def prompt_cache_supported(model: BaseChatModel, model_name: str = "") -> bool:
     return "anthropic" in blob
 
 
+def provider_http_timeout(seconds: float):
+    """connect, read, write, and pool timeouts for one provider HTTP client.
+
+    A single float leaves the pool and connect phases unbounded on some
+    clients. ``None`` when ``seconds`` is 0 or less, which means no deadline.
+    """
+    seconds = float(seconds)
+    if seconds <= 0:
+        return None
+    try:
+        import httpx
+    except ImportError:
+        return seconds
+    return httpx.Timeout(connect=min(10.0, seconds), read=seconds, write=seconds, pool=seconds)
+
+
+def install_provider_http_timeout(model, seconds: float | None):
+    """Set connect/read/write/pool timeouts on a chat model and any live client.
+
+    ``init_chat_model`` still receives the numeric ``timeout`` argument.
+    This writes the structured timeout onto the instance the call will use,
+    including a client that was already constructed. A model without those
+    attributes is left unchanged.
+    """
+    if model is None or seconds is None or float(seconds) <= 0:
+        return model
+    timeout = provider_http_timeout(float(seconds))
+    if timeout is None:
+        return model
+    fields = getattr(type(model), "model_fields", None)
+    for name in ("timeout", "request_timeout"):
+        if isinstance(fields, dict) and name in fields:
+            try:
+                setattr(model, name, timeout)
+            except Exception:
+                continue
+    for name in (
+        "http_client",
+        "http_async_client",
+        "client",
+        "async_client",
+        "root_client",
+        "root_async_client",
+    ):
+        client = getattr(model, name, None)
+        if client is None or not hasattr(client, "timeout"):
+            continue
+        try:
+            client.timeout = timeout
+        except Exception:
+            continue
+    return model
+
+
 def resolve_chat_model(
     model: BaseChatModel | str,
     *,
@@ -291,6 +345,9 @@ def resolve_chat_model(
             f"init_chat_model({model!r}) did not return a BaseChatModel. "
             "Pass a fully specified provider:model-name string or a chat model instance."
         )
+    applied = kwargs.get("timeout", timeout)
+    if isinstance(applied, (int, float)) and not isinstance(applied, bool):
+        install_provider_http_timeout(resolved, float(applied))
     return resolved
 
 

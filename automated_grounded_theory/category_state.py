@@ -303,6 +303,91 @@ def property_stability(runs: Sequence[Any]) -> dict[str, Any]:
     }
 
 
+PROPOSAL_STABILITY_NOTE = (
+    "Code-level stability is the Jaccard overlap of codes that received a revise or drop proposal. "
+    "Key-level stability is the Jaccard overlap of (code_id, passage_id, kind, definition) tuples. "
+    "A single run leaves both scores empty. proposal_stability() compares two or more runs. "
+    "This is not claim support. Conflicting proposals are not applied."
+)
+
+
+def _proposal_rows(run: Any) -> list[Mapping[str, Any]]:
+    """Revise and drop proposals from a run, a segment list, or proposal rows."""
+    if isinstance(run, (list, tuple)):
+        return [row for row in run if isinstance(row, Mapping)]
+    if isinstance(run, Mapping):
+        consolidated = run.get("proposal_consolidation")
+        if consolidated is None and isinstance(run.get("metadata"), Mapping):
+            consolidated = run["metadata"].get("proposal_consolidation")
+        if isinstance(consolidated, list):
+            rows = []
+            for group in consolidated:
+                if not isinstance(group, Mapping):
+                    continue
+                for item in group.get("proposals") or []:
+                    if isinstance(item, Mapping):
+                        rows.append({**item, "code_id": item.get("code_id") or group.get("code_id")})
+            if rows:
+                return rows
+        segments = run.get("segments")
+        if isinstance(segments, list):
+            return _proposals_from_segments(segments)
+    segments = getattr(run, "segments", None)
+    if isinstance(segments, list):
+        return _proposals_from_segments(segments)
+    consolidated = getattr(run, "metadata", None)
+    if isinstance(consolidated, Mapping):
+        return _proposal_rows(consolidated)
+    return []
+
+
+def _proposals_from_segments(segments: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for segment in segments:
+        if not isinstance(segment, Mapping):
+            continue
+        code_id = str(segment.get("code_id") or "")
+        passage_id = str(segment.get("passage_id") or "")
+        for kind in ("focused_revise_proposal", "focused_drop_proposal"):
+            payload = segment.get(kind)
+            if isinstance(payload, Mapping):
+                rows.append({"code_id": code_id, "passage_id": passage_id, "kind": kind, **dict(payload)})
+    return rows
+
+
+def proposal_stability(runs: Sequence[Any]) -> dict[str, Any]:
+    """Overlap of revise and drop proposals across runs.
+
+    One run has no pair, so both scores are empty. The comparison is the set
+    of codes with a proposal and the set of proposal keys. It does not apply
+    a proposal and it is not claim support.
+    """
+    code_sets = []
+    key_sets = []
+    for run in runs:
+        rows = _proposal_rows(run)
+        code_sets.append({str(row.get("code_id") or "") for row in rows if row.get("code_id")})
+        key_sets.append(
+            {
+                (
+                    str(row.get("code_id") or ""),
+                    str(row.get("passage_id") or ""),
+                    str(row.get("kind") or row.get("action") or ""),
+                    str(row.get("definition") or ""),
+                )
+                for row in rows
+                if row.get("code_id")
+            }
+        )
+    return {
+        "name": "proposal_stability",
+        "runs": len(list(runs)),
+        "code_level": _mean_jaccard(code_sets),
+        "key_level": _mean_jaccard(key_sets),
+        "note": PROPOSAL_STABILITY_NOTE,
+    }
+
+
 def property_stability_report(
     raw: Sequence[Mapping[str, Any]],
     merged: Sequence[Mapping[str, Any]],

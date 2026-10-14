@@ -878,9 +878,33 @@ class FocusedCompetePassage(_LLMModel):
 
 
 class FocusedCompeteBatch(_LLMModel):
-    """Compete and claim-compete requests. One entry per passage, each with verdicts and an alternative."""
+    """Compete requests. One entry per passage, each with verdicts and an alternative.
+
+    Claim testing uses :class:`FocusedClaimTest`, not this schema.
+    """
 
     passages: list[FocusedCompetePassage] = Field(default_factory=list)
+
+
+class FocusedClaimJudgment(_LLMModel):
+    """Whether one passage supports a specific property or dimension claim."""
+
+    passage_id: str = Field(default="", description="passage_id from the prompt. Copy it exactly.")
+    entry_id: str = Field(description="entry_id of the claim in the prompt. Copy it exactly.")
+    judgment: Literal["supports", "contradicts", "qualifies", "irrelevant"] = Field(
+        description=(
+            "supports, contradicts, qualifies, or irrelevant to the supplied claim. "
+            "Judge that claim, not a general coding of the passage."
+        )
+    )
+    rationale: str = Field(description="Why this passage supports, contradicts, qualifies, or is irrelevant to the claim.")
+    quote: str = Field(default="", description="Words from this passage. Do not paraphrase.")
+
+
+class FocusedClaimTest(_LLMModel):
+    """Claim-compete requests. One judgment per passage, about the claim in the prompt."""
+
+    passages: list[FocusedClaimJudgment] = Field(default_factory=list)
 
 
 MergeDecision.model_rebuild()

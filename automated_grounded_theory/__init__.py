@@ -17,7 +17,7 @@ from automated_grounded_theory.api import (
 )
 from automated_grounded_theory.evaluate import aevaluate, chen_metrics, evaluate_run
 from automated_grounded_theory.context import PresetCodesError, ResearchContext
-from automated_grounded_theory.category_state import property_stability
+from automated_grounded_theory.category_state import property_stability, proposal_stability
 from automated_grounded_theory.decision_review import (
     ClaimDecision,
     ClaimDecisions,
@@ -83,6 +83,7 @@ __all__ = [
     "open_code",
     "plan_coding",
     "property_stability",
+    "proposal_stability",
     "selection_payload",
     "strict_sequential_settings",
 ]

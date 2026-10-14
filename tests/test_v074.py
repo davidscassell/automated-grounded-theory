@@ -27,8 +27,8 @@ from tests.test_v070 import _entry, _passages, _source
 
 
 def test_version_is_074():
-    assert __version__ == "0.7.4"
-    assert POLICY_VERSION == "0.7.4"
+    assert __version__ == "0.7.5"
+    assert POLICY_VERSION == "0.7.5"
     assert FocusedAlternativeReading.model_fields["alternative_fit"].is_required()
 
 
@@ -430,7 +430,11 @@ def _compete_result(alternative: FocusedAlternativeReading, *, memo: str = ""):
     return focused_code(
         _source(
             passages=passages,
-            codes=[_entry("c-freq", "packing bags", 1, ["d1"]), _entry("c-rare", "writing letters", 1, ["d1"])],
+            codes=[
+                _entry("c-freq", "packing bags", 1, ["d1"]),
+                _entry("c-rare", "writing letters", 1, ["d1"]),
+                _entry("c-hour", "marking the hour", 1, ["d9"]),
+            ],
             segments=[
                 {
                     "segment_id": "s1",
@@ -486,9 +490,9 @@ def test_self_reference_is_invalid_and_only_a_stronger_fit_is_flagged():
 
     weaker = _compete_result(
         FocusedAlternativeReading(
-            code="writing letters",
-            code_id="c-rare",
-            rationale="Writing letters was considered and fits less well.",
+            code="marking the hour",
+            code_id="c-hour",
+            rationale="Marking the hour was considered and fits less well.",
             alternative_fit="weaker",
             quote="letters",
         ),
@@ -500,8 +504,8 @@ def test_self_reference_is_invalid_and_only_a_stronger_fit_is_flagged():
 
     comparable = _compete_result(
         FocusedAlternativeReading(
-            code="writing letters",
-            code_id="c-rare",
+            code="marking the hour",
+            code_id="c-hour",
             rationale="The two readings are comparable.",
             alternative_fit="comparable",
             quote="letters",
@@ -512,9 +516,9 @@ def test_self_reference_is_invalid_and_only_a_stronger_fit_is_flagged():
 
     stronger = _compete_result(
         FocusedAlternativeReading(
-            code="writing letters",
-            code_id="c-rare",
-            rationale="Writing letters fits better than the kept code.",
+            code="marking the hour",
+            code_id="c-hour",
+            rationale="Marking the hour fits better than the kept code.",
             alternative_fit="stronger",
             quote="letters",
         )

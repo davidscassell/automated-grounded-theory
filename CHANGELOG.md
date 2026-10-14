@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.5
+
+- Claim compete uses a dedicated claim-test prompt and schema. The request includes that property or dimension claim (category, name, text, pole, and cited quote) and asks whether the passage supports, contradicts, qualifies, or is irrelevant to it. contradicts and qualifies are negative cases: flagged, not applied, and `evidence_condition` becomes `disputed`. supports and irrelevant are not code changes. `claim_support` stays undefined until a researcher sets it. A call reallocated to outside or compete does not use this schema.
+- A timed model call runs on a private thread and event loop. The provider client gets connect, read, write, and pool timeouts. A synchronous socket read inside `ainvoke` no longer blocks the package loop, so `focused_request_timeout` still fires. A timeout of 0 or less still waits with no deadline. The sync bridge stays a budget for the whole allowance, not one request.
+- `strongest_alternative` cannot name a kept code or a code already assigned on the passage. The prompt lists `allowed_alternatives` and `excluded_alternative_code_ids`. A `code_id` and a label that name different codes, or a label that normalizes to an excluded code, are invalid. `alternative_named_not_chosen` is still only when `alternative_fit` is `stronger` for a different code and a raised code was kept.
+- Revise and drop proposals are consolidated per code for the run. Both a revise and a drop, or two different revised definitions, is `proposal_conflict`. The proposals stay unapplied and the conflict is excluded. `actor` stays `model` in human and LLM decision mode. `proposal_stability` compares those proposals across runs. One run leaves both scores empty.
+- Span splitting caches the structured-output schema token count, so a 100,000-character paragraph does not rebuild that schema on every slice.
+- `policy_version` is `0.7.5`.
+
 ## 0.7.4
 
 - Claim compete no longer depends on a pole string appearing in the passage. It searches the property's category on other passages, opposite dimension poles, lexical similarity and any stored embedding of the property text, then low-confidence or flagged assignments. If passages are still unreread, those fill the remaining slots. If nothing is left to reread, the unused calls are sent as outside or compete calls.

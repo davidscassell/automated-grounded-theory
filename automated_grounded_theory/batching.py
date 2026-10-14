@@ -77,19 +77,30 @@ def count_text_tokens(text: str, tokenizer=None) -> int:
     return estimate_tokens(text)
 
 
+_SCHEMA_TOKEN_CACHE: dict[tuple[int, int | None], int] = {}
+
+
 def schema_token_count(schema, tokenizer=None) -> int:
     """Tokens in the JSON schema sent with a structured request.
 
     Message text does not include it. A budget that ignores it under-counts
-    every call.
+    every call. The schema does not change between span checks, so the count
+    is cached. Rebuilding it for every slice of a long passage dominated the
+    100,000-character split.
     """
     if schema is None:
         return 0
     model = getattr(schema, "model_json_schema", None)
     if not callable(model):
         return 0
+    key = (id(schema), None if tokenizer is None else id(tokenizer))
+    cached = _SCHEMA_TOKEN_CACHE.get(key)
+    if cached is not None:
+        return cached
     raw = json.dumps(model(), ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-    return count_text_tokens(raw, tokenizer)
+    count = count_text_tokens(raw, tokenizer)
+    _SCHEMA_TOKEN_CACHE[key] = count
+    return count
 
 
 def repair_note(schema) -> str:
