@@ -9,7 +9,11 @@ from langchain_core.runnables import RunnableLambda
 
 from automated_grounded_theory.prompts import extract_payload, message_text
 from automated_grounded_theory.schemas import (
+    FocusedAlternativeReading,
     FocusedCodeDecision,
+    FocusedCodeVerdict,
+    FocusedCompeteBatch,
+    FocusedCompetePassage,
     FocusedDimensionNote,
     FocusedPassageRecode,
     FocusedPropertyNote,
@@ -23,6 +27,7 @@ class FakeFocusedCoder(BaseChatModel):
     call_count: int = 0
     mode: str = "echo"
     outside_quote: str = ""
+    reported_usage: dict | None = None
 
     @property
     def _llm_type(self) -> str:
@@ -38,15 +43,21 @@ class FakeFocusedCoder(BaseChatModel):
             self.call_count += 1
             text = "\n".join(message_text(message) for message in messages)
             name = getattr(schema, "__name__", "")
-            if name == "FocusedRecodeBatch":
-                parsed = self.batch(extract_payload(text))
+            payload = extract_payload(text)
+            if name == "FocusedCompeteBatch":
+                parsed = self.compete_batch(payload)
+            elif name == "FocusedRecodeBatch":
+                parsed = self.batch(payload)
             else:
                 parsed = FocusedRecodeBatch(passages=[])
             if not include_raw:
                 return parsed
             raw = AIMessage(
                 content="{}",
-                usage_metadata={"input_tokens": 30, "output_tokens": 12, "total_tokens": 42},
+                usage_metadata=dict(
+                    self.reported_usage
+                    or {"input_tokens": 30, "output_tokens": 12, "total_tokens": 42}
+                ),
             )
             return {"raw": raw, "parsed": parsed, "parsing_error": None}
 
@@ -184,3 +195,70 @@ class FakeFocusedCoder(BaseChatModel):
                 )
             )
         return FocusedRecodeBatch(passages=rows)
+
+    def compete_batch(self, payload: dict) -> FocusedCompeteBatch:
+        """Explicit keep/revise/drop verdicts. The alternative names the kept code unless a test overrides this."""
+        if self.mode == "empty":
+            return FocusedCompeteBatch(passages=[])
+        rows = []
+        for passage in payload.get("passages") or []:
+            text = str(passage.get("text") or "")
+            passage_id = str(passage.get("passage_id") or "")
+            doc_id = str(passage.get("doc_id") or "")
+            quote = text.strip()
+            initial = list(passage.get("initial_codes") or [])
+            if not initial:
+                initial = list(payload.get("codes") or [])[:1]
+            if not initial:
+                initial = [{"code_id": "", "code": "noticing a gap", "definition": ""}]
+            verdict_name = "drop" if self.mode == "drop" else "keep"
+            rationale = (
+                "The passage does not support this code."
+                if verdict_name == "drop"
+                else "The disconfirming reading does not displace this code."
+            )
+            verdicts = [
+                FocusedCodeVerdict(
+                    code_id=str(code.get("code_id") or ""),
+                    code=str(code.get("code") or ""),
+                    verdict=verdict_name,
+                    rationale=rationale,
+                    quote=quote,
+                )
+                for code in initial
+            ]
+            first = initial[0]
+            rows.append(
+                FocusedCompetePassage(
+                    passage_id=passage_id,
+                    verdicts=verdicts,
+                    strongest_alternative=FocusedAlternativeReading(
+                        code=str(first.get("code") or ""),
+                        code_id=str(first.get("code_id") or ""),
+                        rationale="No stronger alternative reading is in this passage.",
+                        quote=quote,
+                    ),
+                    properties=[
+                        FocusedPropertyNote(
+                            category_id=str(first.get("code_id") or ""),
+                            name="timing",
+                            text="The incident is tied to this passage.",
+                            document_id=doc_id,
+                            passage_id=passage_id,
+                            quote=quote,
+                        )
+                    ],
+                    dimensions=[
+                        FocusedDimensionNote(
+                            category_id=str(first.get("code_id") or ""),
+                            name="timing",
+                            pole="during",
+                            text="The incident happens in the quoted moment.",
+                            document_id=doc_id,
+                            passage_id=passage_id,
+                            quote=quote,
+                        )
+                    ],
+                )
+            )
+        return FocusedCompeteBatch(passages=rows)

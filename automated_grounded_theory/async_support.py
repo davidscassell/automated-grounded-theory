@@ -665,16 +665,34 @@ def is_rate_limit(exc: BaseException) -> bool:
     return "rate limit" in text or "too many requests" in text or "429" in text
 
 
+def _cached_tokens(meta: Mapping[str, Any]) -> int:
+    """Provider cache reads. Missing details stay 0 and do not change the total."""
+    details = meta.get("input_token_details") or meta.get("prompt_tokens_details") or {}
+    if not isinstance(details, Mapping):
+        details = {}
+    cached = (
+        details.get("cache_read")
+        or details.get("cache_read_input_tokens")
+        or details.get("cached_tokens")
+        or meta.get("cached_tokens")
+        or meta.get("cache_read_input_tokens")
+        or 0
+    )
+    return int(cached or 0)
+
+
 def usage_from_message(raw: Any) -> dict[str, int]:
     """Read token counts from a LangChain message, or zeros when the provider sent none."""
     meta = getattr(raw, "usage_metadata", None) or {}
     if not meta and raw is not None:
         response = getattr(raw, "response_metadata", None) or {}
         token_usage = response.get("token_usage") or response.get("usage") or {}
+        prompt_details = token_usage.get("prompt_tokens_details") or {}
         meta = {
             "input_tokens": token_usage.get("prompt_tokens") or token_usage.get("input_tokens") or 0,
             "output_tokens": token_usage.get("completion_tokens") or token_usage.get("output_tokens") or 0,
             "total_tokens": token_usage.get("total_tokens") or 0,
+            "cached_tokens": (prompt_details or {}).get("cached_tokens") or token_usage.get("cached_tokens") or 0,
         }
     input_tokens = int(meta.get("input_tokens") or 0)
     output_tokens = int(meta.get("output_tokens") or 0)
@@ -683,6 +701,7 @@ def usage_from_message(raw: Any) -> dict[str, int]:
         total_tokens = input_tokens + output_tokens
     return {
         "input_tokens": input_tokens,
+        "cached_tokens": _cached_tokens(meta),
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
     }
@@ -698,7 +717,7 @@ def usage_from_result(result: Any) -> dict[str, int]:
 
 def combine_usage(*parts: Mapping[str, Any] | None) -> dict[str, Any]:
     """Sum token usage. A schema repair keeps every attempt, not only the success."""
-    keys = ("input_tokens", "output_tokens", "total_tokens")
+    keys = ("input_tokens", "cached_tokens", "output_tokens", "total_tokens")
     total = {key: 0 for key in keys}
     attempts: list[dict[str, int]] = []
     for part in parts:

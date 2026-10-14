@@ -794,4 +794,86 @@ class FocusedRecodeBatch(_LLMModel):
     passages: list[FocusedPassageRecode] = Field(default_factory=list)
 
 
+class FocusedCodeVerdict(_LLMModel):
+    """A required keep, revise, or drop for one initial code on a compete passage."""
+
+    code_id: str = Field(description="code_id copied from initial_codes. One verdict per initial code.")
+    code: str = Field(description="Label copied from that initial code.")
+    verdict: Literal["keep", "revise", "drop"] = Field(
+        description=(
+            "Required. keep, revise, or drop this initial code. "
+            "Use revise when the definition should change. Use drop when the passage does not support the code. "
+            "revise and drop are proposals for the researcher. They are not applied without review."
+        )
+    )
+    rationale: str = Field(
+        description=(
+            "Required. State the disconfirming reading you considered and why this verdict follows. "
+            "Do not leave this empty."
+        )
+    )
+    revised_definition: str = Field(
+        default="",
+        description="The proposed definition when verdict is revise. Empty for keep or drop.",
+    )
+    quote: str = Field(
+        default="",
+        description="Words from this passage that support the verdict. Do not paraphrase.",
+    )
+
+
+class FocusedAlternativeReading(_LLMModel):
+    """The strongest other reading of a compete passage. Required even when every verdict is keep."""
+
+    code: str = Field(
+        description=(
+            "Required. The strongest alternative reading. Prefer a label from the codes list. "
+            "Do not repeat the initial code you kept unless no other reading exists."
+        )
+    )
+    code_id: str = Field(
+        default="",
+        description="code_id when that alternative is already in the codebook. Empty when it is not.",
+    )
+    rationale: str = Field(
+        description="Required. Why this alternative fits the passage, including when you do not adopt it."
+    )
+    quote: str = Field(default="", description="Words from this passage that support the alternative.")
+
+
+class FocusedCompetePassage(_LLMModel):
+    """One compete passage. Every initial code has a verdict, and an alternative reading is required."""
+
+    passage_id: str = Field(default="", description="passage_id from the prompt. Copy it exactly.")
+    verdicts: list[FocusedCodeVerdict] = Field(
+        description=(
+            "One verdict for every code in initial_codes. Do not omit a code. "
+            "keep, revise, and drop are equally available. revise and drop are not applied without review."
+        )
+    )
+    strongest_alternative: FocusedAlternativeReading = Field(
+        description="Required on every passage. Name the strongest alternative reading. Do not leave this out."
+    )
+    properties: list[FocusedPropertyNote] = Field(
+        default_factory=list,
+        description="Analytic properties, each with document_id, passage_id, and a quote.",
+    )
+    dimensions: list[FocusedDimensionNote] = Field(
+        default_factory=list,
+        description="Analytic dimensions and the pole this passage occupies, each with a quote.",
+    )
+    memo: str = Field(
+        default="",
+        description=(
+            "Optional analytic note. If you name an alternative code here, also put that code in strongest_alternative."
+        ),
+    )
+
+
+class FocusedCompeteBatch(_LLMModel):
+    """Compete and claim-compete requests. One entry per passage, each with verdicts and an alternative."""
+
+    passages: list[FocusedCompetePassage] = Field(default_factory=list)
+
+
 MergeDecision.model_rebuild()

@@ -14,8 +14,8 @@ from tests.fake_llm import FakeCoder
 
 
 def test_version_is_0_6_9():
-    assert __version__ == "0.7.2"
-    assert POLICY_VERSION == "0.7.2"
+    assert __version__ == "0.7.3"
+    assert POLICY_VERSION == "0.7.3"
 
 
 def _paragraph(chars: int) -> str:

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.3
+
+- `focused_share_claim_compete` reserves calls for a compete round that runs after properties are written. The four shares sum to 1. The default is one quarter each. A three-purpose split that already sums to 1 keeps this share at 0. `purpose_coverage` reports claim compete the same way as the other purposes. Setting the share to 0 is what skips the round.
+- Compete passages use a separate output. Every initial code needs a `keep`, `revise`, or `drop` verdict with a rationale, and every passage needs `strongest_alternative`. Revise and drop stay flagged proposals and are not applied. The compete prompt lists codes on equal footing, alternatives first, and does not mark which were raised. A kept raised code is flagged `alternative_named_not_chosen` when the memo or the alternative names a different code.
+- `focused_tokens_used` is provider-reported input, cached, and output when the response includes them. `focused_tokens_estimated` is the pre-call ceiling that stops the reread. The estimate is not provider usage.
+- Properties that share a category and a normalized `property_key` merge, keeping every citation. `property_stability` reports category-level and name-level overlap across runs. One run leaves those scores empty and records the keys.
+- `policy_version` is `0.7.3`.
+
 ## 0.7.2
 
 - Each focused reread queue is sized to its reserved share of `max_focused_review_calls`. `focused_neighbor_limit`, `focused_outside_limit`, and `focused_negative_case_limit` are optional caps (`None` by default, `0` adds none). They are not a default of 1. `purpose_coverage.applied_share` is the share of calls actually used. A purpose that receives fewer calls than it reserved is marked reallocated, with a warning.
