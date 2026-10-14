@@ -40,8 +40,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_version_and_batch_size_stay_split_from_procedure():
-    assert __version__ == "0.7.5"
-    assert POLICY_VERSION == "0.7.5"
+    assert __version__ == "0.7.6"
+    assert POLICY_VERSION == "0.7.6"
     assert inspect.signature(focused_code).parameters["batch_size"].default == 1
     assert inspect.signature(afocused_code).parameters["batch_size"].default == 1
     assert DEFAULT_FOCUSED_BATCH_SIZE == 1
@@ -385,12 +385,16 @@ def _run(mode="echo", *, passages=None, segments=None, interrupt=False, **kwargs
 
 def test_recoding_keeps_quotes_and_writes_cited_properties(tmp_path):
     coder, result = _run(segments=_segments_for_raised(), output_dir=tmp_path, max_focused_review_calls=8)
-    assert coder.call_count == 4
-    assert result.metadata["status"] == "complete"
-    assert result.metadata["stop"] == "complete"
-    assert result.metadata["coverage"]["corpus_complete"] is True
-    assert result.focused_not_queued == []
-    assert "p4" in result.purpose_coverage["claim_compete"]["passage_ids"]
+    assert coder.call_count == 5
+    assert result.metadata["status"] == "complete_for_queue"
+    assert result.metadata["stop"] == "complete_for_queue"
+    assert result.metadata["coverage"]["corpus_complete"] is False
+    assert result.focused_not_queued == ["p4"]
+    assert "p4" not in result.purpose_coverage["claim_compete"]["passage_ids"]
+    assert result.purpose_coverage["claim_compete"]["calls"] == 0
+    assert any(
+        "claim_compete" in item and "reallocated to outside" in item for item in result.warnings
+    )
     assert result.metadata["performance"]["batch_size"] == 1
     assert "batch_size" not in result.metadata["procedure"]
     assert result.saturation_report["judgment"] is None

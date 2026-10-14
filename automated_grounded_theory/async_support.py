@@ -459,8 +459,10 @@ class CallLimiter:
         try:
             if limit and limit > 0:
                 # A sync HTTP read inside the provider call must not run on this
-                # loop. asyncio.wait cannot fire while the loop thread is blocked
-                # in that read. The call runs on its own thread and loop.
+                # loop. The call runs on one long-lived model loop so a pooled
+                # async client stays bound to that loop. The wait itself is
+                # future.result(timeout) on a side thread: an idle loop cannot
+                # skip the deadline.
                 return await _ainvoke_off_loop(runnable, payload, timeout=limit)
             return await runnable.ainvoke(payload)
         finally:
@@ -1153,48 +1155,93 @@ def _hold_abandoned(task: asyncio.Task) -> None:
     task.add_done_callback(_consume_task_exception)
 
 
-async def _ainvoke_off_loop(runnable, payload, *, timeout: float):
-    """Run one model call off the caller's event loop.
+_MODEL_LOOP: asyncio.AbstractEventLoop | None = None
+_MODEL_LOOP_LOCK = threading.Lock()
 
-    Provider clients sometimes perform a synchronous socket read from inside
-    ``ainvoke`` (httpx's sync connection pool, reached from the async method).
-    That read holds the loop thread, so a timeout scheduled on the same loop
-    never runs. This starts a private loop on a daemon thread and waits for
-    the result with a hard deadline. Cancellation still runs on that private
-    loop. A sync read that ignores cancellation is abandoned when the deadline
-    expires; the caller's loop is not blocked. A timeout of 0 or less is not
-    passed here.
+
+def _model_loop() -> asyncio.AbstractEventLoop:
+    """One loop for every timed model call.
+
+    A fresh loop per call drops the pooled httpx/xAI connection: the socket
+    stays bound to the loop that opened it, and the next call raises
+    ``Event is bound to a different event loop``. Callers do not keep the
+    client alive. This loop stays up for the process.
     """
-    loop = asyncio.new_event_loop()
-    ready = threading.Event()
+    global _MODEL_LOOP
+    with _MODEL_LOOP_LOCK:
+        if _MODEL_LOOP is not None and _MODEL_LOOP.is_running():
+            return _MODEL_LOOP
+        loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def _run() -> None:
+            asyncio.set_event_loop(loop)
+            ready.set()
+            loop.run_forever()
+
+        threading.Thread(target=_run, name="agt-model-loop", daemon=True).start()
+        if not ready.wait(2):
+            raise TimeoutError("The model-call loop did not start within 2s.")
+        _MODEL_LOOP = loop
+        return loop
+
+
+def _submit_on_loop(loop: asyncio.AbstractEventLoop, coro, context: contextvars.Context):
+    """Schedule ``coro`` on ``loop`` in ``context`` and return a concurrent future."""
+    future: concurrent.futures.Future = concurrent.futures.Future()
+
+    def _start() -> None:
+        try:
+            task = loop.create_task(coro, context=context)
+        except BaseException as exc:
+            future.set_exception(exc)
+            return
+
+        def _done(done_task: asyncio.Task) -> None:
+            # Always read the task exception. Skipping it when the outer wait
+            # already finished logs "Task exception was never retrieved".
+            if done_task.cancelled():
+                if not future.done():
+                    future.cancel()
+                return
+            exc = done_task.exception()
+            if future.done():
+                return
+            if exc is not None:
+                future.set_exception(exc)
+            else:
+                future.set_result(done_task.result())
+
+        task.add_done_callback(_done)
+        future.task = task  # type: ignore[attr-defined]
+
+    loop.call_soon_threadsafe(_start)
+    return future
+
+
+async def _ainvoke_off_loop(runnable, payload, *, timeout: float):
+    """Run one model call on the shared model loop.
+
+    The deadline is ``future.result(timeout)`` on a side thread. It does not
+    depend on the package loop waking up, and it does not run the provider
+    read on the package loop. A timeout of 0 or less is not passed here.
+    The model loop is not stopped between calls.
+    """
+    loop = _model_loop()
     context = contextvars.copy_context()
-
-    def _run() -> None:
-        asyncio.set_event_loop(loop)
-        ready.set()
-        loop.run_forever()
-
-    thread = threading.Thread(target=lambda: context.run(_run), name="agt-model-call", daemon=True)
-    thread.start()
-    if not await asyncio.to_thread(ready.wait, 2):
-        raise TimeoutError("The model-call thread did not start within 2s.")
 
     async def _call():
         return await await_with_wall_timeout(runnable.ainvoke(payload), timeout)
 
-    future = asyncio.run_coroutine_threadsafe(_call(), loop)
-    deadline = time.monotonic() + float(timeout) + 0.05
+    future = _submit_on_loop(loop, _call(), context)
     try:
-        while not future.done():
-            if time.monotonic() >= deadline:
-                future.cancel()
-                raise TimeoutError(f"timed out after {float(timeout):g}s")
-            await asyncio.sleep(0.01)
-        return future.result()
-    finally:
-        if loop.is_running():
-            loop.call_soon_threadsafe(loop.stop)
-        await asyncio.to_thread(thread.join, 0.05)
+        return await asyncio.to_thread(future.result, float(timeout) + 0.05)
+    except concurrent.futures.TimeoutError:
+        task = getattr(future, "task", None)
+        future.cancel()
+        if task is not None and loop.is_running():
+            loop.call_soon_threadsafe(task.cancel)
+        raise TimeoutError(f"timed out after {float(timeout):g}s") from None
 
 
 async def await_with_wall_timeout(awaitable, timeout: float | None):

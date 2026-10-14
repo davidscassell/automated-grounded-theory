@@ -62,12 +62,48 @@ DEFAULT_SHARES = {
 PROPERTY_STABILITY_NOTE = (
     "Category-level stability is the Jaccard overlap of categories that received a property. "
     "Name-level stability is the Jaccard overlap of (category_id, property_key) pairs. "
-    "property_key sorts the content words of the name, so 'timing of departure' and 'departure timing' match. "
+    "property_key sorts the content words of the name and drops function words, "
+    "so 'timing of departure' and 'timing during departure' match 'departure timing'. "
+    "A low name-level score means those remaining words differ. The score is reported as measured. "
     "A single run leaves both scores empty. property_stability() compares two or more runs. "
     "This is not claim support."
 )
 _PROPERTY_STOPWORDS = frozenset(
-    {"a", "an", "the", "of", "to", "and", "or", "in", "on", "for", "with", "at", "by", "from"}
+    {
+        "a",
+        "an",
+        "the",
+        "of",
+        "to",
+        "and",
+        "or",
+        "in",
+        "on",
+        "for",
+        "with",
+        "at",
+        "by",
+        "from",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "this",
+        "that",
+        "these",
+        "those",
+        "it",
+        "as",
+        "when",
+        "during",
+        "about",
+        "into",
+        "over",
+        "than",
+        "their",
+        "its",
+    }
 )
 
 
@@ -263,7 +299,7 @@ def _property_rows(run: Any) -> list[Mapping[str, Any]]:
     return list(rows or [])
 
 
-def _mean_jaccard(sets: Sequence[set]) -> float | None:
+def _mean_jaccard(sets: Sequence[set], *, skip_empty_pairs: bool = False) -> float | None:
     if len(sets) < 2:
         return None
     scores = []
@@ -271,7 +307,11 @@ def _mean_jaccard(sets: Sequence[set]) -> float | None:
         for right in sets[left_index + 1 :]:
             left = sets[left_index]
             union = left | right
+            if skip_empty_pairs and not union:
+                continue
             scores.append(1.0 if not union else len(left & right) / len(union))
+    if not scores:
+        return None
     return round(sum(scores) / len(scores), 6)
 
 
@@ -307,6 +347,7 @@ PROPOSAL_STABILITY_NOTE = (
     "Code-level stability is the Jaccard overlap of codes that received a revise or drop proposal. "
     "Key-level stability is the Jaccard overlap of (code_id, passage_id, kind, definition) tuples. "
     "A single run leaves both scores empty. proposal_stability() compares two or more runs. "
+    "A pair of runs with no proposals is not scored. If no pair has a proposal, both scores are undefined. "
     "This is not claim support. Conflicting proposals are not applied."
 )
 
@@ -358,9 +399,10 @@ def _proposals_from_segments(segments: Sequence[Mapping[str, Any]]) -> list[dict
 def proposal_stability(runs: Sequence[Any]) -> dict[str, Any]:
     """Overlap of revise and drop proposals across runs.
 
-    One run has no pair, so both scores are empty. The comparison is the set
-    of codes with a proposal and the set of proposal keys. It does not apply
-    a proposal and it is not claim support.
+    One run has no pair, so both scores are empty. Two runs that both have no
+    proposals are undefined, not 1. The comparison is the set of codes with a
+    proposal and the set of proposal keys. It does not apply a proposal and it
+    is not claim support.
     """
     code_sets = []
     key_sets = []
@@ -382,8 +424,8 @@ def proposal_stability(runs: Sequence[Any]) -> dict[str, Any]:
     return {
         "name": "proposal_stability",
         "runs": len(list(runs)),
-        "code_level": _mean_jaccard(code_sets),
-        "key_level": _mean_jaccard(key_sets),
+        "code_level": _mean_jaccard(code_sets, skip_empty_pairs=True),
+        "key_level": _mean_jaccard(key_sets, skip_empty_pairs=True),
         "note": PROPOSAL_STABILITY_NOTE,
     }
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.6
+
+- Timed model calls share one process-wide loop. A pooled httpx or xAI client stays bound to that loop, so the second call does not raise `Event is bound to a different event loop`. Callers do not keep the client alive. The wait is `future.result(timeout)` on a side thread. A graph step that calls the model has a watchdog (two request timeouts plus two seconds for a recode step, so a label retry still fits; an LLM checkpoint gets its own call allowance). A timeout still raises `TimeoutError`, and the checkpoint records status `incomplete` with stop `timeout`. A timeout of 0 or less still waits on the caller's loop. The sync bridge remains the whole allowance.
+- A claim is tested only against a passage that claim retrieved: the same category, an opposite substantive pole, a content-token or embedding match, or a negative-case hit. `contradicts` is only when the passage asserts the opposite. Absence of mention is `irrelevant`. A dimension pole that is an absence (`no mention of ...`) is flagged `degenerate_absence_pole`, kept, and not used to generate a test. Only `contradicts` or `qualifies` from a relevant test becomes a disputed negative case. Any other such judgment is stored as `claim_test_invalid`.
+- `claim_test_counts` accumulates every judgment in the run. A later commit no longer replaces the dict with the last call.
+- `proposal_stability` is undefined when there are no proposals to compare. An empty pair is not scored as 1.
+- A compete round that returns only `keep` sets `compete_keep_only` and a warning. Exclusion and consolidation do not drop a non-conflicting revise or drop. Those proposals are stored before the alternative check. The prompt says `keep` is not the default. A live run that still returns only `keep` is model behavior, and the flag records it.
+- `property_key` also drops function words (`during`, `when`, `this`, and the same class). A low name-level score means the remaining words differ. The score is reported. It is not claim support.
+- `focused_tokens_estimated` stays a ceiling of about three characters per token. It is not calibrated down to provider usage. `token_estimate_ratio` is that ceiling divided by provider `total_tokens` when the provider reported tokens, and null otherwise. Both numbers are reported.
+- `policy_version` is `0.7.6`.
+
 ## 0.7.5
 
 - Claim compete uses a dedicated claim-test prompt and schema. The request includes that property or dimension claim (category, name, text, pole, and cited quote) and asks whether the passage supports, contradicts, qualifies, or is irrelevant to it. contradicts and qualifies are negative cases: flagged, not applied, and `evidence_condition` becomes `disputed`. supports and irrelevant are not code changes. `claim_support` stays undefined until a researcher sets it. A call reallocated to outside or compete does not use this schema.
