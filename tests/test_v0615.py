@@ -25,8 +25,8 @@ from tests.fake_llm import FakeCoder
 
 
 def test_version_is_0_6_15():
-    assert __version__ == "0.7.6"
-    assert POLICY_VERSION == "0.7.6"
+    assert __version__ == "0.7.7"
+    assert POLICY_VERSION == "0.7.7"
     assert DEFAULT_MAX_FINAL_REVIEW_CALLS == 8
     assert DEFAULT_MAX_FINAL_REVIEW_TOKENS == 24_000
 

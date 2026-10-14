@@ -65,6 +65,8 @@ PROPERTY_STABILITY_NOTE = (
     "property_key sorts the content words of the name and drops function words, "
     "so 'timing of departure' and 'timing during departure' match 'departure timing'. "
     "A low name-level score means those remaining words differ. The score is reported as measured. "
+    "A low score with many properties in each run means the runs named different properties. "
+    "category_counts, name_counts, and properties_per_run are those set sizes. "
     "A single run leaves both scores empty. property_stability() compares two or more runs. "
     "This is not claim support."
 )
@@ -334,28 +336,133 @@ def property_stability(runs: Sequence[Any]) -> dict[str, Any]:
                 if row.get("property_key") or property_key(str(row.get("name") or ""))
             }
         )
+    name_level = _mean_jaccard(name_sets)
+    name_counts = [len(item) for item in name_sets]
+    volume_note = ""
+    if name_level is not None and name_level < 0.5 and name_counts and min(name_counts) >= 5:
+        volume_note = (
+            "Name-level overlap is low while each run named many properties. "
+            "The runs used different property names. The score is reported and is not claim support."
+        )
     return {
         "name": "property_stability",
         "runs": len(list(runs)),
         "category_level": _mean_jaccard(category_sets),
-        "name_level": _mean_jaccard(name_sets),
+        "name_level": name_level,
+        "category_counts": [len(item) for item in category_sets],
+        "name_counts": name_counts,
+        "properties_per_run": [
+            len([row for row in _property_rows(run) if str(row.get("kind") or "property") == "property"])
+            for run in runs
+        ],
+        "volume_note": volume_note,
         "note": PROPERTY_STABILITY_NOTE,
     }
 
 
 PROPOSAL_STABILITY_NOTE = (
     "Code-level stability is the Jaccard overlap of codes that received a revise or drop proposal. "
-    "Key-level stability is the Jaccard overlap of (code_id, passage_id, kind, definition) tuples. "
+    "Key-level stability compares (code_id, passage_id, property_key(definition)). "
+    "property_key folds wording. An empty definition, which a drop often carries, matches a revise "
+    "of the same code on the same passage, so revise and drop of one code are comparable. "
+    "When those kinds differ, or the folded definitions differ, the pair is listed in cross_seed_conflicts. "
+    "The overlap score does not hide that disagreement, and neither proposal is applied. "
     "A single run leaves both scores empty. proposal_stability() compares two or more runs. "
     "A pair of runs with no proposals is not scored. If no pair has a proposal, both scores are undefined. "
-    "This is not claim support. Conflicting proposals are not applied."
+    "Pass a run, a run folder, an export, segments, or proposal rows. "
+    "This is not claim support."
 )
+_PROPOSAL_KINDS = frozenset({"focused_revise_proposal", "focused_drop_proposal", "revise", "drop"})
+
+
+def _proposal_kind(row: Mapping[str, Any]) -> str:
+    kind = str(row.get("kind") or row.get("action") or "")
+    if kind in {"revise", "focused_revise_proposal"}:
+        return "revise"
+    if kind in {"drop", "focused_drop_proposal"}:
+        return "drop"
+    return kind
+
+
+def _proposal_fold(row: Mapping[str, Any]) -> str:
+    return property_key(str(row.get("definition") or ""))
+
+
+def _proposal_record(row: Mapping[str, Any]) -> bool:
+    return str(row.get("kind") or row.get("action") or "") in _PROPOSAL_KINDS
+
+
+def _segment_like(row: Mapping[str, Any]) -> bool:
+    if any(key in row for key in ("segment_id", "focused_revise_proposal", "focused_drop_proposal")):
+        return True
+    return "code_id" in row and "kind" not in row and "action" not in row
+
+
+def _proposals_from_export(place: Path) -> list[Mapping[str, Any]]:
+    """Revise and drop rows from a run folder or one export file."""
+    if place.is_dir():
+        segments_file = place / "coded_segments.json"
+        run_file = place / "focused_run.json"
+        if not segments_file.exists() and not run_file.exists():
+            raise ValueError(
+                f"No focused export in {place}. Expected coded_segments.json or focused_run.json."
+            )
+        rows: list[Mapping[str, Any]] = []
+        if segments_file.exists():
+            payload = json.loads(segments_file.read_text(encoding="utf-8"))
+            if isinstance(payload, list):
+                rows.extend(_proposals_from_segments(payload))
+        if not rows and run_file.exists():
+            payload = json.loads(run_file.read_text(encoding="utf-8"))
+            if isinstance(payload, Mapping):
+                rows.extend(_proposal_rows(payload))
+        return rows
+    if place.is_file():
+        payload = json.loads(place.read_text(encoding="utf-8"))
+        if isinstance(payload, list):
+            return _proposal_rows(payload)
+        if isinstance(payload, Mapping):
+            return _proposal_rows(payload)
+    raise ValueError(f"proposal_stability cannot read {place}.")
+
+
+def _proposal_rows_from_sequence(items: Sequence[Any]) -> list[Mapping[str, Any]]:
+    """Proposal rows, or the proposals nested on a segment list.
+
+    A bare segment list is not a set of proposals. Scoring every segment's
+    ``code_id`` made two unrelated runs look identical.
+    """
+    rows = list(items)
+    if not rows:
+        return []
+    if all(isinstance(item, (str, Path)) for item in rows):
+        found: list[Mapping[str, Any]] = []
+        for item in rows:
+            found.extend(_proposals_from_export(Path(item)))
+        return found
+    mappings = [item for item in rows if isinstance(item, Mapping)]
+    if len(mappings) != len(rows):
+        raise TypeError(
+            "proposal_stability expected runs, a run folder, an export, segments, or proposal rows. "
+            f"The list contained {type(rows[0]).__name__}."
+        )
+    if all(_proposal_record(item) for item in mappings):
+        return [dict(item) for item in mappings]
+    if all(_segment_like(item) for item in mappings):
+        return _proposals_from_segments(mappings)
+    raise TypeError(
+        "proposal_stability could not tell proposal rows from segments. "
+        "Pass runs, a run folder, coded_segments.json, or rows whose kind is "
+        "focused_revise_proposal or focused_drop_proposal."
+    )
 
 
 def _proposal_rows(run: Any) -> list[Mapping[str, Any]]:
-    """Revise and drop proposals from a run, a segment list, or proposal rows."""
+    """Revise and drop proposals from a run, a folder, a segment list, or proposal rows."""
+    if isinstance(run, (str, Path)):
+        return _proposals_from_export(Path(run))
     if isinstance(run, (list, tuple)):
-        return [row for row in run if isinstance(row, Mapping)]
+        return _proposal_rows_from_sequence(run)
     if isinstance(run, Mapping):
         consolidated = run.get("proposal_consolidation")
         if consolidated is None and isinstance(run.get("metadata"), Mapping):
@@ -379,7 +486,10 @@ def _proposal_rows(run: Any) -> list[Mapping[str, Any]]:
     consolidated = getattr(run, "metadata", None)
     if isinstance(consolidated, Mapping):
         return _proposal_rows(consolidated)
-    return []
+    raise TypeError(
+        "proposal_stability expected a run, a run folder, an export, segments, or proposal rows. "
+        f"Got {type(run).__name__}."
+    )
 
 
 def _proposals_from_segments(segments: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -396,36 +506,102 @@ def _proposals_from_segments(segments: Sequence[Mapping[str, Any]]) -> list[dict
     return rows
 
 
+def _comparable_proposal_key(row: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(row.get("code_id") or ""),
+        str(row.get("passage_id") or ""),
+        _proposal_fold(row),
+    )
+
+
+def _proposal_keys_match(left: tuple[str, str, str], right: tuple[str, str, str]) -> bool:
+    """Same code and passage. An empty definition matches the other side's fold."""
+    if left[0] != right[0] or left[1] != right[1]:
+        return False
+    return not left[2] or not right[2] or left[2] == right[2]
+
+
+def _comparable_key_jaccard(sets: Sequence[set[tuple[str, str, str]]]) -> float | None:
+    if len(sets) < 2:
+        return None
+    scores = []
+    for left_index in range(len(sets)):
+        left = sets[left_index]
+        for right in sets[left_index + 1 :]:
+            if not left and not right:
+                continue
+            used: set[int] = set()
+            intersection = 0
+            for item in left:
+                for index, other in enumerate(tuple(right)):
+                    if index in used:
+                        continue
+                    if _proposal_keys_match(item, other):
+                        used.add(index)
+                        intersection += 1
+                        break
+            union = len(left) + len(right) - intersection
+            scores.append(1.0 if union == 0 else intersection / union)
+    if not scores:
+        return None
+    return round(sum(scores) / len(scores), 6)
+
+
+def _cross_seed_conflicts(grouped_rows: Sequence[Sequence[Mapping[str, Any]]]) -> list[dict[str, Any]]:
+    """Revise versus drop, or different folded definitions, for one code on one passage."""
+    grouped: dict[tuple[str, str], list[tuple[int, Mapping[str, Any]]]] = {}
+    for run_index, rows in enumerate(grouped_rows):
+        for row in rows:
+            code_id = str(row.get("code_id") or "")
+            if not code_id:
+                continue
+            grouped.setdefault((code_id, str(row.get("passage_id") or "")), []).append((run_index, row))
+    conflicts = []
+    for (code_id, passage_id), items in grouped.items():
+        runs_present = {index for index, _row in items}
+        if len(runs_present) < 2:
+            continue
+        kinds = sorted({_proposal_kind(row) for _index, row in items if _proposal_kind(row)})
+        folds = sorted({_proposal_fold(row) for _index, row in items if _proposal_fold(row)})
+        if len(kinds) <= 1 and len(folds) <= 1:
+            continue
+        conflicts.append(
+            {
+                "code_id": code_id,
+                "passage_id": passage_id,
+                "kinds": kinds,
+                "property_keys": folds,
+                "definitions": sorted(
+                    {str(row.get("definition") or "") for _index, row in items if str(row.get("definition") or "")}
+                ),
+                "runs": sorted(runs_present),
+            }
+        )
+    return conflicts
+
+
 def proposal_stability(runs: Sequence[Any]) -> dict[str, Any]:
     """Overlap of revise and drop proposals across runs.
 
     One run has no pair, so both scores are empty. Two runs that both have no
-    proposals are undefined, not 1. The comparison is the set of codes with a
-    proposal and the set of proposal keys. It does not apply a proposal and it
-    is not claim support.
+    proposals are undefined, not 1. Key-level overlap treats a revise and a drop
+    of the same code on the same passage as the same target. ``cross_seed_conflicts``
+    lists that disagreement. It does not apply a proposal and it is not claim support.
     """
     code_sets = []
-    key_sets = []
+    key_sets: list[set[tuple[str, str, str]]] = []
+    grouped_rows = []
     for run in runs:
         rows = _proposal_rows(run)
+        grouped_rows.append(rows)
         code_sets.append({str(row.get("code_id") or "") for row in rows if row.get("code_id")})
-        key_sets.append(
-            {
-                (
-                    str(row.get("code_id") or ""),
-                    str(row.get("passage_id") or ""),
-                    str(row.get("kind") or row.get("action") or ""),
-                    str(row.get("definition") or ""),
-                )
-                for row in rows
-                if row.get("code_id")
-            }
-        )
+        key_sets.append({_comparable_proposal_key(row) for row in rows if row.get("code_id")})
     return {
         "name": "proposal_stability",
         "runs": len(list(runs)),
         "code_level": _mean_jaccard(code_sets, skip_empty_pairs=True),
-        "key_level": _mean_jaccard(key_sets, skip_empty_pairs=True),
+        "key_level": _comparable_key_jaccard(key_sets),
+        "cross_seed_conflicts": _cross_seed_conflicts(grouped_rows),
         "note": PROPOSAL_STABILITY_NOTE,
     }
 

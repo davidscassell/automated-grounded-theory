@@ -41,9 +41,12 @@ developing existing assignments, testing competing interpretations, and
 examining passages outside the initial selection. The fourth,
 ``focused_share_claim_compete``, is reserved and not spent on that queue.
 After properties are written, that share tests a claim only against a passage
-that claim retrieved: the same category, an opposite substantive pole, a
-content or embedding match, or a negative-case hit. An unrelated passage is
-not paired. A pole that is an absence of mention is flagged and not tested.
+that claim retrieved. The same category is not enough: the passage also needs
+shared content or an embedding match. An opposite substantive pole, a content
+or embedding match, or a negative-case hit still qualifies. An empty quote is
+not sent. When nothing qualifies, the skip is logged and the calls are
+reallocated. A pole that is an absence of mention is flagged and not tested.
+``supports`` that points the opposite way from the pole is ``claim_test_invalid``.
 Reserved calls that are not spent, and are not given to another purpose,
 are unused. Calls that are given to another purpose and sent are reallocated.
 The warning's denominator is ``max_focused_review_calls``.
@@ -73,7 +76,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import logging
 import math
+import re
 from functools import wraps
 import json
 import random
@@ -87,11 +92,11 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.errors import NodeTimeoutError
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Command, Send, interrupt
+from langgraph.types import Command, RetryPolicy, Send, interrupt
 from typing_extensions import TypedDict
 
 from automated_grounded_theory.async_support import CallLimiter, ainvoke_structured, combine_usage, run_sync
-from automated_grounded_theory.batching import request_input_tokens, resolve_tokenizer
+from automated_grounded_theory.batching import calibrated_token_estimate, request_input_tokens, resolve_tokenizer
 from automated_grounded_theory.backends import chat_model_settings, describe_model
 from automated_grounded_theory.category_state import (
     ANALYTIC_FEATURES,
@@ -141,6 +146,8 @@ from automated_grounded_theory.validation import (
     code_key,
 )
 from automated_grounded_theory.version import __version__
+
+logger = logging.getLogger("automated_grounded_theory")
 from automated_grounded_theory.decision_review import (
     DecisionReviewer, SelectionDecision, ClaimDecisions, selection_payload,
     claims_payload, apply_model_claim_decisions,
@@ -266,6 +273,9 @@ FOCUSED_CLAIM_TEST_SYSTEM = (
     "Say whether this passage supports, contradicts, qualifies, or is irrelevant to that specific claim. "
     "Use the claim's category, name, text, pole, and cited quote. Do not judge a different claim. "
     "contradicts only when this passage asserts the opposite of the claim. "
+    "supports only when the passage asserts the same direction as the pole. "
+    "A contrast is not supports: a pole that says someone needs to do more is not supported "
+    "by a passage that says they already do it. "
     "If the passage does not mention the claim, judge irrelevant. "
     "Absence of mention is not a contradiction and is not a negative case. "
     "qualifies means the passage limits when the claim holds. "
@@ -2900,6 +2910,7 @@ def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
         "focused_calls_used": int(state.get("focused_calls_used") or 0),
         "focused_tokens_used": int(state.get("focused_tokens_used") or 0),
         "focused_tokens_estimated": int(state.get("focused_tokens_estimated") or 0),
+        "focused_tokens_calibrated": calibrated_token_estimate(int(state.get("focused_tokens_estimated") or 0)),
         "provider_token_usage": dict(state.get("provider_token_usage") or _empty_provider_usage()),
         "token_estimate_ratio": _token_estimate_ratio(
             int(state.get("focused_tokens_estimated") or 0),
@@ -2909,6 +2920,8 @@ def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
             "focused_tokens_estimated is a pre-call ceiling, not a bill, not provider usage, and not a calibrated tokenizer count. "
             "Without a provider tokenizer the ceiling is about three characters per token, plus schema and "
             "message framing, which runs higher than provider usage. "
+            "focused_tokens_calibrated divides that ceiling by 1.28, near the live estimate-to-provider ratio. "
+            "It is not what stops the reread. "
             "focused_tokens_used and provider_token_usage are the provider's counts. "
             "token_estimate_ratio is estimated divided by provider total_tokens when the provider reported "
             "tokens, and null otherwise. The ceiling is what stops the reread. It is not lowered to match the bill."
@@ -3197,7 +3210,30 @@ _ABSENCE_POLE_MARKERS = (
     "does not mention",
     "doesn't mention",
     "did not mention",
+    "not discussed",
+    "absent from",
+    "no evidence",
 )
+_GAP_PHRASES = (
+    "needs to",
+    "need to",
+    "needed to",
+    "should",
+    "ought",
+    "has to",
+    "have to",
+    "fails to",
+    "failed to",
+    "does not",
+    "doesn't",
+    "do not",
+    "don't",
+    "not enough",
+    "rather than",
+    "instead of",
+)
+_GAP_WORDS = frozenset({"more"})
+_TASK_NAME = re.compile(r"During task with name '([^']+)'")
 _RELEVANT_CLAIM_SOURCES = frozenset(
     {
         "claim_negative_case",
@@ -3217,6 +3253,30 @@ def _absence_pole(value: Any) -> bool:
     return any(marker in text for marker in _ABSENCE_POLE_MARKERS)
 
 
+def _has_gap_language(value: Any) -> bool:
+    """True when a pole states an obligation or a shortfall, not an activity already done."""
+    text = " ".join(str(value or "").casefold().split())
+    if not text:
+        return False
+    if any(phrase in text for phrase in _GAP_PHRASES):
+        return True
+    return bool(set(text.split()) & _GAP_WORDS)
+
+
+def _pole_direction_mismatch(pole: Any, passage: Any) -> bool:
+    """True when ``supports`` would treat a contrast as the same direction.
+
+    A pole that says someone needs to do more is not the same claim as a
+    passage that says they already do the activity. Bare ``absent`` is not a
+    gap marker. A passage that states the same shortfall is not a mismatch.
+    """
+    if not _has_gap_language(pole):
+        return False
+    if _has_gap_language(passage):
+        return False
+    return bool(str(passage or "").strip())
+
+
 def _content_tokens(text: str) -> set[str]:
     tokens = set()
     for raw in str(text or "").casefold().replace("-", " ").replace("_", " ").split():
@@ -3227,7 +3287,29 @@ def _content_tokens(text: str) -> set[str]:
 
 
 def _claim_content_tokens(claim: Mapping[str, Any]) -> set[str]:
-    return _content_tokens(" ".join(str(claim.get(key) or "") for key in ("name", "text", "quote")))
+    return _content_tokens(" ".join(str(claim.get(key) or "") for key in ("name", "text", "pole", "quote")))
+
+
+def _claim_similarity_score(passage: Mapping[str, Any], claim: Mapping[str, Any]) -> float:
+    """Shared content or a strong embedding match. Zero means the passage is not about this claim."""
+    text = str(passage.get("text") or "")
+    if not text.strip():
+        return 0.0
+    score = 0.0
+    if _claim_content_tokens(claim) & _content_tokens(text):
+        overlap = jaccard(text, _claim_blob(claim))
+        score = max(score, overlap if overlap > 0 else 0.01)
+    passage_vector = _stored_vector(passage)
+    claim_vector = _stored_vector(claim)
+    if passage_vector and claim_vector:
+        similarity = cosine(passage_vector, claim_vector)
+        if similarity >= _CLAIM_SIMILARITY_COSINE:
+            score = max(score, similarity)
+    return score
+
+
+def _passage_quote(passage: Mapping[str, Any]) -> str:
+    return str(passage.get("text") or "").strip()
 
 
 def _usable_claims(claims: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -3262,17 +3344,45 @@ def _claim_compete_items(
     queue: Sequence[Mapping[str, Any]],
     *,
     slots: int,
+    report: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     """Passages relevant to a specific claim.
 
-    A passage is queued only with the claim that retrieved it: the claim's
-    category on another passage, an opposite pole, a content-token or
-    embedding match to the claim text, or a negative-case hit for that claim.
-    An unrelated passage is not paired so the call can be spent. Absence-pole
-    claims are not tested. Unspent calls are reallocated by the caller.
+    A passage is queued only with the claim that retrieved it. Sharing the
+    claim's category is not enough: that passage also needs shared content or
+    an embedding match. An opposite pole, a content-token or embedding match,
+    or a negative-case hit for that claim still qualifies. An empty quote is
+    not sent. Passages that share a code and nothing else are counted and
+    skipped. Absence-pole claims are not tested. Unspent calls are reallocated
+    by the caller.
     """
+    stats = {
+        "queued": 0,
+        "skipped_no_relevant_passage": 0,
+        "empty_quote_skipped": 0,
+        "notes": [],
+    }
+
+    def finish(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+        stats["queued"] = len(rows)
+        notes = []
+        if stats["skipped_no_relevant_passage"]:
+            notes.append(
+                "Claim test skipped "
+                f"{stats['skipped_no_relevant_passage']} same-code passages with no shared content "
+                "and no embedding match. Unrelated passages were not sent."
+            )
+        if stats["empty_quote_skipped"]:
+            notes.append(
+                f"Claim test skipped {stats['empty_quote_skipped']} passages with an empty quote."
+            )
+        stats["notes"] = notes
+        if report is not None:
+            report.update(stats)
+        return rows
+
     if slots <= 0:
-        return []
+        return finish([])
     raw_claims = [dict(item) for item in (state.get("properties") or []) if isinstance(item, Mapping)]
     raw_claims += [dict(item) for item in (state.get("dimensions") or []) if isinstance(item, Mapping)]
     claims = _usable_claims(raw_claims)
@@ -3284,6 +3394,7 @@ def _claim_compete_items(
     already = set(_queue_passage_ids(queue)) | {str(item) for item in (state.get("focused_reread") or [])}
     extra: list[dict[str, str]] = []
     seen: set[str] = set()
+    empty_ids: set[str] = set()
     by_entry = {str(claim.get("entry_id") or ""): claim for claim in claims if claim.get("entry_id")}
 
     def add(passage_id: str, source: str, claim: Mapping[str, Any] | None) -> None:
@@ -3294,11 +3405,16 @@ def _claim_compete_items(
             return
         if str(claim.get("passage_id") or "") == passage_id:
             return
+        if not _passage_quote(by_id[passage_id]):
+            if passage_id not in empty_ids:
+                empty_ids.add(passage_id)
+                stats["empty_quote_skipped"] += 1
+            return
         seen.add(passage_id)
         extra.append(_queue_item(passage_id, "claim_compete", source, claim=claim))
 
     if not claims:
-        return []
+        return finish([])
     hits = negative_case_candidates(passages, segments, claims, codebook=codebook)
     for hit in hits:
         add(
@@ -3312,8 +3428,21 @@ def _claim_compete_items(
         if not category_id:
             continue
         for segment in segments:
-            if str(segment.get("code_id") or "") == category_id and str(segment.get("passage_id") or "") != written:
-                add(str(segment.get("passage_id") or ""), "claim_same_code", claim)
+            passage_id = str(segment.get("passage_id") or "")
+            if str(segment.get("code_id") or "") != category_id or passage_id == written:
+                continue
+            passage = by_id.get(passage_id)
+            if passage is None:
+                continue
+            if not _passage_quote(passage):
+                if passage_id not in empty_ids:
+                    empty_ids.add(passage_id)
+                    stats["empty_quote_skipped"] += 1
+                continue
+            if _claim_similarity_score(passage, claim) <= 0:
+                stats["skipped_no_relevant_passage"] += 1
+                continue
+            add(passage_id, "claim_same_code", claim)
     poles_by_name: dict[str, set[str]] = {}
     for entry in codebook:
         for dimension in entry.get("dimensions") or []:
@@ -3372,7 +3501,7 @@ def _claim_compete_items(
             ranked.append((best_score, passage_id, best_claim))
     for _score, passage_id, best_claim in sorted(ranked, key=lambda item: (-item[0], item[1])):
         add(passage_id, "claim_similarity", best_claim)
-    return extra
+    return finish(extra)
 
 
 def _reallocate_unspent_claim_calls(
@@ -3387,7 +3516,7 @@ def _reallocate_unspent_claim_calls(
     passages = [
         str(item.get("passage_id") or "")
         for item in (state.get("passages") or [])
-        if item.get("passage_id")
+        if item.get("passage_id") and str(item.get("text") or "").strip()
     ]
     if not passages:
         return []
@@ -3472,26 +3601,58 @@ def _prepare_node(state: FocusedState) -> dict:
             updates["properties"] = properties
             updates["dimensions"] = dimensions
             state = {**state, "properties": properties, "dimensions": dimensions}
-            extra = _claim_compete_items(state, queue, slots=claim_calls * batch_size)
-            if not extra:
-                extra = _reallocate_unspent_claim_calls(
+            relevance: dict[str, Any] = {}
+            extra = _claim_compete_items(
+                state,
+                queue,
+                slots=claim_calls * batch_size,
+                report=relevance,
+            )
+            warnings = list(updates.get("warnings") or state.get("warnings") or [])
+            for note in relevance.get("notes") or []:
+                if note not in warnings:
+                    warnings.append(note)
+            filled_calls = 0 if not extra else min(claim_calls, (len(extra) + batch_size - 1) // batch_size)
+            unspent_calls = claim_calls - filled_calls
+            if unspent_calls > 0:
+                moved = _reallocate_unspent_claim_calls(
                     state,
-                    calls=claim_calls,
+                    calls=unspent_calls,
                     batch_size=batch_size,
                 )
-                if extra:
-                    metadata = dict(state.get("metadata") or {})
+                if moved:
+                    metadata = dict(updates.get("metadata") or state.get("metadata") or {})
                     transfers = list(metadata.get("call_transfers") or [])
                     transfers.append(
                         {
                             "from": "claim_compete",
-                            "to": str(extra[0].get("purpose") or "outside"),
-                            "calls": claim_calls,
+                            "to": str(moved[0].get("purpose") or "outside"),
+                            "calls": unspent_calls,
                         }
                     )
                     metadata["call_transfers"] = transfers
+                    relevance["reallocated_calls"] = unspent_calls
+                    metadata["claim_test_relevance"] = {
+                        key: value for key, value in relevance.items() if key != "notes"
+                    }
                     updates["metadata"] = metadata
-                    state = {**state, "metadata": metadata}
+                    updates["warnings"] = warnings
+                    state = {**state, "metadata": metadata, "warnings": warnings}
+                    extra = extra + moved
+                else:
+                    metadata = dict(updates.get("metadata") or state.get("metadata") or {})
+                    metadata["claim_test_relevance"] = {
+                        key: value for key, value in relevance.items() if key != "notes"
+                    }
+                    updates["metadata"] = metadata
+                    updates["warnings"] = warnings
+            else:
+                metadata = dict(updates.get("metadata") or state.get("metadata") or {})
+                metadata["claim_test_relevance"] = {
+                    key: value for key, value in relevance.items() if key != "notes"
+                }
+                updates["metadata"] = metadata
+                updates["warnings"] = warnings
             if extra:
                 queue = queue + extra
                 updates["recode_queue"] = queue
@@ -3738,6 +3899,47 @@ def _probe_labels(parsed: Mapping[str, Any], passages: Sequence[Mapping], book: 
     return retries
 
 
+def _claim_test_relevance(
+    properties: Sequence[Mapping[str, Any]],
+    dimensions: Sequence[Mapping[str, Any]],
+    prior: Mapping[str, Any],
+) -> dict[str, Any]:
+    """How many claim tests judged the claim, and how many of those were on-point.
+
+    ``relevance_rate`` is supports, contradicts, and qualifies that were valid
+    tests, divided by every judgment. It is null when nothing was judged.
+    Retrieval skips from the claim round are kept from ``prior``.
+    """
+    judgments = 0
+    relevant = 0
+    for bucket in (properties, dimensions):
+        for item in bucket or []:
+            if not isinstance(item, Mapping):
+                continue
+            rows = []
+            for key in ("claim_tests", "negative_cases"):
+                for row in item.get(key) or []:
+                    if not isinstance(row, Mapping):
+                        continue
+                    judgment = str(row.get("judgment") or "")
+                    if judgment not in {"supports", "contradicts", "qualifies", "irrelevant"}:
+                        continue
+                    rows.append(row)
+            for row in rows:
+                judgments += 1
+                if (
+                    str(row.get("judgment") or "") in {"supports", "contradicts", "qualifies"}
+                    and row.get("valid_test")
+                    and not row.get("direction_mismatch")
+                ):
+                    relevant += 1
+    merged = {key: value for key, value in dict(prior or {}).items() if key != "notes"}
+    merged["judgments"] = judgments
+    merged["relevant_judgments"] = relevant
+    merged["relevance_rate"] = None if judgments == 0 else round(relevant / judgments, 4)
+    return merged
+
+
 def _apply_claim_test(
     properties: list,
     dimensions: list,
@@ -3746,13 +3948,15 @@ def _apply_claim_test(
     counts: dict[str, int],
     *,
     valid: bool,
+    passage_text: str = "",
 ) -> None:
     """Record a claim-test judgment. Only a valid contradicts or qualifies disputes the claim.
 
     A valid test retrieved the passage for this claim and the claim is not an
     absence pole. Any other contradicts or qualifies is stored and flagged,
-    and does not become a negative case. Human ``claim_support`` and
-    ``review_actor`` stay untouched.
+    and does not become a negative case. ``supports`` for a pole that states a
+    shortfall, when the passage does not, is ``claim_test_invalid``. Human
+    ``claim_support`` and ``review_actor`` stay untouched.
     """
     judgment = str(row.get("judgment") or "").strip().casefold()
     if judgment not in {"supports", "contradicts", "qualifies", "irrelevant"}:
@@ -3784,6 +3988,12 @@ def _apply_claim_test(
     if target.get("degenerate_absence_pole"):
         valid = False
         record["valid_test"] = False
+    statement = str(target.get("pole") or "") or str(target.get("text") or "")
+    if judgment == "supports" and _pole_direction_mismatch(statement, passage_text):
+        valid = False
+        record["valid_test"] = False
+        record["direction_mismatch"] = True
+        record["flagged"] = True
     if judgment in {"contradicts", "qualifies"} and valid:
         cases = [dict(item) for item in (target.get("negative_cases") or []) if isinstance(item, Mapping)]
         cases.append(record)
@@ -3796,7 +4006,7 @@ def _apply_claim_test(
             flags.append("claim_test_negative")
         target["flags"] = flags
         return
-    if judgment in {"contradicts", "qualifies"} and not valid:
+    if not valid and (judgment in {"contradicts", "qualifies"} or record.get("direction_mismatch")):
         record["flagged"] = True
         flags = [str(item) for item in (target.get("flags") or [])]
         if "claim_test_invalid" not in flags:
@@ -3949,6 +4159,7 @@ def _commit_node(runtime: FocusedRuntime):
                         passage_id,
                         claim_counts,
                         valid=source in _RELEVANT_CLAIM_SOURCES,
+                        passage_text=str((passage or {}).get("text") or ""),
                     )
                     if passage_id not in reread:
                         reread.append(passage_id)
@@ -4047,6 +4258,11 @@ def _commit_node(runtime: FocusedRuntime):
         consolidation = consolidate_code_proposals(segments)
         metadata = dict(state.get("metadata") or {})
         metadata["claim_test_counts"] = claim_counts
+        metadata["claim_test_relevance"] = _claim_test_relevance(
+            properties,
+            dimensions,
+            metadata.get("claim_test_relevance") or {},
+        )
         if any(verdict_counts.values()):
             metadata["compete_verdict_counts"] = verdict_counts
             keep_only = (
@@ -4521,6 +4737,20 @@ class _WorkerInput(TypedDict, total=False):
     worker_raised: list
 
 
+def _watched_node_kwargs(seconds: float) -> dict[str, Any]:
+    """Step watchdog for one attempt. A node timeout is not itself retried.
+
+    ``NodeTimeoutError`` is retryable under LangGraph's default policy. Leaving
+    the policy unset is what the graph does today. Setting ``max_attempts`` to 1
+    keeps a stuck step from running the watchdog twice. Human checkpoints pass
+    0 and stay unwrapped, so ``interrupt()`` is unchanged.
+    """
+    timeout = _positive_timeout(seconds)
+    if timeout is None:
+        return {}
+    return {"timeout": timeout, "retry_policy": RetryPolicy(max_attempts=1)}
+
+
 def _positive_timeout(seconds: float) -> float | None:
     """A graph-step watchdog, or None when this run has no request deadline."""
     try:
@@ -4548,28 +4778,26 @@ def build_focused_graph(runtime: FocusedRuntime | None = None):
     """
     runtime = runtime or FocusedRuntime(coder=_IdleModel())
     builder = StateGraph(FocusedState)
-    worker_timeout = _positive_timeout(runtime.step_timeout)
-    decision_timeout = _positive_timeout(runtime.decision_step_timeout)
     builder.add_node("load_open_coding", _load_node)
     builder.add_node("select_candidates", _select_node)
     builder.add_node(
         "researcher_checkpoint",
         _decision_node(runtime, claims=False),
-        **({"timeout": decision_timeout} if decision_timeout else {}),
+        **_watched_node_kwargs(runtime.decision_step_timeout),
     )
     builder.add_node("prepare_recode", _prepare_node)
     builder.add_node(
         "recode_worker",
         _worker(runtime),
         input_schema=_WorkerInput,
-        **({"timeout": worker_timeout} if worker_timeout else {}),
+        **_watched_node_kwargs(runtime.step_timeout),
     )
     builder.add_node("commit_focused", _commit_node(runtime))
     builder.add_node("review_recode", _review_node)
     builder.add_node(
         "claim_checkpoint",
         _decision_node(runtime, claims=True),
-        **({"timeout": decision_timeout} if decision_timeout else {}),
+        **_watched_node_kwargs(runtime.decision_step_timeout),
     )
     builder.add_node("export_focused", _export_node(runtime))
     builder.add_edge(START, "load_open_coding")
@@ -5088,11 +5316,35 @@ def _is_timeout(exc: BaseException) -> bool:
     return False
 
 
-async def _record_timeout(graph, config, exc: BaseException) -> None:
+def _timeout_step(exc: BaseException, snapshot: Any) -> str:
+    """Which graph step the timeout belongs to."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        node = getattr(current, "node", None)
+        if node:
+            return str(node)
+        for note in getattr(current, "__notes__", ()) or ():
+            match = _TASK_NAME.search(str(note))
+            if match:
+                return match.group(1)
+        match = _TASK_NAME.search(str(current))
+        if match:
+            return match.group(1)
+        current = current.__cause__
+    nxt = [str(item) for item in (getattr(snapshot, "next", ()) or ()) if item]
+    if len(nxt) == 1:
+        return nxt[0]
+    return ""
+
+
+async def _record_timeout(graph, config, exc: BaseException, output_dir: str | Path | None = None) -> None:
     """Keep work already written and mark the checkpoint incomplete.
 
-    The exception still propagates. A later reader sees ``stop`` ``timeout``
-    and status ``incomplete`` instead of a run that looks unfinished without a reason.
+    The exception still propagates. A later reader sees ``stop`` ``timeout``,
+    which step stopped, and status ``incomplete``. When an output directory is
+    set, the same state is written as a partial export.
     """
     try:
         snapshot = await graph.aget_state(config)
@@ -5103,20 +5355,44 @@ async def _record_timeout(graph, config, exc: BaseException) -> None:
         return
     metadata = dict(state.get("metadata") or {})
     warnings = list(state.get("warnings") or [])
+    step = _timeout_step(exc, snapshot)
     note = (
         "Focused coding is incomplete because a model call or graph step exceeded its timeout. "
         "Work already written is kept. Stop is timeout."
     )
+    if step:
+        note = (
+            "Focused coding is incomplete because a model call or graph step exceeded its timeout. "
+            f"Step is {step}. Work already written is kept. Stop is timeout."
+        )
     if note not in warnings:
         warnings.append(note)
     metadata["status"] = "incomplete"
     metadata["complete"] = False
     metadata["stop"] = "timeout"
     metadata["timeout_error"] = str(exc)
+    metadata["timeout_step"] = step
+    place = output_dir or metadata.get("output_dir")
+    export_paths = dict(state.get("export_paths") or {})
+    if place:
+        try:
+            exported = export_focused_state(
+                {**state, "metadata": metadata, "warnings": warnings, "recode_stop": "timeout"},
+                place,
+            )
+            export_paths = exported
+            metadata["partial_export"] = True
+        except Exception:
+            logger.warning("Partial focused export failed after a timeout", exc_info=True)
     try:
         await graph.aupdate_state(
             config,
-            {"metadata": metadata, "warnings": warnings, "recode_stop": "timeout"},
+            {
+                "metadata": metadata,
+                "warnings": warnings,
+                "recode_stop": "timeout",
+                "export_paths": export_paths,
+            },
         )
     except Exception:
         return
@@ -5175,9 +5451,17 @@ async def _invoke(
     except Exception as exc:
         if not _is_timeout(exc):
             raise
-        await _record_timeout(graph, config, exc)
+        await _record_timeout(graph, config, exc, output_dir)
         if isinstance(exc, TimeoutError):
             raise
+        # A call timeout nested under a step timeout keeps its own duration.
+        cause: BaseException | None = exc
+        seen: set[int] = set()
+        while cause is not None and id(cause) not in seen:
+            seen.add(id(cause))
+            if isinstance(cause, TimeoutError) and "timed out after" in str(cause):
+                raise cause
+            cause = cause.__cause__
         raise TimeoutError(str(exc)) from exc
     snapshot = await graph.aget_state(config)
     payloads = _interrupt_payloads(snapshot)
