@@ -13,6 +13,7 @@ thread with its own loop, so the notebook loop is not re-entered.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextvars
 import functools
 import hashlib
@@ -30,6 +31,9 @@ class CallLimiter:
 
     Each attempt is cancelled when it runs longer than ``request_timeout`` (120
     seconds unless you set another value; 0 waits with no per-attempt deadline).
+    The wait returns when that clock expires even if the provider swallows
+    cancellation. The task is cancelled, and ``TimeoutError`` is raised without
+    waiting for the cancelled task to finish.
     ``wall_timeout``, when set above 0, is a single budget for the whole call:
     streaming, retries, and backoff share it, and a retry cannot start a fresh
     ``request_timeout``. Timeouts and connection errors are retried the same
@@ -455,7 +459,7 @@ class CallLimiter:
         try:
             call = runnable.ainvoke(payload)
             if limit and limit > 0:
-                return await asyncio.wait_for(call, limit)
+                return await await_with_wall_timeout(call, limit)
             return await call
         finally:
             if record is not None:
@@ -1074,7 +1078,8 @@ def _package_loop() -> asyncio.AbstractEventLoop:
 
         thread = threading.Thread(target=_spin, name="agt-loop", daemon=True)
         thread.start()
-        ready.wait()
+        if not ready.wait(30):
+            raise TimeoutError("The package event loop did not start within 30s.")
         _LOOP = loop
         return loop
 
@@ -1092,13 +1097,17 @@ def _loop_is_running() -> bool:
     return True
 
 
-def run_sync(coro):
+def run_sync(coro, *, timeout: float | None = None):
     """Run ``coro`` to completion, including inside a running event loop.
 
     Every sync call shares one background loop. A chat model created during
     ``open_code`` stays bound to that loop, so ``build_themes`` can reuse the
     same instance. Shared httpx clients are not closed here: closing them
     made the next call raise ``Event loop is closed``.
+
+    ``timeout`` above 0 is a wall-clock bound on this wait. When it expires the
+    underlying task is cancelled and ``TimeoutError`` is raised. The caller
+    does not keep waiting if that task ignores cancellation.
     """
     loop = _package_loop()
     try:
@@ -1109,6 +1118,61 @@ def run_sync(coro):
         raise RuntimeError("run_sync cannot wait on the package event loop from inside it.")
     future = asyncio.run_coroutine_threadsafe(coro, loop)
     try:
+        if timeout is not None and float(timeout) > 0:
+            return future.result(timeout=float(timeout))
         return future.result()
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        raise TimeoutError(f"timed out after {float(timeout):g}s") from None
     except BaseException as exc:
         raise exc from None
+
+
+_ABANDONED_TIMEOUTS: set[asyncio.Task] = set()
+
+
+def _consume_task_exception(task: asyncio.Task) -> None:
+    _ABANDONED_TIMEOUTS.discard(task)
+    if not task.done() or task.cancelled():
+        return
+    try:
+        task.exception()
+    except (asyncio.CancelledError, Exception):
+        return
+
+
+def _hold_abandoned(task: asyncio.Task) -> None:
+    """Keep a task that ignored cancellation until it actually finishes.
+
+    Dropping the only reference closes the coroutine from outside the loop and
+    raises ``GeneratorExit`` inside the provider call.
+    """
+    _ABANDONED_TIMEOUTS.add(task)
+    task.add_done_callback(_consume_task_exception)
+
+
+async def await_with_wall_timeout(awaitable, timeout: float | None):
+    """Wait up to ``timeout`` seconds, then cancel and raise ``TimeoutError``.
+
+    ``asyncio.wait_for`` cancels the task and then waits for it to finish. A
+    provider that swallows ``CancelledError`` holds that second wait forever.
+    This returns when the clock expires, cancels the task, and does not wait
+    for the cancellation to complete. A timeout of 0 or less waits with no
+    deadline.
+    """
+    if timeout is None or float(timeout) <= 0:
+        return await awaitable
+    task = asyncio.ensure_future(awaitable)
+    task.add_done_callback(_consume_task_exception)
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=float(timeout))
+    except asyncio.CancelledError:
+        task.cancel()
+        _hold_abandoned(task)
+        raise
+    if task in done:
+        return task.result()
+    task.cancel()
+    _hold_abandoned(task)
+    await asyncio.sleep(0)
+    raise TimeoutError(f"timed out after {float(timeout):g}s")

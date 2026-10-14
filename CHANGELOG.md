@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.4
+
+- Claim compete no longer depends on a pole string appearing in the passage. It searches the property's category on other passages, opposite dimension poles, lexical similarity and any stored embedding of the property text, then low-confidence or flagged assignments. If passages are still unreread, those fill the remaining slots. If nothing is left to reread, the unused calls are sent as outside or compete calls.
+- A reserved purpose that was not given to another purpose is reported as unused. A purpose that was given calls, and those calls were sent, is reallocated. The warning denominator is `max_focused_review_calls`. `purpose_coverage.reallocation.reallocated` is true only when a transfer happened.
+- `focused_request_timeout` is enforced on the model wait, on `run_sync` futures, and on the package event-loop bridge. The wait cancels the task and raises `TimeoutError` without waiting for a provider that swallows cancellation.
+- `strongest_alternative` that names the kept code is flagged `alternative_is_kept_code` and recorded as invalid. Compete passages now require `alternative_fit` (`weaker`, `comparable`, or `stronger`). `alternative_named_not_chosen` is raised only when that fit is `stronger` for a different code than the one kept.
+- `policy_version` is `0.7.4`.
+
 ## 0.7.3
 
 - `focused_share_claim_compete` reserves calls for a compete round that runs after properties are written. The four shares sum to 1. The default is one quarter each. A three-purpose split that already sums to 1 keeps this share at 0. `purpose_coverage` reports claim compete the same way as the other purposes. Setting the share to 0 is what skips the round.

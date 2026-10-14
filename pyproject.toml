@@ -1,6 +1,6 @@
 [project]
 name = "automated_grounded_theory"
-version = "0.7.3"
+version = "0.7.4"
 description = "Automated initial open coding, a theme report, and optional focused coding, with any LangChain chat model."
 readme = "README.md"
 license = "MIT"
