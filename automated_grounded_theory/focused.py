@@ -42,22 +42,25 @@ examining passages outside the initial selection. Shares are
 ``focused_share_develop``, ``focused_share_compete``, and
 ``focused_share_outside``. Coverage is reported per purpose.
 
-A code is proposed when its score is at least ``focused_min_score``. The
-default threshold is the median of the positive scores. A researcher pin is
-proposed even when the score is low. A contrast code, the only code on one
-pole of a dimension already recorded, is proposed even when it is rare.
-Nothing is deleted from the codebook. The lists are a proposal. The resume
-value can replace ``raised_code_ids``.
+A code is proposed by ``focused_selection_rule``. The default is ``top_k``:
+about half the codes, ties broken by ``code_id``, and never every code unless
+``focused_raise_all`` is set. ``quantile`` uses the same tie break and the
+same ceiling. An explicit ``focused_min_score`` is a hard ``>=`` cutoff the
+researcher chose. A researcher pin is proposed even when the score is low. A
+contrast code, the only code on one pole of a dimension already recorded, is
+proposed even when it is rare. Nothing is deleted from the codebook. The
+lists are a proposal. The resume value can replace ``raised_code_ids``. A
+selection that raises a high fraction of the book is warned on the result.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import math
 from functools import wraps
 import json
 import random
-import statistics
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -97,7 +100,14 @@ from automated_grounded_theory.category_state import (
     purpose_coverage,
     view_notes,
 )
-from automated_grounded_theory.codebook import codebook_list, commit_passage, empty_counters, interpret_coding
+from automated_grounded_theory.codebook import (
+    _next,
+    codebook_list,
+    commit_passage,
+    empty_counters,
+    interpret_coding,
+    restore_id_counters,
+)
 from automated_grounded_theory.context import parse_context
 from automated_grounded_theory.export import _write_csv, _write_json
 from automated_grounded_theory.prompts import validation_feedback
@@ -119,6 +129,10 @@ DEFAULT_MAX_FOCUSED_REVIEW_TOKENS = 24000
 DEFAULT_FOCUSED_NEIGHBOR_LIMIT = 1
 DEFAULT_FOCUSED_OUTSIDE_LIMIT = 1
 DEFAULT_FOCUSED_NEGATIVE_CASE_LIMIT = 1
+DEFAULT_FOCUSED_SELECTION_RULE = "top_k"
+DEFAULT_FOCUSED_SELECTION_QUANTILE = 0.5
+DEFAULT_FOCUSED_RAISE_WARN_FRACTION = 0.75
+SELECTION_RULES = ("top_k", "quantile")
 DEFAULT_FOCUSED_BATCH_SIZE = 1
 DEFAULT_FOCUSED_CONCURRENCY = 1
 DEFAULT_FOCUSED_TOKEN_BUDGET = 6000
@@ -136,6 +150,11 @@ _PROCEDURE_KEYS = (
     "focused_weight_documents",
     "focused_weight_analytic",
     "focused_min_score",
+    "focused_selection_rule",
+    "focused_selection_k",
+    "focused_selection_quantile",
+    "focused_raise_all",
+    "focused_raise_warn_fraction",
     "max_focused_review_calls",
     "max_focused_review_tokens",
     "focused_neighbor_limit",
@@ -161,7 +180,13 @@ _RESUME_FORBIDDEN = frozenset(
 FOCUSED_SYSTEM = (
     "You are doing focused coding. The raised codes are a proposal the researcher can change. "
     "Reread only the passages in this request. Keep, add, or revise codes the passage supports. "
-    "Quote the target passage. A property or dimension needs the document id, the passage id, and the quote. "
+    "Quote the target passage. "
+    "For each passage, name analytic properties and analytic dimensions of the raised categories: "
+    "what varies in the incident, and the poles of that variation. "
+    "Do not write a descriptive summary of the passage in place of a property. "
+    "Each property and each dimension cites the document id, the passage id, and a quote copied from that passage. "
+    "Also record a competing interpretation when the passage can be read with a different raised code "
+    "or with an opposite pole of the same code. "
     "Do not write relations between categories. Do not name a core category. "
     "Do not decide that a category is saturated."
 )
@@ -492,6 +517,37 @@ def _pin_ids(entries: Sequence[Mapping[str, Any]], pins: Sequence[str] | None) -
     return found
 
 
+def selection_target(
+    n: int,
+    *,
+    rule: str = DEFAULT_FOCUSED_SELECTION_RULE,
+    k: int | None = None,
+    quantile: float = DEFAULT_FOCUSED_SELECTION_QUANTILE,
+    raise_all: bool = False,
+) -> int:
+    """How many codes the score rule may raise.
+
+    Ties are not included past this count. The default is the upper half,
+    and it is at most ``n - 1`` when there is more than one code, unless
+    ``raise_all`` is set.
+    """
+    if n <= 0:
+        return 0
+    if raise_all:
+        return n
+    if n == 1:
+        return 1
+    if rule == "top_k":
+        chosen = (n + 1) // 2 if k is None else int(k)
+    elif rule == "quantile":
+        if not 0 < float(quantile) < 1:
+            raise ValueError("focused_selection_quantile must be between 0 and 1.")
+        chosen = math.floor((1.0 - float(quantile)) * n)
+    else:
+        raise ValueError(f"focused_selection_rule must be one of {SELECTION_RULES}.")
+    return min(max(1, chosen), n - 1)
+
+
 def select_focused_codes(
     codebook: Mapping[str, Mapping[str, Any]] | Sequence[Mapping[str, Any]],
     *,
@@ -505,16 +561,32 @@ def select_focused_codes(
     weight_analytic: float = DEFAULT_FOCUSED_WEIGHT_ANALYTIC,
     min_score: float | None = None,
     analytic_features: Sequence[str] | None = None,
+    selection_rule: str = DEFAULT_FOCUSED_SELECTION_RULE,
+    selection_k: int | None = None,
+    selection_quantile: float = DEFAULT_FOCUSED_SELECTION_QUANTILE,
+    raise_all: bool = False,
+    warn_fraction: float = DEFAULT_FOCUSED_RAISE_WARN_FRACTION,
 ) -> dict[str, Any]:
     """Propose ``raised_code_ids``. The codebook is not filtered.
 
     See the module docstring for the score. Pins and contrast codes are
-    proposed even when the score is below the threshold. ``min_score`` None
-    uses the median of the positive scores. ``analytic_features`` drops memo
-    count, the in-vivo flag, or stored comparisons from the analytic term.
+    proposed even when the score is below the cutoff. ``min_score`` None uses
+    ``selection_rule`` (top-k by default). A float is a hard ``>=`` threshold.
+    Codes tied at the cutoff are ordered by ``code_id`` and only the target
+    count is raised. ``analytic_features`` drops memo count, the in-vivo flag,
+    or stored comparisons from the analytic term.
     """
     if weight_frequency < 0 or weight_documents < 0 or weight_analytic < 0:
         raise ValueError("Focused-coding weights must be zero or more.")
+    rule = str(selection_rule or DEFAULT_FOCUSED_SELECTION_RULE)
+    if rule not in SELECTION_RULES:
+        raise ValueError(f"focused_selection_rule must be one of {SELECTION_RULES}.")
+    if selection_k is not None and int(selection_k) < 1:
+        raise ValueError("focused_selection_k must be at least 1.")
+    if not 0 < float(selection_quantile) < 1:
+        raise ValueError("focused_selection_quantile must be between 0 and 1.")
+    if not 0 < float(warn_fraction) <= 1:
+        raise ValueError("focused_raise_warn_fraction must be above 0 and at most 1.")
     enabled = normalize_analytic_features(analytic_features)
     entries = _code_rows(codebook)
     passage_rows = [dict(item) for item in (passages or [])]
@@ -604,29 +676,60 @@ def select_focused_codes(
                 "pin": code_id in pinned,
             }
         )
-    positive = [row["score"] for row in rows if row["score"] > 0]
-    if min_score is None:
-        threshold = statistics.median(positive) if positive else None
-    else:
+    rows.sort(key=lambda row: (-float(row["score"]), row["code_id"]))
+    threshold = None
+    target = None
+    if raise_all:
+        score_ids = {row["code_id"] for row in rows}
+        target = len(rows)
+    elif min_score is not None:
         threshold = float(min_score)
+        score_ids = {row["code_id"] for row in rows if row["score"] >= threshold}
+    else:
+        target = selection_target(
+            len(rows),
+            rule=rule,
+            k=selection_k,
+            quantile=float(selection_quantile),
+            raise_all=False,
+        )
+        score_ids = {row["code_id"] for row in rows[:target]}
     for row in rows:
         reasons = []
-        if threshold is not None and row["score"] >= threshold:
-            reasons.append("score")
+        if row["code_id"] in score_ids:
+            reasons.append("raise_all" if raise_all else "score")
         if row["pin"]:
             reasons.append("pin")
         if row["contrast"]:
             reasons.append("contrast")
         row["raised"] = bool(reasons)
         row["raise_reason"] = reasons
-    rows.sort(key=lambda row: (-float(row["score"]), row["code_id"]))
     raised = [row["code_id"] for row in rows if row["raised"]]
     not_raised = [row["code_id"] for row in rows if not row["raised"]]
+    fraction = (len(raised) / len(rows)) if rows else 0.0
+    warnings: list[str] = []
+    if rows and fraction + 1e-12 >= float(warn_fraction):
+        detail = (
+            f"Focused selection raised {len(raised)} of {len(rows)} codes "
+            f"({fraction:.0%}), at or above {float(warn_fraction):.0%}."
+        )
+        if len(raised) == len(rows) and raise_all:
+            detail += " focused_raise_all is set, so the score rule included every code."
+        elif len(raised) == len(rows):
+            detail += " Pins or contrast codes completed a set the score rule did not raise on its own."
+        warnings.append(detail)
     return {
         "rows": rows,
         "raised_code_ids": raised,
         "not_raised_code_ids": not_raised,
         "threshold": None if threshold is None else round(float(threshold), 6),
+        "selection_rule": "raise_all" if raise_all else ("min_score" if min_score is not None else rule),
+        "selection_k": None if target is None else int(target),
+        "selection_quantile": float(selection_quantile),
+        "raise_all": bool(raise_all),
+        "tie_policy": "code_id",
+        "raised_fraction": round(fraction, 6),
+        "warnings": warnings,
         "weights": {
             "focused_weight_frequency": float(weight_frequency),
             "focused_weight_documents": float(weight_documents),
@@ -701,6 +804,184 @@ def _dimension_claims(codebook: Sequence[Mapping[str, Any]], raised: set[str]) -
     return claims
 
 
+def _norm_pole(value: Any) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def _text_has_pole(text: str, pole: str) -> bool:
+    token = _norm_pole(pole)
+    return bool(token) and token in _norm_pole(text)
+
+
+def _codes_by_passage(segments: Sequence[Mapping[str, Any]]) -> dict[str, set[str]]:
+    found: dict[str, set[str]] = {}
+    for segment in segments:
+        passage_id = str(segment.get("passage_id") or "")
+        code_id = str(segment.get("code_id") or "")
+        if passage_id and code_id:
+            found.setdefault(passage_id, set()).add(code_id)
+    return found
+
+
+def _pole_index(codebook: Sequence[Mapping[str, Any]]) -> tuple[dict[str, dict[str, set[str]]], dict[str, set[str]]]:
+    by_code: dict[str, dict[str, set[str]]] = {}
+    all_poles: dict[str, set[str]] = {}
+    for entry in codebook:
+        code_id = str(entry.get("code_id") or "")
+        for dimension in entry.get("dimensions") or []:
+            if not isinstance(dimension, Mapping):
+                continue
+            name = _norm_pole(dimension.get("name"))
+            pole = _norm_pole(dimension.get("value") or dimension.get("pole"))
+            if name and pole:
+                by_code.setdefault(code_id, {}).setdefault(name, set()).add(pole)
+                all_poles.setdefault(name, set()).add(pole)
+    return by_code, all_poles
+
+
+def _has_opposite_pole(text: str, code_ids: set[str], poles: tuple[dict, dict]) -> bool:
+    by_code, all_poles = poles
+    for code_id in code_ids:
+        for name, own in (by_code.get(code_id) or {}).items():
+            others = set(all_poles.get(name) or ()) - set(own)
+            if any(_text_has_pole(text, pole) for pole in others):
+                return True
+    return False
+
+
+def _passage_confidence(passage_id: str, segments: Sequence[Mapping[str, Any]], raised: set[str]) -> float:
+    scores = []
+    for segment in segments:
+        if str(segment.get("passage_id") or "") != passage_id:
+            continue
+        if str(segment.get("code_id") or "") not in raised:
+            continue
+        raw = segment.get("confidence")
+        if raw in (None, ""):
+            continue
+        try:
+            scores.append(float(raw))
+        except (TypeError, ValueError):
+            continue
+    return min(scores) if scores else 1.0
+
+
+def _compete_fallback(
+    by_id: Mapping[str, Mapping[str, Any]],
+    segments: Sequence[Mapping[str, Any]],
+    codebook: Sequence[Mapping[str, Any]],
+    raised: set[str],
+    blocked: set[str],
+) -> list[tuple[str, str]]:
+    """Assigned passages that can test a competing reading.
+
+    Order: another code already on the passage, an opposite pole in the text,
+    then a raised code the passage was not given.
+    """
+    held = _codes_by_passage(segments)
+    poles = _pole_index(codebook)
+    assigned = [
+        passage_id
+        for passage_id in by_id
+        if passage_id not in blocked and (held.get(passage_id) or set()) & raised
+    ]
+    alternative: list[str] = []
+    opposite: list[str] = []
+    untried: list[str] = []
+    for passage_id in assigned:
+        codes = held.get(passage_id) or set()
+        if len(codes) > 1:
+            alternative.append(passage_id)
+            continue
+        if _has_opposite_pole(str(by_id[passage_id].get("text") or ""), codes & raised, poles):
+            opposite.append(passage_id)
+            continue
+        if raised - codes:
+            untried.append(passage_id)
+    return (
+        [(passage_id, "alternative_code") for passage_id in alternative]
+        + [(passage_id, "opposite_pole") for passage_id in opposite]
+        + [(passage_id, "untried_code") for passage_id in untried]
+    )
+
+
+def _outside_fallback(
+    by_id: Mapping[str, Mapping[str, Any]],
+    segments: Sequence[Mapping[str, Any]],
+    raised: set[str],
+    blocked: set[str],
+    assigned_ids: set[str],
+) -> list[tuple[str, str]]:
+    """Passages outside the raised assignments, or the weakest assignments."""
+    unassigned = [
+        passage_id
+        for passage_id in by_id
+        if passage_id not in assigned_ids and passage_id not in blocked
+    ]
+    if unassigned:
+        return [(passage_id, "unassigned") for passage_id in unassigned]
+    ranked = sorted(
+        (passage_id for passage_id in assigned_ids if passage_id in by_id and passage_id not in blocked),
+        key=lambda passage_id: (_passage_confidence(passage_id, segments, raised), passage_id),
+    )
+    return [(passage_id, "low_confidence") for passage_id in ranked]
+
+
+def _reallocate_shares(
+    requested: Mapping[str, float],
+    groups: Mapping[str, Sequence[Any]],
+) -> tuple[dict[str, float], dict[str, Any], list[str]]:
+    """Move a positive share off a purpose that still has no passages."""
+    empty = [purpose for purpose in REREAD_PURPOSES if not groups.get(purpose) and float(requested[purpose]) > 0]
+    active = [purpose for purpose in REREAD_PURPOSES if groups.get(purpose)]
+    if not empty:
+        return dict(requested), {"reallocated": False, "purposes": [], "note": ""}, []
+    if not active:
+        note = (
+            "Focused reread purposes "
+            + ", ".join(empty)
+            + " had no passages, and no other purpose had a queue to receive their shares."
+        )
+        return (
+            dict(requested),
+            {
+                "reallocated": True,
+                "purposes": empty,
+                "note": note,
+                "shares_requested": dict(requested),
+                "shares_applied": dict(requested),
+            },
+            [note],
+        )
+    applied = {purpose: 0.0 for purpose in REREAD_PURPOSES}
+    freed = sum(float(requested[purpose]) for purpose in empty)
+    active_total = sum(float(requested[purpose]) for purpose in active)
+    for purpose in active:
+        portion = (float(requested[purpose]) / active_total) if active_total else (1 / len(active))
+        applied[purpose] = float(requested[purpose]) + freed * portion
+    note = (
+        "Focused reread "
+        + ("purpose " if len(empty) == 1 else "purposes ")
+        + ", ".join(f"{purpose} (share {float(requested[purpose]):.3f})" for purpose in empty)
+        + " had no passages after search, so "
+        + ("that share was" if len(empty) == 1 else "those shares were")
+        + " reallocated to "
+        + ", ".join(f"{purpose} {applied[purpose]:.3f}" for purpose in active)
+        + "."
+    )
+    return (
+        applied,
+        {
+            "reallocated": True,
+            "purposes": empty,
+            "note": note,
+            "shares_requested": {purpose: float(requested[purpose]) for purpose in REREAD_PURPOSES},
+            "shares_applied": applied,
+        },
+        [note],
+    )
+
+
 def build_recode_queue(
     passages: Sequence[Mapping[str, Any]],
     segments: Sequence[Mapping[str, Any]],
@@ -715,14 +996,46 @@ def build_recode_queue(
     incidents: Sequence[Mapping[str, Any]] | None = None,
     claims: Sequence[Mapping[str, Any]] | None = None,
 ) -> list[dict[str, str]]:
-    """Interleave three reserved reread purposes. The same seed replays the queue.
+    """Interleave three reserved reread purposes. The same seed replays the queue."""
+    return plan_recode_queue(
+        passages,
+        segments,
+        raised_code_ids,
+        codebook,
+        seed=seed,
+        neighbor_limit=neighbor_limit,
+        outside_limit=outside_limit,
+        negative_case_limit=negative_case_limit,
+        shares=shares,
+        incidents=incidents,
+        claims=claims,
+    )["queue"]
+
+
+def plan_recode_queue(
+    passages: Sequence[Mapping[str, Any]],
+    segments: Sequence[Mapping[str, Any]],
+    raised_code_ids: Sequence[str],
+    codebook: Sequence[Mapping[str, Any]],
+    *,
+    seed: int,
+    neighbor_limit: int,
+    outside_limit: int = DEFAULT_FOCUSED_OUTSIDE_LIMIT,
+    negative_case_limit: int = DEFAULT_FOCUSED_NEGATIVE_CASE_LIMIT,
+    shares: Mapping[str, float] | None = None,
+    incidents: Sequence[Mapping[str, Any]] | None = None,
+    claims: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build the reread queue and say when a reserved purpose was empty.
 
     ``develop`` holds passages already assigned to a raised code.
     ``compete`` holds within-category negative cases and a bounded lexical
-    neighborhood, so a competing interpretation is tried.
-    ``outside`` holds passages outside that initial selection, negative cases
-    against a claim first. Researcher incidents are placed in the purpose they
-    name and are not dropped to satisfy a limit.
+    neighborhood. When that list is empty, assigned passages fill it:
+    another code on the passage, an opposite pole, or a raised code not yet
+    applied. ``outside`` holds passages outside that selection. When none
+    remain, the lowest-confidence raised assignments fill it. A purpose that
+    is still empty gives its share back explicitly, and the plan carries a
+    warning. Researcher incidents are not dropped to satisfy a limit.
     """
     share_values = normalize_shares(shares)
     raised = {str(item) for item in raised_code_ids}
@@ -805,16 +1118,39 @@ def build_recode_queue(
     rng.shuffle(neighbor_shuffled)
     outside_shuffled = list(outside_auto)
     rng.shuffle(outside_shuffled)
+    compete_fallback: list[tuple[str, str]] = []
+    outside_fallback: list[tuple[str, str]] = []
+    # Reserve outside first so a weak assignment is not swallowed by compete.
+    if not outside_shuffled and int(outside_limit) > 0:
+        blocked = reserved | set(compete_auto) | set(neighbor_shuffled)
+        outside_fallback = _outside_fallback(by_id, segments, raised, blocked, assigned_ids)[: int(outside_limit)]
+    if not compete_auto and not neighbor_shuffled:
+        budget = max(0, int(negative_case_limit)) + max(0, int(neighbor_limit))
+        if budget > 0:
+            blocked = reserved | set(outside_shuffled) | {passage_id for passage_id, _source in outside_fallback}
+            compete_fallback = _compete_fallback(by_id, segments, codebook, raised, blocked)[:budget]
+    moved = {passage_id for passage_id, _source in compete_fallback + outside_fallback}
+    develop = [passage_id for passage_id in develop if passage_id not in moved]
     groups = {
         "develop": [_queue_item(passage_id, "develop", "researcher") for passage_id in researcher["develop"]]
         + [_queue_item(passage_id, "develop", "assignment") for passage_id in develop],
         "compete": [_queue_item(passage_id, "compete", "researcher") for passage_id in researcher["compete"]]
         + [_queue_item(passage_id, "compete", "negative_case") for passage_id in compete_auto]
-        + [_queue_item(passage_id, "compete", "neighbor") for passage_id in neighbor_shuffled],
+        + [_queue_item(passage_id, "compete", "neighbor") for passage_id in neighbor_shuffled]
+        + [_queue_item(passage_id, "compete", source) for passage_id, source in compete_fallback],
         "outside": [_queue_item(passage_id, "outside", "researcher") for passage_id in researcher["outside"]]
-        + [_queue_item(passage_id, "outside", "outside") for passage_id in outside_shuffled],
+        + [_queue_item(passage_id, "outside", "outside") for passage_id in outside_shuffled]
+        + [_queue_item(passage_id, "outside", source) for passage_id, source in outside_fallback],
     }
-    return interleave_queue(groups, share_values)
+    applied, reallocation, warnings = _reallocate_shares(share_values, groups)
+    return {
+        "queue": interleave_queue(groups, applied),
+        "warnings": warnings,
+        "shares_requested": share_values,
+        "shares_applied": applied,
+        "reallocation": reallocation,
+        "purpose_counts": {purpose: len(groups[purpose]) for purpose in REREAD_PURPOSES},
+    }
 
 
 def cite_note(
@@ -1072,6 +1408,87 @@ def _needs_label_retry(interpreted: Mapping[str, Any]) -> bool:
     return bool(interpreted.get("label_retries"))
 
 
+def _span_pairs(item: Mapping[str, Any]) -> tuple[tuple[int, int], ...] | None:
+    spans: list[tuple[int, int]] = []
+    for span in item.get("quote_spans") or []:
+        if isinstance(span, Mapping) and span.get("doc_start") is not None and span.get("doc_end") is not None:
+            spans.append((int(span["doc_start"]), int(span["doc_end"])))
+    if not spans and item.get("doc_start") is not None and item.get("doc_end") is not None:
+        spans.append((int(item["doc_start"]), int(item["doc_end"])))
+    if not spans:
+        return None
+    return tuple(spans)
+
+
+def _same_quoted_span(existing: Mapping[str, Any], item: Mapping[str, Any]) -> bool:
+    """True when the reread repeats the stored quote. A different span is not a match."""
+    old, new = _span_pairs(existing), _span_pairs(item)
+    if old is not None and new is not None:
+        return old == new
+    old_quote = " ".join(str(existing.get("quote") or "").split()).casefold()
+    new_quote = " ".join(str(item.get("quote") or item.get("model_quote") or "").split()).casefold()
+    if not new_quote:
+        return True
+    return bool(old_quote) and old_quote == new_quote
+
+
+def _code_id_for_item(item: Mapping[str, Any], book: Mapping[str, Mapping[str, Any]]) -> str:
+    key = str(item.get("key") or "")
+    entry = book.get(key) or {}
+    return str(entry.get("code_id") or item.get("code_id") or "")
+
+
+def _assignments_for(segments: Sequence[Mapping[str, Any]], passage_id: str, code_id: str) -> list[Mapping[str, Any]]:
+    found = []
+    for segment in segments:
+        if str(segment.get("code_id") or "") != code_id:
+            continue
+        homes = {str(segment.get("passage_id") or ""), str(segment.get("coded_passage_id") or "")}
+        if passage_id in homes:
+            found.append(segment)
+    return found
+
+
+def _confirm_assignment(segment: Mapping[str, Any], item: Mapping[str, Any]) -> dict[str, Any]:
+    """Record a focused confirmation. The stored quote and span stay as they were."""
+    row = dict(segment)
+    quote = row.get("quote")
+    start = row.get("doc_start")
+    end = row.get("doc_end")
+    spans = list(row.get("quote_spans") or [])
+    provenance = dict(row.get("provenance") or {})
+    focused = dict(provenance.get("focused") or {})
+    focused.update(
+        {
+            "confirmed": True,
+            "stage": "focused",
+            "confidence": item.get("confidence"),
+            "rationale": item.get("rationale") or "",
+            "model_quote": item.get("model_quote") or item.get("quote") or "",
+            "quote_status": item.get("quote_status") or "",
+        }
+    )
+    provenance["focused"] = focused
+    notes = [dict(note) for note in (row.get("confirmations") or []) if isinstance(note, Mapping)]
+    notes.append(
+        {
+            "stage": "focused",
+            "confidence": item.get("confidence"),
+            "rationale": item.get("rationale") or "",
+            "model_quote": item.get("model_quote") or item.get("quote") or "",
+            "quote_status": item.get("quote_status") or "",
+        }
+    )
+    row["provenance"] = provenance
+    row["confirmations"] = notes
+    row["focused_confirmation"] = True
+    row["quote"] = quote
+    row["doc_start"] = start
+    row["doc_end"] = end
+    row["quote_spans"] = spans
+    return row
+
+
 def apply_passage_recode(
     book: dict[str, dict],
     segments: list[dict],
@@ -1091,7 +1508,10 @@ def apply_passage_recode(
     """Validate one reread and append assignments. Initial codes stay.
 
     An initial raised-code assignment that this reread does not repeat is kept
-    and flagged ``focused_disagreement``. Quotes follow the open-coding anchor.
+    and flagged ``focused_disagreement``. The same code and the same span is a
+    confirmation on that assignment, with focused provenance. A different span
+    is a separate proposal and does not rewrite the stored quote. Quotes follow
+    the open-coding anchor.
     """
     coding = {
         "passage_id": str(passage.get("passage_id") or ""),
@@ -1109,6 +1529,27 @@ def apply_passage_recode(
         passages=passages,
         request_passages=passages,
     )
+    coded_id = str(passage.get("passage_id") or "")
+    confirm_ids: dict[str, Mapping[str, Any]] = {}
+    span_proposal_ids: set[str] = set()
+    to_commit = []
+    for item in interpreted.get("accepted") or []:
+        code_id = _code_id_for_item(item, book)
+        existing = _assignments_for(segments, coded_id, code_id) if code_id else []
+        if existing and _same_quoted_span(existing[0], item):
+            confirm_ids[str(existing[0].get("segment_id") or "")] = item
+            continue
+        if existing:
+            span_proposal_ids.add(code_id)
+        to_commit.append(item)
+    confirmed_code_ids = set()
+    for index, segment in enumerate(segments):
+        sid = str(segment.get("segment_id") or "")
+        if sid not in confirm_ids:
+            continue
+        segments[index] = _confirm_assignment(segment, confirm_ids[sid])
+        confirmed_code_ids.add(str(segment.get("code_id") or ""))
+    interpreted = {**interpreted, "accepted": to_commit}
     before_ids = {str(item.get("segment_id") or "") for item in segments}
     committed = commit_passage(
         book,
@@ -1128,6 +1569,11 @@ def apply_passage_recode(
         reasons = [str(item) for item in (row.get("review_reasons") or [])]
         if "focused_recode" not in reasons:
             reasons.append("focused_recode")
+        if str(row.get("code_id") or "") in span_proposal_ids:
+            if "focused_span_proposal" not in reasons:
+                reasons.append("focused_span_proposal")
+            row["focused_span_proposal"] = True
+            row["needs_review"] = True
         row["review_reasons"] = reasons
         new_segments.append(row)
     replaced = {str(item.get("segment_id") or ""): item for item in new_segments}
@@ -1135,7 +1581,7 @@ def apply_passage_recode(
     for segment in committed["segments"]:
         sid = str(segment.get("segment_id") or "")
         merged.append(replaced.get(sid, segment))
-    accepted_ids = set()
+    accepted_ids = set(confirmed_code_ids)
     for item in interpreted.get("accepted") or []:
         key = str(item.get("key") or "")
         entry = committed["codebook"].get(key) or {}
@@ -1144,7 +1590,6 @@ def apply_passage_recode(
         if item.get("code_id"):
             accepted_ids.add(str(item.get("code_id")))
     raised = set(str(item) for item in raised_code_ids)
-    coded_id = str(passage.get("passage_id") or "")
     disagreed = []
     flagged = []
     for segment in merged:
@@ -1344,7 +1789,15 @@ def _load_node(state: FocusedState) -> dict:
     for key, entry in book.items():
         entry["category_revision_id"] = str(entry.get("category_revision_id") or category_revision_id(entry))
         book[key] = entry
-    return {"warnings": list(state.get("warnings") or []), "codebook": book}
+    restored = restore_id_counters(
+        state.get("segments") or [],
+        state.get("memos") or [],
+        highlight_ids=state.get("highlight_ids") or {},
+    )
+    counters = dict(state.get("counters") or {})
+    for name, value in restored.items():
+        counters[name] = max(int(counters.get(name) or 0), int(value or 0))
+    return {"warnings": list(state.get("warnings") or []), "codebook": book, "counters": counters}
 
 
 def _select_node(state: FocusedState) -> dict:
@@ -1366,13 +1819,43 @@ def _select_node(state: FocusedState) -> dict:
         weight_analytic=float(weights.get("focused_weight_analytic", DEFAULT_FOCUSED_WEIGHT_ANALYTIC)),
         min_score=None if minimum is None else float(minimum),
         analytic_features=weights.get("focused_analytic_features"),
+        selection_rule=str(procedure.get("focused_selection_rule") or DEFAULT_FOCUSED_SELECTION_RULE),
+        selection_k=procedure.get("focused_selection_k"),
+        selection_quantile=float(
+            procedure.get("focused_selection_quantile")
+            if procedure.get("focused_selection_quantile") is not None
+            else DEFAULT_FOCUSED_SELECTION_QUANTILE
+        ),
+        raise_all=bool(procedure.get("focused_raise_all")),
+        warn_fraction=float(
+            procedure.get("focused_raise_warn_fraction")
+            if procedure.get("focused_raise_warn_fraction") is not None
+            else DEFAULT_FOCUSED_RAISE_WARN_FRACTION
+        ),
     )
     known = [str(entry.get("code_id") or "") for entry in (state.get("codebook") or {}).values()]
+    warnings = list(state.get("warnings") or [])
+    for note in selection.get("warnings") or []:
+        if note not in warnings:
+            warnings.append(note)
+    metadata = dict(meta)
+    metadata["selection_summary"] = {
+        "rule": selection.get("selection_rule"),
+        "k": selection.get("selection_k"),
+        "quantile": selection.get("selection_quantile"),
+        "tie_policy": selection.get("tie_policy"),
+        "raise_all": selection.get("raise_all"),
+        "raised": len(selection.get("raised_code_ids") or []),
+        "total": len(selection.get("rows") or []),
+        "raised_fraction": selection.get("raised_fraction"),
+    }
     return {
         "selection": selection["rows"],
         "proposed_raised_code_ids": list(selection["raised_code_ids"]),
         "proposed_not_raised_code_ids": list(selection["not_raised_code_ids"]),
         "known_code_ids": known,
+        "warnings": warnings,
+        "metadata": metadata,
     }
 
 
@@ -1432,7 +1915,7 @@ def _prepare_node(state: FocusedState) -> dict:
     if not state.get("queue_ready"):
         meta = state.get("metadata") or {}
         procedure = meta.get("procedure") or {}
-        queue = build_recode_queue(
+        plan = plan_recode_queue(
             state.get("passages") or [],
             state.get("segments") or [],
             state.get("raised_code_ids") or [],
@@ -1445,6 +1928,17 @@ def _prepare_node(state: FocusedState) -> dict:
             incidents=(meta.get("researcher_incidents") or []),
             claims=list(state.get("properties") or []) + list(state.get("dimensions") or []),
         )
+        queue = list(plan["queue"])
+        warnings = list(state.get("warnings") or [])
+        for note in plan.get("warnings") or []:
+            if note not in warnings:
+                warnings.append(note)
+        metadata = dict(meta)
+        metadata["reread_shares_applied"] = plan.get("shares_applied") or {}
+        metadata["reread_reallocation"] = plan.get("reallocation") or {}
+        metadata["reread_purpose_counts"] = plan.get("purpose_counts") or {}
+        updates["warnings"] = warnings
+        updates["metadata"] = metadata
         updates["recode_queue"] = queue
         updates["recode_cursor"] = 0
         updates["queue_ready"] = True
@@ -1565,12 +2059,14 @@ def _worker(runtime: FocusedRuntime):
         raised = [entry for entry in book.values() if str(entry.get("code_id") or "") in raised_ids]
         passages = list(job.get("passages") or [])
         messages = _recode_messages(passages, raised)
+        raw_parts: list[str] = []
         (parsed, usage), sent = await ainvoke_structured(
             runtime.coder,
             FocusedRecodeBatch,
             messages,
             runtime.limiter,
             use_cache=False,
+            raw_out=raw_parts,
         )
         calls = 1
         interpreted_retry = False
@@ -1585,6 +2081,7 @@ def _worker(runtime: FocusedRuntime):
                     retry_messages,
                     runtime.limiter,
                     use_cache=False,
+                    raw_out=raw_parts,
                 )
                 usage = {
                     "input_tokens": int((usage or {}).get("input_tokens") or 0)
@@ -1603,6 +2100,8 @@ def _worker(runtime: FocusedRuntime):
             "calls": calls,
             "usage": usage,
             "label_retry": interpreted_retry,
+            "response": parsed,
+            "raw_response": "\n".join(part for part in raw_parts if part),
             "messages": [
                 {"role": getattr(message, "type", "unknown"), "content": getattr(message, "content", "")}
                 for message in sent
@@ -1680,6 +2179,9 @@ def _commit_node(runtime: FocusedRuntime):
                     "passage_ids": sent_ids,
                     "usage": usage,
                     "label_retry": bool(proposal.get("label_retry")),
+                    "response": proposal.get("response"),
+                    "raw_response": proposal.get("raw_response") or "",
+                    "messages": list(proposal.get("messages") or []),
                 }
             )
             actual = int(usage.get("input_tokens") or 0)
@@ -1737,8 +2239,7 @@ def _commit_node(runtime: FocusedRuntime):
                         )
                 memo_text = str(row.get("memo") or "").strip()
                 if memo_text:
-                    memo_id = f"m{int(counters.get('memo') or 0) + 1}"
-                    counters["memo"] = int(counters.get("memo") or 0) + 1
+                    memo_id = _next(counters, "memo", "m")
                     memos.append(
                         {
                             "memo_id": memo_id,
@@ -1807,13 +2308,23 @@ def _review_node(state: FocusedState) -> dict:
             warnings.append(note)
     metadata = dict(state.get("metadata") or {})
     procedure = metadata.get("procedure") or {}
+    requested = _shares_from_procedure(procedure)
+    applied = metadata.get("reread_shares_applied") or requested
+    reallocation = dict(metadata.get("reread_reallocation") or {})
     coverage = purpose_coverage(
         list(state.get("recode_queue") or []),
         list(state.get("focused_reread") or []),
         state.get("purpose_calls") or {},
         state.get("purpose_tokens") or {},
-        _shares_from_procedure(procedure),
+        applied,
     )
+    emptied = set(reallocation.get("purposes") or [])
+    for purpose in REREAD_PURPOSES:
+        coverage[purpose]["requested_share"] = float(requested.get(purpose, 0))
+        coverage[purpose]["applied_share"] = float(applied.get(purpose, 0))
+        coverage[purpose]["reallocated_away"] = purpose in emptied
+    if reallocation:
+        coverage["reallocation"] = reallocation
     metadata.update(fields)
     metadata["purpose_coverage"] = coverage
     metadata["saturation_judgment"] = None
@@ -1994,6 +2505,11 @@ def export_focused_state(state: Mapping[str, Any], directory: str | Path) -> dic
         ],
     )
     _write_json(place / "code_id_sidecar.json", code_id_sidecar(list((state.get("codebook") or {}).values())))
+    segments = list(state.get("segments") or [])
+    assignments = _assignment_rows(segments)
+    _write_json(place / "coded_segments.json", segments)
+    _write_json(place / "assignments.json", assignments)
+    _write_json(place / "prompt_log.json", list(state.get("prompt_log") or []))
     return {
         "category_development.json": str(place / "category_development.json"),
         "focused_selection.json": str(place / "focused_selection.json"),
@@ -2002,8 +2518,36 @@ def export_focused_state(state: Mapping[str, Any], directory: str | Path) -> dic
         "downstream_claims.json": str(place / "downstream_claims.json"),
         "code_id_sidecar.json": str(place / "code_id_sidecar.json"),
         "focused_run.json": str(place / "focused_run.json"),
+        "coded_segments.json": str(place / "coded_segments.json"),
+        "assignments.json": str(place / "assignments.json"),
+        "prompt_log.json": str(place / "prompt_log.json"),
         "uses": view_notes(),
     }
+
+
+def _assignment_rows(segments: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """One row per segment. Confirmations stay on the original span."""
+    rows = []
+    for segment in segments:
+        rows.append(
+            {
+                "segment_id": segment.get("segment_id"),
+                "code_id": segment.get("code_id"),
+                "code": segment.get("code"),
+                "passage_id": segment.get("passage_id"),
+                "coded_passage_id": segment.get("coded_passage_id"),
+                "doc_id": segment.get("doc_id"),
+                "quote": segment.get("quote"),
+                "doc_start": segment.get("doc_start"),
+                "doc_end": segment.get("doc_end"),
+                "focused_confirmation": bool(segment.get("focused_confirmation")),
+                "focused_span_proposal": bool(segment.get("focused_span_proposal")),
+                "needs_review": bool(segment.get("needs_review")),
+                "review_reasons": list(segment.get("review_reasons") or []),
+                "provenance": segment.get("provenance") or {},
+            }
+        )
+    return rows
 
 
 class _WorkerInput(TypedDict, total=False):
@@ -2091,7 +2635,7 @@ def _initial_state(source: OpenCodeResult, metadata: dict, *, interrupt_enabled:
         "prompt_log": [],
         "proposal_buffer": {"items": [], "duplicates": 0, "conflicts": []},
         "committed_ids": [],
-        "counters": empty_counters(),
+        "counters": restore_id_counters(source.segments, source.memos),
         "highlight_ids": {},
         "snapshot_id": "s00000",
         "snapshot_version": 0,
@@ -2175,6 +2719,11 @@ def _procedure(
     shares: Mapping[str, float],
     analytic_features: Sequence[str] | None,
     validation_retries: int,
+    selection_rule: str,
+    selection_k: int | None,
+    selection_quantile: float,
+    raise_all: bool,
+    warn_fraction: float,
 ) -> dict[str, Any]:
     if coding_lens != "charmaz":
         raise ValueError(
@@ -2187,6 +2736,15 @@ def _procedure(
         raise ValueError("Focused passage limits must be zero or more.")
     if validation_retries < 0:
         raise ValueError("validation_retries must be zero or more.")
+    rule = str(selection_rule or DEFAULT_FOCUSED_SELECTION_RULE)
+    if rule not in SELECTION_RULES:
+        raise ValueError(f"focused_selection_rule must be one of {SELECTION_RULES}.")
+    if selection_k is not None and int(selection_k) < 1:
+        raise ValueError("focused_selection_k must be at least 1.")
+    if not 0 < float(selection_quantile) < 1:
+        raise ValueError("focused_selection_quantile must be between 0 and 1.")
+    if not 0 < float(warn_fraction) <= 1:
+        raise ValueError("focused_raise_warn_fraction must be above 0 and at most 1.")
     share_values = normalize_shares(shares)
     features = list(normalize_analytic_features(analytic_features))
     return {
@@ -2197,6 +2755,11 @@ def _procedure(
         "focused_weight_documents": float(weight_documents),
         "focused_weight_analytic": float(weight_analytic),
         "focused_min_score": None if min_score is None else float(min_score),
+        "focused_selection_rule": rule,
+        "focused_selection_k": None if selection_k is None else int(selection_k),
+        "focused_selection_quantile": float(selection_quantile),
+        "focused_raise_all": bool(raise_all),
+        "focused_raise_warn_fraction": float(warn_fraction),
         "max_focused_review_calls": int(max_calls),
         "max_focused_review_tokens": int(max_tokens),
         "focused_neighbor_limit": int(neighbor_limit),
@@ -2233,6 +2796,11 @@ async def afocused_code(
     focused_weight_documents: float = DEFAULT_FOCUSED_WEIGHT_DOCUMENTS,
     focused_weight_analytic: float = DEFAULT_FOCUSED_WEIGHT_ANALYTIC,
     focused_min_score: float | None = None,
+    focused_selection_rule: str = DEFAULT_FOCUSED_SELECTION_RULE,
+    focused_selection_k: int | None = None,
+    focused_selection_quantile: float = DEFAULT_FOCUSED_SELECTION_QUANTILE,
+    focused_raise_all: bool = False,
+    focused_raise_warn_fraction: float = DEFAULT_FOCUSED_RAISE_WARN_FRACTION,
     focused_neighbor_limit: int = DEFAULT_FOCUSED_NEIGHBOR_LIMIT,
     focused_outside_limit: int = DEFAULT_FOCUSED_OUTSIDE_LIMIT,
     focused_negative_case_limit: int = DEFAULT_FOCUSED_NEGATIVE_CASE_LIMIT,
@@ -2294,6 +2862,11 @@ async def afocused_code(
         },
         analytic_features=focused_analytic_features,
         validation_retries=validation_retries,
+        selection_rule=focused_selection_rule,
+        selection_k=focused_selection_k,
+        selection_quantile=focused_selection_quantile,
+        raise_all=focused_raise_all,
+        warn_fraction=focused_raise_warn_fraction,
     )
     performance = _performance(batch_size=batch_size, concurrency=concurrency, token_budget=token_budget)
     manifest = focused_manifest(

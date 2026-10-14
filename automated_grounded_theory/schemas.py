@@ -735,26 +735,32 @@ class FocusedCodeDecision(_LLMModel):
 
 
 class FocusedPropertyNote(_LLMModel):
-    """A property of a category. The citation is the evidence, not a theme property."""
+    """An analytic property of a category. The citation is the evidence, not a description of the passage."""
 
     category_id: str = Field(default="", description="code_id of the category this property develops.")
-    name: str = Field(default="", description="Short name of the property.")
-    text: str = Field(default="", description="What varies, in a sentence grounded in the quote.")
+    name: str = Field(
+        default="",
+        description="Analytic property: what varies inside the category. Not a descriptive summary of the passage.",
+    )
+    text: str = Field(default="", description="What varies, in a sentence grounded in the quote. Not a paraphrase of the whole passage.")
     document_id: str = Field(default="", description="Document id of the passage that contains the quote.")
     passage_id: str = Field(default="", description="passage_id that contains the quote.")
-    quote: str = Field(default="", description="Words from that passage. Empty citations are kept and flagged.")
+    quote: str = Field(default="", description="Words copied from that passage. Empty citations are kept and flagged.")
 
 
 class FocusedDimensionNote(_LLMModel):
-    """One pole of a dimension. Cite the passage that sits at that pole."""
+    """One pole of an analytic dimension. Cite the passage that sits at that pole."""
 
     category_id: str = Field(default="", description="code_id of the category.")
-    name: str = Field(default="", description="Name of the dimension, the range, not a relationship.")
-    pole: str = Field(default="", description="The end of the range this passage sits at.")
-    text: str = Field(default="", description="How this pole shows up in the quote.")
+    name: str = Field(
+        default="",
+        description="Analytic dimension: the range the category varies along. Not a description of the passage and not a relationship between categories.",
+    )
+    pole: str = Field(default="", description="The end of the range this passage sits at, including an opposite pole when the passage supports one.")
+    text: str = Field(default="", description="How this pole shows up in the quote. Not a descriptive summary.")
     document_id: str = Field(default="", description="Document id of the passage that contains the quote.")
     passage_id: str = Field(default="", description="passage_id that contains the quote.")
-    quote: str = Field(default="", description="Words from that passage.")
+    quote: str = Field(default="", description="Words copied from that passage.")
 
 
 class FocusedPassageRecode(_LLMModel):
@@ -765,9 +771,18 @@ class FocusedPassageRecode(_LLMModel):
         default_factory=list,
         description="Codes this passage still supports. Omit an initial code only when the passage does not support it.",
     )
-    properties: list[FocusedPropertyNote] = Field(default_factory=list)
-    dimensions: list[FocusedDimensionNote] = Field(default_factory=list)
-    memo: str = Field(default="", description="Analytic note from the model. Not a saturation judgment.")
+    properties: list[FocusedPropertyNote] = Field(
+        default_factory=list,
+        description="Analytic properties of the raised categories, each with document_id, passage_id, and a quote. Do not substitute a descriptive summary.",
+    )
+    dimensions: list[FocusedDimensionNote] = Field(
+        default_factory=list,
+        description="Analytic dimensions and the pole this passage occupies, each with document_id, passage_id, and a quote.",
+    )
+    memo: str = Field(
+        default="",
+        description="Analytic note, including a competing interpretation when another raised code or an opposite pole also fits. Not a saturation judgment and not a descriptive summary.",
+    )
 
 
 class FocusedRecodeBatch(_LLMModel):

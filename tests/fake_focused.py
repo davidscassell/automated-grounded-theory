@@ -71,6 +71,46 @@ class FakeFocusedCoder(BaseChatModel):
             if self.mode == "drop":
                 rows.append(FocusedPassageRecode(passage_id=passage_id, codes=[]))
                 continue
+            if self.mode == "alt_span":
+                quote = "packing my suitcase" if "packing my suitcase" in text else text[: max(1, len(text) // 2)]
+            if self.mode == "new_label":
+                decision = FocusedCodeDecision(
+                    action="add",
+                    code="marking the hour",
+                    code_id="",
+                    quote=quote,
+                    definition="Noting the time of the incident.",
+                    rationale="The passage marks when the incident happened.",
+                )
+                rows.append(
+                    FocusedPassageRecode(
+                        passage_id=passage_id,
+                        codes=[decision],
+                        memo="A competing reading is that the passage is marking the hour rather than only packing.",
+                        properties=[
+                            FocusedPropertyNote(
+                                category_id="",
+                                name="timing of the incident",
+                                text="The analytic property is when the incident sits in the day, not a summary of the scene.",
+                                document_id=doc_id,
+                                passage_id=passage_id,
+                                quote=quote,
+                            )
+                        ],
+                        dimensions=[
+                            FocusedDimensionNote(
+                                category_id="",
+                                name="time of day",
+                                pole="morning",
+                                text="This pole is morning rather than night.",
+                                document_id=doc_id,
+                                passage_id=passage_id,
+                                quote=quote,
+                            )
+                        ],
+                    )
+                )
+                continue
             if self.mode == "outside":
                 quote = self.outside_quote or quote
             decision = FocusedCodeDecision(

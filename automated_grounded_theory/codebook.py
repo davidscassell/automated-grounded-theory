@@ -75,12 +75,57 @@ def _code_id(key: str) -> str:
 
 
 def empty_counters() -> dict[str, int]:
-    return {"segment": 0, "memo": 0, "highlight": 0, "sweep": 0}
+    return {"segment": 0, "memo": 0, "highlight": 0, "sweep": 0, "op": 0}
 
 
 def _next(counters: dict[str, int], name: str, prefix: str) -> str:
     counters[name] = int(counters.get(name, 0)) + 1
     return f"{prefix}{counters[name]:05d}"
+
+
+_PREFIXED_ID = re.compile(r"^([A-Za-z]+)(\d+)$")
+_ID_PREFIXES = {"s": "segment", "m": "memo", "h": "highlight", "o": "op"}
+
+
+def restore_id_counters(
+    segments: Sequence[Mapping[str, Any]] | None = None,
+    memos: Sequence[Mapping[str, Any]] | None = None,
+    ops: Sequence[Mapping[str, Any]] | None = None,
+    *,
+    highlight_ids: Mapping[str, str] | None = None,
+) -> dict[str, int]:
+    """Continue id sequences from a loaded run.
+
+    New ids use the same ``s00001`` / ``m00001`` width as open coding. The
+    counter is the highest numeric suffix already stored, so the next id does
+    not collide with a segment or memo read from the open-coding folder.
+    """
+    counters = empty_counters()
+
+    def absorb(value: Any) -> None:
+        match = _PREFIXED_ID.match(str(value or "").strip())
+        if not match:
+            return
+        name = _ID_PREFIXES.get(match.group(1).lower())
+        if name is None:
+            return
+        counters[name] = max(int(counters.get(name) or 0), int(match.group(2)))
+
+    for segment in segments or []:
+        if not isinstance(segment, Mapping):
+            continue
+        absorb(segment.get("segment_id"))
+        absorb(segment.get("highlight_id"))
+        absorb(segment.get("memo_id"))
+    for memo in memos or []:
+        if isinstance(memo, Mapping):
+            absorb(memo.get("memo_id"))
+    for op in ops or []:
+        if isinstance(op, Mapping):
+            absorb(op.get("op_id"))
+    for value in (highlight_ids or {}).values():
+        absorb(value)
+    return counters
 
 
 def _fallback_rationale(op: str, reason: str) -> str:
