@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.15
+
+- After the final consolidation pass, codes that still have unsent assignments are reviewed again. Each follow-up pass sends another batch inside the prompt example limit (2) and only includes codes `code_needs_review` still marks. The loop stops when every current assignment has been sent, when `max_final_review_calls` follow-up sweep calls have been used (default 8), when the next prompt's estimated input would pass `max_final_review_tokens` (default 24000), or when a pass sends no new assignment id. A prompt that does not fit is not sent. Zero for either allowance keeps the consolidation batch and then stops. The call allowance is checked first.
+- If that loop stops with evidence still unsent, the run is not fully consolidated. Warnings name the pending codes and ids. Metadata records `review_complete` false, `review_stop` (`call_allowance`, `token_allowance`, or `no_progress`), `pending_counts`, `pending_assignment_ids`, `assignments_available`, `assignments_sent`, `assignments_pending`, `review_calls_used`, and `review_tokens_used`. `consolidated` is true only when a consolidation pass ran and `review_complete` is true. A consolidation row in the sweep log means that pass ran. It does not by itself mean every assignment was sent.
+- An embedding that succeeds is published to its shared future as soon as the vector arrives, before the cache stores it and before a later vector can evict it. A follower waiting on that text receives the vector even when `vector_limit` is 1, a sibling is stored afterwards, and another sibling raises `ConnectionError`. The batch-query, single-query, and document paths all do this.
+- `policy_version` is `0.6.15`.
+
 ## 0.6.14
 
 - A speaker label may include a number (`Participant 02:`) or initials (`J.D.:`, `J. D.:`). `Table 1:`, `Figure 2:`, `Chapter 3:`, `e.g.:`, and `U.S.:` are still not speakers. A known role at the end of a line-start label still shrinks to that role, and a mid-line label still has to follow a sentence boundary. In an incident transcript, `Participant 02`'s answer is its own passage. It is not folded into the interviewer question.

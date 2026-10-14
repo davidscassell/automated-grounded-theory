@@ -32,6 +32,8 @@ from automated_grounded_theory.prompts import CODING_SYSTEM, SWEEP_SYSTEM
 from automated_grounded_theory.records import POLICY_VERSION
 from automated_grounded_theory.results import OpenCodeResult, result_from_state
 from automated_grounded_theory.retrieval import (
+    DEFAULT_MAX_FINAL_REVIEW_CALLS,
+    DEFAULT_MAX_FINAL_REVIEW_TOKENS,
     CodeRetriever,
     EmbeddingCodeRetriever,
     LexicalCodeRetriever,
@@ -223,6 +225,8 @@ def open_code(
     embed_batch_size: int = 64,
     full_audit_every: int = 4,
     cross_chunk_limit: int = 8,
+    max_final_review_calls: int | None = None,
+    max_final_review_tokens: int | None = None,
     max_retries: int = 4,
     retry_backoff: float = 0.5,
     retry_max_backoff: float = 8.0,
@@ -307,7 +311,21 @@ def open_code(
     discovery call names candidates across the book. Sweeps after the first
     review only new or changed codes, and every ``full_audit_every`` sweeps
     (default 4), plus the final consolidation, read the whole book again. The
-    sweep model reads each chunk and proposes duplicate merges with a reason.
+    consolidation pass shows ``PROMPT_EXAMPLE_LIMIT`` examples per code (2).
+    Assignments that were not sent stay pending. After consolidation the graph
+    runs further evidence passes, only for codes that still need review, until
+    every current assignment has been sent or an allowance runs out.
+    ``max_final_review_calls`` (default 8) is how many follow-up sweep calls
+    those passes may make. ``max_final_review_tokens`` (default 24000) is the
+    estimated input of those prompts; a prompt is sent only when it fits in
+    what remains. Either ceiling stops the loop. A pass that sends no new
+    assignment id stops it too. Zero calls, or zero tokens, keeps the
+    consolidation batch and then stops. The run is fully consolidated only
+    when ``review_complete`` is true. Otherwise warnings name the pending
+    evidence, ``consolidated`` is false, and metadata records
+    ``pending_counts``, ``pending_assignment_ids``, ``assignments_available``,
+    ``assignments_sent``, ``assignments_pending``, and ``review_calls_used``.
+    The sweep model reads each chunk and proposes duplicate merges with a reason.
     ``token_budget`` (default 6000) bounds the request that will be sent:
     retrieved codes, the JSON schema, a short repair allowance, and reserved
     output. A batch that does not fit is repacked, and retrieved codes are
@@ -387,6 +405,8 @@ def open_code(
             embed_batch_size=embed_batch_size,
             full_audit_every=full_audit_every,
             cross_chunk_limit=cross_chunk_limit,
+            max_final_review_calls=max_final_review_calls,
+            max_final_review_tokens=max_final_review_tokens,
             max_retries=max_retries,
             retry_backoff=retry_backoff,
             retry_max_backoff=retry_max_backoff,
@@ -458,6 +478,8 @@ async def aopen_code(
     embed_batch_size: int = 64,
     full_audit_every: int = 4,
     cross_chunk_limit: int = 8,
+    max_final_review_calls: int | None = None,
+    max_final_review_tokens: int | None = None,
     max_retries: int = 4,
     retry_backoff: float = 0.5,
     retry_max_backoff: float = 8.0,
@@ -521,6 +543,14 @@ async def aopen_code(
         raise ValueError("tokens_per_minute and requests_per_minute must be zero or more.")
     if int(short_turn_chars) < 0:
         raise ValueError("short_turn_chars must be zero or more.")
+    if max_final_review_calls is None:
+        max_final_review_calls = DEFAULT_MAX_FINAL_REVIEW_CALLS
+    if max_final_review_tokens is None:
+        max_final_review_tokens = DEFAULT_MAX_FINAL_REVIEW_TOKENS
+    if int(max_final_review_calls) < 0 or int(max_final_review_tokens) < 0:
+        raise ValueError("max_final_review_calls and max_final_review_tokens must be zero or more.")
+    max_final_review_calls = int(max_final_review_calls)
+    max_final_review_tokens = int(max_final_review_tokens)
     parsed_context = parse_context(context)
     documents = load_corpus(corpus)
     coder = resolve_chat_model(
@@ -623,6 +653,8 @@ async def aopen_code(
         token_budget=token_budget,
         full_audit_every=full_audit_every,
         cross_chunk_limit=cross_chunk_limit,
+        max_final_review_calls=max_final_review_calls,
+        max_final_review_tokens=max_final_review_tokens,
         prompt_cache=cache,
         api_key_provided=api_key is not None,
         thread_id=thread_id,
@@ -824,6 +856,8 @@ _MANIFEST_PROCEDURE = (
     "token_budget",
     "full_audit_every",
     "cross_chunk_limit",
+    "max_final_review_calls",
+    "max_final_review_tokens",
     "tokens_per_minute",
     "requests_per_minute",
     "allow_oversized",
@@ -1119,6 +1153,8 @@ def _metadata(**kwargs: Any) -> dict:
         "allow_oversized": bool(kwargs.get("allow_oversized", False)),
         "full_audit_every": kwargs.get("full_audit_every", 4),
         "cross_chunk_limit": kwargs.get("cross_chunk_limit", 8),
+        "max_final_review_calls": int(kwargs.get("max_final_review_calls", DEFAULT_MAX_FINAL_REVIEW_CALLS)),
+        "max_final_review_tokens": int(kwargs.get("max_final_review_tokens", DEFAULT_MAX_FINAL_REVIEW_TOKENS)),
         "prompt_cache": kwargs["prompt_cache"],
         "api_key_provided": kwargs["api_key_provided"],
         "thread_id": kwargs["thread_id"],
@@ -1148,6 +1184,8 @@ def _metadata(**kwargs: Any) -> dict:
             "passages_per_codebook_update": kwargs.get("passages_per_codebook_update", kwargs["batch_size"]),
             "full_audit_every": kwargs.get("full_audit_every", 4),
             "cross_chunk_limit": kwargs.get("cross_chunk_limit", 8),
+            "max_final_review_calls": int(kwargs.get("max_final_review_calls", DEFAULT_MAX_FINAL_REVIEW_CALLS)),
+            "max_final_review_tokens": int(kwargs.get("max_final_review_tokens", DEFAULT_MAX_FINAL_REVIEW_TOKENS)),
             "tokens_per_minute": kwargs.get("tokens_per_minute", 0),
             "requests_per_minute": kwargs.get("requests_per_minute", 0),
             "allow_oversized": bool(kwargs.get("allow_oversized", False)),

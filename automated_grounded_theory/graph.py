@@ -81,6 +81,8 @@ from automated_grounded_theory.prompts import (
 )
 from automated_grounded_theory.results import missing_slot_retry_cost, result_from_state
 from automated_grounded_theory.retrieval import (
+    DEFAULT_MAX_FINAL_REVIEW_CALLS,
+    DEFAULT_MAX_FINAL_REVIEW_TOKENS,
     CodeRetriever,
     EmbeddingCodeRetriever,
     LexicalCodeRetriever,
@@ -98,6 +100,7 @@ from automated_grounded_theory.retrieval import (
     select_cross_chunk,
     select_prompt_codes,
     shared_codebook_vectors,
+    unsent_assignment_ids,
 )
 from automated_grounded_theory.validation import (
     attributed_passage_ids,
@@ -296,6 +299,7 @@ def build_graph(runtime: RunConfig):
     builder.add_node("commit", _commit_node(runtime))
     builder.add_node("sweep", _sweep_node(runtime))
     builder.add_node("consolidate", _sweep_node(runtime, consolidation=True))
+    builder.add_node("review_evidence", _sweep_node(runtime, evidence_followup=True))
     builder.add_node("export", _export_node(runtime))
     builder.add_edge(START, "segment_and_shuffle")
     builder.add_conditional_edges(
@@ -317,9 +321,23 @@ def build_graph(runtime: RunConfig):
     builder.add_conditional_edges(
         "sweep",
         _route_after_sweep,
-        {"prepare_round": "prepare_round", "consolidate": "consolidate", "export": "export"},
+        {
+            "prepare_round": "prepare_round",
+            "consolidate": "consolidate",
+            "review_evidence": "review_evidence",
+            "export": "export",
+        },
     )
-    builder.add_edge("consolidate", "export")
+    builder.add_conditional_edges(
+        "consolidate",
+        _route_after_consolidation,
+        {"review_evidence": "review_evidence", "export": "export"},
+    )
+    builder.add_conditional_edges(
+        "review_evidence",
+        _route_after_consolidation,
+        {"review_evidence": "review_evidence", "export": "export"},
+    )
     builder.add_edge("export", END)
     return builder
 
@@ -460,12 +478,47 @@ def _route_after_validate(state: CodingState) -> str:
     return "code_passage"
 
 
+_TERMINAL_REVIEW_STOPS = {"complete", "call_allowance", "token_allowance", "no_progress"}
+
+
+def _book_needs_review(codebook: Mapping) -> bool:
+    return any(code_needs_review(entry) for entry in codebook.values() if isinstance(entry, Mapping))
+
+
+def _unsent_count(codebook: Mapping) -> int:
+    return sum(len(unsent_assignment_ids(entry)) for entry in codebook.values() if isinstance(entry, Mapping))
+
+
+def _route_after_consolidation(state: CodingState) -> str:
+    """Another evidence pass, or export when review is done or the allowance is spent.
+
+    The allowance is the follow-up calls and tokens after consolidation. A stop
+    reason set by the pass that just finished is terminal even when the numeric
+    counters have not reached the cap, which is how a prompt that does not fit
+    in the remaining tokens ends the run.
+    """
+    book = state.get("codebook") or {}
+    if not _book_needs_review(book):
+        return "export"
+    meta = state.get("metadata") or {}
+    if str(meta.get("review_stop") or "") in _TERMINAL_REVIEW_STOPS:
+        return "export"
+    max_calls = int(meta.get("max_final_review_calls", DEFAULT_MAX_FINAL_REVIEW_CALLS))
+    max_tokens = int(meta.get("max_final_review_tokens", DEFAULT_MAX_FINAL_REVIEW_TOKENS))
+    if int(meta.get("review_calls_used") or 0) >= max_calls:
+        return "export"
+    if int(meta.get("review_tokens_used") or 0) >= max_tokens:
+        return "export"
+    return "review_evidence"
+
+
 def _route_after_sweep(state: CodingState) -> str:
     if _remaining(state):
         return "prepare_round"
-    if not state.get("consolidated") and len(state.get("codebook") or {}) >= 2:
+    book = state.get("codebook") or {}
+    if not state.get("consolidated") and len(book) >= 2:
         return "consolidate"
-    return "export"
+    return _route_after_consolidation(state)
 
 
 def _prepare_round(runtime: RunConfig):
@@ -2181,7 +2234,60 @@ def _resync(codebook: dict, segments: list[dict]) -> dict:
     return sync_counts(codebook, segments)
 
 
-def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
+def _review_budget(meta: Mapping) -> tuple[int, int, int, int]:
+    """Call cap, token cap, calls already used, tokens already used."""
+    return (
+        int(meta.get("max_final_review_calls", DEFAULT_MAX_FINAL_REVIEW_CALLS)),
+        int(meta.get("max_final_review_tokens", DEFAULT_MAX_FINAL_REVIEW_TOKENS)),
+        int(meta.get("review_calls_used") or 0),
+        int(meta.get("review_tokens_used") or 0),
+    )
+
+
+def _review_fields(
+    book: Mapping,
+    meta: Mapping,
+    *,
+    added_calls: int,
+    added_tokens: int,
+    refused: str,
+    evidence_followup: bool,
+    progress: bool,
+) -> dict:
+    """Counters and the stop reason for the post-consolidation evidence loop.
+
+    An empty ``review_stop`` means another pass is still allowed. ``complete``
+    means nothing still needs review. The other reasons end the run with
+    pending evidence.
+    """
+    max_calls, max_tokens, used_calls, used_tokens = _review_budget(meta)
+    calls = used_calls + int(added_calls)
+    tokens = used_tokens + int(added_tokens)
+    needs = _book_needs_review(book)
+    if not needs:
+        stop = "complete"
+    elif refused:
+        stop = refused
+    elif calls >= max_calls:
+        stop = "call_allowance"
+    elif tokens >= max_tokens:
+        stop = "token_allowance"
+    elif evidence_followup and not progress:
+        stop = "no_progress"
+    elif not evidence_followup and (max_calls <= 0 or max_tokens <= 0):
+        stop = "token_allowance" if max_tokens <= 0 and max_calls > 0 else "call_allowance"
+    else:
+        stop = ""
+    return {
+        "max_final_review_calls": max_calls,
+        "max_final_review_tokens": max_tokens,
+        "review_calls_used": calls,
+        "review_tokens_used": tokens,
+        "review_stop": stop,
+    }
+
+
+def _sweep_node(runtime: RunConfig, *, consolidation: bool = False, evidence_followup: bool = False):
     async def sweep(state: CodingState) -> dict:
         started = time.perf_counter()
         extras = {"rewrites": 0.0}
@@ -2199,6 +2305,8 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
             timing["rewrites"] = round(float(timing.get("rewrites") or 0) + extras["rewrites"], 4)
             if consolidation:
                 timing["consolidation"] = round(float(timing.get("consolidation") or 0) + elapsed, 4)
+            if evidence_followup:
+                timing["evidence_review"] = round(float(timing.get("evidence_review") or 0) + elapsed, 4)
             update["stage_seconds"] = timing
             update["consolidated"] = True if consolidation else bool(state.get("consolidated"))
             return update
@@ -2271,9 +2379,19 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
                 code_task = asyncio.create_task(_pending_rows(runtime, state, jobs))
         codes = comparison_order(list(codebook.values()))
         frozen = frozen_pair_keys(list(state.get("pair_decisions") or []), codebook)
+        meta = dict(state.get("metadata") or {})
+        max_calls, max_tokens, used_calls, used_tokens = _review_budget(meta)
+        unsent_before = _unsent_count(codebook)
         try:
             parsed, candidates, chunk_count = await _sweep_chunks(
-                runtime, codes, sweep_index, frozen=frozen, consolidation=consolidation
+                runtime,
+                codes,
+                sweep_index,
+                frozen=frozen,
+                consolidation=consolidation,
+                evidence_followup=evidence_followup,
+                review_calls_remaining=max(0, max_calls - used_calls) if evidence_followup else None,
+                review_tokens_remaining=max(0, max_tokens - used_tokens) if evidence_followup else None,
             )
             overlap_pending: list = []
             if code_task is not None:
@@ -2490,6 +2608,7 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
             "chunks": chunk_count,
             "review": list(applied.get("review") or []),
             "consolidation": consolidation,
+            "evidence_followup": evidence_followup,
             "quotes_checked": quote_stats["quotes_checked"],
             "quotes_split": quote_stats["quotes_split"],
         }
@@ -2565,6 +2684,26 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
             update["metadata"] = oversized_metadata
         elif overlap_state is not None and overlap_state.get("metadata"):
             update["metadata"] = overlap_state["metadata"]
+        reviewed_book = applied["codebook"]
+        added_calls = int(parsed.get("review_calls") or 0) if evidence_followup else 0
+        added_tokens = int(parsed.get("review_tokens") or 0) if evidence_followup else 0
+        refused = str(parsed.get("review_refused") or "") if evidence_followup else ""
+        progress = _unsent_count(reviewed_book) < unsent_before or (
+            unsent_before > 0 and not _book_needs_review(reviewed_book)
+        )
+        base_meta = dict(update.get("metadata") or state.get("metadata") or {})
+        base_meta.update(
+            _review_fields(
+                reviewed_book,
+                base_meta,
+                added_calls=added_calls,
+                added_tokens=added_tokens,
+                refused=refused,
+                evidence_followup=evidence_followup,
+                progress=progress,
+            )
+        )
+        update["metadata"] = base_meta
         if overlap_state is not None:
             coded_before = int(state.get("passages_since_sweep") or 0)
             new_before = int(state.get("new_codes_since_sweep") or 0)
@@ -3030,13 +3169,18 @@ async def _sweep_chunks(
     *,
     frozen: set[frozenset[str]] | None = None,
     consolidation: bool = False,
+    evidence_followup: bool = False,
+    review_calls_remaining: int | None = None,
+    review_tokens_remaining: int | None = None,
 ) -> tuple[dict, list, int]:
     """Detect candidates, confirm merges, and refine definitions per chunk, concurrently.
 
     Chunks share one ``abatch``. Their merge maps are reconciled by chunk index,
-    not by which chunk returned first.
+    not by which chunk returned first. An evidence follow-up reviews only codes
+    that still need review, and it sends a call only when the remaining call
+    and token allowances can take that prompt.
     """
-    audit_all = full_audit_due(
+    audit_all = False if evidence_followup else full_audit_due(
         sweep_index,
         consolidation=consolidation,
         full_audit_every=runtime.full_audit_every,
@@ -3063,6 +3207,9 @@ async def _sweep_chunks(
                 "available_assignment_ids": {},
                 "audit": audit,
                 "codes_sent": 0,
+                "review_calls": 0,
+                "review_tokens": 0,
+                "review_refused": "",
             },
             [],
             0,
@@ -3131,7 +3278,7 @@ async def _sweep_chunks(
         hints.append(proposal)
         offered.add(pair)
     warnings: list[str] = [embed_note] if embed_note else []
-    if len(chunks) > 1:
+    if len(chunks) > 1 and not evidence_followup:
         try:
             discovered = await _label_discovery_pairs(runtime, codes, sweep_index)
         except CodingError as exc:
@@ -3192,15 +3339,9 @@ async def _sweep_chunks(
             order = owner if item["primary"] else owner + part * span * 1000
             calls.append({**item, "owner": owner, "part": part, "order": order, "chunk": chunk})
 
-    async def confirm(call: dict) -> tuple:
+    def _call_messages(call: dict) -> list:
         owner = int(call["owner"])
-        if call["primary"]:
-            passage_id = (
-                f"sweep-{sweep_index}" if len(chunks) == 1 else f"sweep-{sweep_index}-chunk-{owner:04d}"
-            )
-        else:
-            passage_id = f"sweep-{sweep_index}-chunk-{owner:04d}-compare-{int(call['part']):04d}"
-        messages = build_sweep_messages(
+        return build_sweep_messages(
             context=runtime.context,
             codes=call["local"],
             candidates=call["hints"],
@@ -3212,6 +3353,40 @@ async def _sweep_chunks(
             consolidation=consolidation,
             audit=audit,
         )
+
+    review_calls = 0
+    review_tokens = 0
+    review_refused = ""
+    if evidence_followup:
+        room_calls = 0 if review_calls_remaining is None else int(review_calls_remaining)
+        room_tokens = 0 if review_tokens_remaining is None else int(review_tokens_remaining)
+        selected: list[dict] = []
+        planned_tokens = 0
+        for call in sorted(calls, key=lambda item: int(item["order"])):
+            if len(selected) >= room_calls:
+                review_refused = review_refused or "call_allowance"
+                break
+            messages = _call_messages(call)
+            estimate = count_message_tokens(messages)
+            if planned_tokens + estimate > room_tokens:
+                review_refused = review_refused or "token_allowance"
+                break
+            call["messages"] = messages
+            planned_tokens += estimate
+            selected.append(call)
+        calls = selected
+        review_calls = len(selected)
+        review_tokens = planned_tokens
+
+    async def confirm(call: dict) -> tuple:
+        owner = int(call["owner"])
+        if call["primary"]:
+            passage_id = (
+                f"sweep-{sweep_index}" if len(chunks) == 1 else f"sweep-{sweep_index}-chunk-{owner:04d}"
+            )
+        else:
+            passage_id = f"sweep-{sweep_index}-chunk-{owner:04d}-compare-{int(call['part']):04d}"
+        messages = call.get("messages") or _call_messages(call)
         empty = {
             "merges": [],
             "rejections": [],
@@ -3281,7 +3456,13 @@ async def _sweep_chunks(
     reconciled["sent_assignment_ids"] = sent_ids
     reconciled["available_assignment_ids"] = available_ids
     reconciled["audit"] = audit
-    reconciled["codes_sent"] = len(due)
+    if evidence_followup:
+        reconciled["codes_sent"] = sum(len(call.get("chunk") or []) for call in calls if call.get("primary"))
+    else:
+        reconciled["codes_sent"] = len(due)
+    reconciled["review_calls"] = review_calls
+    reconciled["review_tokens"] = review_tokens
+    reconciled["review_refused"] = review_refused
     return reconciled, candidates, len(chunks)
 
 

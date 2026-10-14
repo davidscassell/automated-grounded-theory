@@ -1,4 +1,4 @@
-# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, and 0.6.14)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, 0.6.14, and 0.6.15)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
 Status: steps 1 and 2 of the v0.6 plan. Category development, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
@@ -76,7 +76,9 @@ Uncertainty flags: `ambiguous_span`, `insufficient_context`, `competing_code`, `
 
 `get_graph("open_code")`:
 
-`segment_and_shuffle` → `prepare_round` → `Send("code_worker")` → `commit` → `sweep` → `consolidate` → `export`.
+`segment_and_shuffle` → `prepare_round` → `Send("code_worker")` → `commit` → `sweep` → `consolidate` → `review_evidence` → `export`.
+
+`review_evidence` runs only while a code still needs review and the final-review allowance remains. Otherwise consolidation goes straight to export.
 
 `prepare_round` freezes `snapshot_id`, `definition_revision`, `evidence_revision`, and `policy_version` (`0.6.5`). Workers do not mutate the codebook. `passages_per_codebook_update` is how many passages share that snapshot. `max_concurrent_requests` only caps in-flight calls. The proposal reducer dedupes by proposal id, drops conflicting payloads, sorts, and clears only on `{"__reset__": True}`. `commit` rejects a stale snapshot id, skips proposal ids already committed, and is the only writer of definitions.
 
@@ -304,6 +306,23 @@ Solo retries of a missing batch slot are tagged `missing_slot_retry` on the prom
 
 `policy_version` is `0.6.14`.
 
-## 23. Out of scope
+## 23. Corrections in 0.6.15
+
+Consolidation used to have an unconditional edge to export. A code can still have unsent assignments after that pass, because each review shows at most `PROMPT_EXAMPLE_LIMIT` (2) examples. Eleven documents, a fake coder, `sweep_every=100`, and `pipeline=False` produced two sweeps and sent 4 of 10 assignments on `packing bags`, with `code_needs_review` still true and no warning about that.
+
+After consolidation, `review_evidence` loops while `code_needs_review` is true. Each pass is an incremental review of the codes that still need it. It does not repeat label-only discovery. A sweep call in that loop is sent only when both allowances can take it:
+
+- `max_final_review_calls` (default 8) counts follow-up sweep calls, not the consolidation pass and not coding calls. The call cap is checked first. The default covers the reviewer's case: 6 assignments remain after consolidation, and 3 calls send them at 2 per call, with room left. A code of about 20 assignments is the size the default is aimed at (the end sweep and consolidation send 4, and 8 follow-up calls send 16 when that code is alone in the chunk).
+- `max_final_review_tokens` (default 24000, four times the default `token_budget`) is the estimated input of those prompts, about three characters per token plus a small per-message frame. A prompt whose estimate would pass what remains is not sent. Provider usage stays on the prompt log. When it is larger than the estimate, the charge is still the estimate that gated the call, so the cap and the gate use the same number.
+
+Stopping criteria, in order: nothing still needs review (`review_complete` true, `review_stop` `complete`); the next call would exceed the call allowance (`call_allowance`); the next prompt would exceed the token allowance (`token_allowance`); a follow-up pass sends no new assignment id (`no_progress`). `max_final_review_calls=0` or `max_final_review_tokens=0` does not start the loop. The consolidation batch still runs when the book has at least two codes.
+
+When the loop stops early, metadata `consolidated` is false. Warnings say the run is not fully consolidated and name the pending counts and ids. The result also records `review_complete`, `pending_counts`, `pending_assignment_ids`, `assignments_available`, `assignments_sent`, `assignments_pending`, `review_calls_used`, `review_tokens_used`, and `review_by_code` (available, sent, and pending per code). A sweep-log row with `consolidation: true` means that pass ran. It is not a claim that every assignment was sent.
+
+A successful embedding is published to the shared future before `_store_vector` can evict it. Waiters do not read the vector back out of the cache, so a later sibling can fill `vector_limit` and a failed sibling can raise without turning the published success into `ConnectionError`. The batch-query, single-query, and document paths all publish from `_hold_stored`.
+
+`policy_version` is `0.6.15`.
+
+## 24. Out of scope
 
 Category feedback, focused recoding of earlier negatives, relationship hypotheses, sampling briefs, and a Taguette project-file adapter. See the v0.6 plan steps 3–5.

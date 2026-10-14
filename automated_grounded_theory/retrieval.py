@@ -459,12 +459,13 @@ def _abort_inflight(keys: Sequence[tuple[str, str]], exc: BaseException) -> None
 
 
 def _release_inflight(keys: Sequence[tuple[str, str]], exc: BaseException) -> None:
-    """Fail unfinished calls. A query that already cached its vector is kept.
+    """Fail unfinished calls. A vector already published to its future is kept.
 
     An entry whose provider task is still running stays. Clearing it while the
     task continues lets the next request start a second call. A sibling that
     another caller is waiting on is that case: the task keeps the entry and
-    publishes the vector when it returns.
+    publishes the vector when it returns. A future that already has that vector
+    is done, so this error does not replace it.
     """
     with _VECTOR_CACHE.lock:
         for key in keys:
@@ -510,9 +511,10 @@ def _shared_with_other_waiters(keys: Sequence[tuple[str, str]]) -> bool:
 def _finish_flight(key: tuple[str, str], exc: BaseException | None) -> None:
     """Publish the outcome of the task that owns ``key``, if it still does.
 
-    Success is the cached vector. A failure unblocks waiters when this task
-    still holds the entry, which is what happens when the group left a shared
-    sibling running.
+    A vector is published when it arrives, before eviction. This lookup is the
+    fallback for a result that is still only in the cache. A failure unblocks
+    waiters when this task still holds the entry and nothing was published,
+    which is what happens when the group left a shared sibling running.
     """
     task = asyncio.current_task()
     with _VECTOR_CACHE.lock:
@@ -881,6 +883,18 @@ def assignment_ids(entry: Mapping) -> list[str]:
 # bookkeeping uses the same bound, so an id is "reviewed" only when it was sent.
 PROMPT_EXAMPLE_LIMIT = 2
 
+# Follow-up sweep calls after consolidation that deliver assignments the
+# consolidation pass did not send. Each call shows PROMPT_EXAMPLE_LIMIT new
+# examples per code in that request. The default clears a code of about 20
+# assignments: the end sweep and the consolidation pass send 4, and 8 more
+# calls send 16. Zero runs the consolidation batch and then stops.
+DEFAULT_MAX_FINAL_REVIEW_CALLS = 8
+
+# Estimated input tokens of those follow-up prompts. Four times the default
+# coding token budget. A prompt is sent only when its estimate fits in what
+# remains. The call allowance and this token allowance are both ceilings.
+DEFAULT_MAX_FINAL_REVIEW_TOKENS = 24_000
+
 
 def record_review(
     entry: dict,
@@ -1096,6 +1110,60 @@ def code_needs_review(entry: Mapping) -> bool:
     return any(assignment_ident(item) not in sent for item in evidence_rows(entry))
 
 
+def unsent_assignment_ids(entry: Mapping) -> list[str]:
+    """Assignment ids on ``entry`` that no review has put in a prompt.
+
+    A code that has never been reviewed reports every current id. A code whose
+    fingerprint changed after every id was sent reports none: the fingerprint
+    is what :func:`code_needs_review` uses for that case.
+    """
+    ids = assignment_ids(entry)
+    sent = _reviewed_ids(entry)
+    if sent is None:
+        return list(ids) if code_needs_review(entry) else []
+    return [item for item in ids if item not in sent]
+
+
+def assignment_review_totals(codebook: Mapping) -> dict[str, Any]:
+    """How much evidence was available, sent, and still pending.
+
+    Totals cover the whole book. ``pending_counts`` and
+    ``pending_assignment_ids`` are per code label, and only codes with unsent
+    ids appear. ``by_code`` has available, sent, and pending for every code.
+    ``needs_review`` is true while any code fails :func:`code_needs_review`.
+    """
+    available = 0
+    sent = 0
+    pending_counts: dict[str, int] = {}
+    pending_ids: dict[str, list[str]] = {}
+    by_code: dict[str, dict[str, int]] = {}
+    needs = False
+    for key, entry in codebook.items():
+        if not isinstance(entry, Mapping):
+            continue
+        label = str(entry.get("code") or key)
+        ids = assignment_ids(entry)
+        unsent = unsent_assignment_ids(entry)
+        available += len(ids)
+        sent_here = len(ids) - len(unsent)
+        sent += sent_here
+        if code_needs_review(entry):
+            needs = True
+        if unsent:
+            pending_counts[label] = pending_counts.get(label, 0) + len(unsent)
+            pending_ids.setdefault(label, []).extend(unsent)
+        by_code[label] = {"available": len(ids), "sent": sent_here, "pending": len(unsent)}
+    return {
+        "assignments_available": available,
+        "assignments_sent": sent,
+        "assignments_pending": available - sent,
+        "pending_counts": pending_counts,
+        "pending_assignment_ids": pending_ids,
+        "by_code": by_code,
+        "needs_review": needs,
+    }
+
+
 def full_audit_due(sweep_index: int, *, consolidation: bool, full_audit_every: int) -> bool:
     """Consolidation is always a full audit. Otherwise every ``full_audit_every`` sweeps.
 
@@ -1222,6 +1290,20 @@ def _hold_cached(embeddings, texts: Sequence[str], role: str, held: dict[tuple[s
             held[key] = list(hit)
 
 
+def _publish_vector(key: tuple[str, str], vector: Sequence[float]) -> None:
+    """Give waiters this vector before the cache is allowed to drop it.
+
+    The shared future keeps the copy. A later eviction, or a sibling query that
+    fails, does not replace a result that was already published.
+    """
+    payload = [float(item) for item in vector]
+    with _VECTOR_CACHE.lock:
+        flight = _VECTOR_CACHE.inflight.get(key)
+        if flight is None or flight.future.done():
+            return
+        flight.future.set_result(payload)
+
+
 def _hold_stored(
     embeddings,
     text: str,
@@ -1229,9 +1311,18 @@ def _hold_stored(
     vector: Sequence[float],
     held: dict[tuple[str, str], list[float]],
 ) -> list[float]:
-    """Cache ``vector`` and keep the request's copy. Eviction only affects reuse."""
+    """Publish ``vector`` to its shared future, then cache it.
+
+    Publishing happens before the store, so a cap that evicts this vector while
+    the next one is stored cannot turn a success into a sibling's error.
+    The request keeps its own copy. Eviction only affects what a later request
+    can reuse.
+    """
+    _check_vectors(embeddings, [vector])
+    key = _content_key(embedding_model_id(embeddings), text, role)
+    _publish_vector(key, vector)
     stored = _cache_vector(embeddings, text, role, vector)
-    held[_content_key(embedding_model_id(embeddings), text, role)] = list(stored)
+    held[key] = list(stored)
     return stored
 
 

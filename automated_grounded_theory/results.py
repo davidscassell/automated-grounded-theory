@@ -9,6 +9,11 @@ from typing import Any
 
 from automated_grounded_theory.codebook import codebook_list
 from automated_grounded_theory.records import materialize_records, percentile
+from automated_grounded_theory.retrieval import (
+    DEFAULT_MAX_FINAL_REVIEW_CALLS,
+    DEFAULT_MAX_FINAL_REVIEW_TOKENS,
+    assignment_review_totals,
+)
 from automated_grounded_theory.saturation import saturation_report
 
 
@@ -173,6 +178,91 @@ def missing_slot_retry_cost(prompt_log: list) -> dict[str, int]:
     }
 
 
+def _attach_review_status(metadata: dict, state: dict, warnings: list[str]) -> None:
+    """Record whether every assignment was sent, and say so when it was not.
+
+    A finished run with ``review_complete`` false is not fully consolidated.
+    The sweep log can still show that a consolidation pass ran. That pass is
+    one bounded batch. It is not a claim that every assignment was in a prompt.
+    """
+    totals = assignment_review_totals(state.get("codebook") or {})
+    max_calls = int(metadata.get("max_final_review_calls", DEFAULT_MAX_FINAL_REVIEW_CALLS))
+    max_tokens = int(metadata.get("max_final_review_tokens", DEFAULT_MAX_FINAL_REVIEW_TOKENS))
+    calls = int(metadata.get("review_calls_used") or 0)
+    tokens = int(metadata.get("review_tokens_used") or 0)
+    stop = str(metadata.get("review_stop") or "")
+    needs = bool(totals["needs_review"])
+    if not needs:
+        stop = "complete"
+    elif stop not in {"call_allowance", "token_allowance", "no_progress"}:
+        if max_calls <= 0 or calls >= max_calls:
+            stop = "call_allowance"
+        elif max_tokens <= 0 or tokens >= max_tokens:
+            stop = "token_allowance"
+        else:
+            stop = stop or "call_allowance"
+    consolidation_ran = bool(state.get("consolidated")) or any(
+        isinstance(item, dict) and item.get("consolidation") for item in (state.get("sweep_log") or [])
+    )
+    review_complete = not needs
+    metadata["review_complete"] = review_complete
+    metadata["review_stop"] = stop
+    metadata["pending_counts"] = dict(totals["pending_counts"])
+    metadata["pending_assignment_ids"] = {
+        label: list(ids) for label, ids in totals["pending_assignment_ids"].items()
+    }
+    metadata["assignments_available"] = int(totals["assignments_available"])
+    metadata["assignments_sent"] = int(totals["assignments_sent"])
+    metadata["assignments_pending"] = int(totals["assignments_pending"])
+    metadata["review_calls_used"] = calls
+    metadata["review_tokens_used"] = tokens
+    metadata["max_final_review_calls"] = max_calls
+    metadata["max_final_review_tokens"] = max_tokens
+    metadata["review_by_code"] = dict(totals["by_code"])
+    metadata["consolidated"] = bool(consolidation_ran and review_complete)
+    if review_complete:
+        return
+    note = _incomplete_review_warning(metadata)
+    if note not in warnings:
+        warnings.append(note)
+
+
+def _incomplete_review_warning(metadata: dict) -> str:
+    """Name the unsent evidence and the allowance that stopped the review."""
+    counts = metadata.get("pending_counts") or {}
+    pending_ids = metadata.get("pending_assignment_ids") or {}
+    parts = []
+    for label in sorted(counts):
+        ids = list(pending_ids.get(label) or [])
+        shown = ", ".join(ids[:30])
+        if len(ids) > 30:
+            shown = f"{shown}, and {len(ids) - 30} more"
+        parts.append(f"{counts[label]} on {label} ({shown})")
+    if not parts:
+        parts.append("a code whose review fingerprint is not current")
+    stop = str(metadata.get("review_stop") or "")
+    calls = int(metadata.get("review_calls_used") or 0)
+    tokens = int(metadata.get("review_tokens_used") or 0)
+    max_calls = int(metadata.get("max_final_review_calls") or 0)
+    max_tokens = int(metadata.get("max_final_review_tokens") or 0)
+    reasons = {
+        "call_allowance": (
+            f"the final review call allowance is {max_calls} and {calls} follow-up calls were used"
+        ),
+        "token_allowance": (
+            f"the final review token allowance is {max_tokens} and {tokens} estimated follow-up tokens were used"
+        ),
+        "no_progress": "a follow-up review sent no new assignment ids",
+    }
+    why = reasons.get(stop, "pending evidence remained")
+    return (
+        "Review stopped with evidence that was not sent: "
+        + "; ".join(parts)
+        + f". review_complete is false because {why}. "
+        "The run is not fully consolidated."
+    )
+
+
 def result_from_state(
     state: dict,
     *,
@@ -228,6 +318,9 @@ def result_from_state(
     summary = dict(metadata.get("summary") or {})
     summary["failed_passages"] = failed_ids
     metadata["summary"] = summary
+    warnings = list(state.get("warnings") or [])
+    if not interrupted:
+        _attach_review_status(metadata, state, warnings)
     metadata["coverage"] = [
         {
             "incident_id": item["incident_id"],
@@ -247,7 +340,7 @@ def result_from_state(
         sweep_log=list(state.get("sweep_log") or []),
         prompt_log=list(state.get("prompt_log") or []),
         metadata=metadata,
-        warnings=list(state.get("warnings") or []),
+        warnings=warnings,
         ops=list(state.get("ops") or []),
         review=list(state.get("review") or []),
         export_paths=dict(export_paths or state.get("export_paths") or {}),
