@@ -138,6 +138,10 @@ from automated_grounded_theory.validation import (
     code_key,
 )
 from automated_grounded_theory.version import __version__
+from automated_grounded_theory.decision_review import (
+    DecisionReviewer, SelectionDecision, ClaimDecisions, selection_payload,
+    claims_payload, apply_model_claim_decisions,
+)
 
 DEFAULT_FOCUSED_WEIGHT_FREQUENCY = 1.0
 DEFAULT_FOCUSED_WEIGHT_DOCUMENTS = 1.0
@@ -192,6 +196,11 @@ _PROCEDURE_KEYS = (
     "focused_request_retries",
     "focused_claim_compete_round",
     "validation_retries",
+    "decision_mode",
+    "decision_model",
+    "max_decision_calls",
+    "max_decision_tokens",
+    "decision_token_budget",
 )
 _PERFORMANCE_KEYS = (
     "batch_size",
@@ -302,6 +311,8 @@ class FocusedState(TypedDict, total=False):
 @dataclass
 class FocusedRuntime:
     coder: BaseChatModel
+    decision_mode: str = "human"
+    reviewer: Any = None
     output_dir: str | None = None
     batch_size: int = DEFAULT_FOCUSED_BATCH_SIZE
     token_budget: int = DEFAULT_FOCUSED_TOKEN_BUDGET
@@ -2694,6 +2705,9 @@ def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
         stop = stop or "incomplete"
     coverage["queue_complete"] = status in {"complete", "complete_for_queue"}
     coverage["corpus_complete"] = status == "complete"
+    decision_stop = (state.get("metadata") or {}).get("decision_stop")
+    if decision_stop:
+        status, complete, stop = "incomplete", False, f"decision_{decision_stop}"
     return {
         "stage": "focused",
         "status": status,
@@ -2905,10 +2919,14 @@ def _checkpoint_payload(state: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _researcher_node(state: FocusedState) -> dict:
+def _researcher_node(state: FocusedState, *, model_decision: dict | None = None) -> dict:
     proposed = list(state.get("proposed_raised_code_ids") or [])
     known = list(state.get("known_code_ids") or [])
-    if not state.get("interrupt_enabled", True):
+    if model_decision is not None:
+        decision = model_decision
+        raised, changed = apply_selection_override(known, proposed, decision)
+        source = "llm"
+    elif not state.get("interrupt_enabled", True):
         raised = proposed
         decision = {"accept": True}
         source = "proposal"
@@ -2924,14 +2942,17 @@ def _researcher_node(state: FocusedState) -> dict:
     except ValueError as exc:
         raise FocusedError(str(exc)) from exc
     metadata = dict(state.get("metadata") or {})
-    metadata["researcher_decision"] = decision if isinstance(decision, (dict, list, str, int, float, bool)) or decision is None else str(decision)
-    metadata["researcher_edit_hash"] = _hash_rows(decision)
+    if model_decision is None:
+        metadata["researcher_decision"] = decision if isinstance(decision, (dict, list, str, int, float, bool)) or decision is None else str(decision)
+        metadata["researcher_edit_hash"] = _hash_rows(decision)
+    else:
+        metadata["model_selection_decision"] = decision
     metadata["selection_source"] = source
     metadata["researcher_incidents"] = incidents
     return {
         "raised_code_ids": raised,
         "not_raised_code_ids": not_raised,
-        "researcher_decision": decision,
+        "researcher_decision": decision if model_decision is None else None,
         "selection_source": source,
         "metadata": metadata,
     }
@@ -3764,6 +3785,78 @@ def _claim_node(state: FocusedState) -> dict:
     }
 
 
+def _decision_node(runtime: FocusedRuntime, *, claims: bool):
+    async def review(state: FocusedState) -> dict:
+        if runtime.decision_mode != "llm":
+            return _claim_node(state) if claims else _researcher_node(state)
+        reviewer = runtime.reviewer
+        metadata = dict(state.get("metadata") or {})
+        logs = list(state.get("prompt_log") or [])
+        warnings = list(state.get("warnings") or [])
+        metadata.pop("decision_stop", None)
+        if not claims:
+            parsed, audit = await reviewer.decide(selection_payload(state), SelectionDecision, metadata)
+            if audit:
+                logs.append(audit)
+            if parsed is not None:
+                try:
+                    ids = parsed["raised_code_ids"]
+                    if len(ids) != len(set(ids)):
+                        raise FocusedError("Duplicate raised code IDs from decision model.")
+                    updates = _researcher_node({**state, "metadata": metadata}, model_decision=parsed)
+                    return {**updates, "prompt_log": logs}
+                except (ValueError, FocusedError) as exc:
+                    metadata["decision_stop"] = "invalid_decision"
+                    audit.update(status="error", error=str(exc))
+            metadata["selection_source"] = "unreviewed"
+            warnings.append(f"LLM selection review incomplete: {metadata['decision_stop']}.")
+            return {"metadata": metadata, "prompt_log": logs, "warnings": warnings,
+                    "focused_not_reread": [p["passage_id"] for p in state.get("passages", [])]}
+
+        properties = list(state.get("properties") or [])
+        dimensions = list(state.get("dimensions") or [])
+        records = properties + dimensions
+        reviewed = {}
+        cursor = 0
+        while cursor < len(records):
+            batch = [records[cursor]]
+            # Greedy packing shares category and passage context within a request.
+            while cursor + len(batch) < len(records):
+                candidate = batch + [records[cursor + len(batch)]]
+                if reviewer.estimate(claims_payload(state, candidate), ClaimDecisions) > reviewer.token_budget:
+                    break
+                batch = candidate
+            parsed, audit = await reviewer.decide(claims_payload(state, batch), ClaimDecisions, metadata)
+            if audit:
+                logs.append(audit)
+            if parsed is None:
+                break
+            try:
+                rows = apply_model_claim_decisions(batch, parsed["claims"], audit)
+            except ValueError as exc:
+                metadata["decision_stop"] = "invalid_decision"
+                audit.update(status="error", error=str(exc))
+                break
+            reviewed.update({r["entry_id"]: r for r in rows})
+            cursor += len(batch)
+        metadata["decision_pending_claim_ids"] = [r["entry_id"] for r in records[cursor:]]
+        metadata["decision_review_complete"] = cursor == len(records)
+        if metadata.get("decision_stop"):
+            warnings.append(f"LLM claim review incomplete: {metadata['decision_stop']}.")
+        return {"properties": [reviewed.get(r["entry_id"], r) for r in properties],
+                "dimensions": [reviewed.get(r["entry_id"], r) for r in dimensions],
+                "metadata": metadata, "prompt_log": logs, "warnings": warnings}
+    return review
+
+
+def _route_decision(state: FocusedState) -> str:
+    if (state.get("metadata") or {}).get("decision_stop"):
+        return "export_focused"
+    if not state.get("raised_code_ids"):
+        return "review_recode"
+    return "prepare_recode"
+
+
 def _export_node(runtime: FocusedRuntime):
     def export_focused(state: FocusedState) -> dict:
         paths = dict(state.get("export_paths") or {})
@@ -3775,19 +3868,26 @@ def _export_node(runtime: FocusedRuntime):
     return export_focused
 
 
+def _selected_ids(state, key):
+    # An empty reviewed selection is a decision, not a missing value.
+    if state.get("selection_source"):
+        return state.get(key) or []
+    return state.get("proposed_" + key) or []
+
+
 def export_focused_state(state: Mapping[str, Any], directory: str | Path) -> dict[str, str]:
     place = Path(directory)
     place.mkdir(parents=True, exist_ok=True)
     development = _category_development(state)
     selection = list(state.get("selection") or [])
-    raised = set(state.get("raised_code_ids") or state.get("proposed_raised_code_ids") or [])
+    raised = set(_selected_ids(state, "raised_code_ids"))
     _write_json(place / "category_development.json", development)
     _write_json(
         place / "focused_selection.json",
         {
-            "raised_code_ids": list(state.get("raised_code_ids") or state.get("proposed_raised_code_ids") or []),
+            "raised_code_ids": list(_selected_ids(state, "raised_code_ids")),
             "not_raised_code_ids": list(
-                state.get("not_raised_code_ids") or state.get("proposed_not_raised_code_ids") or []
+                _selected_ids(state, "not_raised_code_ids")
             ),
             "scores": selection,
             "selection_source": (state.get("metadata") or {}).get("selection_source"),
@@ -3826,6 +3926,7 @@ def export_focused_state(state: Mapping[str, Any], directory: str | Path) -> dic
         ],
     )
     metadata = dict(state.get("metadata") or {})
+    metadata.update(_status_fields(state))
     metadata["saturation_judgment"] = None
     records = list(development.get("properties") or []) + list(development.get("dimensions") or [])
     eligible = [row for row in records if row.get("downstream_eligible")]
@@ -3850,6 +3951,10 @@ def export_focused_state(state: Mapping[str, Any], directory: str | Path) -> dic
             "evidence_condition",
             "downstream_eligible",
             "claim_support",
+            "model_claim_support",
+            "review_actor",
+            "review_model",
+            "review_rationale",
             "quote_status",
             "document_id",
             "passage_id",
@@ -3868,6 +3973,10 @@ def export_focused_state(state: Mapping[str, Any], directory: str | Path) -> dic
                 row.get("evidence_condition"),
                 row.get("downstream_eligible"),
                 row.get("claim_support"),
+                row.get("model_claim_support"),
+                row.get("review_actor"),
+                row.get("review_model"),
+                row.get("review_rationale"),
                 row.get("quote_status"),
                 row.get("document_id"),
                 row.get("passage_id"),
@@ -3949,17 +4058,18 @@ def build_focused_graph(runtime: FocusedRuntime | None = None):
     builder = StateGraph(FocusedState)
     builder.add_node("load_open_coding", _load_node)
     builder.add_node("select_candidates", _select_node)
-    builder.add_node("researcher_checkpoint", _researcher_node)
+    builder.add_node("researcher_checkpoint", _decision_node(runtime, claims=False))
     builder.add_node("prepare_recode", _prepare_node)
     builder.add_node("recode_worker", _worker(runtime), input_schema=_WorkerInput)
     builder.add_node("commit_focused", _commit_node(runtime))
     builder.add_node("review_recode", _review_node)
-    builder.add_node("claim_checkpoint", _claim_node)
+    builder.add_node("claim_checkpoint", _decision_node(runtime, claims=True))
     builder.add_node("export_focused", _export_node(runtime))
     builder.add_edge(START, "load_open_coding")
     builder.add_edge("load_open_coding", "select_candidates")
     builder.add_edge("select_candidates", "researcher_checkpoint")
-    builder.add_edge("researcher_checkpoint", "prepare_recode")
+    builder.add_conditional_edges("researcher_checkpoint", _route_decision,
+        ["export_focused", "prepare_recode", "review_recode"])
     builder.add_conditional_edges(
         "prepare_recode",
         _route_prepare,
@@ -4049,8 +4159,8 @@ def _result_from_state(
     development = _category_development(state)
     metadata["property_stability"] = development.get("property_stability") or {}
     return FocusedResult(
-        raised_code_ids=list(state.get("raised_code_ids") or state.get("proposed_raised_code_ids") or []),
-        not_raised_code_ids=list(state.get("not_raised_code_ids") or state.get("proposed_not_raised_code_ids") or []),
+        raised_code_ids=list(_selected_ids(state, "raised_code_ids")),
+        not_raised_code_ids=list(_selected_ids(state, "not_raised_code_ids")),
         selection=list(state.get("selection") or []),
         codebook=codebook_list(state.get("codebook") or {}),
         segments=list(state.get("segments") or []),
@@ -4227,6 +4337,11 @@ async def afocused_code(
     concurrency: int = DEFAULT_FOCUSED_CONCURRENCY,
     token_budget: int = DEFAULT_FOCUSED_TOKEN_BUDGET,
     validation_retries: int = 1,
+    decision_mode: str = "human",
+    decision_model: BaseChatModel | str | None = None,
+    max_decision_calls: int = 8,
+    max_decision_tokens: int = 24000,
+    decision_token_budget: int = 6000,
     interrupt: bool = True,
     resume: Any = None,
     resuming: bool = False,
@@ -4239,6 +4354,15 @@ async def afocused_code(
     recursion_limit: int | None = None,
 ) -> FocusedResult:
     """Run focused coding over a finished open-coding result.
+
+    ``decision_mode='human'`` preserves the two human interrupts. With
+    ``decision_mode='llm'``, a bounded LLM reviewer decides selection and claim
+    dispositions without interrupts. ``decision_model`` defaults to ``model``.
+    Model support is stored separately as ``model_claim_support``; human
+    ``claim_support`` and the saturation judgment are not fabricated.
+    Decision calls and estimated input tokens have independent allowances;
+    failures export incomplete results. ``interrupt=False`` in human mode
+    retains the legacy behavior: accept the selection and skip claim review.
 
     ``interrupt`` defaults to true. The graph pauses inside
     ``researcher_checkpoint`` with :func:`langgraph.types.interrupt`. Resume by
@@ -4255,6 +4379,15 @@ async def afocused_code(
     selects codes and, when ``interrupt`` is true, still pauses. The model loop
     is skipped and the status is ``incomplete``.
     """
+    if decision_mode not in {"human", "llm"}:
+        raise ValueError("decision_mode must be 'human' or 'llm'.")
+    for name, value in (("max_decision_calls", max_decision_calls),
+                        ("max_decision_tokens", max_decision_tokens),
+                        ("decision_token_budget", decision_token_budget)):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer.")
+    if decision_mode == "human" and decision_model is not None:
+        raise ValueError("decision_model requires decision_mode='llm'.")
     source = _as_result(open_coding_result)
     procedure = _procedure(
         seed=seed,
@@ -4288,6 +4421,14 @@ async def afocused_code(
         warn_fraction=focused_raise_warn_fraction,
     )
     performance = _performance(batch_size=batch_size, concurrency=concurrency, token_budget=token_budget)
+    reviewer_model = None
+    if decision_mode == "llm":
+        chosen = model if decision_model is None else decision_model
+        reviewer_model = _resolve_model(chosen) if isinstance(chosen, str) else chosen
+    procedure.update(decision_mode=decision_mode, decision_model=(
+        {"model": describe_model(reviewer_model), "model_settings": chat_model_settings(reviewer_model)}
+        if reviewer_model is not None else None), max_decision_calls=max_decision_calls,
+        max_decision_tokens=max_decision_tokens, decision_token_budget=decision_token_budget)
     manifest = focused_manifest(
         source,
         model=model,
@@ -4307,10 +4448,15 @@ async def afocused_code(
         "context": manifest["context"],
         "model": manifest["model"],
         "saturation_judgment": None,
+        "decision_mode": decision_mode,
     }
     limit = recursion_limit if recursion_limit is not None else max(250, 8 * max(1, len(source.passages)) + 40)
     runtime = FocusedRuntime(
         coder=model if not isinstance(model, str) else _resolve_model(model),
+        decision_mode=decision_mode,
+        reviewer=DecisionReviewer(reviewer_model, max_calls=max_decision_calls,
+            max_tokens=max_decision_tokens, token_budget=decision_token_budget,
+            timeout=focused_request_timeout) if reviewer_model is not None else None,
         output_dir=None if output_dir is None else str(output_dir),
         batch_size=performance["batch_size"],
         token_budget=performance["token_budget"],
@@ -4422,7 +4568,9 @@ async def _invoke(
             metadata = dict(metadata)
             metadata["continuations"] = list(saved_meta.get("continuations") or []) + continuation
             await graph.aupdate_state(config, {"metadata": {**saved_meta, **metadata}})
-        await graph.ainvoke(Command(resume=resume), config)
+        await graph.aupdate_state(config, {"interrupt_enabled": interrupt_enabled})
+        await graph.ainvoke(Command(resume=({"automated_review": True}
+            if runtime.decision_mode == "llm" else resume)), config)
     else:
         if has_state:
             raise FocusedError(
@@ -4470,6 +4618,8 @@ def _focused_sync_timeout(kwargs: Mapping[str, Any]) -> float | None:
         call_budget = int(calls or 0)
     except (TypeError, ValueError):
         call_budget = int(DEFAULT_MAX_FOCUSED_REVIEW_CALLS)
+    if kwargs.get("decision_mode") == "llm":
+        call_budget += max(0, int(kwargs.get("max_decision_calls", 8)))
     return request * max(1, call_budget) + 1.0
 
 
@@ -4519,9 +4669,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     resume_parser = sub.add_parser("resume", help="Resume with Command(resume=...).")
     resume_parser.add_argument("--checkpoint", required=True)
     resume_parser.add_argument("--thread", required=True)
-    resume_parser.add_argument("--resume", required=True, help="JSON value passed to Command(resume=...).")
+    resume_parser.add_argument("--resume", help="JSON value passed to Command(resume=...); required in human mode.")
     resume_parser.add_argument("--open-run", required=True, help="Open-coding output directory.")
     resume_parser.add_argument("--model", required=True, help="provider:model or the same model string as the run.")
+    resume_parser.add_argument("--decision-mode", choices=["human", "llm"], default="human")
+    resume_parser.add_argument("--decision-model")
+    resume_parser.add_argument("--max-decision-calls", type=int, default=8)
+    resume_parser.add_argument("--max-decision-tokens", type=int, default=24000)
+    resume_parser.add_argument("--decision-token-budget", type=int, default=6000)
     resume_parser.add_argument("--seed", type=int, default=0)
     resume_parser.add_argument("--allow-changes", action="store_true")
     resume_parser.add_argument("--continuation", action="store_true")
@@ -4534,10 +4689,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = run_sync(_show_checkpoint(args.checkpoint, args.thread))
         _print_json(payload)
         return 0 if payload.get("interrupted") else 1
-    decision = json.loads(args.resume)
+    if args.decision_mode == "human" and args.resume is None:
+        parser.error("--resume is required in human mode")
+    decision = json.loads(args.resume) if args.resume is not None else None
     result = focused_code(
         args.open_run,
         model=args.model,
+        decision_mode=args.decision_mode,
+        decision_model=args.decision_model,
+        max_decision_calls=args.max_decision_calls,
+        max_decision_tokens=args.max_decision_tokens,
+        decision_token_budget=args.decision_token_budget,
         seed=args.seed,
         resume=decision,
         resuming=True,

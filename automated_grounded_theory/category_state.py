@@ -8,13 +8,17 @@ Every proposal keeps three separate fields:
 
 - ``disposition``: ``proposed``, ``accepted``, ``rejected``, or ``superseded``
 - ``evidence_condition``: ``anchored``, ``disputed``, or ``insufficient``
-- ``downstream_eligible``: true only when the disposition is ``accepted`` and
-  the evidence condition is ``anchored``
+- ``downstream_eligible``: true only when the disposition is ``accepted``,
+  the evidence condition is ``anchored``, the row is not marked
+  ``needs_review``, human ``claim_support`` is not ``contradicted``, and the
+  row is not a conflicting property merge
 
 ``claim_support`` is a researcher review. It stays ``undefined`` until a person
 sets ``supported``, ``partially_supported``, ``contradicted``, or
-``indeterminate``. Citation anchoring is a different measurement: whether the
-quote located a span. It is not claim support.
+``indeterminate``. A contradicted claim is excluded downstream. Citation
+anchoring is a different measurement: whether the quote located a span. It is
+not claim support. An LLM reviewer writes ``model_claim_support`` and does not
+set ``claim_support``.
 """
 
 from __future__ import annotations
@@ -147,11 +151,42 @@ def _property_citation(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _norm_statement(value: Any) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def _property_constituent(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Identity of one row folded into a merged property."""
+    return {
+        "entry_id": row.get("entry_id"),
+        "name": row.get("name"),
+        "text": row.get("text"),
+        "pole": row.get("pole"),
+        "document_id": row.get("document_id"),
+        "passage_id": row.get("passage_id"),
+        "quote": row.get("quote"),
+    }
+
+
+def _statements_conflict(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    """Same property key, different stated text or pole. Names may still match."""
+    for key in ("text", "pole"):
+        a = _norm_statement(left.get(key))
+        b = _norm_statement(right.get(key))
+        if a and b and a != b:
+            return True
+    return False
+
+
 def merge_properties(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Collapse properties that share a category and a normalized name.
 
-    The first row keeps its text. Later rows add a citation. Dimensions are
-    not merged. A blank name is not merged with another blank name.
+    The first row keeps its text. Later rows add a citation and a constituent.
+    A different non-empty text or pole is a ``property_merge_conflict``: the
+    merged row is flagged, keeps every constituent, and is not downstream
+    eligible. Dimensions are not merged. A blank name is not merged with
+    another blank name. A human ``contradicted`` label on either row excludes
+    the merged property downstream.
     """
     merged: list[dict[str, Any]] = []
     index: dict[tuple[str, str], int] = {}
@@ -170,6 +205,8 @@ def merge_properties(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any
             if own and own not in names:
                 names.append(own)
             item["merged_names"] = names
+            if str(item.get("claim_support") or "") == "contradicted":
+                item["downstream_eligible"] = False
             if key:
                 index[slot] = len(merged)
             merged.append(item)
@@ -183,13 +220,33 @@ def merge_properties(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any
             if name and name not in names:
                 names.append(name)
         target["merged_names"] = names
+        constituents = list(target.get("constituents") or [])
+        if not constituents:
+            constituents.append(_property_constituent(target))
+        constituents.append(_property_constituent(item))
+        target["constituents"] = constituents
         flags = list(target.get("flags") or [])
         for flag in item.get("flags") or []:
             if flag not in flags:
                 flags.append(flag)
+        conflict = (
+            _statements_conflict(target, item)
+            or bool(item.get("property_merge_conflict"))
+            or bool(target.get("property_merge_conflict"))
+            or "property_merge_conflict" in flags
+        )
+        if conflict and "property_merge_conflict" not in flags:
+            flags.append("property_merge_conflict")
         target["flags"] = flags
+        if conflict:
+            target["property_merge_conflict"] = True
+            target["needs_review"] = True
+            target["downstream_eligible"] = False
         if item.get("needs_review"):
             target["needs_review"] = True
+            target["downstream_eligible"] = False
+        if str(item.get("claim_support") or "") == "contradicted" or str(target.get("claim_support") or "") == "contradicted":
+            target["claim_support"] = "contradicted"
             target["downstream_eligible"] = False
     return merged
 
@@ -313,7 +370,12 @@ def proposal_record_fields(
         raise ValueError(f"evidence_condition must be one of {EVIDENCE_CONDITIONS}")
     if claim_support not in CLAIM_SUPPORTS:
         raise ValueError(f"claim_support must be one of {CLAIM_SUPPORTS}")
-    eligible = disposition == "accepted" and evidence_condition == "anchored" and not needs_review
+    eligible = (
+        disposition == "accepted"
+        and evidence_condition == "anchored"
+        and not needs_review
+        and claim_support != "contradicted"
+    )
     return {
         "disposition": disposition,
         "evidence_condition": evidence_condition,
@@ -374,8 +436,14 @@ def view_notes() -> dict[str, str]:
     return {
         "category_development.json": "all records, including rejected, superseded, and insufficient",
         "focused_claims.csv": "all records",
-        "downstream_claims.json": "downstream_eligible only: disposition accepted, evidence anchored, not needs_review",
-        "downstream_eligible": "accepted and anchored, and not marked needs_review",
+        "downstream_claims.json": (
+            "downstream_eligible only: disposition accepted, evidence anchored, "
+            "not needs_review, claim_support not contradicted, and not a property_merge_conflict"
+        ),
+        "downstream_eligible": (
+            "accepted and anchored, not marked needs_review, "
+            "claim_support not contradicted, and not a property_merge_conflict"
+        ),
     }
 
 
@@ -660,9 +728,11 @@ def apply_claim_review(
                         disposition="accepted",
                         evidence_condition="anchored",
                         claim_support=str(item.get("claim_support") or "undefined"),
-                        needs_review=bool(item.get("needs_review")),
+                        needs_review=bool(item.get("needs_review") or item.get("property_merge_conflict")),
                     )
                 )
+                if item.get("property_merge_conflict") or "property_merge_conflict" in (item.get("flags") or []):
+                    item["downstream_eligible"] = False
     for update in decision.get("claim_dispositions") or []:
         item = rows.get(str(update.get("entry_id") or ""))
         if item is None:
@@ -673,9 +743,13 @@ def apply_claim_review(
                 disposition=disposition,
                 evidence_condition=str(item.get("evidence_condition") or "insufficient"),
                 claim_support=str(item.get("claim_support") or "undefined"),
-                needs_review=bool(item.get("needs_review")),
+                needs_review=bool(item.get("needs_review") or item.get("property_merge_conflict")),
             )
         )
+        if item.get("property_merge_conflict") or "property_merge_conflict" in (item.get("flags") or []):
+            item["downstream_eligible"] = False
+        if str(item.get("claim_support") or "") == "contradicted":
+            item["downstream_eligible"] = False
     for update in decision.get("claim_reviews") or []:
         item = rows.get(str(update.get("entry_id") or ""))
         if item is None:
@@ -684,6 +758,21 @@ def apply_claim_review(
         if label not in CLAIM_SUPPORTS or label == "":
             raise ValueError(f"claim_support must be one of {CLAIM_SUPPORTS}")
         item["claim_support"] = label
+        item["review_actor"] = "human"
+        history = list(item.get("review_history") or [])
+        history.append({"actor": "human", "model": None, "claim_support": label})
+        item["review_history"] = history
+        if label == "contradicted" or item.get("property_merge_conflict") or "property_merge_conflict" in (item.get("flags") or []):
+            item["downstream_eligible"] = False
+        else:
+            item.update(
+                proposal_record_fields(
+                    disposition=str(item.get("disposition") or "proposed"),
+                    evidence_condition=str(item.get("evidence_condition") or "insufficient"),
+                    claim_support=label,
+                    needs_review=bool(item.get("needs_review")),
+                )
+            )
     return {"properties": property_rows, "dimensions": dimension_rows}
 
 

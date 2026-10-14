@@ -18,6 +18,15 @@ from automated_grounded_theory.api import (
 from automated_grounded_theory.evaluate import aevaluate, chen_metrics, evaluate_run
 from automated_grounded_theory.context import PresetCodesError, ResearchContext
 from automated_grounded_theory.category_state import property_stability
+from automated_grounded_theory.decision_review import (
+    ClaimDecision,
+    ClaimDecisions,
+    DecisionReviewer,
+    SelectionDecision,
+    apply_model_claim_decisions,
+    claims_payload,
+    selection_payload,
+)
 from automated_grounded_theory.focused import (
     FocusedError,
     FocusedResult,
@@ -38,8 +47,11 @@ from automated_grounded_theory.themes import ThemeError, ThemeResult, abuild_the
 from automated_grounded_theory.version import __version__
 
 __all__ = [
+    "ClaimDecision",
+    "ClaimDecisions",
     "CodeRetriever",
     "CodingError",
+    "DecisionReviewer",
     "EmbeddingCodeRetriever",
     "FocusedError",
     "FocusedResult",
@@ -47,6 +59,7 @@ __all__ = [
     "OpenCodeResult",
     "PresetCodesError",
     "ResearchContext",
+    "SelectionDecision",
     "StabilityReport",
     "ThemeError",
     "ThemeResult",
@@ -54,6 +67,8 @@ __all__ = [
     "abuild_themes",
     "aevaluate",
     "afocused_code",
+    "apply_model_claim_decisions",
+    "claims_payload",
     "amulti_seed_stability",
     "aopen_code",
     "build_themes",
@@ -68,5 +83,6 @@ __all__ = [
     "open_code",
     "plan_coding",
     "property_stability",
+    "selection_payload",
     "strict_sequential_settings",
 ]
