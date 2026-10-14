@@ -18,8 +18,8 @@ from tests.test_v070 import _book, _entry, _passages, _source
 
 
 def test_version_is_071():
-    assert __version__ == "0.7.1"
-    assert POLICY_VERSION == "0.7.1"
+    assert __version__ == "0.7.2"
+    assert POLICY_VERSION == "0.7.2"
 
 
 def _tied_codes(n=6):
@@ -303,12 +303,15 @@ def test_reapplied_code_confirms_and_a_different_span_is_a_proposal():
     assert original["doc_start"] == 0
     assert original["doc_end"] == len(text)
     assert not original.get("focused_confirmation")
-    proposals = [segment for segment in proposed.segments if segment.get("focused_span_proposal")]
+    assert [segment for segment in proposed.segments if segment.get("code_id") == "c-freq"] == [original]
+    proposals = list(original.get("span_proposals") or [])
     assert len(proposals) == 1
-    assert proposals[0]["segment_id"] != "s00002"
+    assert proposals[0]["original_segment_id"] == "s00002"
     assert proposals[0]["quote"] != text
-    assert "focused_span_proposal" in proposals[0]["review_reasons"]
-    assert proposals[0]["needs_review"] is True
+    assert proposals[0]["narrowed_span"] is True
+    assert "focused_span_proposal" in original["review_reasons"]
+    assert "narrowed_span" in original["review_reasons"]
+    assert original["needs_review"] is True
 
 
 def test_prompt_asks_for_analytic_claims_and_export_writes_them(tmp_path):

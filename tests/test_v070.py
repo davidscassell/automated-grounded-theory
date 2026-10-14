@@ -40,8 +40,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_version_and_batch_size_stay_split_from_procedure():
-    assert __version__ == "0.7.1"
-    assert POLICY_VERSION == "0.7.1"
+    assert __version__ == "0.7.2"
+    assert POLICY_VERSION == "0.7.2"
     assert inspect.signature(focused_code).parameters["batch_size"].default == 1
     assert inspect.signature(afocused_code).parameters["batch_size"].default == 1
     assert DEFAULT_FOCUSED_BATCH_SIZE == 1
@@ -386,8 +386,10 @@ def _run(mode="echo", *, passages=None, segments=None, interrupt=False, **kwargs
 def test_recoding_keeps_quotes_and_writes_cited_properties(tmp_path):
     coder, result = _run(segments=_segments_for_raised(), output_dir=tmp_path, max_focused_review_calls=8)
     assert coder.call_count == 3
-    assert result.metadata["status"] == "complete"
-    assert result.metadata["stop"] == "complete"
+    assert result.metadata["status"] == "complete_for_queue"
+    assert result.metadata["stop"] == "complete_for_queue"
+    assert result.metadata["coverage"]["corpus_complete"] is False
+    assert "p4" in result.metadata["focused_not_queued"]
     assert result.metadata["performance"]["batch_size"] == 1
     assert "batch_size" not in result.metadata["procedure"]
     assert result.saturation_report["judgment"] is None
@@ -453,11 +455,12 @@ def test_allowance_exhaustion_is_incomplete_and_skips_the_model():
         max_focused_review_tokens=24000,
     )
     assert coder.call_count == 1
-    assert starved.metadata["status"] == "incomplete"
-    assert starved.metadata["stop"] == "call_allowance"
+    assert starved.metadata["status"] == "complete_for_queue"
+    assert starved.metadata["stop"] == "complete_for_queue"
     assert starved.metadata["complete"] is False
     assert len(starved.focused_reread) == 1
-    assert len(starved.focused_not_reread) == 2
+    assert starved.focused_not_reread == []
+    assert len(starved.focused_not_queued) >= 2
     assert {segment["segment_id"] for segment in starved.segments} >= {"s1", "s2", "s3"}
 
     silent, tokens = _run(
@@ -689,8 +692,10 @@ def test_reread_budget_is_interleaved_and_reported_per_purpose():
     assert set(coverage["develop"]["reread"]) | set(coverage["compete"]["reread"]) | set(coverage["outside"]["reread"]) == set(
         result.focused_reread
     )
-    assert result.metadata["status"] == "incomplete"
-    assert coverage["develop"]["not_reread"]
+    assert result.metadata["status"] == "complete_for_queue"
+    assert result.metadata["coverage"]["queue_complete"] is True
+    assert result.metadata["coverage"]["corpus_complete"] is False
+    assert result.focused_not_queued
 
 
 def test_researcher_incident_can_enter_any_purpose(tmp_path):

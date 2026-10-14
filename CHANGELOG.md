@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.2
+
+- Each focused reread queue is sized to its reserved share of `max_focused_review_calls`. `focused_neighbor_limit`, `focused_outside_limit`, and `focused_negative_case_limit` are optional caps (`None` by default, `0` adds none). They are not a default of 1. `purpose_coverage.applied_share` is the share of calls actually used. A purpose that receives fewer calls than it reserved is marked reallocated, with a warning.
+- Status `complete` means every corpus passage was reread. Status `complete_for_queue` means the queue finished and is not corpus coverage. Passages never queued are `focused_not_queued`. Passages queued and not sent stay `focused_not_reread`.
+- Compete can run before property claims exist. Seeds are a different valence or consequence, a low-confidence or flagged assignment, another code on the passage, or an opposite pole. One later round searches claims written by the first reread. The prompt asks for a disconfirming reading. `revise` and `drop` are flagged proposals and are not applied without review.
+- The recode prompt includes the full codebook and says to prefer an existing code. A new code with lexical similarity at or above `focused_duplicate_similarity` (default 0.5) is flagged `possible_duplicate`.
+- A property whose category is not assigned on the cited passage is flagged `property_category_mismatch`. `category_match` is reported beside citation anchoring. Anchoring is not category fit and not claim support.
+- A different span is nested on the original assignment. It is not a second row in assignment or downstream views. A quote that drops words of the original is flagged `narrowed_span`.
+- `focused_request_timeout` (default 120 seconds) is a wall-clock budget for one model call, including streaming and retries. `focused_request_retries` caps retries inside that budget.
+- `seed` orders the queue. When the candidates fit the allowance, it does not change membership. `focused_sampling_seed` chooses membership only when a candidate list is longer than its slot.
+- `policy_version` is `0.7.2`.
+
 ## 0.7.1
 
 - Focused selection no longer raises every code when scores tie at a median cutoff. The default rule is `top_k` (the upper half, ties broken by `code_id`). `focused_selection_rule=quantile` uses the same ceiling. The score rule does not raise every code unless `focused_raise_all` is set. An explicit `focused_min_score` stays a hard threshold. The result warns when the raised fraction reaches `focused_raise_warn_fraction` (default 0.75).
