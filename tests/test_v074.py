@@ -134,7 +134,11 @@ def test_claim_search_uses_category_pole_similarity_and_flags_before_a_guarantee
         [],
         slots=1,
     )
-    assert low[0] == {"passage_id": "p2", "purpose": "claim_compete", "source": "claim_low_confidence"}
+    assert low[0]["passage_id"] == "p2"
+    assert low[0]["purpose"] == "claim_compete"
+    assert low[0]["source"] == "claim_low_confidence"
+    assert low[0]["claim"]["category_id"] == "c1"
+    assert low[0]["claim"]["text"] == "qqqq"
 
     guaranteed = _claim_compete_items(
         _state(
