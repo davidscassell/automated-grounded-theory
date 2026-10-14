@@ -21,6 +21,7 @@ the coded passage is not used as a fallback.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any, Mapping, Sequence
@@ -107,7 +108,42 @@ FUZZY_MATCH_MIN = 0.90
 POSSIBLY_MODIFIED_MIN = 0.60
 QUOTE_FLAG_STATUSES = frozenset({"possibly_modified", "unanchored"})
 _ELLIPSIS = re.compile(r"\.\.\.|…|\[(?:\.\.\.|…|\.\s\.\s\.)\]")
-_WORD = re.compile(r"[A-Za-z0-9']+")
+
+
+def _is_letter_or_number(char: str) -> bool:
+    """Unicode letters (L*) and numbers (N*), not an ASCII range."""
+    category = unicodedata.category(char)
+    return category.startswith("L") or category.startswith("N")
+
+
+def _is_word_char(char: str) -> bool:
+    return char == "'" or _is_letter_or_number(char)
+
+
+def has_unicode_letter(text: str) -> bool:
+    return any(unicodedata.category(char).startswith("L") for char in text)
+
+
+def has_unicode_alnum(text: str) -> bool:
+    return any(_is_letter_or_number(char) for char in text)
+
+
+def iter_words(text: str):
+    """Yield ``(start, end, token)`` for letters, numbers, and apostrophes.
+
+    ASCII tokens match the old ``[A-Za-z0-9']+`` split. Letters outside that
+    range stay inside the token instead of disappearing.
+    """
+    start = None
+    for index, char in enumerate(text):
+        if _is_word_char(char):
+            if start is None:
+                start = index
+        elif start is not None:
+            yield start, index, text[start:index]
+            start = None
+    if start is not None:
+        yield start, len(text), text[start:]
 
 
 def code_key(label: str) -> str:
@@ -139,7 +175,7 @@ def is_generic_code(label: str) -> bool:
     key = code_key(label)
     if not key or key in GENERIC_CODES:
         return True
-    words = [word for word in re.findall(r"[a-z0-9']+", key) if word not in _STOPWORDS]
+    words = [word.casefold() for _start, _end, word in iter_words(key) if word.casefold() not in _STOPWORDS]
     if not words:
         return True
     return all(word in GENERIC_CODES for word in words)
@@ -246,7 +282,7 @@ def locate_quote(quote: str, passage: str) -> tuple[int, int] | None:
     start = anchor.spans[0][0]
     end = anchor.spans[-1][1]
     verbatim = passage[start:end]
-    if len(verbatim.strip()) < 3 or not re.search(r"[A-Za-z]", verbatim):
+    if len(verbatim.strip()) < 3 or not has_unicode_letter(verbatim):
         return None
     return start, end
 
@@ -883,13 +919,13 @@ def _fuzzy_span(quote: str, haystack: str, *, bias: int) -> tuple[float, int, in
 
 
 def _norm_tokens(text: str) -> list[str]:
-    return [match.group(0).casefold() for match in _WORD.finditer(text.translate(_FOLD))]
+    return [token.casefold() for _start, _end, token in iter_words(text.translate(_FOLD))]
 
 
 def _token_spans(text: str) -> list[tuple[int, int, str]]:
     return [
-        (match.start(), match.end(), match.group(0).translate(_FOLD).casefold())
-        for match in _WORD.finditer(text)
+        (start, end, token.translate(_FOLD).casefold())
+        for start, end, token in iter_words(text)
     ]
 
 
@@ -898,7 +934,7 @@ def _span_ok(haystack: str, span: tuple[int, int]) -> bool:
     if start < 0 or end > len(haystack) or end - start < 3:
         return False
     verbatim = haystack[start:end]
-    return re.search(r"[A-Za-z]", verbatim) is not None
+    return has_unicode_letter(verbatim)
 
 
 def assess_label(label: str, *, in_vivo: bool, passage: str, require_gerund: bool) -> tuple[bool, list[str], dict[str, Any]]:
@@ -1043,7 +1079,7 @@ def nonsubstantive_kind(text: str) -> str | None:
         return "refusal"
     if folded in _NON_ANSWER_EXACT:
         return "non_answer"
-    if folded in _TRIVIAL_EXACT or re.search(r"[A-Za-z0-9]", stripped) is None:
+    if folded in _TRIVIAL_EXACT or not has_unicode_alnum(stripped):
         return "no_substantive_text"
     return None
 

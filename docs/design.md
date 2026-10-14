@@ -341,7 +341,7 @@ The README and [methodology.md](methodology.md) describe the package as automate
 
 ## 25. Focused coding in 0.7.0
 
-Focused coding is a new graph. It is not a node on `open_code`. Selection is deterministic and is a proposal. The researcher checkpoint is `interrupt()` inside `researcher_checkpoint`, resumed with `Command(resume=...)`. Properties and dimensions are a new store, `category_development.json`. Axial relations, a core category, and a saturation decision are not in this version. `judgment` stays null.
+Focused coding is a new graph. It is not a node on `open_code`. Selection is deterministic and is a proposal. `researcher_checkpoint` and `claim_checkpoint` call `interrupt()` inside the node, resumed with `Command(resume=...)`. The reread allowance is split across developing assignments, competing interpretations, and passages outside the selection. Properties and dimensions are `category_development.json` (`state_version` 1, `relations` null). Each row has a disposition, an evidence condition, downstream eligibility, a category revision id, and an evidence revision id. `claim_support` stays undefined until a researcher sets it. Axial relations, a core category, and a saturation decision are not in this version. `judgment` stays null. Non-substantive detection treats Unicode letters and numbers as text.
 
 `policy_version` is `0.7.0`.
 

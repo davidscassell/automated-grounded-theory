@@ -77,9 +77,11 @@ graph TD;
 	recode_worker(recode_worker)
 	commit_focused(commit_focused)
 	review_recode(review_recode)
+	claim_checkpoint(claim_checkpoint)
 	export_focused(export_focused)
 	__end__([<p>__end__</p>]):::last
 	__start__ --> load_open_coding;
+	claim_checkpoint --> export_focused;
 	commit_focused -.-> prepare_recode;
 	commit_focused -.-> review_recode;
 	load_open_coding --> select_candidates;
@@ -87,7 +89,7 @@ graph TD;
 	prepare_recode -.-> review_recode;
 	recode_worker --> commit_focused;
 	researcher_checkpoint --> prepare_recode;
-	review_recode --> export_focused;
+	review_recode --> claim_checkpoint;
 	select_candidates --> researcher_checkpoint;
 	export_focused --> __end__;
 	classDef default fill:#f2f0ff,line-height:1.2
@@ -96,9 +98,9 @@ graph TD;
 ```
 <!-- graph:focused:end -->
 
-`select_candidates` ranks initial codes by assignment frequency, document and respondent spread, and analytic weight. Analytic weight is substantive memos, the in-vivo flag, and a stored model comparison (`refine_definition`, `record_dimension`, `link_to_category`, or `keep_distinct`). It is not an importance score. A researcher pin is included even when the score is low. A rare contrast, the only code on one pole of a dimension already recorded, stays eligible. The lists `raised_code_ids` and `not_raised_code_ids` are a proposal. Nothing is deleted from the codebook.
+`select_candidates` ranks initial codes by assignment frequency, document and respondent spread, and analytic weight. Analytic weight is the mean of the features you leave on: substantive memo count, the in-vivo flag, and a stored model comparison (`refine_definition`, `record_dimension`, `link_to_category`, or `keep_distinct`). It is not an importance score. Memo count can reward a verbose memo. `focused_analytic_features` drops any of `memo`, `in_vivo`, and `comparison`. A researcher pin is included even when the score is low. A rare contrast, the only code on one pole of a dimension already recorded, stays eligible. The lists `raised_code_ids` and `not_raised_code_ids` are a proposal. Nothing is deleted from the codebook.
 
-`researcher_checkpoint` is the human checkpoint. It calls LangGraph's `interrupt()` inside the node and pauses there. The default checkpointer is `InMemorySaver`. Pass `checkpointer` or `checkpoint_path` to keep the thread. Resume with the same checkpointer and `thread_id`, `resuming=True`, and `resume` set to the value for `Command(resume=...)`. `{"accept": true}` keeps the proposal. `{"raised_code_ids": [...]}` replaces it. Codes you leave out stay in the book and are not raised.
+`researcher_checkpoint` and `claim_checkpoint` are the human checkpoints. Each calls LangGraph's `interrupt()` inside the node. The default checkpointer is `InMemorySaver`. Pass `checkpointer` or `checkpoint_path` to keep the thread. Resume with the same checkpointer and `thread_id`, `resuming=True`, and `resume` set to the value for `Command(resume=...)`. `{"accept": true}` keeps the code proposal. `{"raised_code_ids": [...]}` replaces it. Codes you leave out stay in the book and are not raised. An empty object is not a resume value: LangGraph reads a dict of interrupt ids, and an empty dict matches that pattern. Use `{"accept": true}` or `{"leave_claims": true}`.
 
 ```python
 from langgraph.checkpoint.memory import InMemorySaver
@@ -113,6 +115,15 @@ paused = focused_code(
     thread_id="focused-1",
 )
 payload = read_focused_interrupt(saver, "focused-1")
+paused_claims = focused_code(
+    open_coding_result,
+    model=model,
+    seed=7,
+    checkpointer=saver,
+    thread_id="focused-1",
+    resuming=True,
+    resume={"raised_code_ids": payload["payload"]["raised_code_ids"], "incidents": [{"passage_id": "p4", "purpose": "compete"}]},
+)
 finished = focused_code(
     open_coding_result,
     model=model,
@@ -120,7 +131,7 @@ finished = focused_code(
     checkpointer=saver,
     thread_id="focused-1",
     resuming=True,
-    resume={"raised_code_ids": payload["payload"]["raised_code_ids"]},
+    resume={"leave_claims": True},
 )
 ```
 
@@ -128,13 +139,17 @@ finished = focused_code(
 
 Performance settings are a separate manifest block. `batch_size` (default 1) is how many passages share one recode request. `concurrency` caps in-flight calls. `token_budget` (default 6000) bounds that request. They do not change which codes the score proposes. Changing them on resume is a continuation, not a change of analytic procedure, and still needs `allow_changes` when the checkpoint already exists.
 
-`prepare_recode` queues passages already assigned to a raised code, then a bounded lexical neighborhood (`focused_neighbor_limit`, default 1). The same `seed` replays that order. `recode_worker` rereads a frozen snapshot. `commit_focused` is the only writer. An initial assignment the reread does not repeat is kept and flagged `focused_disagreement`. A quote that is not in the target passage is kept. If it is found in another passage, that passage is the attribution and the row is flagged `evidence_outside_passage`. If it is found nowhere, it is flagged and not assigned to a different passage. It is not dropped.
+`prepare_recode` splits the allowance across three purposes and interleaves them. `develop` rereads passages already assigned to a raised code. `compete` tests competing interpretations: within-category negative cases (the same code, another pole or consequence) and a bounded lexical neighborhood (`focused_neighbor_limit`, default 1; `focused_negative_case_limit`, default 1). `outside` examines passages outside that selection (`focused_outside_limit`, default 1), negative cases against a claim first. Shares `focused_share_develop`, `focused_share_compete`, and `focused_share_outside` default to one third each and must sum to 1. An empty purpose gives its share back to the others. The same `seed` replays the queue. `result.purpose_coverage` reports queued, reread, not reread, calls, and tokens for each purpose. A researcher incident, from the resume value or `focused_incidents.csv` (`passage_id`, `purpose`), can enter any purpose.
 
-Properties and dimensions are written to `category_development.json`, one row per note, each with a document id, a passage id, and a quote. A note that does not cite a located passage is flagged `unsupported` and kept. These rows are not theme `properties` and they are not relations.
+`recode_worker` rereads a frozen snapshot. `commit_focused` is the only writer. An initial assignment the reread does not repeat is kept and flagged `focused_disagreement`. A quote that is not in the target passage is kept. If it is found in another passage, that passage is the attribution and the row is flagged `evidence_outside_passage`. If it is found nowhere, it is flagged and not assigned to a different passage. It is not dropped.
 
-`max_focused_review_calls` (default 8) and `max_focused_review_tokens` (default 24000) bound the reread. Calls are checked first, then tokens. Zero on either still runs the selection and, when `interrupt` is true, still pauses, then skips the model. Passages the allowance does not reach stay on their initial assignments and are listed as `focused_not_reread`. The result status is `incomplete`, and `stop` is `call_allowance`, `token_allowance`, or `no_progress`. Work already written stays. `saturation_report["judgment"]` stays null. This stage does not set it.
+Properties and dimensions are written to `category_development.json` (`state_version` 1). `relations` is null until a later stage writes them. Loading this state does not require an axial run. Each row keeps a disposition (`proposed`, `accepted`, `rejected`, `superseded`), an evidence condition (`anchored`, `disputed`, `insufficient`), and `downstream_eligible` (accepted, anchored, and not `needs_review`). `claim_support` stays `undefined` until a researcher sets `supported`, `partially_supported`, `contradicted`, or `indeterminate`. Citation anchoring, the share of quotes that locate a span, is a separate report. It is not claim support. Each row cites `category_revision_id` and `evidence_revision_id`. A category edit keeps the old text in `revision_history` and marks dependent claims and assignments `needs_review`. `category_development.json` and `focused_claims.csv` list every row. `downstream_claims.json` lists only eligible rows, and the file says so. `code_id_sidecar.json` maps Taguette tags to stable code ids. A label change is a rename only when an approved mapping says so. Otherwise a missing tag is kept and flagged `researcher_removed`, and a new tag is `ambiguous`.
 
-Weights are `focused_weight_frequency`, `focused_weight_documents`, and `focused_weight_analytic` (each default 1). `focused_min_score` defaults to the median of the positive scores. `coding_lens` accepts `charmaz` only. Axial lenses are not implemented.
+`claim_checkpoint` pauses after the reread when `interrupt` is true. `{"leave_claims": true}` keeps dispositions proposed. `{"accept_claims": true}` accepts anchored proposals. `{"claim_reviews": [{"entry_id": "...", "claim_support": "supported"}]}` records the researcher label. `{"category_edits": [{"code_id": "...", "definition": "..."}]}` revises a category without erasing dependents.
+
+`max_focused_review_calls` (default 8) and `max_focused_review_tokens` (default 24000) are ceilings, not measured costs. Calls are checked first, then tokens. Zero on either still runs the selection and, when `interrupt` is true, still pauses, then skips the model. Passages the allowance does not reach stay on their initial assignments and are listed as `focused_not_reread`, also broken out by purpose. The result status is `incomplete`, and `stop` is `call_allowance`, `token_allowance`, or `no_progress`. Work already written stays. `saturation_report["judgment"]` stays null. This stage does not set it.
+
+Weights are `focused_weight_frequency`, `focused_weight_documents`, and `focused_weight_analytic` (each default 1). `focused_min_score` defaults to the median of the positive scores. `coding_lens` accepts `charmaz` only. Axial lenses are not implemented. `scripts/evaluate_focused.py` compares initial coding with a focused reread offline and prints a live-cost estimate. It does not call an API. The plan is in [docs/focused-evaluation.md](docs/focused-evaluation.md).
 
 ## Install
 

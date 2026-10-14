@@ -208,11 +208,19 @@ def test_recode_queue_is_seeded_and_puts_assigned_passages_first():
         {"segment_id": "s2", "code_id": "c-freq", "passage_id": "p2", "doc_id": "d2", "quote": passages[1]["text"]},
     ]
     codes = _book()
-    first = build_recode_queue(passages, segments, ["c-freq"], codes, seed=7, neighbor_limit=1)
-    again = build_recode_queue(passages, segments, ["c-freq"], codes, seed=7, neighbor_limit=1)
+    first = build_recode_queue(
+        passages, segments, ["c-freq"], codes, seed=7, neighbor_limit=1, outside_limit=0
+    )
+    again = build_recode_queue(
+        passages, segments, ["c-freq"], codes, seed=7, neighbor_limit=1, outside_limit=0
+    )
     assert first == again
-    assert set(first[:2]) == {"p1", "p2"}
-    assert first[2] == "p5"
+    purposes = {item["passage_id"]: item["purpose"] for item in first}
+    assert purposes["p1"] == "develop"
+    assert purposes["p2"] == "develop"
+    assert purposes["p5"] == "compete"
+    ids = [item["passage_id"] for item in first]
+    assert ids.index("p5") < max(ids.index("p1"), ids.index("p2"))
 
 
 def test_property_citation_attributes_or_flags_and_never_drops():
@@ -368,6 +376,7 @@ def _run(mode="echo", *, passages=None, segments=None, interrupt=False, **kwargs
         pins=["c-rare"],
         focused_min_score=1.0,
         focused_neighbor_limit=0,
+        focused_outside_limit=0,
         interrupt=interrupt,
         **kwargs,
     )
@@ -391,8 +400,12 @@ def test_recoding_keeps_quotes_and_writes_cited_properties(tmp_path):
     assert not any(item.get("focused_disagreement") for item in result.segments)
     stored = json.loads((tmp_path / "category_development.json").read_text(encoding="utf-8"))
     assert stored["properties"]
-    assert "relations" not in stored
+    assert stored["relations"] is None
+    assert stored["relations_required"] is False
+    assert stored["views"]["category_development.json"].startswith("all records")
     assert result.focused_not_reread == []
+    assert all(item["disposition"] == "proposed" for item in result.properties)
+    assert all(item["claim_support"] == "undefined" for item in result.properties)
 
 
 def test_outside_quote_is_attributed_and_missing_quote_is_flagged():
@@ -560,12 +573,23 @@ def test_api_resume_records_a_performance_continuation():
     with pytest.raises(CheckpointMismatch) as caught:
         focused_code(source, interrupt=True, batch_size=2, resuming=True, resume={"accept": True}, **common)
     assert any(path.startswith("performance.") for path in caught.value.differences)
-    finished = focused_code(
+    paused_claims = focused_code(
         source,
         interrupt=True,
         batch_size=2,
         resuming=True,
         resume={"raised_code_ids": ["c-memo"]},
+        allow_changes=True,
+        **common,
+    )
+    assert paused_claims.interrupted is True
+    assert paused_claims.interrupt_payload["kind"] == "focused_claims"
+    finished = focused_code(
+        source,
+        interrupt=True,
+        batch_size=2,
+        resuming=True,
+        resume={"leave_claims": True},
         allow_changes=True,
         **common,
     )
@@ -591,6 +615,7 @@ def test_later_graphs_and_theme_report_stay_out_of_this_pr():
     assert "select_candidates" in focused.nodes
     assert "researcher_checkpoint" in focused.nodes
     assert "recode_worker" in focused.nodes
+    assert "claim_checkpoint" in focused.nodes
     open_code = get_graph("open_code")
     themes = get_graph("themes")
     assert "recode_worker" not in open_code.nodes
@@ -630,3 +655,235 @@ def test_cli_prints_the_interrupt_payload(tmp_path, capsys):
     assert main(["interrupt", "--checkpoint", str(path), "--thread", "cli-1"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["payload"]["kind"] == "focused_selection"
+
+
+def test_reread_budget_is_interleaved_and_reported_per_purpose():
+    passages = _passages()
+    passages.append(
+        {
+            "passage_id": "p5",
+            "doc_id": "d5",
+            "text": "The bags stayed by the door.",
+            "start_offset": 0,
+            "end_offset": 29,
+            "metadata": {"respondent_id": "d5"},
+        }
+    )
+    segments = _segments_for_raised()[:2]
+    coder = FakeFocusedCoder()
+    result = focused_code(
+        _source(passages=passages, codes=[_book()[0]], segments=segments),
+        model=coder,
+        seed=1,
+        focused_min_score=0,
+        focused_neighbor_limit=1,
+        focused_outside_limit=1,
+        focused_negative_case_limit=0,
+        max_focused_review_calls=3,
+        interrupt=False,
+    )
+    coverage = result.purpose_coverage
+    assert coverage["develop"]["calls"] >= 1
+    assert coverage["compete"]["reread"] == ["p5"]
+    assert coverage["outside"]["calls"] == 1
+    assert set(coverage["develop"]["reread"]) | set(coverage["compete"]["reread"]) | set(coverage["outside"]["reread"]) == set(
+        result.focused_reread
+    )
+    assert result.metadata["status"] == "incomplete"
+    assert coverage["develop"]["not_reread"]
+
+
+def test_researcher_incident_can_enter_any_purpose(tmp_path):
+    incidents = tmp_path / "focused_incidents.csv"
+    incidents.write_text("passage_id,purpose\np4,compete\n", encoding="utf-8")
+    saver = InMemorySaver()
+    coder = FakeFocusedCoder()
+    source = _source(segments=_segments_for_raised()[:1], memos=_memos(), sweep=_sweep())
+    paused = focused_code(
+        source,
+        model=coder,
+        seed=3,
+        pins=["c-rare"],
+        focused_min_score=1.0,
+        focused_neighbor_limit=0,
+        focused_outside_limit=0,
+        focused_negative_case_limit=0,
+        interrupt=True,
+        checkpointer=saver,
+        thread_id="incidents",
+        max_focused_review_calls=4,
+    )
+    assert paused.interrupt_payload["kind"] == "focused_selection"
+    resumed = focused_code(
+        source,
+        model=coder,
+        seed=3,
+        pins=["c-rare"],
+        focused_min_score=1.0,
+        focused_neighbor_limit=0,
+        focused_outside_limit=0,
+        focused_negative_case_limit=0,
+        resuming=True,
+        resume={"accept": True, "incidents_csv": str(incidents)},
+        checkpointer=saver,
+        thread_id="incidents",
+        max_focused_review_calls=4,
+    )
+    assert resumed.interrupt_payload["kind"] == "focused_claims"
+    compete = resumed.purpose_coverage["compete"]["passage_ids"]
+    assert compete == ["p4"]
+
+
+def test_negative_cases_include_the_supporting_category():
+    from automated_grounded_theory.category_state import negative_case_candidates
+
+    passages = [
+        {"passage_id": "p1", "text": "I was going to the station."},
+        {"passage_id": "p2", "text": "I was staying despite the plan."},
+        {"passage_id": "p3", "text": "The staying lasted all winter."},
+    ]
+    segments = [
+        {"code_id": "c1", "passage_id": "p1"},
+        {"code_id": "c1", "passage_id": "p2"},
+    ]
+    codebook = [
+        {"code_id": "c1", "dimensions": [{"name": "leaving", "value": "going"}]},
+        {"code_id": "c2", "dimensions": [{"name": "leaving", "value": "staying"}]},
+    ]
+    claims = [
+        {
+            "entry_id": "dim-c1",
+            "category_id": "c1",
+            "name": "leaving",
+            "pole": "going",
+        }
+    ]
+    hits = negative_case_candidates(passages, segments, claims, codebook=codebook)
+    within = [hit for hit in hits if hit["reason"] == "within_category"]
+    outside = [hit for hit in hits if hit["reason"] == "outside_support"]
+    assert any(hit["passage_id"] == "p2" and hit["preflagged"] is False for hit in within)
+    assert any(hit["passage_id"] == "p3" for hit in outside)
+
+
+def test_category_edit_marks_dependents_and_keeps_history():
+    from automated_grounded_theory.category_state import apply_category_edits, category_revision_id
+
+    entry = {
+        "code_id": "c1",
+        "code": "packing bags",
+        "definition": "Packing.",
+        "revision": 1,
+    }
+    entry["category_revision_id"] = category_revision_id(entry)
+    claim = {
+        "entry_id": "prop-0001",
+        "category_id": "c1",
+        "category_revision_id": entry["category_revision_id"],
+        "text": "Morning packing.",
+        "disposition": "accepted",
+        "evidence_condition": "anchored",
+        "downstream_eligible": True,
+        "flags": [],
+    }
+    edited = apply_category_edits(
+        {"c1": entry},
+        [{"segment_id": "s1", "code_id": "c1", "quote": "I packed.", "review_reasons": []}],
+        [claim],
+        [],
+        [{"code_id": "c1", "definition": "Packing in order to leave."}],
+    )
+    revised = edited["codebook"]["c1"]
+    assert revised["definition"] == "Packing in order to leave."
+    assert revised["revision_history"][0]["definition"] == "Packing."
+    assert revised["category_revision_id"] != entry["category_revision_id"]
+    assert edited["properties"][0]["text"] == "Morning packing."
+    assert edited["properties"][0]["previous_category_revision_id"] == entry["category_revision_id"]
+    assert edited["properties"][0]["needs_review"] is True
+    assert edited["properties"][0]["downstream_eligible"] is False
+    assert edited["segments"][0]["needs_review"] is True
+    assert "category_revised" in edited["segments"][0]["review_reasons"]
+    assert edited["segments"][0]["quote"] == "I packed."
+
+
+def test_taguette_roundtrip_requires_a_mapping_to_rename():
+    from automated_grounded_theory.category_state import classify_codebook_roundtrip, code_id_sidecar
+
+    sidecar = code_id_sidecar(
+        [
+            {"code_id": "c1", "code": "packing bags", "tag": "packing bags"},
+            {"code_id": "c2", "code": "crying", "tag": "crying"},
+        ]
+    )
+    ambiguous = classify_codebook_roundtrip(sidecar, ["packing luggage", "crying"])
+    actions = {item.get("code_id") or item.get("tag"): item["action"] for item in ambiguous["actions"]}
+    assert actions["c1"] == "remove_kept"
+    assert actions["packing luggage"] == "ambiguous"
+    renamed = classify_codebook_roundtrip(
+        sidecar,
+        ["packing luggage", "crying"],
+        {"renames": [{"code_id": "c1", "tag": "packing luggage"}]},
+    )
+    by_action = {(item["action"], item.get("code_id"), item.get("tag")) for item in renamed["actions"]}
+    assert ("rename", "c1", "packing luggage") in by_action
+    assert ("unchanged", "c2", "crying") in by_action
+
+
+def test_linked_run_preserves_the_parent_and_relations_are_optional():
+    from automated_grounded_theory.category_state import (
+        load_category_development,
+        plan_linked_run,
+        plan_relation_pairs,
+        record_revision_cycle,
+    )
+
+    loaded = load_category_development({"state_version": 1, "properties": [], "dimensions": []})
+    assert loaded["relations"] is None
+    assert loaded["relations_required"] is False
+    plan = plan_linked_run(
+        parent_run_id="run-a",
+        parent_output_dir="/tmp/run-a",
+        additional_passages=[{"passage_id": "p9", "text": "A later interview."}],
+        sampling_brief="Ask about staying.",
+        new_run_id="run-b",
+    )
+    assert plan["preserves_parent"] is True
+    assert plan["mutates_parent"] is False
+    assert plan["relations_required"] is False
+    cycled = record_revision_cycle(
+        {"properties": [{"entry_id": "prop-0001", "text": "kept", "flags": []}], "dimensions": []},
+        cycle="return_to_evidence",
+        reason="The definition changed.",
+        passage_ids=["p1"],
+        claim_ids=["prop-0001"],
+    )
+    assert cycled["properties"][0]["text"] == "kept"
+    assert cycled["properties"][0]["needs_review"] is True
+    pairs = plan_relation_pairs([f"c{i}" for i in range(50)], round_size=8, seed=1)
+    assert pairs["pair_count"] == 1225
+    assert pairs["unexamined_pair_count"] == 1225 - len(pairs["round"])
+    assert any(item["band"] == "less_obvious" for item in pairs["round"])
+    assert "ceilings" in pairs["allowance_note"]
+
+
+def test_analytic_ablation_and_live_estimate_make_no_api_call():
+    from automated_grounded_theory.evaluation_plan import ablation_selection, estimate_live_cost
+
+    selected = ablation_selection(
+        _book(),
+        passages=_passages(),
+        memos=_memos(),
+        sweep_log=_sweep(),
+        pins=["c-rare"],
+        min_score=1.0,
+    )
+    assert "memo" in selected["full"]["analytic_features"]
+    assert "memo" not in selected["ablated"]["memo"]["analytic_features"]
+    assert "verbose" in selected["memo_note"]
+    estimate = estimate_live_cost()
+    assert estimate["live_calls"] is False
+    assert estimate["model"] == "grok-4.20-0309-non-reasoning"
+    assert estimate["within_target"] is True
+    assert estimate["total_usd"] <= 2.0
+    from scripts.evaluate_focused import main
+
+    assert main(["--live"]) == 2

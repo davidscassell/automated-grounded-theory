@@ -10,6 +10,12 @@
 - Properties and dimensions go to `category_development.json`, each with a document id, passage id, and quote. Unsupported citations are flagged and kept. They are not theme properties and not relations.
 - `max_focused_review_calls` (default 8) and `max_focused_review_tokens` (default 24000) bound the reread. Calls are checked first. An exhausted allowance sets `status` to `incomplete` and names the stop (`call_allowance`, `token_allowance`, or `no_progress`). Passages not reread are `focused_not_reread`. `judgment` is not set.
 - `policy_version` is `0.7.0`.
+- The focused reread splits its call and token ceiling across three reserved purposes, `develop`, `compete`, and `outside`, interleaved by `focused_share_develop`, `focused_share_compete`, and `focused_share_outside` (default one third each). `purpose_coverage` reports each purpose. Researcher incidents from the resume value or `focused_incidents.csv` can enter any purpose. Negative-case search includes passages inside a claim's supporting category.
+- Each property and dimension keeps `disposition`, `evidence_condition`, `downstream_eligible`, `claim_support` (undefined until a researcher reviews), `category_revision_id`, and `evidence_revision_id`. Citation anchoring is reported separately from claim support. A category edit marks dependents `needs_review` and keeps history. `code_id_sidecar.json` distinguishes a Taguette rename from a removal plus an addition. `category_development.json` is versioned and `relations` may be null.
+- `claim_checkpoint` is a second `interrupt()`. Resume claims with `{"leave_claims": true}`. An empty object is not a resume value.
+- `focused_analytic_features` drops memo count, the in-vivo flag, or stored comparisons. Memo count can reward verbosity.
+- `scripts/evaluate_focused.py` compares initial coding with focused rereading offline and estimates a live run. It does not call an API.
+- `nonsubstantive_kind` treats Unicode letters and numbers as substantive text. `我辞职了`, `Я уволился`, `تركت العمل`, and `I quit.` are not `no_substantive_text`.
 
 ## 0.6.16
 

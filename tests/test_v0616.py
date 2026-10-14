@@ -277,6 +277,10 @@ def test_nonsubstantive_replies_are_coded_and_flagged():
     assert nonsubstantive_kind("I don't know") == "uncertainty"
     assert nonsubstantive_kind("prefer not to say") == "refusal"
     assert nonsubstantive_kind("I don't know what the policy says about leave") is None
+    for substantive in ("我辞职了", "Я уволился", "تركت العمل", "I quit."):
+        assert nonsubstantive_kind(substantive) is None
+        assert exclusion_reason(substantive) is None
+    assert nonsubstantive_kind("...") == "no_substantive_text"
     assert exclusion_reason("n/a", code_nonsubstantive=False) == "non_answer"
 
     plan = plan_coding(
