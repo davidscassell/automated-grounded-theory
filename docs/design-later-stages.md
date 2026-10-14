@@ -1,8 +1,8 @@
-# Later-stage design (not implemented)
+# Later-stage design
 
-Status: design only, against package 0.6.16 (`e1c7a74`). No graph, schema, or test in this change implements a later stage. `policy_version` stays `0.6.16`.
+Status: focused coding and the property log (PR1) are implemented in package 0.7.0. Axial coding, selective coding, a core category, theoretical sampling, and a saturation decision in this note are not implemented. `judgment` stays null. This note was written against package 0.6.16 (`e1c7a74`).
 
-The README and [methodology.md](methodology.md) link here without using the words "focused coding." `test_docs_describe_open_coding_and_a_theme_report` rejects that phrase in those two files, so the theme report is not described as focused coding. This note is the place that uses the term.
+The README and [methodology.md](methodology.md) describe focused coding as a separate graph. The theme report still does not reread passages, and it is not focused coding.
 
 This document specifies how focused coding, axial coding, selective coding, theoretical saturation, and theoretical sampling inside a fixed corpus could be added. The default run remains initial coding plus a theme report. [methodology.md](methodology.md) states that limit. The engineering of the current run is [design.md](design.md).
 

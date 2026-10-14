@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.0
+
+- Focused coding is a separate graph, `get_graph("focused")`: `load_open_coding`, `select_candidates`, `researcher_checkpoint`, `prepare_recode`, `recode_worker`, `commit_focused`, `review_recode`, `export_focused`. It reads a finished open-coding run. It is not inserted into `open_code` or `themes`. `build_themes` still does not reread passages.
+- `select_candidates` ranks codes by assignment frequency, document and respondent spread, and analytic weight from substantive memos, the in-vivo flag, and stored model comparisons. A researcher pin is proposed even when the score is low. A rare contrast, the only code on one pole of a recorded dimension, stays eligible. The result is a proposal. Nothing is deleted from the codebook.
+- The researcher checkpoint calls `langgraph.types.interrupt()` inside `researcher_checkpoint`. Resume with `Command(resume=...)` through `focused_code(..., resuming=True, resume=...)`. The default checkpointer is `InMemorySaver`. `read_focused_interrupt` and `agt-focused interrupt` show the payload. `agt-focused resume` continues a sqlite checkpoint. Resume checks the stored manifest of corpus, source, context, model settings, and analytic procedure. Corpus identity and `seed` are not continuable. Other changes need `allow_changes` or `continuation`.
+- `batch_size` (default 1), `concurrency`, and `token_budget` are performance settings in their own manifest block. They do not change the selection score.
+- The reread keeps quotes that are not in the target passage. A quote found in another passage is attributed there and flagged `evidence_outside_passage`. A quote found nowhere is flagged and is not assigned to a different passage. Nothing is dropped. An initial assignment the reread does not repeat is kept and flagged `focused_disagreement`.
+- Properties and dimensions go to `category_development.json`, each with a document id, passage id, and quote. Unsupported citations are flagged and kept. They are not theme properties and not relations.
+- `max_focused_review_calls` (default 8) and `max_focused_review_tokens` (default 24000) bound the reread. Calls are checked first. An exhausted allowance sets `status` to `incomplete` and names the stop (`call_allowance`, `token_allowance`, or `no_progress`). Passages not reread are `focused_not_reread`. `judgment` is not set.
+- `policy_version` is `0.7.0`.
+
 ## 0.6.16
 
 - A coding action whose confidence is below `review_below` (default 0.5) is applied and flagged `needs_review` with reason `low_confidence`. The same decision stays on `review.json`. The confidence score is the model's own diagnostic. It is not a probability and not a calibrated frequency. In-vivo flags, definition rewrites, theme assignments, and merges below their own gates are still not applied.

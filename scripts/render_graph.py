@@ -44,6 +44,12 @@ BLOCK_RE = re.compile(
     re.escape(BEGIN) + r"\n```mermaid\n(.*?)```\n" + re.escape(END),
     re.DOTALL,
 )
+FOCUSED_BEGIN = "<!-- graph:focused:begin -->"
+FOCUSED_END = "<!-- graph:focused:end -->"
+FOCUSED_RE = re.compile(
+    re.escape(FOCUSED_BEGIN) + r"\n```mermaid\n(.*?)```\n" + re.escape(FOCUSED_END),
+    re.DOTALL,
+)
 
 
 def _runtime(**overrides) -> RunConfig:
@@ -101,6 +107,11 @@ def interrupt_mermaid() -> str:
     return compile_graph(_runtime(), None, interrupt_before_sweep=True).get_graph().draw_mermaid()
 
 
+def focused_mermaid() -> str:
+    """Mermaid for ``get_graph("focused")``, the separate focused-coding graph."""
+    return get_graph("focused").compile().get_graph().draw_mermaid()
+
+
 def readme_mermaid(readme: str) -> str:
     match = BLOCK_RE.search(readme)
     if match is None:
@@ -111,24 +122,39 @@ def readme_mermaid(readme: str) -> str:
     return match.group(1)
 
 
-def replace_readme_mermaid(readme: str, mermaid: str) -> str:
+def readme_focused_mermaid(readme: str) -> str:
+    match = FOCUSED_RE.search(readme)
+    if match is None:
+        raise ValueError(
+            "README.md is missing the generated focused mermaid block "
+            f"between {FOCUSED_BEGIN} and {FOCUSED_END}."
+        )
+    return match.group(1)
+
+
+def _replace_block(readme: str, pattern: re.Pattern[str], begin: str, end: str, mermaid: str) -> str:
     if not mermaid.endswith("\n"):
         mermaid = mermaid + "\n"
-    block = f"{BEGIN}\n```mermaid\n{mermaid}```\n{END}"
+    block = f"{begin}\n```mermaid\n{mermaid}```\n{end}"
 
     def _swap(match: re.Match[str]) -> str:
-        # Return the block literally. A replacement string would treat
-        # backslashes in a node id as re escapes.
         del match
         return block
 
-    updated, count = BLOCK_RE.subn(_swap, readme, count=1)
+    updated, count = pattern.subn(_swap, readme, count=1)
     if count != 1:
-        raise ValueError(
-            "README.md is missing the generated open_code mermaid block "
-            f"between {BEGIN} and {END}."
-        )
+        raise ValueError(f"README.md is missing the generated mermaid block between {begin} and {end}.")
     return updated
+
+
+def replace_readme_mermaid(readme: str, mermaid: str) -> str:
+    # Return the block literally. A replacement string would treat
+    # backslashes in a node id as re escapes.
+    return _replace_block(readme, BLOCK_RE, BEGIN, END, mermaid)
+
+
+def replace_focused_mermaid(readme: str, mermaid: str) -> str:
+    return _replace_block(readme, FOCUSED_RE, FOCUSED_BEGIN, FOCUSED_END, mermaid)
 
 
 def _edge_tuples(compiled) -> set[tuple[str, str, bool]]:
@@ -203,22 +229,26 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     mermaid = diagram_mermaid()
     check_variants(mermaid)
+    focused = focused_mermaid()
     readme = README_PATH.read_text(encoding="utf-8")
     try:
         current = readme_mermaid(readme)
+        current_focused = readme_focused_mermaid(readme)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     if args.check:
         if current != mermaid:
             raise SystemExit("README mermaid block does not match graph.get_graph().draw_mermaid().")
-        print("README open_code diagram matches the compiled graph.")
+        if current_focused != focused:
+            raise SystemExit("README focused mermaid block does not match get_graph('focused').draw_mermaid().")
+        print("README open_code and focused diagrams match the compiled graphs.")
         return 0
-    updated = replace_readme_mermaid(readme, mermaid)
+    updated = replace_focused_mermaid(replace_readme_mermaid(readme, mermaid), focused)
     if updated != readme:
         README_PATH.write_text(updated, encoding="utf-8")
         print(f"Updated {README_PATH.relative_to(ROOT)}")
     else:
-        print("README mermaid block already matches.")
+        print("README mermaid blocks already match.")
     if not args.skip_png:
         mmdc = args.mmdc or shutil.which("mmdc")
         if not mmdc:
