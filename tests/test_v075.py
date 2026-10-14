@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 
+import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
