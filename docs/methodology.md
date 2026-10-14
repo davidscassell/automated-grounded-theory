@@ -1,6 +1,6 @@
 # Methodology
 
-The default procedure is **automated initial (open) coding**, constant comparison during that coding, and a **theme report**. The theme report is a descriptive grouping for presentation. It does not reread the data. The package does not do theoretical sampling, axial coding, selective coding, or a saturation decision. Category development and theory integration are later work. The engineering design is [docs/design.md](design.md).
+The default procedure is **automated initial (open) coding**, constant comparison during that coding, and a **theme report**. The theme report is a descriptive grouping for presentation. It does not reread the data. The package does not do theoretical sampling, axial coding, selective coding, or a saturation decision. Category development and theory integration are later work. A design for that later work, including where Glaser, Strauss and Corbin, and Charmaz disagree, is in [design-later-stages.md](design-later-stages.md). Nothing in that note is implemented in this version. The engineering design of the current run is [docs/design.md](design.md).
 
 ## Sources
 
