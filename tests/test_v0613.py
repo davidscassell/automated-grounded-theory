@@ -29,8 +29,8 @@ from tests.fake_llm import FakeCoder
 
 
 def test_version_is_0_6_13():
-    assert __version__ == "0.6.13"
-    assert POLICY_VERSION == "0.6.13"
+    assert __version__ == "0.6.14"
+    assert POLICY_VERSION == "0.6.14"
 
 
 RAND_LIKE = """ Interviewer: What did you read before you left?
@@ -103,19 +103,18 @@ Participant: The exile poems matched packing a life into two bags and leaving ho
 
 
 def test_short_filler_turns_merge_into_the_adjacent_answer_and_can_be_disabled():
-    merged = plan_coding([{"id": "f", "text": FILLER}], unit="incident", seed=1)
-    assert merged.passages
-    assert not any(passage["text"].strip() == "Participant: Ovid." for passage in merged.passages)
-    holder = next(passage for passage in merged.passages if "Ovid." in passage["text"])
-    assert "poetry" in holder["text"]
-    assert holder["metadata"].get("merged_short_turn") is True
-    assert _covers(FILLER, "Ovid.", merged.passages)
-    assert any("exile poems" in passage["text"] and "Ovid." not in passage["text"] for passage in merged.passages)
-
-    separate = plan_coding([{"id": "f", "text": FILLER}], unit="incident", seed=1, short_turn_chars=0)
+    # The default is off. "Ovid." stays its own passage, and so does "I quit."
+    separate = plan_coding([{"id": "f", "text": FILLER}], unit="incident", seed=1)
     ovid = next(passage for passage in separate.passages if passage["text"].strip() == "Participant: Ovid.")
     assert "poetry" not in ovid["text"]
     assert _covers(FILLER, "Ovid.", separate.passages)
+    assert separate.passages
+    # Even with the merge turned on, an interviewer question between the turns blocks it.
+    blocked = plan_coding([{"id": "f", "text": FILLER}], unit="incident", seed=1, short_turn_chars=60)
+    ovid_blocked = next(passage for passage in blocked.passages if passage["text"].strip() == "Participant: Ovid.")
+    assert "poetry" not in ovid_blocked["text"]
+    assert "Which author?" not in ovid_blocked["text"]
+    assert _covers(FILLER, "Ovid.", blocked.passages)
 
 
 class _DropSecond(FakeCoder):

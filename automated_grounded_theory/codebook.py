@@ -1099,6 +1099,11 @@ def interpret_coding(
             if flag not in review_flags:
                 review_flags.append(flag)
         nearest_code_id = known_nearest[0] if known_nearest else None
+        evidence_doc_id, evidence_doc_name, evidence_metadata = _evidence_source(
+            anchor,
+            passage,
+            list(same_request) + list(passages or []),
+        )
         accepted.append(
             {
                 "action": action,
@@ -1139,6 +1144,9 @@ def interpret_coding(
                 "attributed_passage_ids": attributed_passage_ids,
                 "attribution": attribution.status,
                 "evidence_outside_passage": outside,
+                "evidence_doc_id": evidence_doc_id,
+                "evidence_doc_name": evidence_doc_name,
+                "evidence_metadata": evidence_metadata,
             }
         )
         applied = _op(
@@ -1414,13 +1422,22 @@ def commit_passage(
             book[key]["in_vivo"] = True
         _mark_label_review(book[key], item.get("review_reasons") or [])
 
+        evidence_doc_id = str(item.get("evidence_doc_id") or passage.get("doc_id") or "")
+        evidence_doc_name = item.get("evidence_doc_name")
+        if evidence_doc_name in (None, ""):
+            evidence_doc_name = passage.get("doc_name")
+        evidence_metadata = item.get("evidence_metadata")
+        if not isinstance(evidence_metadata, Mapping):
+            evidence_metadata = dict(passage.get("metadata") or {})
+        else:
+            evidence_metadata = dict(evidence_metadata)
         if item.get("doc_start") is None or item.get("doc_end") is None:
             span_key = (
-                f"{passage.get('doc_id')}:{passage.get('passage_id')}:"
+                f"{evidence_doc_id}:{passage.get('passage_id')}:"
                 f"{item.get('quote_status')}:{item.get('model_quote')}"
             )
         else:
-            span_key = f"{passage.get('doc_id')}:{item['doc_start']}:{item['doc_end']}"
+            span_key = f"{evidence_doc_id}:{item['doc_start']}:{item['doc_end']}"
         if span_key not in highlights:
             highlights[span_key] = _next(counters, "highlight", "h")
         coded_passage_id = str(passage.get("passage_id") or "")
@@ -1450,8 +1467,8 @@ def commit_passage(
             "attributed_passage_id": attributed_passage_id,
             "attributed_passage_ids": attributed_ids,
             "attribution": attribution,
-            "doc_id": passage.get("doc_id"),
-            "doc_name": passage.get("doc_name"),
+            "doc_id": evidence_doc_id,
+            "doc_name": evidence_doc_name,
             "code": book[key]["code"],
             "code_key": key,
             "quote": item["quote"],
@@ -1473,7 +1490,8 @@ def commit_passage(
             "nearest_code_id": item.get("nearest_code_id"),
             "why_not_nearest": item.get("why_not_nearest") or "",
             "uncertainty_flags": list(item.get("uncertainty_flags") or []),
-            "metadata": dict(passage.get("metadata") or {}),
+            "metadata": evidence_metadata,
+            "provenance": _coded_provenance(passage),
             "confidence": item["confidence"],
             "needs_review": item["needs_review"],
             "review_reasons": list(item["review_reasons"]),
@@ -1482,13 +1500,16 @@ def commit_passage(
         targets = [pid for pid in attributed_ids if pid]
         if passage_id_for_row and passage_id_for_row not in targets:
             targets.append(passage_id_for_row)
-        duplicate_at = None
-        if _is_cross_passage(item, coded_passage_id, targets):
-            duplicate_at = _find_same_evidence(new_segments, key, str(item.get("quote") or ""), targets)
+        # Every incoming assignment, including one that lands on the passage
+        # being coded. Identity is the code, the source document, and the
+        # matched spans. The same words at another offset stay a second quote.
+        duplicate_at = _find_same_evidence(new_segments, key, evidence_doc_id, item)
         if duplicate_at is not None:
             new_segments[duplicate_at] = _merge_cross_passage(
                 new_segments[duplicate_at],
                 coded_passage_id=coded_passage_id,
+                coded_doc_id=str(passage.get("doc_id") or ""),
+                coded_doc_name=str(passage.get("doc_name") or ""),
                 targets=targets,
                 item=item,
             )
@@ -1526,6 +1547,74 @@ def _request_passages(
     return [item for item in passages if str(item.get("passage_id") or "") in wanted]
 
 
+def _evidence_source(
+    anchor: Any,
+    passage: Mapping[str, Any],
+    passages: Sequence[Mapping[str, Any]],
+) -> tuple[str, str, dict]:
+    """Document identity of the located evidence, not of the passage being coded.
+
+    A same-request hit can sit in another document. The segment's document,
+    name, and respondent metadata come from that passage. The coded passage
+    stays on provenance.
+    """
+    located_id = str(getattr(anchor, "located_passage_id", "") or "")
+    located = None
+    if located_id and getattr(anchor, "source", "") == "request":
+        for item in passages:
+            if str(item.get("passage_id") or "") == located_id:
+                located = item
+                break
+    if located is not None:
+        return (
+            str(located.get("doc_id") or getattr(anchor, "located_doc_id", "") or ""),
+            str(located.get("doc_name") or getattr(anchor, "located_doc_name", "") or ""),
+            dict(located.get("metadata") or {}),
+        )
+    if getattr(anchor, "source", "") == "request" and str(getattr(anchor, "located_doc_id", "") or ""):
+        return (
+            str(anchor.located_doc_id),
+            str(getattr(anchor, "located_doc_name", "") or ""),
+            {},
+        )
+    return (
+        str(passage.get("doc_id") or ""),
+        str(passage.get("doc_name") or ""),
+        dict(passage.get("metadata") or {}),
+    )
+
+
+def _coded_provenance(passage: Mapping[str, Any]) -> dict:
+    """The passage and document that were being coded, kept apart from the evidence."""
+    passage_id = str(passage.get("passage_id") or "")
+    doc_id = str(passage.get("doc_id") or "")
+    doc_name = str(passage.get("doc_name") or "")
+    return {
+        "coded_passage_id": passage_id,
+        "coded_doc_id": doc_id,
+        "coded_doc_name": doc_name,
+        "coded_documents": [
+            {"passage_id": passage_id, "doc_id": doc_id, "doc_name": doc_name},
+        ],
+    }
+
+
+def _span_identity(item: Mapping[str, Any]) -> tuple[tuple[int, int], ...] | None:
+    """Matched document spans. The quote text is not an identity."""
+    spans: list[tuple[int, int]] = []
+    for span in item.get("quote_spans") or []:
+        if not isinstance(span, Mapping):
+            continue
+        if span.get("doc_start") is None or span.get("doc_end") is None:
+            continue
+        spans.append((int(span["doc_start"]), int(span["doc_end"])))
+    if not spans and item.get("doc_start") is not None and item.get("doc_end") is not None:
+        spans.append((int(item["doc_start"]), int(item["doc_end"])))
+    if not spans:
+        return None
+    return tuple(spans)
+
+
 def _norm_quote(quote: Any) -> str:
     return re.sub(r"\s+", " ", str(quote or "").strip()).casefold()
 
@@ -1542,23 +1631,24 @@ def _is_cross_passage(item: Mapping[str, Any], coded_passage_id: str, targets: S
 def _find_same_evidence(
     segments: Sequence[Mapping[str, Any]],
     key: str,
-    quote: str,
-    targets: Sequence[str],
+    doc_id: str,
+    item: Mapping[str, Any],
 ) -> int | None:
-    needle = _norm_quote(quote)
-    if not needle:
+    """An existing assignment of this code, document, and span.
+
+    Text equality is not enough. The same words at a different offset are a
+    different quote and stay a second assignment.
+    """
+    spans = _span_identity(item)
+    source = str(doc_id or "")
+    if spans is None or not source:
         return None
-    wanted = {str(item) for item in targets if str(item)}
     for index, segment in enumerate(segments):
         if _segment_key(segment) != key:
             continue
-        if _norm_quote(segment.get("quote")) != needle and _norm_quote(segment.get("model_quote")) != needle:
+        if str(segment.get("doc_id") or "") != source:
             continue
-        covered = set(attributed_passage_ids(segment))
-        passage_id = str(segment.get("passage_id") or "")
-        if passage_id:
-            covered.add(passage_id)
-        if covered & wanted:
+        if _span_identity(segment) == spans:
             return index
     return None
 
@@ -1567,6 +1657,8 @@ def _merge_cross_passage(
     segment: Mapping[str, Any],
     *,
     coded_passage_id: str,
+    coded_doc_id: str = "",
+    coded_doc_name: str = "",
     targets: Sequence[str],
     item: Mapping[str, Any],
 ) -> dict:
@@ -1574,12 +1666,31 @@ def _merge_cross_passage(
     updated = dict(segment)
     provenance = dict(updated.get("provenance") or {})
     coded_ids = [str(value) for value in (provenance.get("coded_passage_ids") or []) if str(value)]
-    original = str(updated.get("coded_passage_id") or "")
+    original = str(updated.get("coded_passage_id") or provenance.get("coded_passage_id") or "")
     if original and original not in coded_ids:
         coded_ids.append(original)
     if coded_passage_id and coded_passage_id not in coded_ids:
         coded_ids.append(coded_passage_id)
     provenance["coded_passage_ids"] = coded_ids
+    documents = [dict(row) for row in (provenance.get("coded_documents") or []) if isinstance(row, Mapping)]
+
+    def _add_doc(passage_id: str, doc_id: str, doc_name: str) -> None:
+        if not passage_id and not doc_id:
+            return
+        marker = (passage_id, doc_id)
+        if any((str(row.get("passage_id") or ""), str(row.get("doc_id") or "")) == marker for row in documents):
+            return
+        documents.append({"passage_id": passage_id, "doc_id": doc_id, "doc_name": doc_name})
+
+    _add_doc(
+        original,
+        str(provenance.get("coded_doc_id") or ""),
+        str(provenance.get("coded_doc_name") or ""),
+    )
+    _add_doc(coded_passage_id, coded_doc_id, coded_doc_name)
+    provenance["coded_documents"] = documents
+    if coded_passage_id and not provenance.get("coded_passage_id"):
+        provenance["coded_passage_id"] = coded_passage_id
     updated["provenance"] = provenance
     current = [str(value) for value in (updated.get("attributed_passage_ids") or []) if str(value)]
     if not current:
@@ -1639,6 +1750,7 @@ _ENTRY_LISTS = (
     "examples",
     "assignments",
     "reviewed_assignment_ids",
+    "available_assignment_ids",
     "reviews_seen",
     "document_ids",
     "review_reasons",

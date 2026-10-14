@@ -1,4 +1,4 @@
-# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, and 0.6.13)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, and 0.6.14)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
 Status: steps 1 and 2 of the v0.6 plan. Category development, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
@@ -284,6 +284,26 @@ The coding prompt, which document mode uses, tells the model to code each passag
 
 `policy_version` is `0.6.13`.
 
-## 22. Out of scope
+## 22. Corrections in 0.6.14
+
+A speaker label is a word, a number (`Participant 02`), or initials (`J.D.`, `J. D.`). The initials alternative is tried first so `J.D.:` is not read as the word `J`. A numbered label whose other words are on the mid-line blocklist (`Table 1`, `Figure 2`, `Chapter 3`) is not a speaker. Dotted abbreviations (`e.g.`, `U.S.`, `i.e.`) are not speakers. A line-start label that ends in a known role still shrinks to that role, and a mid-line label still has to follow `.`, `!`, or `?`.
+
+`_source_text_coverage` does not call the speaker parser. Every non-whitespace character of the document is compared with passage spans and with question context (the question string, plus the `Label:` that introduces it on that line). Passage text wins where they overlap. A looser speaker detector flags a turn whose label sits only inside a question body (`Participant 02:`, `J.D.:`, an extra `Interviewer:`). `Note:` and `Table 1:` inside a question stay ordinary prose. Uncovered characters are warned and stored as `source_uncovered` (`doc_id`, `chars`, `text`). Flagged turns are `question_context_turns`.
+
+`anchor_quote` carries `located_doc_id` and `located_doc_name` from the passage that contained the hit. `commit_passage` writes that document id, name, and respondent metadata onto the segment. Provenance keeps the passage and document that were being coded: `coded_passage_id`, `coded_doc_id`, `coded_doc_name`, and `coded_documents`. Frequency `document_ids`, respondent counts, and `highlights.csv` `document` follow the located document.
+
+Duplicate detection runs for every incoming assignment. Identity is the code key, the evidence document, and the matched spans (`quote_spans`, or the bounding `doc_start`/`doc_end` when there is one span). Quote text is not an identity. Spans that were never anchored do not merge. A hit copies the coded passage and document onto the existing segment's provenance. Inside-passage first and cross-passage first both leave one segment and frequency 1.
+
+`configure_embedding_cache(vector_limit=...)` still evicts least-recently-used vectors. A request copies the vectors it will return before that eviction, on the batch-query path, the single-query path, and the document path. Eviction changes only what a later request can reuse. Two queries in one request with `vector_limit=1` return both vectors.
+
+`select_prompt_examples` returns at most `limit` rows. Unsent assignments stay fresh. When there are more fresh rows than the limit, the batch prefers a new document and then the quote that overlaps the chosen set the least. `PROMPT_EXAMPLE_LIMIT` is 2, and coding prompts and sweeps use it. `record_review` stores the ids that were sent on `reviewed_assignment_ids` and on `reviews_seen.sent_assignment_ids`. `available_assignment_ids` is every id that existed when the review was built. `code_needs_review` stays true while any current assignment was not sent. A fingerprint with no per-assignment bookkeeping is unchanged.
+
+Solo retries of a missing batch slot are tagged `missing_slot_retry` on the prompt log. `missing_slot_retry_cost` sums those calls into the run metrics. The batch call is not included.
+
+`SHORT_TURN_CHARS` is 0. `I quit.` is a meaningful incident, and a character cap cannot tell it from filler such as `Ovid.`. The merge stays off until that has been evaluated. A positive `short_turn_chars` still merges a short turn into an adjacent answer, and `_gap_has_question` refuses the merge when an interviewer, moderator, or question label sits between the spans. A 0.6.13 checkpoint stored `short_turn_chars` 60. It is in the procedure manifest and not in the structural paths, so resume without passing 60 raises `CheckpointMismatch` unless `allow_changes` or `continuation` is set. Resume does not re-segment.
+
+`policy_version` is `0.6.14`.
+
+## 23. Out of scope
 
 Category feedback, focused recoding of earlier negatives, relationship hypotheses, sampling briefs, and a Taguette project-file adapter. See the v0.6 plan steps 3–5.
