@@ -113,6 +113,8 @@ _ABBREVIATIONS = frozenset(
 )
 # A label part may be a word, a number (Participant 02), or initials (J.D.).
 # The first alternative is initials so "J.D.:" is not read as the word "J".
+# Speaker labels in this grammar are Latin-script role names (Interviewer, Participant 02, J.D.).
+# Reply text in other scripts is still substantive; nonsubstantive_kind uses Unicode letters.
 _WORD_PART = r"[A-Za-z][\w'\-]{0,30}"
 _NUMBER_PART = r"\d{1,4}"
 _INITIALS_PART = r"[A-Za-z](?:\.[ \t]*[A-Za-z]){1,3}\.?"

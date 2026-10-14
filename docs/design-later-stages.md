@@ -1,8 +1,8 @@
-# Later-stage design (not implemented)
+# Later-stage design
 
-Status: design only, against package 0.6.16 (`e1c7a74`). No graph, schema, or test in this change implements a later stage. `policy_version` stays `0.6.16`.
+Status: focused coding and the property log (PR1) are implemented in package 0.7.0. Axial coding, selective coding, a core category, theoretical sampling, and a saturation decision in this note are not implemented. `judgment` stays null. This note was written against package 0.6.16 (`e1c7a74`).
 
-The README and [methodology.md](methodology.md) link here without using the words "focused coding." `test_docs_describe_open_coding_and_a_theme_report` rejects that phrase in those two files, so the theme report is not described as focused coding. This note is the place that uses the term.
+The README and [methodology.md](methodology.md) describe focused coding as a separate graph. The theme report still does not reread passages, and it is not focused coding.
 
 This document specifies how focused coding, axial coding, selective coding, theoretical saturation, and theoretical sampling inside a fixed corpus could be added. The default run remains initial coding plus a theme report. [methodology.md](methodology.md) states that limit. The engineering of the current run is [design.md](design.md).
 
@@ -150,7 +150,7 @@ Chain-of-thought, as Dunivin (2024) used it, is a rationale attached to a coding
 2. Workers read a frozen snapshot and return proposals. One commit node writes. The proposal reducer keeps the current rules: dedupe by proposal id, drop conflicting payloads, sort, clear only on a reset.
 3. Every analytic claim carries span ids and document ids. Quotes go through the existing anchor. `quote_status` of `possibly_modified` or `unanchored` keeps the claim and flags it. `evidence_outside_passage` keeps the current attribution rules.
 4. A claim with weak support is flagged and kept. The open-coding rule is the later-stage rule.
-5. Each stage has a call allowance and a token allowance, checked in that order, with the same stop reasons as `review_evidence`: `complete`, `call_allowance`, `token_allowance`, `no_progress`. An exhausted allowance sets the stage `complete` flag false and leaves an incomplete status. Outputs written so far stay.
+5. Each stage has a call allowance and a token allowance, checked in that order, with the same stop reasons as `review_evidence`: `complete`, `call_allowance`, `token_allowance`, `no_progress`. An exhausted allowance sets the stage `complete` flag false and leaves an incomplete status. Outputs written so far stay. Allowances are ceilings. They are not measured costs. A live corpus has to be priced separately. The focused reread splits its ceiling across three reserved purposes (section 6) and reports coverage for each.
 6. The checkpoint manifest gains the stage name, the lens, the allowances, and a hash of any researcher edit applied at the start of the stage. Corpus, `unit`, and `seed` stay non-continuable. A researcher edit is an expected continuation, recorded with old and new values.
 7. Tests use a fake model that returns fixed JSON for the new schemas. Tests assert flags, incomplete status, and that `judgment` is still null when the researcher has not set it. They assert that `build_themes` is unchanged and that an open-coding sweep still stores `relate_categories` without executing it.
 8. Preset codes stay forbidden on the initial-coding `context`. A lens is a parameter of the later call.
@@ -167,7 +167,7 @@ Charmaz (2006) defines focused coding as sifting data with the most significant 
 
 Raise a code because it is frequent, because it spreads across documents, or because it carries analytic weight: a researcher pin, a substantive memo, an in-vivo term, or a contrast the book would lose if only frequent codes survived. Charmaz's "and/or" is the rule. A rare code that holds a negative case stays eligible.
 
-Then reread. The point of the stage is to try the raised codes against passages, including passages that might contradict them, and to revise. Passages the allowance does not reach keep their initial assignments and are flagged `focused_not_reread`.
+Then reread. The point of the stage is to try the raised codes against passages, including passages that might contradict them, and to revise. The allowance is one ceiling split into three reserved, interleaved purposes: developing existing assignments, testing competing interpretations, and examining passages outside the initial selection. A purpose with an empty queue returns its share to the others. Passages the allowance does not reach keep their initial assignments and are flagged `focused_not_reread`. Coverage is reported per purpose. Researcher-selected incidents, from the interrupt resume or from `focused_incidents.csv`, can enter any of the three purposes.
 
 ### Pitfalls
 
@@ -177,24 +177,39 @@ Selecting on frequency alone buries the variation saturation is supposed to stre
 
 `get_graph("focused")`:
 
-`load_open_coding` → `select_candidates` → `prepare_recode` → `Send("recode_worker")` → `commit_focused` → `review_recode` → `export_focused`.
+`load_open_coding` → `select_candidates` → `researcher_checkpoint` → `prepare_recode` → `Send("recode_worker")` → `commit_focused` → `review_recode` → `claim_checkpoint` → `export_focused`.
+
+`researcher_checkpoint` and `claim_checkpoint` call `interrupt()` inside the node. Resume is `Command(resume=...)`. An empty object is not a resume value, because LangGraph treats a dict whose keys are interrupt ids, and an empty dict matches.
 
 `select_candidates` is deterministic. Inputs, all already on the codebook or the memo list:
 
 - assignment frequency
 - share of documents and of respondents
-- count of substantive memos on the code
-- in-vivo flag
+- count of substantive memos on the code. This count can reward a verbose memo. `focused_analytic_features` can drop `memo`
+- in-vivo flag, dropped by ablating `in_vivo`
+- stored comparisons (`refine_definition`, `record_dimension`, `link_to_category`, `keep_distinct`), dropped by ablating `comparison`
 - researcher pin, written into the run before the graph starts
 - a contrast flag when the code is the sole counter-example on a dimension already recorded
 
-Weights are config (`focused_weight_frequency`, `focused_weight_documents`, `focused_weight_analytic`) and the function is documented beside the code. Pins are included even when the score is low. The output is `raised_code_ids` plus `not_raised_code_ids`. Nothing is deleted from the codebook.
+Weights are config (`focused_weight_frequency`, `focused_weight_documents`, `focused_weight_analytic`) and the function is documented beside the code. The analytic term is the mean of the features that remain. Pins are included even when the score is low. The output is `raised_code_ids` plus `not_raised_code_ids`. Nothing is deleted from the codebook.
 
-`prepare_recode` queues two kinds of passage, in an order the seed can replay. First, passages already assigned to a raised code. Second, a bounded set of passages not assigned to that code, taken from the existing retriever as neighbors, so the recode can see competing incidents. The queue stops when the next prompt would break the allowance. The rest are `focused_not_reread`.
+`prepare_recode` builds three queues and interleaves them by share (`focused_share_develop`, `focused_share_compete`, `focused_share_outside`, default one third each, required to sum to 1). The same seed replays the order.
+
+- `develop`: passages already assigned to a raised code, except those moved into `compete` as within-category negative cases
+- `compete`: passages that test a competing interpretation. That includes a within-category negative case (same code, another pole or consequence of a property or dimension claim) up to `focused_negative_case_limit` (default 1), then lexical neighbors up to `focused_neighbor_limit` (default 1)
+- `outside`: passages outside the initial selection, up to `focused_outside_limit` (default 1). Hits from a claim's negative-case search fill this quota before other unassigned passages
+
+Negative-case search is per claim. It searches passages inside the claim's supporting category, including the same code with an opposite consequence, and passages outside that support. It does not search only outside a storyline, and it does not search only passages that were already flagged. Researcher incidents from the resume value or from `focused_incidents.csv` are placed in the purpose the researcher names and are not dropped to meet a limit. The queue stops when the next prompt would break the allowance. The rest are `focused_not_reread`. `purpose_coverage` reports queued, reread, not reread, calls, and tokens for each purpose.
 
 `recode_worker` sees the frozen book, the raised labels, the passage, and its neighbors. It may keep, add, or propose a revision. `commit_focused` appends assignments. An initial assignment that the recode does not repeat is kept and flagged `focused_disagreement`. The researcher resolves it later. New labels follow today's validation: retry once, then keep and flag. They do not bypass `PresetCodesError` rules; the raised list is a lens on an earned book, and a brand-new label is still earned from the passage.
 
-Property and dimension notes may be proposed in this stage as a log, one row per note, each with span ids. They are not relations, and they are not theme `properties`. The store is `category_development.json`. PR1 stops there.
+Property and dimension notes are a log, one row per note, each with span ids, a `category_revision_id`, and an `evidence_revision_id`. They are not relations, and they are not theme `properties`. The store is `category_development.json`, `state_version` 1. `relations` is present and null. A later stage may fill it. Integration reads this state and does not require `load_axial`.
+
+Each proposal row keeps three separate fields. `disposition` is `proposed`, `accepted`, `rejected`, or `superseded`. `evidence_condition` is `anchored`, `disputed`, or `insufficient`. `downstream_eligible` is true only when the disposition is `accepted`, the evidence condition is `anchored`, and the row is not `needs_review`. Rows are kept. `category_development.json` and `focused_claims.csv` use every row. `downstream_claims.json` uses only eligible rows. Each file states which records it uses.
+
+`claim_support` is a researcher label: `supported`, `partially_supported`, `contradicted`, or `indeterminate`. Until that review it is `undefined`, and reports say undefined. The model does not set it. Citation anchoring rate is the share of quotes that locate a span (`exact`, `normalized_match`, or `fuzzy_match`). Tentative and unanchored quotes are counted beside it. Citation anchoring is not claim support.
+
+A researcher edit to a category appends the previous label and definition to `revision_history`, bumps `category_revision_id`, and marks dependent claims and assignments `needs_review`. It does not erase the claim text or the quote. `record_revision_cycle` records a return to evidence the same way. A new run that adds data is `plan_linked_run`: it cites the parent directory and the sampling brief and does not rewrite the parent.
 
 This graph is distinct from `build_themes` because it rereads passages and can add assignments. `build_themes` remains the reporting view over whatever book it is given.
 
@@ -228,6 +243,10 @@ Each property, dimension pole, subcategory, and relation is a record: stable id,
 
 Relation prompts are bounded the way sweep chunks are bounded. One request carries the two categories, their definitions, and a capped set of evidence (`axial_evidence_limit`, default the same idea as `cross_chunk_limit`). Further pairs wait for another request. A pair is not decided from one side's evidence.
 
+Fifty categories make 1,225 unordered pairs. The allowance cannot examine that set. `plan_relation_pairs` takes categories in salience order. Adjacent categories are the obvious band. The other pairs are the less-obvious band. Each round mixes both bands (`obvious_share`, default 0.5). Pairs not chosen are reported as unexamined, with ids, not only as a count. Examined pairs are not repeated. The call and token allowances that stop the rounds are ceilings, not measured costs. A round that would exceed the ceiling is not sent. The unexamined list stays on the result.
+
+Relation rows use the same proposal fields as properties: disposition, evidence condition, and downstream eligibility. Core centrality, when selective coding scores candidates, is reported twice: once over proposed relations and once over researcher-accepted relations. The two numbers are not collapsed. Relation stability, in the evaluation table, compares direction, relation type, and conditions. It does not compare endpoint pairs alone. Two runs that name the same categories in opposite directions, or under different conditions, are not the same relation.
+
 `relate_categories` rows already on the open-coding sweep log are copied into the axial input as hints. `commit_relations` does not treat them as finished relations.
 
 Theme `properties` are not read or written here.
@@ -242,9 +261,9 @@ Yue et al. (2025) asked the model to perform selective coding from axial results
 
 ### Best practice
 
-Score candidates so the researcher can see centrality, reach, and explanatory variation. Centrality is how many other categories have a relation to this one. Reach is document and respondent coverage of its evidence. Explanatory variation is how many properties and dimension poles the category organizes, including poles that contradict a simple story. The scores are a table. The core is whatever the researcher writes into `researcher_core_id`. The field ships empty. Several candidates can stay in play.
+Score candidates so the researcher can see centrality, reach, and explanatory variation. Centrality is how many other categories have a relation to this one, reported separately for proposed relations and for relations the researcher has accepted. Reach is document and respondent coverage of its evidence. Explanatory variation is how many properties and dimension poles the category organizes, including poles that contradict a simple story. The scores are a table. The core is whatever the researcher writes into `researcher_core_id`. The field ships empty. Several candidates can stay in play.
 
-The storyline is a memo with links to category ids and span ids. An adversarial pass searches the corpus for incidents that the storyline does not cover and proposes them as negative cases. The researcher keeps, revises, or sets aside the storyline. Analytic induction and constant comparison both take negative cases seriously; Glaser and Strauss distinguished their method from analytic induction, and the pass here is a search for misfits, not a claim to have proved the storyline by eliminating every alternative.
+The storyline is a memo with links to category ids and span ids. An adversarial pass searches each claim, including passages inside its supporting category that show an opposite consequence, and proposes those passages as negative cases. The researcher keeps, revises, or sets aside the storyline. Analytic induction and constant comparison both take negative cases seriously; Glaser and Strauss distinguished their method from analytic induction, and the pass here is a search for misfits, not a claim to have proved the storyline by eliminating every alternative.
 
 ### Pitfalls
 
@@ -252,15 +271,17 @@ A weighted sum that picks the winner forces a core the same way a paradigm force
 
 ### Implementation
 
-`get_graph("selective")`:
+`get_graph("selective")` reads a versioned category-development state. Relations on that state are optional. The graph does not require a node named `load_axial`. A run that never wrote relations still loads. `state_version` is checked. A missing version is read as 1.
 
-`load_axial` → `score_candidates` → `draft_storyline` → `negative_case` → `export_selective`.
+`load_category_development` → `score_candidates` → `draft_storyline` → `negative_case` → `export_selective`.
 
-`score_candidates` is deterministic from the axial records. It writes `core_candidates` with the three scores and the ids behind them. It does not set a core.
+Returning to evidence is a recorded cycle, `return_to_evidence`, `revise_claim`, or `researcher_edit`. The cycle names the claim ids and passage ids. Dependent rows gain `needs_review`. Their text stays. A sampling brief that needs data the corpus does not contain is a new linked run (`plan_linked_run`). The new run stores `parent_run_id` and does not rewrite the parent directory.
+
+`score_candidates` is deterministic from the category-development records. Centrality is counted twice, once for proposed relations and once for relations whose disposition is `accepted`. The two scores stay in separate fields. It writes `core_candidates` with the scores and the ids behind them. It does not set a core.
 
 `draft_storyline` is one bounded model call, or several if the candidate set does not fit, under the selective allowance. The memo `kind` is `model_memo`, `role` is `storyline_draft`, and every sentence that names a category carries ids. Missing citations flag `storyline_uncited`. The export banner says the storyline is a draft for revision.
 
-`negative_case` retrieves passages whose assignments sit outside the storyline's categories, plus passages already flagged `focused_disagreement` or `tentative_few_documents`. The model proposes which of those passages strain the draft. Each proposal stores the span ids. The researcher disposition (`keep_storyline`, `revise`, `set_aside`) is a later edit, default empty.
+`negative_case` searches each relationship and property claim, not the storyline as a single blob. For each claim it retrieves passages inside that claim's supporting category, including the same code with an opposite consequence or another pole of the same dimension, and passages outside that support. Passages already flagged `focused_disagreement` or `tentative_few_documents` are included. They are not the whole search. The model proposes which of those passages strain the draft. Each proposal stores the span ids and the claim id. The researcher disposition (`keep_storyline`, `revise`, `set_aside`) is a later edit, default empty.
 
 Glaserian order, core before families, is a configuration note in section 14. It is not a second graph in the first three implementation PRs.
 
@@ -326,7 +347,7 @@ Reordering the original coding queue on resume is already forbidden: corpus, `un
 
 Charmaz's memos, Nelson's pattern refinement, and Berente and colleagues' lexical framing are checkpoints between machine passes. LangGraph already supports `interrupt_before`. The later graphs interrupt before `commit_focused`, before `commit_relations`, and before `export_selective`. The researcher resumes with an unchanged manifest or with a recorded edit. A model call cannot clear an interrupt.
 
-The round-trip uses the files Taguette can actually import. `taguette_codebook.csv` carries labels and descriptions. A researcher may rename, rewrite a definition, pin a code, or mark a code `not_raised`, then reimport. The import hashes the file into the manifest, stores the previous text, and flags `researcher_edited`. A code missing from the imported file is flagged `researcher_removed` and kept, with its segments, until the researcher confirms deletion in a separate field. Silent deletion would break the flag-and-keep rule.
+The round-trip uses the files Taguette can actually import, plus a stable-id sidecar this package writes and Taguette does not read. `taguette_codebook.csv` carries labels and descriptions. `code_id_sidecar.json` maps each tag to `code_id` and `category_revision_id`. A researcher may rename, rewrite a definition, pin a code, or mark a code `not_raised`, then reimport. The import hashes the file into the manifest, stores the previous text, and flags `researcher_edited`. A code missing from the imported file is flagged `researcher_removed` and kept, with its segments, until an approved mapping lists that `code_id` under `removals`. A new tag and a missing tag are not a rename. They are a removal plus an addition until `renames` in the approved mapping names the `code_id` and the new tag. `classify_codebook_roundtrip` is that check. Silent deletion would break the flag-and-keep rule. A category edit from that mapping marks dependent claims and assignments `needs_review` and keeps `revision_history`.
 
 `.qdc` stays an export for other QDA tools. Taguette does not import it, and this package still does not write a Taguette SQLite project. `highlights.csv` remains an export of evidence. Editing a highlight and expecting it to re-enter the run is out of scope until an import for that file exists. The open question is whether that import is worth building, or whether researchers should edit `category_development.json` directly.
 
@@ -338,15 +359,18 @@ Metrics answer different questions. None of them is a saturation decision.
 
 | Check | What it measures | What it does not measure |
 | --- | --- | --- |
-| Evidence-support rate | Share of properties, dimensions, relations, and storyline claims whose spans anchor as `exact`, `normalized_match`, or `fuzzy_match`. Tentative and unanchored claims are reported beside it, not folded in. | Truth of the relationship. |
-| Researcher ratings | A small sheet, `researcher_ratings.json`: forcing, usefulness, and whether the claim was recognizable in the cited passages. Stored as the researcher's numbers. | A model score of quality. |
-| Cross-seed stability | Jaccard of `raised_code_ids`, and of relation endpoint pairs, across seeds, after the existing label alignment. Instability is reported. | Validity. A constructivist reading expects some variation (Charmaz, 2006). |
+| Citation anchoring rate | Share of properties, dimensions, relations, and storyline claims whose spans anchor as `exact`, `normalized_match`, or `fuzzy_match`. Tentative and unanchored claims are reported beside it, not folded in. | Whether the claim is true. That question is claim support. |
+| Claim support | Researcher review of each claim: `supported`, `partially_supported`, `contradicted`, or `indeterminate`. Unreviewed claims are `undefined` and are reported as undefined. | A model score. The model does not write this field. |
+| Researcher ratings | A small sheet, `researcher_ratings.json`: forcing, usefulness, and whether the claim was recognizable in the cited passages. Stored as the researcher's numbers. Correction time is recorded by the researcher and stays undefined until then. | A model score of quality. |
+| Cross-seed stability | Jaccard of `raised_code_ids`. For relations, stability compares direction, relation type, and conditions. Endpoint pairs alone are not the comparison. Instability is reported. | Validity. A constructivist reading expects some variation (Charmaz, 2006). |
 | Chen et al. (2024) coverage, overlap, novelty, divergence | Open codebooks, as now. | Relations, cores, or saturation. |
 | Agreement on a fixed grid | Reuse `aligned_assignment_agreement` when a second coder, human or model, codes the same passages with the raised set. | A license to skip the researcher. Tai et al. (2024) are the reason a live comparison uses more than one model completion. |
 
 A comparison with a published grounded-theory study needs a public codebook, public excerpts or spans, and a stated school (Glaser, Strauss and Corbin, or Charmaz). This design does not name a dataset that meets that bar. The Muse figures in `design.md` are an open-coding comparison from the 0.5.4 era. They are not a benchmark for properties, relations, or a core. Using them as one would over-claim.
 
 The offline test of the implementation is the fake model: known passages, known citations, a relation with one document flagged tentative, `judgment` still null, an exhausted allowance leaving `incomplete`, and `build_themes` still refusing to reread.
+
+`scripts/evaluate_focused.py` and [focused-evaluation.md](focused-evaluation.md) compare initial coding alone with a focused reread on a small corpus: category revisions, citation-anchored properties, claim support (undefined until reviewed), counterexamples, system disagreements kept in the published example, researcher correction time (undefined until recorded), token cost, and cost per supported claim. Analytic-weight ablation drops memo count, the in-vivo flag, or stored comparisons. Memo count can reward verbosity. The script estimates a live run and does not call an API. A person approves a live run before one is started. The estimate for `grok-4.20-0309-non-reasoning` is about $1.98, under a $2 ceiling. That figure is a plan, not a bill. Allowances remain ceilings.
 
 ## 13. Proposed API and config
 
@@ -358,6 +382,12 @@ focused = await afocused_code(
     coding_lens="charmaz",  # "paradigm" | "glaser_families"
     max_focused_review_calls=8,
     max_focused_review_tokens=24000,
+    focused_share_develop=1 / 3,
+    focused_share_compete=1 / 3,
+    focused_share_outside=1 / 3,
+    focused_outside_limit=1,
+    focused_negative_case_limit=1,
+    focused_analytic_features=("memo", "in_vivo", "comparison"),
     interrupt=True,
 )
 axial = await aaxial_code(
@@ -426,14 +456,14 @@ The brief asked for a literature-grounded design of those five stages on the cur
 ## 16. Open questions
 
 1. Is the Charmaz order (focused, then relations, then a core) the order to implement, or should a Glaserian order (core, then families) be a second graph in the same series of PRs?
-2. For focused coding, is an allowance-bounded reread enough, or should the default reread every passage assigned to a raised code even when that exceeds the allowance and returns `incomplete`?
+2. The focused reread now reserves shares for developing assignments, competing interpretations, and passages outside the selection, and it reports coverage per purpose. Should a purpose be required to finish its own queue before its unused calls move, even when that returns `incomplete` for the other purposes?
 3. Should researcher edits re-enter only through `focused_selection.csv` and the Taguette codebook CSV, or is a `highlights.csv` import in scope?
 4. May a run keep multiple cores without a warning, or should an empty `researcher_core_id` at export raise a warning the researcher can silence?
 5. Is `min_relation_documents=2` the right flag threshold for the first axial PR?
 6. Should `record_saturation_decision` be a Python call, a JSON file dropped into the run directory, or both?
 7. Is there a published grounded-theory study, with a public codebook and public excerpts, that should be the later-stage evaluation corpus?
 8. Should the sampling brief be allowed to call the model, or should PR3 write it deterministically from the gap list so the brief does not add a prose pass?
-9. The starting allowances (8/24000, 12/36000, 8/24000) are analogies with final review. What corpus should set the real defaults before a live run?
+9. The starting allowances (8/24000, 12/36000, 8/24000) are ceilings by analogy with final review. They are not measured costs. The live evaluation plan in [focused-evaluation.md](focused-evaluation.md) prices one small comparison near $2 before anyone approves the calls. What corpus should replace that plan?
 
 ## 17. References
 

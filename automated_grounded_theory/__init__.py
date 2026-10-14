@@ -2,7 +2,9 @@
 
 Codes are produced passage by passage from the corpus. The research context
 sensitizes attention and is not a codebook. The theme report groups those
-codes afterwards for presentation. It does not reread the passages.
+codes afterwards for presentation. It does not reread the passages. Focused
+coding is a separate graph that rereads passages against a proposed subset of
+codes already earned. It is not the theme report.
 """
 
 from automated_grounded_theory.api import (
@@ -15,6 +17,13 @@ from automated_grounded_theory.api import (
 )
 from automated_grounded_theory.evaluate import aevaluate, chen_metrics, evaluate_run
 from automated_grounded_theory.context import PresetCodesError, ResearchContext
+from automated_grounded_theory.focused import (
+    FocusedError,
+    FocusedResult,
+    afocused_code,
+    focused_code,
+    read_focused_interrupt,
+)
 from automated_grounded_theory.graph import CodingError, get_graph
 from automated_grounded_theory.results import OpenCodeResult, load_run
 from automated_grounded_theory.retrieval import (
@@ -31,6 +40,8 @@ __all__ = [
     "CodeRetriever",
     "CodingError",
     "EmbeddingCodeRetriever",
+    "FocusedError",
+    "FocusedResult",
     "LexicalCodeRetriever",
     "OpenCodeResult",
     "PresetCodesError",
@@ -41,14 +52,17 @@ __all__ = [
     "__version__",
     "abuild_themes",
     "aevaluate",
+    "afocused_code",
     "amulti_seed_stability",
     "aopen_code",
     "build_themes",
     "chen_metrics",
     "compare_runs",
     "evaluate_run",
+    "focused_code",
     "get_graph",
     "load_run",
+    "read_focused_interrupt",
     "multi_seed_stability",
     "open_code",
     "plan_coding",

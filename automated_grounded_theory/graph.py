@@ -373,13 +373,19 @@ class _IdleModel(BaseChatModel):
 
 
 def get_graph(kind: str = "open_code"):
-    """Return the LangGraph for ``open_code`` or ``themes``.
+    """Return the LangGraph for ``open_code``, ``themes``, or ``focused``.
 
-    Both graphs fan out with ``Send``. ``draw_mermaid_png`` posts the diagram
-    to ``mermaid.ink``. ``draw_ascii`` needs the ``viz`` extra (``grandalf``).
-    ``draw_png`` needs optional ``pygraphviz`` and a Graphviz install.
+    The graphs fan out with ``Send``. ``focused`` is a separate graph. It is
+    not inserted into ``open_code`` or ``themes``. ``draw_mermaid_png`` posts
+    the diagram to ``mermaid.ink``. ``draw_ascii`` needs the ``viz`` extra
+    (``grandalf``). ``draw_png`` needs optional ``pygraphviz`` and a Graphviz
+    install.
     """
     name = str(kind or "open_code").strip().casefold()
+    if name == "focused":
+        from automated_grounded_theory.focused import build_focused_graph
+
+        return build_focused_graph()
     if name == "open_code":
         from automated_grounded_theory.context import ResearchContext
         from automated_grounded_theory.retrieval import LexicalCodeRetriever
@@ -397,7 +403,7 @@ def get_graph(kind: str = "open_code"):
         from automated_grounded_theory.themes import build_theme_graph
 
         return build_theme_graph()
-    raise ValueError("kind must be 'open_code' or 'themes'.")
+    raise ValueError("kind must be 'open_code', 'themes', or 'focused'.")
 
 
 def compile_graph(runtime: RunConfig, checkpointer, *, interrupt_before_sweep: bool = False):

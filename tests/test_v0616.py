@@ -24,8 +24,8 @@ from tests.fake_llm import FakeCoder
 
 
 def test_version_is_0_6_16():
-    assert __version__ == "0.6.16"
-    assert POLICY_VERSION == "0.6.16"
+    assert __version__ == "0.7.0"
+    assert POLICY_VERSION == "0.7.0"
     assert "not a probability" in CONFIDENCE_HELP
 
 
@@ -277,6 +277,10 @@ def test_nonsubstantive_replies_are_coded_and_flagged():
     assert nonsubstantive_kind("I don't know") == "uncertainty"
     assert nonsubstantive_kind("prefer not to say") == "refusal"
     assert nonsubstantive_kind("I don't know what the policy says about leave") is None
+    for substantive in ("我辞职了", "Я уволился", "تركت العمل", "I quit."):
+        assert nonsubstantive_kind(substantive) is None
+        assert exclusion_reason(substantive) is None
+    assert nonsubstantive_kind("...") == "no_substantive_text"
     assert exclusion_reason("n/a", code_nonsubstantive=False) == "non_answer"
 
     plan = plan_coding(
@@ -378,10 +382,12 @@ def test_docs_describe_open_coding_and_a_theme_report():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     method = (ROOT / "docs/methodology.md").read_text(encoding="utf-8")
     for text in (readme, method):
-        assert "focused coding" not in text.casefold()
         assert "0.5.4" in text
         assert "simulated fake-coder" in text.casefold()
         assert "one step of lag" in text
+        assert "does not reread" in text
     assert "not a probability" in readme
     assert "code_nonsubstantive" in readme
-    assert "does not reread" in method
+    assert "not the theme report" in method.casefold()
+    assert "judgment" in method
+    assert "build_themes" in readme

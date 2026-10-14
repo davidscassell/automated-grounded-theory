@@ -1,7 +1,7 @@
-# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, 0.6.14, 0.6.15, and 0.6.16)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, 0.6.14, 0.6.15, and 0.6.16, focused coding in 0.7.0)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
-Status: steps 1 and 2 of the v0.6 plan. Category development, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
+Status: steps 1 and 2 of the v0.6 plan, plus focused coding in 0.7.0. Axial coding, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
 
 The default procedure is Charmaz-informed automated analysis: initial coding against a frozen snapshot, constant comparison with distinct operations, and `build_themes` as a descriptive reporting view. It is not an axial-coding template.
 
@@ -339,6 +339,12 @@ The README and [methodology.md](methodology.md) describe the package as automate
 
 `policy_version` is `0.6.16`.
 
-## 25. Out of scope
+## 25. Focused coding in 0.7.0
+
+Focused coding is a new graph. It is not a node on `open_code`. Selection is deterministic and is a proposal. `researcher_checkpoint` and `claim_checkpoint` call `interrupt()` inside the node, resumed with `Command(resume=...)`. The reread allowance is split across developing assignments, competing interpretations, and passages outside the selection. Properties and dimensions are `category_development.json` (`state_version` 1, `relations` null). Each row has a disposition, an evidence condition, downstream eligibility, a category revision id, and an evidence revision id. `claim_support` stays undefined until a researcher sets it. Axial relations, a core category, and a saturation decision are not in this version. `judgment` stays null. Non-substantive detection treats Unicode letters and numbers as text.
+
+`policy_version` is `0.7.0`.
+
+## 26. Out of scope
 
 Category feedback, focused recoding of earlier negatives, relationship hypotheses, sampling briefs, and a Taguette project-file adapter. See the v0.6 plan steps 3–5.

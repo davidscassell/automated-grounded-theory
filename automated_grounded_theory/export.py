@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from xml.etree import ElementTree as ET
 
+from automated_grounded_theory.category_state import code_id_sidecar
 from automated_grounded_theory.version import __version__
 
 QDC_NAMESPACE = "urn:QDA-XML:codebook:1.0"
@@ -231,6 +232,7 @@ def export_result(result, directory: str | Path) -> dict[str, str]:
 
     used_tags: set[str] = set()
     tag_rows = []
+    sidecar_codes = []
     for entry in codes:
         tag = taguette_tag(str(entry.get("code") or ""), used_tags)
         tag_rows.append(
@@ -241,11 +243,13 @@ def export_result(result, directory: str | Path) -> dict[str, str]:
                 len(entry.get("document_ids") or []),
             ]
         )
+        sidecar_codes.append({**dict(entry), "tag": tag})
     _write_csv(
         place("taguette_codebook.csv"),
         ["tag", "description", "number of highlights", "number of documents"],
         tag_rows,
     )
+    _write_json(place("code_id_sidecar.json"), code_id_sidecar(sidecar_codes))
     place("codebook.qdc").write_text(
         codebook_qdc(codes, origin=f"automated_grounded_theory {__version__}"),
         encoding="utf-8",

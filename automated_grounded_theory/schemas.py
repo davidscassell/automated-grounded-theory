@@ -713,4 +713,67 @@ class CodeMatchBatch(_LLMModel):
     matches: list[CodeMatch] = Field(default_factory=list)
 
 
+class FocusedCodeDecision(_LLMModel):
+    """One code the focused reread keeps, adds, or revises for a passage."""
+
+    action: Literal["keep", "add", "revise"] = Field(
+        default="keep",
+        description="keep an initial code, add a code the passage supports, or revise its definition.",
+    )
+    code: str = Field(default="", description="Label. Empty only when you cannot name the incident.")
+    code_id: str = Field(
+        default="",
+        description="code_id when the code is already in the raised set. Empty when the label is new.",
+    )
+    definition: str = Field(default="", description="What incident this code captures. Empty when keeping unchanged.")
+    quote: str = Field(
+        default="",
+        description="Participant words from the target passage. Do not paraphrase. Do not quote another passage.",
+    )
+    rationale: str = Field(default="", description=RATIONALE_HELP)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0, description=CONFIDENCE_HELP)
+
+
+class FocusedPropertyNote(_LLMModel):
+    """A property of a category. The citation is the evidence, not a theme property."""
+
+    category_id: str = Field(default="", description="code_id of the category this property develops.")
+    name: str = Field(default="", description="Short name of the property.")
+    text: str = Field(default="", description="What varies, in a sentence grounded in the quote.")
+    document_id: str = Field(default="", description="Document id of the passage that contains the quote.")
+    passage_id: str = Field(default="", description="passage_id that contains the quote.")
+    quote: str = Field(default="", description="Words from that passage. Empty citations are kept and flagged.")
+
+
+class FocusedDimensionNote(_LLMModel):
+    """One pole of a dimension. Cite the passage that sits at that pole."""
+
+    category_id: str = Field(default="", description="code_id of the category.")
+    name: str = Field(default="", description="Name of the dimension, the range, not a relationship.")
+    pole: str = Field(default="", description="The end of the range this passage sits at.")
+    text: str = Field(default="", description="How this pole shows up in the quote.")
+    document_id: str = Field(default="", description="Document id of the passage that contains the quote.")
+    passage_id: str = Field(default="", description="passage_id that contains the quote.")
+    quote: str = Field(default="", description="Words from that passage.")
+
+
+class FocusedPassageRecode(_LLMModel):
+    """Focused reread of one passage against the raised codes."""
+
+    passage_id: str = Field(default="", description="passage_id from the prompt. Copy it exactly.")
+    codes: list[FocusedCodeDecision] = Field(
+        default_factory=list,
+        description="Codes this passage still supports. Omit an initial code only when the passage does not support it.",
+    )
+    properties: list[FocusedPropertyNote] = Field(default_factory=list)
+    dimensions: list[FocusedDimensionNote] = Field(default_factory=list)
+    memo: str = Field(default="", description="Analytic note from the model. Not a saturation judgment.")
+
+
+class FocusedRecodeBatch(_LLMModel):
+    """One focused-coding request. One entry per passage in the request."""
+
+    passages: list[FocusedPassageRecode] = Field(default_factory=list)
+
+
 MergeDecision.model_rebuild()

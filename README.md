@@ -1,8 +1,8 @@
 # automated_grounded_theory
 
-**Automated initial (open) coding**, plus a **theme report**, informed by the grounded theory tradition (Glaser and Strauss 1967; Glaser 1978, 1992; Strauss and Corbin 1990/1998; Charmaz 2006/2014). By default the model reads every document in a seeded order, and every passage of that document in reading order, comparing each incident with the codebook earned so far. The package does not do theoretical sampling, axial coding, selective coding, or a saturation decision. How each step maps onto those sources is in [docs/methodology.md](docs/methodology.md). The 0.6 design, including the 0.6.1 corrections, is in [docs/design.md](docs/design.md). A literature-grounded design for those stages, and for the category work that would follow initial coding, is in [docs/design-later-stages.md](docs/design-later-stages.md). That note is a design. It is not implemented. A short notebook with the same citations and the Taguette import steps is [docs/open_coding.ipynb](docs/open_coding.ipynb). A full walkthrough on a fictional employee survey, including an offline mode that needs no API key, is [examples/demo.ipynb](examples/demo.ipynb). The notebook writes its outputs to a temporary directory.
+**Automated initial (open) coding**, plus a **theme report**, informed by the grounded theory tradition (Glaser and Strauss 1967; Glaser 1978, 1992; Strauss and Corbin 1990/1998; Charmaz 2006/2014). By default the model reads every document in a seeded order, and every passage of that document in reading order, comparing each incident with the codebook earned so far. The package does not do theoretical sampling, axial coding, selective coding, or a saturation decision. How each step maps onto those sources is in [docs/methodology.md](docs/methodology.md). The 0.6 design, including the 0.6.1 corrections, is in [docs/design.md](docs/design.md). A literature-grounded design for the stages after initial coding is in [docs/design-later-stages.md](docs/design-later-stages.md). Focused coding, the first of those stages, is implemented as its own graph. Axial relations, a core category, and a saturation decision from that note are not. A short notebook with the same citations and the Taguette import steps is [docs/open_coding.ipynb](docs/open_coding.ipynb). A full walkthrough on a fictional employee survey, including an offline mode that needs no API key, is [examples/demo.ipynb](examples/demo.ipynb). The notebook writes its outputs to a temporary directory.
 
-`build_themes` is a descriptive grouping of the open codes for reporting. It does not reread the passages and it does not mint codes.
+`build_themes` is a descriptive grouping of the open codes for reporting. It does not reread the passages and it does not mint codes. Focused coding is not that report.
 
 ## How it works
 
@@ -55,7 +55,101 @@ graph TD;
 
 `segment_and_shuffle` orders the corpus, or goes straight to `export` when there is nothing to code. Each round freezes a snapshot in `prepare_round`, fans out `code_worker` with `Send`, and `commit` is the only writer. Dotted arrows are conditional: a round returns to `prepare_round` until a sweep is due, a sweep returns to `prepare_round` while passages remain, and when the queue is empty `consolidate` reads the codebook once more if at least two codes are still unconsolidated, or the run goes into `review_evidence`, which loops while a code still needs review and the final-review call and token allowances remain, and `export` runs when that review is done, the allowance is spent, or nothing needed review. Document mode (the default) keeps reading order inside a document so later passages see codes committed earlier; wave mode may mix documents in one snapshot; `parallel_documents=True` keeps a codebook per document until a sweep; `pipeline=True` (the default) overlaps the next round with that sweep when more than one request can be in flight, and `strict_sequential_settings()` is this same graph with one passage in flight and the pipeline off.
 
-A PNG of this drawing is [docs/open_code_graph.png](docs/open_code_graph.png). `python scripts/render_graph.py` rewrites the block from the compiled graph.
+A PNG of this drawing is [docs/open_code_graph.png](docs/open_code_graph.png). `python scripts/render_graph.py` rewrites this block, and the focused-coding block below, from the compiled graphs.
+
+## Focused coding
+
+Focused coding is a separate graph, `get_graph("focused")`. It reads a finished open-coding run. It does not insert nodes into `open_code` or `themes`. The diagram is `get_graph("focused").compile().get_graph().draw_mermaid()`.
+
+<!-- graph:focused:begin -->
+```mermaid
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	load_open_coding(load_open_coding)
+	select_candidates(select_candidates)
+	researcher_checkpoint(researcher_checkpoint)
+	prepare_recode(prepare_recode)
+	recode_worker(recode_worker)
+	commit_focused(commit_focused)
+	review_recode(review_recode)
+	claim_checkpoint(claim_checkpoint)
+	export_focused(export_focused)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> load_open_coding;
+	claim_checkpoint --> export_focused;
+	commit_focused -.-> prepare_recode;
+	commit_focused -.-> review_recode;
+	load_open_coding --> select_candidates;
+	prepare_recode -.-> recode_worker;
+	prepare_recode -.-> review_recode;
+	recode_worker --> commit_focused;
+	researcher_checkpoint --> prepare_recode;
+	review_recode --> claim_checkpoint;
+	select_candidates --> researcher_checkpoint;
+	export_focused --> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
+```
+<!-- graph:focused:end -->
+
+`select_candidates` ranks initial codes by assignment frequency, document and respondent spread, and analytic weight. Analytic weight is the mean of the features you leave on: substantive memo count, the in-vivo flag, and a stored model comparison (`refine_definition`, `record_dimension`, `link_to_category`, or `keep_distinct`). It is not an importance score. Memo count can reward a verbose memo. `focused_analytic_features` drops any of `memo`, `in_vivo`, and `comparison`. A researcher pin is included even when the score is low. A rare contrast, the only code on one pole of a dimension already recorded, stays eligible. The lists `raised_code_ids` and `not_raised_code_ids` are a proposal. Nothing is deleted from the codebook.
+
+`researcher_checkpoint` and `claim_checkpoint` are the human checkpoints. Each calls LangGraph's `interrupt()` inside the node. The default checkpointer is `InMemorySaver`. Pass `checkpointer` or `checkpoint_path` to keep the thread. Resume with the same checkpointer and `thread_id`, `resuming=True`, and `resume` set to the value for `Command(resume=...)`. `{"accept": true}` keeps the code proposal. `{"raised_code_ids": [...]}` replaces it. Codes you leave out stay in the book and are not raised. An empty object is not a resume value: LangGraph reads a dict of interrupt ids, and an empty dict matches that pattern. Use `{"accept": true}` or `{"leave_claims": true}`.
+
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+from automated_grounded_theory import focused_code, read_focused_interrupt
+
+saver = InMemorySaver()
+paused = focused_code(
+    open_coding_result,
+    model=model,
+    seed=7,
+    checkpointer=saver,
+    thread_id="focused-1",
+)
+payload = read_focused_interrupt(saver, "focused-1")
+paused_claims = focused_code(
+    open_coding_result,
+    model=model,
+    seed=7,
+    checkpointer=saver,
+    thread_id="focused-1",
+    resuming=True,
+    resume={"raised_code_ids": payload["payload"]["raised_code_ids"], "incidents": [{"passage_id": "p4", "purpose": "compete"}]},
+)
+finished = focused_code(
+    open_coding_result,
+    model=model,
+    seed=7,
+    checkpointer=saver,
+    thread_id="focused-1",
+    resuming=True,
+    resume={"leave_claims": True},
+)
+```
+
+`agt-focused interrupt --checkpoint PATH --thread THREAD` prints that payload. `agt-focused resume` continues the same thread. The resume value cannot carry a replacement corpus, context, model, or procedure. The call is checked against the manifest stored when the run started: corpus hash, the open-coding source hash, context, model settings, and the analytic procedure. A mismatch raises `CheckpointMismatch`. `allow_changes=True` or `continuation=True` records the old and new values and continues. Corpus identity and `seed` are not continuable (`CheckpointMigrationRequired`).
+
+Performance settings are a separate manifest block. `batch_size` (default 1) is how many passages share one recode request. `concurrency` caps in-flight calls. `token_budget` (default 6000) bounds that request. They do not change which codes the score proposes. Changing them on resume is a continuation, not a change of analytic procedure, and still needs `allow_changes` when the checkpoint already exists.
+
+`prepare_recode` splits the allowance across three purposes and interleaves them. `develop` rereads passages already assigned to a raised code. `compete` tests competing interpretations: within-category negative cases (the same code, another pole or consequence) and a bounded lexical neighborhood (`focused_neighbor_limit`, default 1; `focused_negative_case_limit`, default 1). `outside` examines passages outside that selection (`focused_outside_limit`, default 1), negative cases against a claim first. Shares `focused_share_develop`, `focused_share_compete`, and `focused_share_outside` default to one third each and must sum to 1. An empty purpose gives its share back to the others. The same `seed` replays the queue. `result.purpose_coverage` reports queued, reread, not reread, calls, and tokens for each purpose. A researcher incident, from the resume value or `focused_incidents.csv` (`passage_id`, `purpose`), can enter any purpose.
+
+`recode_worker` rereads a frozen snapshot. `commit_focused` is the only writer. An initial assignment the reread does not repeat is kept and flagged `focused_disagreement`. A quote that is not in the target passage is kept. If it is found in another passage, that passage is the attribution and the row is flagged `evidence_outside_passage`. If it is found nowhere, it is flagged and not assigned to a different passage. It is not dropped.
+
+Properties and dimensions are written to `category_development.json` (`state_version` 1). `relations` is null until a later stage writes them. Loading this state does not require an axial run. Each row keeps a disposition (`proposed`, `accepted`, `rejected`, `superseded`), an evidence condition (`anchored`, `disputed`, `insufficient`), and `downstream_eligible` (accepted, anchored, and not `needs_review`). `claim_support` stays `undefined` until a researcher sets `supported`, `partially_supported`, `contradicted`, or `indeterminate`. Citation anchoring, the share of quotes that locate a span, is a separate report. It is not claim support. Each row cites `category_revision_id` and `evidence_revision_id`. A category edit keeps the old text in `revision_history` and marks dependent claims and assignments `needs_review`. `category_development.json` and `focused_claims.csv` list every row. `downstream_claims.json` lists only eligible rows, and the file says so. `code_id_sidecar.json` maps Taguette tags to stable code ids. A label change is a rename only when an approved mapping says so. Otherwise a missing tag is kept and flagged `researcher_removed`, and a new tag is `ambiguous`.
+
+`claim_checkpoint` pauses after the reread when `interrupt` is true. `{"leave_claims": true}` keeps dispositions proposed. `{"accept_claims": true}` accepts anchored proposals. `{"claim_reviews": [{"entry_id": "...", "claim_support": "supported"}]}` records the researcher label. `{"category_edits": [{"code_id": "...", "definition": "..."}]}` revises a category without erasing dependents.
+
+`max_focused_review_calls` (default 8) and `max_focused_review_tokens` (default 24000) are ceilings, not measured costs. Calls are checked first, then tokens. Zero on either still runs the selection and, when `interrupt` is true, still pauses, then skips the model. Passages the allowance does not reach stay on their initial assignments and are listed as `focused_not_reread`, also broken out by purpose. The result status is `incomplete`, and `stop` is `call_allowance`, `token_allowance`, or `no_progress`. Work already written stays. `saturation_report["judgment"]` stays null. This stage does not set it.
+
+Weights are `focused_weight_frequency`, `focused_weight_documents`, and `focused_weight_analytic` (each default 1). `focused_min_score` defaults to the median of the positive scores. `coding_lens` accepts `charmaz` only. Axial lenses are not implemented. `scripts/evaluate_focused.py` compares initial coding with a focused reread offline and prints a live-cost estimate. It does not call an API. The plan is in [docs/focused-evaluation.md](docs/focused-evaluation.md).
 
 ## Install
 
