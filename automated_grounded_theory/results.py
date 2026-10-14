@@ -142,6 +142,37 @@ def load_run(directory: str | Path) -> OpenCodeResult:
     return OpenCodeResult.load(directory)
 
 
+def missing_slot_retry_cost(prompt_log: list) -> dict[str, int]:
+    """Token cost of solo retries for passages a batch reply left out.
+
+    The batch call is not included. Each retry is tagged ``missing_slot_retry``
+    on the prompt log when it is sent.
+    """
+    calls = 0
+    input_tokens = 0
+    output_tokens = 0
+    total_tokens = 0
+    for entry in prompt_log:
+        if not isinstance(entry, dict) or not entry.get("missing_slot_retry"):
+            continue
+        calls += 1
+        usage = entry.get("usage") or {}
+        incoming = int(usage.get("input_tokens") or 0)
+        outgoing = int(usage.get("output_tokens") or 0)
+        total = int(usage.get("total_tokens") or 0)
+        if total <= 0:
+            total = incoming + outgoing
+        input_tokens += incoming
+        output_tokens += outgoing
+        total_tokens += total
+    return {
+        "missing_slot_retry_calls": calls,
+        "missing_slot_retry_input_tokens": input_tokens,
+        "missing_slot_retry_output_tokens": output_tokens,
+        "missing_slot_retry_tokens": total_tokens,
+    }
+
+
 def result_from_state(
     state: dict,
     *,
@@ -158,6 +189,7 @@ def result_from_state(
             key: round(float(value), 4) for key, value in dict(state.get("stage_seconds") or {}).items()
         }
     metrics = dict(state.get("metrics") or {})
+    metrics.update(missing_slot_retry_cost(list(state.get("prompt_log") or [])))
     samples = list(metrics.get("coding_request_latency_seconds") or metrics.get("coding_seconds") or [])
     if samples:
         metrics["coding_p50"] = percentile(samples, 50)

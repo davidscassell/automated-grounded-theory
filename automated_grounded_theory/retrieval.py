@@ -694,6 +694,9 @@ async def cached_aembed_texts(
         return []
     model = embedding_model_id(embeddings)
     keys = [_content_key(model, text, role) for text in texts]
+    indexes_for: dict[tuple[str, str], list[int]] = {}
+    for index, key in enumerate(keys):
+        indexes_for.setdefault(key, []).append(index)
     loop = asyncio.get_running_loop()
     result: list[list[float] | None] = [None] * len(texts)
     mine_keys: list[tuple[str, str]] = []
@@ -736,9 +739,15 @@ async def cached_aembed_texts(
                 with _VECTOR_CACHE.lock:
                     for key, vector in zip(mine_keys, embedded):
                         stored = _store_vector(key, vector)
+                        # Keep the copy on this request. Storing the next vector
+                        # may evict this one; that only changes what a later
+                        # request can reuse.
+                        for index in indexes_for.get(key, []):
+                            if result[index] is None:
+                                result[index] = list(stored)
                         flight = _VECTOR_CACHE.inflight.pop(key, None)
                         if flight is not None and not flight.future.done():
-                            flight.future.set_result(stored)
+                            flight.future.set_result(list(stored))
             except BaseException as exc:
                 _release_inflight(mine_keys, exc)
                 raise
@@ -868,21 +877,55 @@ def assignment_ids(entry: Mapping) -> list[str]:
     return [assignment_ident(item) for item in evidence_rows(entry)]
 
 
-def record_review(entry: dict, fingerprint: str, seen_ids: Sequence[str] | None = None) -> None:
-    """Remember the fingerprint and the assignment ids this review saw.
+# How many examples a sweep or coding prompt shows for one code. Review
+# bookkeeping uses the same bound, so an id is "reviewed" only when it was sent.
+PROMPT_EXAMPLE_LIMIT = 2
 
-    ``seen_ids`` is the evidence that was on the code when the review was
-    built. Later assignments are "since the last review" and are not truncated
-    out of the next prompt.
+
+def record_review(
+    entry: dict,
+    fingerprint: str,
+    seen_ids: Sequence[str] | None = None,
+    sent_ids: Sequence[str] | None = None,
+) -> None:
+    """Remember the fingerprint, the ids that were sent, and the ids that existed.
+
+    ``seen_ids`` is every assignment available when the review was built.
+    ``sent_ids`` is the subset that was actually put in the prompt. Only the
+    sent ids count as reviewed. Assignments that were available but not sent
+    stay pending, so a later review still includes them, in a bounded batch.
+    ``reviewed_assignment_ids`` is the cumulative sent set. Each ``reviews_seen``
+    row keeps that review's sent ids separate from the ids available then.
     """
-    ids = [str(item) for item in (seen_ids if seen_ids is not None else assignment_ids(entry))]
+    available = [str(item) for item in (seen_ids if seen_ids is not None else assignment_ids(entry))]
+    if sent_ids is None:
+        sent = [assignment_ident(item) for item in select_prompt_examples(entry, limit=PROMPT_EXAMPLE_LIMIT)]
+    else:
+        sent = [str(item) for item in sent_ids if str(item)]
+    prior = [str(item) for item in (entry.get("reviewed_assignment_ids") or [])] if "reviewed_assignment_ids" in entry else []
+    cumulative = list(dict.fromkeys([*prior, *sent]))
     entry["reviewed_revision"] = fingerprint
-    entry["reviewed_assignment_ids"] = list(ids)
+    entry["reviewed_assignment_ids"] = cumulative
+    entry["available_assignment_ids"] = list(available)
     history = []
     for item in entry.get("reviews_seen") or []:
         if isinstance(item, Mapping):
-            history.append({"fingerprint": str(item.get("fingerprint") or ""), "assignment_ids": list(item.get("assignment_ids") or [])})
-    history.append({"fingerprint": fingerprint, "assignment_ids": list(ids)})
+            history.append(
+                {
+                    "fingerprint": str(item.get("fingerprint") or ""),
+                    "assignment_ids": list(item.get("sent_assignment_ids") or item.get("assignment_ids") or []),
+                    "sent_assignment_ids": list(item.get("sent_assignment_ids") or item.get("assignment_ids") or []),
+                    "available_assignment_ids": list(item.get("available_assignment_ids") or []),
+                }
+            )
+    history.append(
+        {
+            "fingerprint": fingerprint,
+            "assignment_ids": list(sent),
+            "sent_assignment_ids": list(sent),
+            "available_assignment_ids": list(available),
+        }
+    )
     entry["reviews_seen"] = history
 
 
@@ -990,13 +1033,13 @@ def _diverse_examples(pool: Sequence[Mapping], room: int, chosen: Sequence[Mappi
 def select_prompt_examples(entry: Mapping, *, limit: int = 3) -> list[dict]:
     """A bounded example set for prompts. Not the review digest.
 
-    Evidence added since the last review is always included, even when that
-    is more than ``limit``. The last review's assignment ids are
-    ``reviewed_assignment_ids`` (and each review is appended to
-    ``reviews_seen``). Representative and contrasting quotes from the rest of
-    the history fill up to ``limit``: one new document at a time, then quotes
-    that overlap the chosen set the least, then passage order. Document
-    diversity runs before that passage-order fill.
+    New evidence is sent in batches of at most ``limit``, newest and most
+    contrasting first. It is not all copied into one prompt. The last review's
+    sent ids are ``reviewed_assignment_ids``. Ids that existed but were not
+    sent stay fresh, so the next review takes another bounded batch.
+    Representative and contrasting quotes from the already-sent history fill
+    any room left under ``limit``: one new document at a time, then quotes
+    that overlap the chosen set the least, then passage order.
     """
     rows = evidence_rows(entry)
     cap = max(0, int(limit))
@@ -1004,18 +1047,19 @@ def select_prompt_examples(entry: Mapping, *, limit: int = 3) -> list[dict]:
         return []
     reviewed = _reviewed_ids(entry)
     if reviewed is None:
-        fresh: list[Mapping] = []
-        pool = rows
+        fresh = list(rows)
+        pool: list[Mapping] = []
     else:
         fresh = [item for item in rows if assignment_ident(item) not in reviewed]
         pool = [item for item in rows if assignment_ident(item) in reviewed]
-    if len(rows) <= cap and not fresh:
-        return [dict(item) for item in rows]
-    chosen = [dict(item) for item in fresh]
+    if len(fresh) <= cap:
+        chosen = [dict(item) for item in fresh]
+    else:
+        chosen = _diverse_examples(fresh, cap, [])
     if len(chosen) >= cap:
-        return chosen
+        return chosen[:cap]
     chosen.extend(_diverse_examples(pool, cap - len(chosen), chosen))
-    return chosen
+    return chosen[:cap]
 
 
 def review_fingerprint(entry: Mapping) -> str:
@@ -1037,8 +1081,19 @@ def review_fingerprint(entry: Mapping) -> str:
 
 
 def code_needs_review(entry: Mapping) -> bool:
-    """True when the code is new or its review fingerprint changed."""
-    return str(entry.get("reviewed_revision") or "") != review_fingerprint(entry)
+    """True when the code is new, its fingerprint changed, or evidence was not sent.
+
+    A review that showed two of ten assignments does not retire the other
+    eight. Those ids stay pending and the code is reviewed again, still
+    inside the example limit. A fingerprint with no per-assignment bookkeeping
+    is unchanged: older rows recorded only the revision.
+    """
+    if str(entry.get("reviewed_revision") or "") != review_fingerprint(entry):
+        return True
+    sent = _reviewed_ids(entry)
+    if sent is None:
+        return False
+    return any(assignment_ident(item) not in sent for item in evidence_rows(entry))
 
 
 def full_audit_due(sweep_index: int, *, consolidation: bool, full_audit_every: int) -> bool:
@@ -1155,6 +1210,51 @@ def _cache_vector(embeddings, text: str, role: str, vector: Sequence[float]) -> 
         return list(_store_vector(key, vector))
 
 
+def _hold_cached(embeddings, texts: Sequence[str], role: str, held: dict[tuple[str, str], list[float]]) -> None:
+    """Copy vectors this request already has. Later eviction cannot drop the copy."""
+    model = embedding_model_id(embeddings)
+    for text in texts:
+        key = _content_key(model, text, role)
+        if key in held:
+            continue
+        hit = _cached_vector(embeddings, text, role)
+        if hit is not None:
+            held[key] = list(hit)
+
+
+def _hold_stored(
+    embeddings,
+    text: str,
+    role: str,
+    vector: Sequence[float],
+    held: dict[tuple[str, str], list[float]],
+) -> list[float]:
+    """Cache ``vector`` and keep the request's copy. Eviction only affects reuse."""
+    stored = _cache_vector(embeddings, text, role, vector)
+    held[_content_key(embedding_model_id(embeddings), text, role)] = list(stored)
+    return stored
+
+
+def _vectors_from_hold(
+    embeddings,
+    texts: Sequence[str],
+    role: str,
+    held: dict[tuple[str, str], list[float]],
+) -> list[list[float]] | None:
+    """Return this request's vectors. None when one text was never held or cached."""
+    model = embedding_model_id(embeddings)
+    result: list[list[float]] = []
+    for text in texts:
+        key = _content_key(model, text, role)
+        vector = held.get(key)
+        if vector is None:
+            vector = _cached_vector(embeddings, text, role)
+        if vector is None:
+            return None
+        result.append(list(vector))
+    return result
+
+
 def _batch_query_api(embeddings):
     """A provider call that embeds many queries at once, or None.
 
@@ -1231,6 +1331,8 @@ async def _embed_query_batch(embeddings, texts: Sequence[str], *, batch_size: in
     """
     fn, sync = _batch_query_api(embeddings)
     size = max(1, int(batch_size))
+    held: dict[tuple[str, str], list[float]] = {}
+    _hold_cached(embeddings, texts, "query", held)
     pending = _uncached_unique(embeddings, texts, "query")
     chunks = [pending[start : start + size] for start in range(0, len(pending), size)]
     model = embedding_model_id(embeddings)
@@ -1255,7 +1357,7 @@ async def _embed_query_batch(embeddings, texts: Sequence[str], *, batch_size: in
                         raise RuntimeError("embedding model returned a different number of vectors than texts")
                     _check_vectors(embeddings, vectors)
                     for text, vector in zip(current, vectors):
-                        _cache_vector(embeddings, text, "query", vector)
+                        _hold_stored(embeddings, text, "query", vector, held)
 
                 await _retry_embedding(limiter, attempt)
         finally:
@@ -1269,10 +1371,10 @@ async def _embed_query_batch(embeddings, texts: Sequence[str], *, batch_size: in
             keys = [_content_key(model, text, "query") for text in chunk]
             jobs.append((one(chunk, keys), keys))
         await _await_query_group(jobs)
-    cached = [_cached_vector(embeddings, text, "query") for text in texts]
-    if any(vector is None for vector in cached):
+    collected = _vectors_from_hold(embeddings, texts, "query", held)
+    if collected is None:
         raise RuntimeError("embedding cache missed a query it had claimed")
-    return [list(vector) for vector in cached if vector is not None]
+    return collected
 
 
 async def _embed_queries_one_by_one(embeddings, texts: Sequence[str], limiter) -> list[list[float]]:
@@ -1284,6 +1386,8 @@ async def _embed_queries_one_by_one(embeddings, texts: Sequence[str], limiter) -
     stay until those tasks finish, and a sibling another caller is waiting on
     is not cancelled when this caller is cancelled.
     """
+    held: dict[tuple[str, str], list[float]] = {}
+    _hold_cached(embeddings, texts, "query", held)
     unique = _uncached_unique(embeddings, texts, "query")
     model = embedding_model_id(embeddings)
 
@@ -1299,7 +1403,7 @@ async def _embed_queries_one_by_one(embeddings, texts: Sequence[str], limiter) -
                     if _cached_vector(embeddings, text, "query") is not None:
                         return
                     vector = await _invoke_one_query(embeddings, text)
-                    _cache_vector(embeddings, text, "query", vector)
+                    _hold_stored(embeddings, text, "query", vector, held)
 
                 await _retry_embedding(limiter, attempt)
         finally:
@@ -1311,10 +1415,10 @@ async def _embed_queries_one_by_one(embeddings, texts: Sequence[str], limiter) -
             key = _content_key(model, text, "query")
             jobs.append((one(text, key), [key]))
         await _await_query_group(jobs)
-    cached = [_cached_vector(embeddings, text, "query") for text in texts]
-    if any(vector is None for vector in cached):
+    collected = _vectors_from_hold(embeddings, texts, "query", held)
+    if collected is None:
         raise RuntimeError("embedding cache missed a query it had claimed")
-    return [list(vector) for vector in cached if vector is not None]
+    return collected
 
 
 async def aembed_texts(
@@ -1364,6 +1468,8 @@ async def _embed_document_batches(
     that is still embedding, and a later request for that sibling is a cache hit.
     """
     size = max(1, int(batch_size))
+    held: dict[tuple[str, str], list[float]] = {}
+    _hold_cached(embeddings, texts, role, held)
     pending = _uncached_unique(embeddings, texts, role)
     chunks = [pending[start : start + size] for start in range(0, len(pending), size)]
     model = embedding_model_id(embeddings)
@@ -1384,7 +1490,7 @@ async def _embed_document_batches(
                         raise RuntimeError("embedding model returned a different number of vectors than texts")
                     _check_vectors(embeddings, vectors)
                     for text, vector in zip(current, vectors):
-                        _cache_vector(embeddings, text, role, vector)
+                        _hold_stored(embeddings, text, role, vector, held)
 
                 await _retry_embedding(limiter, attempt)
         finally:
@@ -1398,10 +1504,10 @@ async def _embed_document_batches(
             keys = [_content_key(model, text, role) for text in chunk]
             jobs.append((one(chunk, keys), keys))
         await _await_query_group(jobs)
-    cached = [_cached_vector(embeddings, text, role) for text in texts]
-    if any(vector is None for vector in cached):
+    collected = _vectors_from_hold(embeddings, texts, role, held)
+    if collected is None:
         raise RuntimeError("embedding cache missed a text it had claimed")
-    return [list(vector) for vector in cached if vector is not None]
+    return collected
 
 
 def _rate_limit(exc: BaseException) -> bool:

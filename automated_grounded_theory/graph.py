@@ -79,7 +79,7 @@ from automated_grounded_theory.prompts import (
     serialize_messages,
     validation_feedback,
 )
-from automated_grounded_theory.results import result_from_state
+from automated_grounded_theory.results import missing_slot_retry_cost, result_from_state
 from automated_grounded_theory.retrieval import (
     CodeRetriever,
     EmbeddingCodeRetriever,
@@ -88,10 +88,13 @@ from automated_grounded_theory.retrieval import (
     code_text,
     comparison_order,
     assignment_ids,
+    assignment_ident,
     full_audit_due,
     hint_pairs,
+    PROMPT_EXAMPLE_LIMIT,
     record_review,
     review_fingerprint,
+    select_prompt_examples,
     select_cross_chunk,
     select_prompt_codes,
     shared_codebook_vectors,
@@ -112,7 +115,12 @@ from automated_grounded_theory.schemas import (
     QuoteFitBatch,
     SweepCoding,
 )
-from automated_grounded_theory.segment import interleave_document_queue, next_round_count, plan_coding
+from automated_grounded_theory.segment import (
+    SHORT_TURN_CHARS,
+    interleave_document_queue,
+    next_round_count,
+    plan_coding,
+)
 
 logger = logging.getLogger("automated_grounded_theory")
 
@@ -694,6 +702,8 @@ def _commit_node(runtime: RunConfig):
         )
         metrics["schema_repairs"] = int(getattr(limiter, "schema_repairs", 0) or 0)
         metrics["cache_hits"] = int(getattr(limiter, "cache_hits", 0) or 0)
+        prompt_log = list(update.get("prompt_log") or state.get("prompt_log") or [])
+        metrics.update(missing_slot_retry_cost(prompt_log))
         update["review"] = review
         update["committed_ids"] = committed
         update["proposal_buffer"] = {"__reset__": True}
@@ -736,7 +746,7 @@ def _segment_node(state: CodingState) -> dict:
         seed=metadata["seed"],
         parallel_documents=bool(metadata.get("parallel_documents")),
         review_mode=str(metadata.get("review_mode") or "document"),
-        short_turn_chars=int(metadata.get("short_turn_chars", 60) or 0),
+        short_turn_chars=int(metadata.get("short_turn_chars", SHORT_TURN_CHARS) or 0),
     )
     branch_codebooks = {doc_id: {} for doc_id in plan.branch_queues} if plan.parallel else {}
     queue = list(plan.queue)
@@ -1815,6 +1825,7 @@ async def _retry_missing_slots(
                 feedback,
                 budget,
                 use_cache=False,
+                missing_slot_retry=True,
             )
             alone = _align_batch(alone_parsed, [passage])
             if alone and not alone[0].get("missing_slot"):
@@ -1851,6 +1862,7 @@ async def _request_coding(
     budget: int,
     *,
     use_cache: bool = True,
+    missing_slot_retry: bool = False,
 ) -> dict:
     messages = _fit_coding_messages(runtime, subset, entries, ranks, feedback, budget)
     passage_ids = ",".join(str(passage.get("passage_id")) for passage in subset)
@@ -1871,6 +1883,7 @@ async def _request_coding(
         ),
         token_budget=budget,
         use_cache=use_cache,
+        missing_slot_retry=missing_slot_retry,
     )
 
 
@@ -2366,10 +2379,16 @@ def _sweep_node(runtime: RunConfig, *, consolidation: bool = False):
         )
         applied["codebook"] = book
         applied["segments"] = rows
-        seen_ids = parsed.get("reviewed_assignment_ids") or {}
+        sent_ids = parsed.get("sent_assignment_ids") or {}
+        available_ids = parsed.get("available_assignment_ids") or {}
         for key, fingerprint in (parsed.get("reviewed_revisions") or {}).items():
             if key in applied["codebook"]:
-                record_review(applied["codebook"][key], fingerprint, seen_ids.get(key))
+                record_review(
+                    applied["codebook"][key],
+                    fingerprint,
+                    available_ids.get(key),
+                    sent_ids.get(key),
+                )
         applied.setdefault("ops", []).extend(post_ops)
         applied.setdefault("review", []).extend(op for op in post_ops if op.get("status") == "review")
         if runtime.check_model is not None and applied["accepted_merges"] and quote_stats["quotes_checked"] == 0:
@@ -3040,6 +3059,8 @@ async def _sweep_chunks(
                 ],
                 "reviewed_revisions": {},
                 "reviewed_assignment_ids": {},
+                "sent_assignment_ids": {},
+                "available_assignment_ids": {},
                 "audit": audit,
                 "codes_sent": 0,
             },
@@ -3225,7 +3246,8 @@ async def _sweep_chunks(
     confirmed.sort(key=lambda item: item[0])
     parts = []
     reviewed: dict[str, str] = {}
-    reviewed_ids: dict[str, list[str]] = {}
+    sent_ids: dict[str, list[str]] = {}
+    available_ids: dict[str, list[str]] = {}
     for index, parsed, note, call in confirmed:
         if note:
             warnings.append(note)
@@ -3236,7 +3258,9 @@ async def _sweep_chunks(
                 key = code_key(str(entry.get("code") or ""))
                 if key:
                     reviewed[key] = review_fingerprint(entry)
-                    reviewed_ids[key] = assignment_ids(entry)
+                    shown = select_prompt_examples(entry, limit=PROMPT_EXAMPLE_LIMIT)
+                    sent_ids[key] = [assignment_ident(item) for item in shown]
+                    available_ids[key] = assignment_ids(entry)
         parts.append(
             {
                 "chunk_index": index,
@@ -3253,7 +3277,9 @@ async def _sweep_chunks(
     reconciled["skipped_candidates"] = skipped_candidates
     reconciled["warnings"] = warnings
     reconciled["reviewed_revisions"] = reviewed
-    reconciled["reviewed_assignment_ids"] = reviewed_ids
+    reconciled["reviewed_assignment_ids"] = sent_ids
+    reconciled["sent_assignment_ids"] = sent_ids
+    reconciled["available_assignment_ids"] = available_ids
     reconciled["audit"] = audit
     reconciled["codes_sent"] = len(due)
     return reconciled, candidates, len(chunks)
@@ -3401,6 +3427,7 @@ async def _ainvoke_structured(
     reserved_output: int | None = None,
     token_budget: int | None = None,
     use_cache: bool = True,
+    missing_slot_retry: bool = False,
 ) -> dict:
     timeout = None
     if kind in {"sweep", "merge_verify", "definition_rewrite", "quote_fit", "candidate_discovery"}:
@@ -3421,17 +3448,17 @@ async def _ainvoke_structured(
         )
     except Exception as exc:
         raise CodingError(f"{kind} failed for {passage_id}: {exc}") from exc
-    _append_prompt_log(
-        runtime,
-        {
-            "kind": kind,
-            "passage_id": passage_id,
-            "model": model_name,
-            "messages": serialize_messages(used),
-            "output": payload,
-            "usage": usage,
-        },
-    )
+    entry = {
+        "kind": kind,
+        "passage_id": passage_id,
+        "model": model_name,
+        "messages": serialize_messages(used),
+        "output": payload,
+        "usage": usage,
+    }
+    if missing_slot_retry:
+        entry["missing_slot_retry"] = True
+    _append_prompt_log(runtime, entry)
     return payload
 
 

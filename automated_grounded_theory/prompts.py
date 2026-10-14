@@ -32,7 +32,7 @@ from automated_grounded_theory.schemas import (
     ThemeRequest,
     ThemeReviewRequest,
 )
-from automated_grounded_theory.retrieval import select_prompt_examples
+from automated_grounded_theory.retrieval import PROMPT_EXAMPLE_LIMIT, select_prompt_examples
 from automated_grounded_theory.validation import code_key
 
 STANCE_POLICY = (
@@ -279,7 +279,7 @@ def stable_code_id(entry: Mapping[str, Any]) -> str:
 
 def code_input(entry: Mapping[str, Any]) -> CodeInput:
     examples = []
-    for item in select_prompt_examples(entry, limit=2):
+    for item in select_prompt_examples(entry, limit=PROMPT_EXAMPLE_LIMIT):
         quote = clip(str(item.get("quote") or ""), 240)
         if not quote:
             continue

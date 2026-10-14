@@ -218,6 +218,8 @@ class QuoteAnchor:
     doc_spans: tuple[tuple[int, int], ...] = ()
     flags: tuple[str, ...] = ()
     located_passage_id: str = ""
+    located_doc_id: str = ""
+    located_doc_name: str = ""
 
     @property
     def doc_start(self) -> int | None:
@@ -561,6 +563,8 @@ def _place(
     haystack: str,
     model_quote: str,
     located_passage_id: str = "",
+    located_doc_id: str = "",
+    located_doc_name: str = "",
 ) -> QuoteAnchor:
     doc_spans: tuple[tuple[int, int], ...] = ()
     if origin is not None and hit.spans:
@@ -575,6 +579,8 @@ def _place(
         doc_spans=doc_spans,
         flags=hit.flags,
         located_passage_id=located_passage_id,
+        located_doc_id=located_doc_id,
+        located_doc_name=located_doc_name,
     )
 
 
@@ -605,6 +611,8 @@ def _anchor_in_request(
             haystack=other_text,
             model_quote=quote,
             located_passage_id=other_id,
+            located_doc_id=str(other.get("doc_id") or ""),
+            located_doc_name=str(other.get("doc_name") or ""),
         )
         if best is None or _better(anchored, best):
             best = anchored

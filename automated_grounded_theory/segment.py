@@ -25,9 +25,11 @@ _QUESTION_SPEAKER = re.compile(
     r"^(interviewer|moderator|question|q)\b",
     re.IGNORECASE,
 )
-# A whole turn at or under this length is a filler (for example "Participant: Ovid.").
-# It is merged into the adjacent answer. Zero keeps every turn as its own passage.
-SHORT_TURN_CHARS = 60
+# Zero keeps every speaker turn as its own passage. A positive limit merges a
+# short turn into an adjacent answer, but only when no interviewer question
+# sits between them. The default is off: a short answer such as "I quit." is
+# often the incident, and a length cap cannot tell that from filler like "Ovid."
+SHORT_TURN_CHARS = 0
 _KNOWN_SPEAKER_LABELS = frozenset(
     {
         "interviewer",
@@ -109,15 +111,25 @@ _ABBREVIATIONS = frozenset(
         "i.e",
     }
 )
-# Line start, after optional indent. Words only, so "best.   Interviewer:"
-# is not one label. A period inside the label is what used to swallow the
-# next speaker.
-_SPEAKER_LINE = re.compile(
-    r"(?m)^[ \t]*([A-Za-z][\w'\-]{0,30}(?:[ \t]+[A-Za-z][\w'\-]{0,30}){0,3}):[ \t]+"
+# A label part may be a word, a number (Participant 02), or initials (J.D.).
+# The first alternative is initials so "J.D.:" is not read as the word "J".
+_WORD_PART = r"[A-Za-z][\w'\-]{0,30}"
+_NUMBER_PART = r"\d{1,4}"
+_INITIALS_PART = r"[A-Za-z](?:\.[ \t]*[A-Za-z]){1,3}\.?"
+_SPEAKER_LABEL = (
+    rf"(?:{_INITIALS_PART}(?:[ \t]+{_WORD_PART}){{0,2}}"
+    rf"|{_WORD_PART}(?:[ \t]+(?:{_WORD_PART}|{_NUMBER_PART})){{0,3}})"
 )
+# Line start, after optional indent. "best.   Interviewer:" is not one label:
+# a period ends the previous sentence instead of joining the next speaker.
+_SPEAKER_LINE = re.compile(rf"(?m)^[ \t]*({_SPEAKER_LABEL}):[ \t]+")
 # Mid-line only after a sentence boundary, and only for a short or known label.
-_SPEAKER_MID = re.compile(
-    r"(?<=[.!?])[ \t]+([A-Za-z][\w'\-]{0,30}(?:[ \t]+[A-Za-z][\w'\-]{0,30}){0,2}):[ \t]+"
+_SPEAKER_MID = re.compile(rf"(?<=[.!?])[ \t]+({_SPEAKER_LABEL}):[ \t]+")
+_INITIALS_LABEL = re.compile(rf"^{_INITIALS_PART}$")
+# Coverage uses this, not the segmentation parser. It is intentionally looser
+# so a label the parser missed can still be flagged inside question context.
+_LOOSE_SPEAKER = re.compile(
+    r"(?m)(?:^|(?<=[.!?]))[ \t]*([A-Za-z][A-Za-z0-9.'\-]{0,40}(?:[ \t]+[A-Za-z0-9][A-Za-z0-9.'\-]{0,20}){0,3}):[ \t]+\S"
 )
 _SPEAKER = _SPEAKER_LINE
 
@@ -134,6 +146,8 @@ class CodingPlan:
     parallel: bool = False
     uncovered_answers: list[dict] = field(default_factory=list)
     attached_preambles: list[dict] = field(default_factory=list)
+    source_uncovered: list[dict] = field(default_factory=list)
+    question_context_turns: list[dict] = field(default_factory=list)
 
 
 def interleave_document_queue(passages: Sequence[Mapping], queue: Sequence[int], batch_size: int) -> list[int]:
@@ -222,10 +236,12 @@ def plan_coding(
     passages across documents. That weakens constant comparison, because a
     later passage in a document can be coded before an earlier one.
 
-    ``short_turn_chars`` (default 60) merges a very short speaker turn, such as
-    ``Participant: Ovid.``, into the adjacent answer passage. The turn is not
-    skipped and its text is not dropped. Zero leaves every turn as its own
-    passage. This changes passage boundaries for a new run.
+    ``short_turn_chars`` defaults to 0, so every speaker turn stays its own
+    passage. A positive value merges a shorter turn into an adjacent answer,
+    and never across an interviewer question that sits between them. ``I quit.``
+    is a meaningful incident that a length cap would otherwise hide. The text
+    is not skipped and not dropped. This changes passage boundaries for a new
+    run.
     """
     if unit not in UNITS:
         raise ValueError(f"unit must be one of {', '.join(UNITS)}. Got {unit!r}.")
@@ -257,6 +273,8 @@ def plan_coding(
             parallel=parallel_documents,
             uncovered_answers=_collect_uncovered(passages),
             attached_preambles=_collect_preambles(passages),
+            source_uncovered=[],
+            question_context_turns=[],
         )
 
     rng = random.Random(seed)
@@ -283,6 +301,8 @@ def plan_coding(
             parallel=True,
             uncovered_answers=_collect_uncovered(passages),
             attached_preambles=_collect_preambles(passages),
+            source_uncovered=_collect_marked(passages, "source_uncovered_text", "source_uncovered_chars"),
+            question_context_turns=_collect_turns(passages),
         )
 
     if review_mode == "document":
@@ -311,6 +331,8 @@ def plan_coding(
         parallel=False,
         uncovered_answers=_collect_uncovered(passages),
         attached_preambles=_collect_preambles(passages),
+        source_uncovered=_collect_marked(passages, "source_uncovered_text", "source_uncovered_chars"),
+        question_context_turns=_collect_turns(passages),
     )
 
 
@@ -377,6 +399,7 @@ def segment_document(
             answers_only=True,
         )
         _attach_leading_preamble(text, passages, warnings, document.doc_id)
+    _apply_source_coverage(text, passages, warnings, document.doc_id)
     return passages, warnings
 
 
@@ -530,11 +553,13 @@ def _segment_incidents(
     A short answer stays whole. A long answer splits only on sentence boundaries
     and never mid-answer. One sentence longer than the cap stays intact.
 
-    A speaker turn whose text is at most ``short_turn_chars`` (default 60,
-    for example ``Participant: Ovid.``) is merged into the adjacent answer
-    passage. It is not skipped and its characters stay in that passage. Zero
-    disables the merge. New runs pick up the new boundaries; a checkpoint does
-    not re-segment.
+    A speaker turn whose text is at most ``short_turn_chars`` is merged into
+    the adjacent answer when nothing that looks like an interviewer question
+    sits between them. The default is 0, so the merge is off: ``I quit.`` is
+    a meaningful incident, and a length cap cannot tell it from filler such
+    as ``Ovid.``. The turn is not skipped and its characters stay in a
+    passage. New runs pick up the new boundaries; a checkpoint does not
+    re-segment.
     """
     warnings: list[str] = []
     pairs = _question_answer_pairs(text)
@@ -574,6 +599,7 @@ def _segment_incidents(
         answers_only=False,
     )
     _attach_leading_preamble(text, passages, warnings, document.doc_id)
+    _apply_source_coverage(text, passages, warnings, document.doc_id)
     gap = _uncovered_answer_text(text, pairs, passages)
     if gap:
         warnings.append(
@@ -732,7 +758,11 @@ def _speaker_matches(text: str) -> list[_SpeakerHit]:
     ``I said:``. A line-start label whose last word is a known role matches
     only that word, so ``download the results   Interviewer:`` is ``Interviewer``.
     """
-    line_hits = [_line_speaker_hit(match) for match in _SPEAKER_LINE.finditer(text)]
+    line_hits = [
+        hit
+        for hit in (_line_speaker_hit(match) for match in _SPEAKER_LINE.finditer(text))
+        if _label_allowed(hit.group(1))
+    ]
     seen = {hit.group(1).strip().casefold() for hit in line_hits}
     covered = [(hit.start(), hit.end()) for hit in line_hits]
     found = list(line_hits)
@@ -740,7 +770,7 @@ def _speaker_matches(text: str) -> list[_SpeakerHit]:
         if any(start <= match.start(1) < end for start, end in covered):
             continue
         label = match.group(1).strip()
-        if not _midline_label_ok(label, seen):
+        if not _midline_label_ok(label, seen) or not _label_allowed(label):
             continue
         found.append(_SpeakerHit(match))
         covered.append((match.start(), match.end()))
@@ -755,13 +785,59 @@ def _speaker_matches(text: str) -> list[_SpeakerHit]:
     return kept
 
 
+def _is_initials(label: str) -> bool:
+    return _INITIALS_LABEL.fullmatch(label.strip()) is not None
+
+
+def _initials_blocked(label: str) -> bool:
+    """Latin abbreviations and similar dotted forms are not speakers."""
+    stripped = label.strip().casefold().rstrip(".")
+    letters = re.sub(r"[^a-z]", "", stripped)
+    blocked = {item.rstrip(".") for item in _ABBREVIATIONS}
+    blocked.update({"eg", "ie", "ps", "vs", "us", "usa", "eg", "ie"})
+    return stripped in blocked or letters in blocked or letters in _ABBREVIATIONS
+
+
+def _label_allowed(label: str) -> bool:
+    """Numbered and initialed labels, without figure/table/abbreviation hits.
+
+    A number is allowed on a label whose other words are not the midline
+    blocklist (``Table 1`` is not a speaker; ``Participant 02`` is). Initials
+    such as ``J.D.`` are speakers. ``e.g.`` and ``U.S.`` are not.
+    """
+    text = label.strip()
+    if not text:
+        return False
+    if _is_initials(text):
+        return not _initials_blocked(text)
+    words = text.split()
+    if any(word.isdigit() for word in words):
+        letters = [word for word in words if not word.isdigit()]
+        if not letters or not any(character.isalpha() for character in text):
+            return False
+        if any(word.casefold() in _MIDLINE_SPEAKER_BLOCKLIST for word in letters):
+            return False
+    return True
+
+
 def _midline_label_ok(label: str, seen: set[str]) -> bool:
     key = label.strip().casefold()
     if not key:
         return False
     if key in _KNOWN_SPEAKER_LABELS or key in seen:
         return True
+    if _is_initials(label) and not _initials_blocked(label):
+        return True
     words = label.split()
+    letter_words = [word for word in words if not word.isdigit()]
+    if any(word.isdigit() for word in words):
+        if not letter_words or any(word.casefold() in _MIDLINE_SPEAKER_BLOCKLIST for word in letter_words):
+            return False
+        if not all(word[:1].isupper() for word in letter_words):
+            return False
+        if any(word.casefold() in _KNOWN_SPEAKER_LABELS for word in letter_words):
+            return True
+        return 2 <= len(label) <= 24 and 1 <= len(letter_words) <= 2
     short = 2 <= len(label) <= 24 and 1 <= len(words) <= 2 and all(word[:1].isupper() for word in words)
     if not short or key in _MIDLINE_SPEAKER_BLOCKLIST:
         return False
@@ -810,7 +886,7 @@ def _absorb_short_passages(
         if not is_short(passage) or not is_answer(passage):
             index += 1
             continue
-        target = _adjacent_answer(remaining, index, is_answer)
+        target = _adjacent_answer(text, remaining, index, is_answer)
         if target is None:
             index += 1
             continue
@@ -825,13 +901,44 @@ def _absorb_short_passages(
     return remaining
 
 
-def _adjacent_answer(passages: Sequence[Mapping], index: int, is_answer) -> dict | None:
+def _gap_has_question(text: str, left: Mapping, right: Mapping) -> bool:
+    """True when an interviewer question sits between two passages.
+
+    Merging across that question would attach one answer to a different
+    question. The characters between the spans are the check. A question that
+    is only stored on a passage's question field still appears in ``text``.
+    """
+    left_start = int(left.get("start_offset") or 0)
+    left_end = int(left.get("end_offset") or 0)
+    right_start = int(right.get("start_offset") or 0)
+    right_end = int(right.get("end_offset") or 0)
+    gap_start = min(left_end, right_end)
+    gap_end = max(left_start, right_start)
+    if gap_end <= gap_start:
+        return False
+    gap = text[gap_start:gap_end]
+    for hit in _speaker_matches(gap):
+        if _QUESTION_SPEAKER.match(hit.group(1).strip()):
+            return True
+    return False
+
+
+def _adjacent_answer(text: str, passages: Sequence[Mapping], index: int, is_answer) -> dict | None:
+    """Nearest answer that can be merged without crossing an interviewer question."""
+    passage = passages[index]
+    candidates: list[Mapping] = []
     for cursor in range(index - 1, -1, -1):
         if is_answer(passages[cursor]):
-            return passages[cursor]
+            candidates.append(passages[cursor])
+            break
     for cursor in range(index + 1, len(passages)):
         if is_answer(passages[cursor]):
-            return passages[cursor]
+            candidates.append(passages[cursor])
+            break
+    for target in candidates:
+        if _gap_has_question(text, passage, target):
+            continue
+        return target
     return None
 
 
@@ -965,6 +1072,174 @@ def _uncovered_answer_text(
             regions.append(text[buf_start:right])
     kept = [region.strip() for region in regions if region.strip()]
     return "\n".join(kept)
+
+
+def _apply_source_coverage(text: str, passages: list[dict], warnings: list[str], doc_id: str) -> None:
+    """Compare source characters with passage text and question context.
+
+    This does not ask the speaker parser which regions are answers. Every
+    non-whitespace character has to sit in a passage span or in question
+    context (the question string plus the speaker label that introduces it).
+    A speaker-like stretch that is only inside a question is flagged. Any
+    other missing character is warned.
+    """
+    report = _source_text_coverage(text, passages)
+    uncovered = str(report.get("uncovered") or "")
+    chars = int(report.get("uncovered_chars") or 0)
+    turns = [str(item) for item in (report.get("question_turns") or []) if str(item)]
+    if chars:
+        warnings.append(
+            f"{doc_id}: {chars} non-whitespace characters are in neither a passage nor question context."
+        )
+    if turns:
+        warnings.append(f"{doc_id}: speaker turn text is only in question context: " + " | ".join(turns))
+    if not passages or (not chars and not turns):
+        return
+    for passage in passages:
+        metadata = dict(passage.get("metadata") or {})
+        if chars:
+            metadata["source_uncovered_chars"] = chars
+            metadata["source_uncovered_text"] = uncovered
+        if turns:
+            metadata["question_context_turns"] = list(turns)
+        passage["metadata"] = metadata
+
+
+def _source_text_coverage(text: str, passages: Sequence[Mapping]) -> dict:
+    """Parser-independent coverage of ``text``.
+
+    ``covered`` is 2 inside a passage span and 1 inside question context.
+    Passage text wins when the two overlap. The return value counts
+    non-whitespace characters that are still 0, and lists speaker-like text
+    that is only in question context.
+    """
+    covered = bytearray(len(text))
+    for passage in passages:
+        start = max(0, int(passage.get("start_offset") or 0))
+        end = min(len(text), int(passage.get("end_offset") or 0))
+        for index in range(start, end):
+            covered[index] = 2
+    bodies: list[tuple[int, int]] = []
+    for passage in passages:
+        question = str(passage.get("question") or "")
+        if not question:
+            continue
+        start_offset = int(passage.get("start_offset") or 0)
+        index = text.rfind(question, 0, max(start_offset, 0))
+        if index < 0:
+            index = text.find(question)
+        if index < 0:
+            continue
+        bodies.append((index, index + len(question)))
+        line_start = text.rfind("\n", 0, index) + 1
+        prefix = text[line_start:index]
+        context_start = index
+        if re.fullmatch(r"[ \t]*[^\n:]{1,80}:[ \t]*", prefix):
+            context_start = line_start
+        for cursor in range(context_start, index + len(question)):
+            if covered[cursor] == 0:
+                covered[cursor] = 1
+    uncovered_chars = 0
+    regions: list[str] = []
+    region_start = None
+    for index, character in enumerate(text):
+        if covered[index] == 0:
+            # Whitespace stays inside the run so the warning is the source text.
+            if not character.isspace():
+                uncovered_chars += 1
+                if region_start is None:
+                    region_start = index
+            continue
+        if region_start is not None:
+            regions.append(text[region_start:index].strip())
+            region_start = None
+    if region_start is not None:
+        regions.append(text[region_start:].strip())
+    turns: list[str] = []
+    seen: set[str] = set()
+    for match in _LOOSE_SPEAKER.finditer(text):
+        label_at = match.start(1)
+        if not any(start <= label_at < end for start, end in bodies):
+            continue
+        if label_at < len(covered) and covered[label_at] == 2:
+            continue
+        label = match.group(1).strip()
+        if not _question_context_speaker(label):
+            continue
+        line_end = text.find("\n", match.end())
+        if line_end < 0:
+            line_end = len(text)
+        snippet = text[match.start(1) : line_end].strip()
+        if snippet and snippet not in seen:
+            seen.add(snippet)
+            turns.append(snippet)
+    kept = [region for region in regions if region]
+    return {
+        "uncovered": "\n".join(kept),
+        "uncovered_chars": uncovered_chars,
+        "question_turns": turns,
+    }
+
+
+def _question_context_speaker(label: str) -> bool:
+    """True when a label inside a question looks like its own speaker turn.
+
+    ``Note:`` and ``Table 1:`` stay ordinary prose. ``Participant 02:`` and
+    ``J.D.:`` do not. The question's own interviewer label is outside the
+    question body, so a role label found in the body is an extra turn.
+    """
+    text = label.strip()
+    if not text:
+        return False
+    if _is_initials(text):
+        return not _initials_blocked(text)
+    words = text.split()
+    letters = [word for word in words if not word.isdigit()]
+    if letters and all(word.casefold() in _MIDLINE_SPEAKER_BLOCKLIST for word in letters):
+        return False
+    if any(word.casefold() in _MIDLINE_SPEAKER_BLOCKLIST for word in letters) and not any(
+        word.casefold() in _KNOWN_SPEAKER_LABELS for word in letters
+    ):
+        if not any(word.isdigit() for word in words):
+            return False
+    if _QUESTION_SPEAKER.match(text):
+        return True
+    if any(word.casefold() in _KNOWN_SPEAKER_LABELS for word in letters):
+        return True
+    if any(word.isdigit() for word in words) and letters:
+        return True
+    return bool(letters) and all(word[:1].isupper() for word in letters)
+
+
+def _collect_marked(passages: Sequence[Mapping], text_key: str, chars_key: str) -> list[dict]:
+    found: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for passage in passages:
+        metadata = passage.get("metadata") or {}
+        gap = str(metadata.get(text_key) or "")
+        doc_id = str(passage.get("doc_id") or "")
+        marker = (doc_id, gap)
+        if not gap or marker in seen:
+            continue
+        seen.add(marker)
+        found.append({"doc_id": doc_id, "chars": int(metadata.get(chars_key) or len(gap)), "text": gap})
+    return found
+
+
+def _collect_turns(passages: Sequence[Mapping]) -> list[dict]:
+    found: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for passage in passages:
+        metadata = passage.get("metadata") or {}
+        doc_id = str(passage.get("doc_id") or "")
+        for item in metadata.get("question_context_turns") or []:
+            text = str(item or "").strip()
+            marker = (doc_id, text)
+            if not text or marker in seen:
+                continue
+            seen.add(marker)
+            found.append({"doc_id": doc_id, "text": text})
+    return found
 
 
 def _collect_uncovered(passages: Sequence[Mapping]) -> list[dict]:

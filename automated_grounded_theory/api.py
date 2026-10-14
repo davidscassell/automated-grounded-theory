@@ -37,7 +37,7 @@ from automated_grounded_theory.retrieval import (
     LexicalCodeRetriever,
     embedding_run_scope,
 )
-from automated_grounded_theory.segment import UNITS, CodingPlan, plan_coding
+from automated_grounded_theory.segment import SHORT_TURN_CHARS, UNITS, CodingPlan, plan_coding
 from automated_grounded_theory.stability import StabilityReport, compare_runs
 from automated_grounded_theory.version import __version__
 
@@ -175,7 +175,7 @@ def open_code(
     sweep_every: int = 25,
     sweep_model: BaseChatModel | str | None = None,
     unit: str = "incident",
-    short_turn_chars: int = 60,
+    short_turn_chars: int = SHORT_TURN_CHARS,
     embeddings: Embeddings | str | None = None,
     api_key: str | None = None,
     embeddings_api_key: str | None = None,
@@ -286,11 +286,14 @@ def open_code(
     The coding prompt tells the model to code each passage separately and to
     quote only the target passage, not the surrounding context.
 
-    ``short_turn_chars`` (default 60) merges a very short speaker turn, such as
-    ``Participant: Ovid.``, into the adjacent answer during segmentation. The
-    text is kept. Set it to 0 to leave every turn as its own passage. That
-    changes passage boundaries, so it applies to a new run. Resume does not
-    re-segment.
+    ``short_turn_chars`` defaults to 0. Every speaker turn stays its own passage.
+    A positive value merges a shorter turn into an adjacent answer, and never
+    across an interviewer question. ``I quit.`` is a meaningful incident that a
+    length cap would hide in a neighbor, which is why the merge stays off until
+    it has been evaluated. The text is kept either way. A positive value changes
+    passage boundaries, so it applies to a new run. Resume does not re-segment.
+    A 0.6.13 checkpoint stored 60; pass that value, or allow a continuation, to
+    resume it.
 
     When ``pipeline`` is true, synthesis of the passages just coded runs while
     the next document or wave is coded against the pre-merge snapshot. The
@@ -407,7 +410,7 @@ async def aopen_code(
     sweep_every: int = 25,
     sweep_model: BaseChatModel | str | None = None,
     unit: str = "incident",
-    short_turn_chars: int = 60,
+    short_turn_chars: int = SHORT_TURN_CHARS,
     embeddings: Embeddings | str | None = None,
     api_key: str | None = None,
     embeddings_api_key: str | None = None,
@@ -1087,7 +1090,7 @@ def _metadata(**kwargs: Any) -> dict:
         "protocol": "open-coding-1",
         "seed": kwargs["seed"],
         "unit": kwargs["unit"],
-        "short_turn_chars": int(kwargs.get("short_turn_chars", 60)),
+        "short_turn_chars": int(kwargs.get("short_turn_chars", SHORT_TURN_CHARS)),
         "sweep_every": kwargs["sweep_every"],
         "model": kwargs["model_name"],
         "sweep_model": kwargs["sweep_name"],
@@ -1135,7 +1138,7 @@ def _metadata(**kwargs: Any) -> dict:
             "neighbor_chars": kwargs["neighbor_chars"],
             "validation_retries": kwargs["validation_retries"],
             "require_gerund": kwargs["require_gerund"],
-            "short_turn_chars": int(kwargs.get("short_turn_chars", 60)),
+            "short_turn_chars": int(kwargs.get("short_turn_chars", SHORT_TURN_CHARS)),
             "retriever": kwargs["retriever"],
             "parallel_documents": kwargs["parallel_documents"],
             "batch_size": kwargs["batch_size"],

@@ -76,8 +76,9 @@ def test_demo_notebook_runs_offline(tmp_path):
                     chunks.append(data[key])
     rendered = "\n".join(chunks)
     assert "review_mode document" in rendered
-    # short_turn_chars (default 60) merges filler turns such as "Other: Thanks for asking."
-    assert "passages 100" in rendered
+    # short_turn_chars defaults to 0, so each survey comment stays its own passage (150).
+    # short_turn_chars=60 merges short filler and yields 100. "Thanks for asking." is kept.
+    assert "passages 150" in rendered
     assert "coverage_pct" in rendered
     assert "mean Jaccard 1.0" in rendered
     assert "taguette_codebook.csv" in rendered
