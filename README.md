@@ -4,6 +4,54 @@
 
 `build_themes` is the next round: it groups those open codes into themes. It does not do axial coding, selective coding, or theoretical sampling.
 
+## How it works
+
+The diagram is the default compiled `open_code` graph from `draw_mermaid()` (`xray=True` draws the same picture, because there are no subgraphs). Sequential, document, wave, pipeline, and parallel-document runs share it; those settings change which passages share a frozen snapshot and when the codebook is written, and `interrupt_before_sweep=True` only marks `sweep` with an interrupt-before breakpoint.
+
+<!-- graph:open_code:begin -->
+```mermaid
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	segment_and_shuffle(segment_and_shuffle)
+	prepare_round(prepare_round)
+	code_worker(code_worker)
+	commit(commit)
+	sweep(sweep)
+	consolidate(consolidate)
+	export(export)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> segment_and_shuffle;
+	code_worker --> commit;
+	commit -.-> consolidate;
+	commit -.-> export;
+	commit -.-> prepare_round;
+	commit -.-> sweep;
+	consolidate --> export;
+	prepare_round -.-> code_worker;
+	prepare_round -.-> consolidate;
+	prepare_round -.-> export;
+	prepare_round -.-> sweep;
+	segment_and_shuffle -.-> export;
+	segment_and_shuffle -.-> prepare_round;
+	sweep -.-> consolidate;
+	sweep -.-> export;
+	sweep -.-> prepare_round;
+	export --> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
+```
+<!-- graph:open_code:end -->
+
+`segment_and_shuffle` orders the corpus, or goes straight to `export` when there is nothing to code. Each round freezes a snapshot in `prepare_round`, fans out `code_worker` with `Send`, and `commit` is the only writer. Dotted arrows are conditional: a round returns to `prepare_round` until a sweep is due, a sweep returns to `prepare_round` while passages remain, and after the last passage `consolidate` reads the codebook once more when at least two codes exist, then `export` writes the artifacts (`commit` and `prepare_round` also declare an edge to `consolidate`, which the current routers do not take). Document mode (the default) keeps reading order inside a document so later passages see codes committed earlier; wave mode may mix documents in one snapshot; `parallel_documents=True` keeps a codebook per document until a sweep; `pipeline=True` (the default) overlaps the next round with that sweep when more than one request can be in flight, and `strict_sequential_settings()` is this same graph with one passage in flight and the pipeline off.
+
+A PNG of this drawing is [docs/open_code_graph.png](docs/open_code_graph.png). `python scripts/render_graph.py` rewrites the block from the compiled graph.
+
 ## Install
 
 ```bash
