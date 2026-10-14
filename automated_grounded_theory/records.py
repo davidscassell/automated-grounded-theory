@@ -11,7 +11,7 @@ import json
 from itertools import combinations
 from typing import Any, Mapping, Sequence
 
-POLICY_VERSION = "0.6.15"
+POLICY_VERSION = "0.6.16"
 
 COMPARISON_OPS = (
     "alias_duplicate",
@@ -479,6 +479,8 @@ def materialize_records(
                 "text_sha256": hashlib.sha256(str(passage.get("text") or "").encode("utf-8")).hexdigest(),
                 "coverage_status": passage.get("coverage_status") or ("excluded" if passage.get("skipped") else "pending"),
                 "exclusion_reason": passage.get("exclusion_reason") or "",
+                "nonsubstantive": bool(passage.get("nonsubstantive")),
+                "nonsubstantive_kind": str(passage.get("nonsubstantive_kind") or ""),
             }
         )
     spans = []

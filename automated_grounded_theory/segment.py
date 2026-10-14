@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Mapping, Sequence
 
 from automated_grounded_theory.corpus import LoadedDocument, load_corpus, normalize_newlines
-from automated_grounded_theory.validation import exclusion_reason
+from automated_grounded_theory.validation import exclusion_reason, nonsubstantive_kind
 
 Unit = Literal["paragraph", "sentence", "line", "speaker_turn", "incident"]
 UNITS: tuple[str, ...] = ("paragraph", "sentence", "line", "speaker_turn", "incident")
@@ -225,6 +225,7 @@ def plan_coding(
     parallel_documents: bool = False,
     review_mode: str = "document",
     short_turn_chars: int = SHORT_TURN_CHARS,
+    code_nonsubstantive: bool = True,
 ) -> CodingPlan:
     """Segment ``corpus`` and return passages in the order a run would code them.
 
@@ -242,6 +243,12 @@ def plan_coding(
     is a meaningful incident that a length cap would otherwise hide. The text
     is not skipped and not dropped. This changes passage boundaries for a new
     run.
+
+    ``code_nonsubstantive`` defaults to true. Uncertainty, refusal, ``n/a``,
+    and punctuation-only replies are queued and flagged (``nonsubstantive``,
+    ``nonsubstantive_kind``) so a reader can filter them. Only empty or
+    whitespace text is excluded. Set the flag false to exclude those replies
+    with ``exclusion_reason`` and leave them out of the model queue.
     """
     if unit not in UNITS:
         raise ValueError(f"unit must be one of {', '.join(UNITS)}. Got {unit!r}.")
@@ -291,7 +298,7 @@ def plan_coding(
         queue = [0] * len(passages)
         for index, passage in enumerate(passages):
             queue[passage["coding_order"]] = index
-        _mark_trivial(passages, warnings)
+        _mark_trivial(passages, warnings, code_nonsubstantive=code_nonsubstantive)
         return CodingPlan(
             passages=passages,
             seed=seed,
@@ -321,7 +328,7 @@ def plan_coding(
         rng.shuffle(queue)
     for order, index in enumerate(queue):
         passages[index]["coding_order"] = order
-    _mark_trivial(passages, warnings)
+    _mark_trivial(passages, warnings, code_nonsubstantive=code_nonsubstantive)
     return CodingPlan(
         passages=passages,
         seed=seed,
@@ -426,19 +433,36 @@ def _empty_passage(document: LoadedDocument, unit: str) -> dict:
     }
 
 
-def _mark_trivial(passages: list[dict], warnings: list[str]) -> None:
+def _mark_trivial(passages: list[dict], warnings: list[str], *, code_nonsubstantive: bool = True) -> None:
     skipped = 0
+    flagged = 0
     for passage in passages:
-        reason = exclusion_reason(passage.get("text") or "")
+        text = passage.get("text") or ""
+        reason = exclusion_reason(text, code_nonsubstantive=code_nonsubstantive)
+        kind = nonsubstantive_kind(text) or ""
         passage["skipped"] = reason is not None
         passage["exclusion_reason"] = reason or ""
         passage["coverage_status"] = "excluded" if reason else passage.get("coverage_status") or "pending"
+        passage["nonsubstantive"] = bool(kind)
+        passage["nonsubstantive_kind"] = kind
         skipped += int(passage["skipped"])
+        flagged += int(bool(kind) and reason is None)
     if skipped:
         noun = "passage" if skipped == 1 else "passages"
+        if code_nonsubstantive:
+            warnings.append(
+                f"Retained {skipped} empty {noun}. They were not sent to the model."
+            )
+        else:
+            warnings.append(
+                f"Retained {skipped} empty or non-answer {noun} with an exclusion reason. "
+                "They were not sent to the model."
+            )
+    if flagged:
+        noun = "passage" if flagged == 1 else "passages"
         warnings.append(
-            f"Retained {skipped} empty or non-answer {noun} with an exclusion reason. "
-            "They were not sent to the model."
+            f"Queued {flagged} non-substantive {noun} for coding and flagged them "
+            "so they can be filtered."
         )
 
 

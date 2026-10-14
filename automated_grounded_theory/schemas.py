@@ -16,7 +16,8 @@ class _LLMModel(BaseModel):
 
 
 CONFIDENCE_HELP = (
-    "Confidence from 0 to 1. Anchors: 0.2 thin or contradictory evidence, "
+    "The model's own diagnostic from 0 to 1, not a probability and not a calibrated frequency. "
+    "Anchors: 0.2 thin or contradictory evidence, "
     "0.5 plausible, 0.8 the quotes support it, 0.95 the quotes show it directly."
 )
 RATIONALE_HELP = "One to three sentences explaining this decision. Do not leave this empty."
@@ -129,8 +130,8 @@ class PassageCoding(_LLMModel):
     memo: str = Field(
         default="",
         description=(
-            "Empty, or about 50 to 120 words with a comparison to a named code, "
-            "a property or dimension, and one emerging question. Do not restate the passage."
+            "Free-form analytic memo, or empty. Write one when something analytically interesting happens. "
+            "A comparison, a property, and a question are useful and not required. About 20 to 400 words."
         ),
     )
     memo_confidence: float = Field(
@@ -334,7 +335,7 @@ class BatchCoding(_LLMModel):
 
 
 class ThemeProposal(_LLMModel):
-    """One focused-coding theme. It groups open codes; it is not a new code."""
+    """One reporting theme. It groups open codes; it is not a new code."""
 
     name: str = Field(description="Short theme name. Not an open-code label.")
     definition: str = Field(description="What kind of incident this theme gathers.")
@@ -349,7 +350,10 @@ class ThemeProposal(_LLMModel):
     )
     codes: list[str] = Field(
         default_factory=list,
-        description="Open-code labels in this theme. Copy each label exactly. Every code belongs to one theme.",
+        description=(
+            "Open-code labels in this theme. Copy each label exactly. "
+            "A code may belong to more than one theme. The first theme that lists it is the primary theme."
+        ),
     )
     confidence: float = Field(default=1.0, ge=0.0, le=1.0, description=CONFIDENCE_HELP)
     rationale: str = Field(default="", description=RATIONALE_HELP)
@@ -418,7 +422,7 @@ class ThemeMergePlan(_LLMModel):
 
 
 class ThemeCoding(_LLMModel):
-    """Focused coding of one codebook. Does not invent open codes."""
+    """A reporting grouping of one codebook. Does not invent open codes and does not reread passages."""
 
     themes: list[ThemeProposal] = Field(default_factory=list)
     tensions: list[ThemeTension] = Field(default_factory=list)
@@ -523,6 +527,19 @@ class PassageInput(_LLMModel):
     metadata: dict = Field(default_factory=dict)
     nearest_code_ids: list[str] = Field(default_factory=list)
     question: str = ""
+    nonsubstantive: bool = Field(
+        default=False,
+        description=(
+            "True for uncertainty, refusal, n/a, or punctuation only. Code it from the question."
+        ),
+    )
+    nonsubstantive_kind: str = Field(
+        default="",
+        description=(
+            "uncertainty, refusal, non_answer, or no_substantive_text. "
+            "Empty when the passage is substantive."
+        ),
+    )
 
 
 class CodingRequest(_LLMModel):
@@ -587,7 +604,7 @@ class SweepRequest(_LLMModel):
 
 
 class ThemeRequest(_LLMModel):
-    """Typed input for focused coding."""
+    """Typed input for the theme report. Does not reread passages."""
 
     chunk_index: int = 1
     chunk_count: int = 1

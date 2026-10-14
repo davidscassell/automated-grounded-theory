@@ -110,9 +110,10 @@ def test_merge_map_relabels_earlier_segments():
         candidates=[{"source": "packing bags", "target": "packing bags up", "score": 0.7}],
         definitions=[{"code": "packing bags up", "definition": "Bagging possessions while leaving."}],
     )
-    assert list(applied["codebook"]) == ["packing bags"]
-    assert applied["codebook"]["packing bags"]["frequency"] == 2
-    assert applied["codebook"]["packing bags"]["definition"] == "packing bags"
+    assert list(applied["codebook"]) == ["packing bags up"]
+    assert applied["codebook"]["packing bags up"]["frequency"] == 2
+    assert applied["codebook"]["packing bags up"]["definition"] == "Bagging possessions while leaving."
+    assert "packing bags" in applied["codebook"]["packing bags up"]["aliases"]
     sharpened = apply_sweep(
         codebook,
         segments,
@@ -128,8 +129,9 @@ def test_merge_map_relabels_earlier_segments():
         candidates=[{"source": "packing bags", "target": "packing bags up", "score": 0.7}],
         definitions=[{"code": "packing bags", "definition": "Bagging possessions while leaving."}],
     )
-    assert sharpened["codebook"]["packing bags"]["definition"] == "Bagging possessions while leaving."
-    assert {item["code"] for item in applied["segments"]} == {"packing bags"}
+    assert list(sharpened["codebook"]) == ["packing bags up"]
+    assert sharpened["codebook"]["packing bags up"]["definition"] == "packing bags up"
+    assert {item["code"] for item in applied["segments"]} == {"packing bags up"}
 
 
 def test_sweep_may_propose_a_pair_that_was_not_a_candidate():

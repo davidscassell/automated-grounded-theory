@@ -237,6 +237,7 @@ def open_code(
     allow_oversized: bool = False,
     allow_changes: bool = False,
     continuation: bool = False,
+    code_nonsubstantive: bool = True,
 ) -> OpenCodeResult:
     """Run first-round grounded-theory open coding over ``corpus``.
 
@@ -290,6 +291,18 @@ def open_code(
     The coding prompt tells the model to code each passage separately and to
     quote only the target passage, not the surrounding context.
 
+    ``code_nonsubstantive`` defaults to true. ``I don't know``, ``n/a``, a
+    refusal, and punctuation-only text are coded and flagged
+    (``nonsubstantive``, ``nonsubstantive_kind``) so they can be filtered.
+    Only empty or whitespace text stays excluded. Set the flag false to exclude
+    those replies with ``exclusion_reason`` instead of coding them.
+
+    With the defaults, one passage is in each request and the codebook commits
+    after that passage, so raising ``concurrency`` does not shorten the run.
+    A faster schedule sets ``passages_per_request`` or
+    ``passages_per_codebook_update`` above 1, or uses wave mode. Wave mode is
+    a constant-comparison tradeoff.
+
     ``short_turn_chars`` defaults to 0. Every speaker turn stays its own passage.
     A positive value merges a shorter turn into an adjacent answer, and never
     across an interviewer question. ``I quit.`` is a meaningful incident that a
@@ -300,7 +313,8 @@ def open_code(
     resume it.
 
     When ``pipeline`` is true, synthesis of the passages just coded runs while
-    the next document or wave is coded against the pre-merge snapshot. The
+    the next document or wave is coded against the pre-merge snapshot. That is
+    one step of lag: the passages in flight do not yet see the merge. The
     merge map is applied afterwards, in a fixed order. ``sweep_model`` defaults
     to ``model``. Sweep chunks default to 20 codes, sorted alphabetically by
     label and then by definition. A chunk carries full evidence for its own
@@ -417,6 +431,7 @@ def open_code(
             allow_oversized=allow_oversized,
             allow_changes=allow_changes,
             continuation=continuation,
+            code_nonsubstantive=code_nonsubstantive,
         )
     )
 
@@ -490,6 +505,7 @@ async def aopen_code(
     allow_oversized: bool = False,
     allow_changes: bool = False,
     continuation: bool = False,
+    code_nonsubstantive: bool = True,
     limiter: CallLimiter | None = None,
 ) -> OpenCodeResult:
     """Async form of :func:`open_code`."""
@@ -674,6 +690,7 @@ async def aopen_code(
         tokens_per_minute=tokens_per_minute,
         requests_per_minute=requests_per_minute,
         allow_oversized=allow_oversized,
+        code_nonsubstantive=code_nonsubstantive,
         context=parsed_context,
     )
     metadata["checkpoint_manifest"] = checkpoint_manifest(documents, metadata)
@@ -861,6 +878,7 @@ _MANIFEST_PROCEDURE = (
     "tokens_per_minute",
     "requests_per_minute",
     "allow_oversized",
+    "code_nonsubstantive",
 )
 
 
@@ -877,6 +895,22 @@ def checkpoint_manifest(documents: Sequence[LoadedDocument], metadata: dict) -> 
         },
         "policy_version": POLICY_VERSION,
     }
+
+
+def _with_procedure_defaults(saved: Any) -> Any:
+    """Treat a missing ``code_nonsubstantive`` as the default, true.
+
+    Checkpoints from before 0.6.16 omit the field. Resume with the default
+    matches them. An explicit false is a real procedure change.
+    """
+    if not isinstance(saved, dict):
+        return saved
+    procedure = saved.get("procedure")
+    if not isinstance(procedure, dict) or "code_nonsubstantive" in procedure:
+        return saved
+    updated = dict(saved)
+    updated["procedure"] = {**procedure, "code_nonsubstantive": True}
+    return updated
 
 
 def manifest_diff(saved: Any, current: Any) -> dict[str, dict[str, Any]]:
@@ -952,7 +986,10 @@ async def _execute_locked(
                 f"No checkpoint was found for thread {thread_id!r}. Start a run before passing resume=True."
             )
         saved_meta = dict(getattr(snapshot, "values", {}).get("metadata") or {})
-        differences = manifest_diff(saved_meta.get("checkpoint_manifest"), metadata.get("checkpoint_manifest"))
+        differences = manifest_diff(
+            _with_procedure_defaults(saved_meta.get("checkpoint_manifest")),
+            metadata.get("checkpoint_manifest"),
+        )
         if differences:
             structural = {path: change for path, change in differences.items() if _structural_manifest_path(path)}
             if structural:
@@ -1151,6 +1188,7 @@ def _metadata(**kwargs: Any) -> dict:
         "tokens_per_minute": kwargs.get("tokens_per_minute", 0),
         "requests_per_minute": kwargs.get("requests_per_minute", 0),
         "allow_oversized": bool(kwargs.get("allow_oversized", False)),
+        "code_nonsubstantive": bool(kwargs.get("code_nonsubstantive", True)),
         "full_audit_every": kwargs.get("full_audit_every", 4),
         "cross_chunk_limit": kwargs.get("cross_chunk_limit", 8),
         "max_final_review_calls": int(kwargs.get("max_final_review_calls", DEFAULT_MAX_FINAL_REVIEW_CALLS)),

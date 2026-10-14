@@ -800,6 +800,7 @@ def _segment_node(state: CodingState) -> dict:
         parallel_documents=bool(metadata.get("parallel_documents")),
         review_mode=str(metadata.get("review_mode") or "document"),
         short_turn_chars=int(metadata.get("short_turn_chars", SHORT_TURN_CHARS) or 0),
+        code_nonsubstantive=bool(metadata.get("code_nonsubstantive", True)),
     )
     branch_codebooks = {doc_id: {} for doc_id in plan.branch_queues} if plan.parallel else {}
     queue = list(plan.queue)

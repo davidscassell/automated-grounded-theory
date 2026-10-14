@@ -82,11 +82,11 @@ or no listed code is close. Set valence to positive, negative, neutral, or mixed
 Valence is context. It does not stop two codes from informing one category, and it \
 is not by itself a reason to merge them. Set uncertainty_flags when the span is \
 ambiguous, the context is thin, two codes compete, or the inference is unsupported. \
-Confidence is a diagnostic, not a probability. Set confidence \
-from 0 to 1 on the action, on in_vivo, and on the memo. Anchors: 0.2 thin or \
-contradictory evidence, 0.5 plausible, 0.8 the quotes support it, 0.95 the quotes \
-show it directly. Write a rationale of one to three sentences for the action, for \
-in_vivo, and for the memo.
+Confidence is the model's own diagnostic, not a probability and not a \
+calibrated frequency. Set confidence from 0 to 1 on the action, on in_vivo, and \
+on the memo. Anchors: 0.2 thin or contradictory evidence, 0.5 plausible, 0.8 the \
+quotes support it, 0.95 the quotes show it directly. Write a rationale of one to \
+three sentences for the action, for in_vivo, and for the memo.
 
 Definitions name a property that could apply to another incident. Do not put respondent \
 attributes (name, role, department, tenure, site) or the question wording into a label \
@@ -105,13 +105,15 @@ Use ... only for words you skip inside that passage. Do not invent wording.
 
 Do not use generic labels such as "experience", "discussion", "theme", or "response".
 
-If a passage has no codable incident, return an empty code list and an empty memo.
+Uncertainty, refusal, n/a, and punctuation-only text are data. Code them from \
+the question, for example "expressing uncertainty about pay" or "declining to \
+answer about staffing", including when nonsubstantive is true. Only a passage \
+with no words has nothing to code.
 
-A memo is not a restatement. Leave it empty unless you can write about 50 to 120 \
-words that include all three of these: a comparison with a named code (or a statement \
-that the book had no close code), a property or dimension this incident varies, and \
-one emerging question the next passage could answer. Do not write a sentence that \
-only says no property was recorded.
+Write a free-form memo when something analytically interesting happens. A \
+comparison, a property, and a question are useful and not required. About 20 to \
+400 words is comfortable. Leave it empty when there is no analytic point. Do not \
+restate the passage or say only that nothing was recorded.
 
 Code each passage separately. Do not write one code that spans several passages. \
 If several passages are in the user message, return one passages item for every \
@@ -357,9 +359,17 @@ def build_coding_messages(
                 metadata=dict(passage.get("metadata") or {}),
                 nearest_code_ids=[by_label.get(code_key(label), "") for label in labels if code_key(label)],
                 question=str(passage.get("question") or ""),
+                nonsubstantive=bool(passage.get("nonsubstantive")),
+                nonsubstantive_kind=str(passage.get("nonsubstantive_kind") or ""),
             )
         )
     notes = [note for note in (feedback or {}).values() if note]
+    if any(row.nonsubstantive for row in passage_rows):
+        notes.append(
+            "A passage with nonsubstantive true is uncertainty, a refusal, n/a, or punctuation only. "
+            "Code it from its question, for example expressing uncertainty about that question "
+            "or declining to answer it. Do not leave it uncoded."
+        )
     request = CodingRequest(
         note="" if codebook_view else "The codebook is empty. Codes you create must emerge from this passage.",
         omitted_codes=omitted_codes,
@@ -595,16 +605,18 @@ def build_in_batch_messages(
     return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=dump_request(request))]
 
 
-THEME_SYSTEM = """You are doing focused coding, the round after open coding (Charmaz).
+THEME_SYSTEM = """You are grouping open codes into a descriptive reporting view.
 
-The open codes already exist. Group them into themes. A theme gathers codes \
-about the same kind of incident. Name the theme, define the incident it gathers, \
-and list a few properties (dimensions that vary inside it) when the codes show any.
+The open codes already exist. You do not reread the passages and you do not mint \
+codes. Group those codes into themes for a report. A theme gathers codes about \
+the same kind of incident. Name the theme, define the incident it gathers, and \
+list a few properties (dimensions that vary inside it) when the codes show any.
 
 Assign every CODE_LABEL to at least one theme. A code may belong to more than one \
-theme when it genuinely informs both. Copy the label text exactly. Do not invent a \
-code, do not rename a code, and do not drop one to keep the list short. \
-max_themes is a presentation budget, not a reason to erase a membership.
+theme when it genuinely informs both. The first theme you assign a code to is its \
+primary theme. Copy the label text exactly. Do not invent a code, do not rename a \
+code, and do not drop one to keep the list short. max_themes is a presentation \
+budget, not a reason to erase a membership.
 
 Themes are categories of the codes in front of you. The research context is only \
 for understanding those codes. It is not a list of themes to force, and it is not \
@@ -641,7 +653,7 @@ def format_theme_codebook(codes: Sequence[Mapping[str, Any]]) -> str:
         return "OPEN CODES\n(none)"
     lines = [
         "OPEN CODES",
-        "Assign every CODE_LABEL below to exactly one theme. Copy the label text exactly.",
+        "Assign every CODE_LABEL below to at least one theme. A code may belong to more than one theme. The first theme is primary. Copy the label text exactly.",
     ]
     for entry in codes:
         lines.append(f"CODE_LABEL: {entry.get('code', '')}")
@@ -674,7 +686,10 @@ def build_theme_messages(
     request = ThemeRequest(
         chunk_index=chunk_index,
         chunk_count=chunk_count,
-        note="Assign every code_id to exactly one theme. Copy labels exactly.",
+        note=(
+            "Assign every code_id to at least one theme. A code may belong to more than one theme. "
+            "The first theme is the primary theme. Copy labels exactly."
+        ),
         codes=[code_input(entry) for entry in codes],
         feedback=feedback,
     )
@@ -728,7 +743,8 @@ def build_theme_review_messages(
     request = ThemeReviewRequest(
         note=(
             "Read every theme. Put duplicates in one group with a rationale and a confidence. "
-            f"Do not build a group with more than {ceiling}% of the open codes. "
+            f"About {ceiling}% of the open codes in one theme is a soft presentation target. "
+            "Going past it is noted. It does not block a fold and it does not drop a membership. "
             + ("No similarity hints." if not hints else "Hints are optional.")
         ),
         themes=rows,
@@ -737,12 +753,13 @@ def build_theme_review_messages(
     from automated_grounded_theory.prompts import render_context as _render
 
     system = (
-        "You are comparing themes with themes after focused coding. "
+        "You are comparing themes after the codes have been grouped for a report. "
         "Members are theme names, not open codes. "
         "Propose a group when two themes gather the same kind of incident, and say why in rationale. "
         "Set confidence on every group. "
         "Hints are optional. Embeddings are not required. "
-        f"One theme must not hold more than {ceiling}% of the codes.\n\n" + _render(context)
+        f"About {ceiling}% of the codes in one theme is a soft presentation target. "
+        "Exceeding it is noted. It does not block a fold and it does not drop a membership.\n\n" + _render(context)
     )
     return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=dump_request(request))]
 
@@ -755,7 +772,10 @@ def build_leftover_messages(
     prompt_cache: bool,
 ) -> list:
     request = LeftoverRequest(
-        note="Assign every leftover code_id to one existing theme, or propose a theme that holds only those codes.",
+        note=(
+            "Assign every leftover code_id to at least one existing theme, or propose a theme that holds those codes. "
+            "A code may belong to more than one theme. The first theme is primary."
+        ),
         themes=[
             ThemeInput(
                 theme_id=f"t{index:04d}",
@@ -768,7 +788,8 @@ def build_leftover_messages(
         codes=[code_input(entry) for entry in codes],
     )
     system = (
-        "You are finishing focused coding. Assign only the leftover open codes. "
+        "You are finishing the theme report. Assign only the leftover open codes. "
+        "A code may belong to more than one theme. The first theme is primary. "
         "Do not invent a code_id.\n\n" + render_context(context)
     )
     return [_system_message(system, prompt_cache=prompt_cache), HumanMessage(content=dump_request(request))]

@@ -1,8 +1,9 @@
-"""Deterministic grouping for synthesis and focused coding.
+"""Deterministic grouping for synthesis.
 
 Average-linkage agglomerative clustering on cosine distance. No random seed:
-ties break toward the lower index. Union-find roots are the lexicographically
-smaller code id, so the merge map does not depend on pair order.
+ties break toward the lower index. :func:`union_roots` keeps the
+lexicographically smaller key. Sweep merge survivors are chosen separately,
+from the model's target, in the codebook module.
 """
 
 from __future__ import annotations

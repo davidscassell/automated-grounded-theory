@@ -926,7 +926,42 @@ def assess_label(label: str, *, in_vivo: bool, passage: str, require_gerund: boo
     return True, reasons, {"code": shown, "key": code_key(shown), "in_vivo": in_vivo_flag, "gerund_ok": has_gerund}
 
 
-_TRIVIAL_EXACT = frozenset(
+_UNCERTAINTY_EXACT = frozenset(
+    {
+        "i don't know",
+        "i dont know",
+        "i do not know",
+        "don't know",
+        "dont know",
+        "do not know",
+        "idk",
+        "not sure",
+        "unsure",
+        "uncertain",
+        "no idea",
+        "dunno",
+    }
+)
+_REFUSAL_EXACT = frozenset(
+    {
+        "no comment",
+        "no comments",
+        "prefer not to say",
+        "prefer not to answer",
+        "rather not say",
+        "rather not answer",
+        "decline to answer",
+        "declined to answer",
+        "declined",
+        "refused",
+        "refusal",
+        "i refuse",
+        "i'd rather not say",
+        "i would rather not say",
+        "no response",
+    }
+)
+_NON_ANSWER_EXACT = frozenset(
     {
         "n/a",
         "na",
@@ -936,19 +971,12 @@ _TRIVIAL_EXACT = frozenset(
         "nil",
         "null",
         "nothing",
-        "no comment",
-        "no comments",
-        "i don't know",
-        "i dont know",
-        "idk",
         "-",
         "--",
         "---",
-        ".",
-        "...",
-        "?",
     }
 )
+_TRIVIAL_EXACT = _UNCERTAINTY_EXACT | _REFUSAL_EXACT | _NON_ANSWER_EXACT | frozenset({".", "...", "?"})
 
 
 _EMPTY_MEMO = re.compile(
@@ -961,17 +989,31 @@ def substantive_memo(text: str) -> bool:
     """True when a memo says something about the incidents.
 
     The placeholder that only reports the absence of a property is not a memo.
-    Short leftovers ("none", "n/a") are not either.
+    Short leftovers ("none", "n/a") are not either. A short analytic note can
+    still be true here; :func:`memo_review_reasons` is what flags it as thin.
+    """
+    return memo_review_reasons(text) is not None and len(re.sub(r"\s+", " ", (text or "").strip())) >= 12
+
+
+def memo_review_reasons(text: str) -> list[str] | None:
+    """Flags for a free-form memo, or None when the text is not a memo.
+
+    Blank notes and placeholders ("none", "n/a", "no property was recorded")
+    are not memos. A real note is kept. Under 20 words it is flagged ``thin``.
+    A missing comparison, property, or question is not a reason to drop it
+    and is not by itself a flag.
     """
     cleaned = re.sub(r"\s+", " ", (text or "").strip())
-    if len(cleaned) < 12:
-        return False
+    if not cleaned:
+        return None
     folded = cleaned.casefold().strip(" .")
     if folded in {"none", "n/a", "na", "no comparison", "nothing to add"}:
-        return False
+        return None
     if _EMPTY_MEMO.search(cleaned):
-        return False
-    return True
+        return None
+    if len(cleaned.split()) < 20:
+        return ["thin"]
+    return []
 
 
 _HEX_CODE_ID = re.compile(r"^[0-9a-f]{16}$")
@@ -982,32 +1024,59 @@ def is_code_id_text(label: str) -> bool:
     return bool(_HEX_CODE_ID.fullmatch(str(label or "").strip().casefold()))
 
 
-def is_trivial_passage(text: str) -> bool:
-    """True when a passage has no incident worth a model call.
+def nonsubstantive_kind(text: str) -> str | None:
+    """Why a reply is non-substantive, or None when it is empty or substantive.
 
-    Empty comments, punctuation, and explicit non-answers are excluded.
-    A short but substantive reply such as "yes" is kept. The original row
-    stays in the corpus with :func:`exclusion_reason`.
+    ``uncertainty`` covers "I don't know" and close variants. ``refusal`` covers
+    "no comment", "prefer not to say", and similar. ``non_answer`` covers
+    ``n/a`` and ``none``. ``no_substantive_text`` is punctuation with no
+    letters or digits. Empty or whitespace text is not a kind: it stays excluded.
+    A longer sentence that happens to mention uncertainty is substantive.
     """
-    return exclusion_reason(text) is not None
+    stripped = (text or "").strip()
+    if not stripped:
+        return None
+    folded = re.sub(r"\s+", " ", stripped).casefold().strip(" .")
+    if folded in _UNCERTAINTY_EXACT:
+        return "uncertainty"
+    if folded in _REFUSAL_EXACT:
+        return "refusal"
+    if folded in _NON_ANSWER_EXACT:
+        return "non_answer"
+    if folded in _TRIVIAL_EXACT or re.search(r"[A-Za-z0-9]", stripped) is None:
+        return "no_substantive_text"
+    return None
 
 
-def exclusion_reason(text: str) -> str | None:
-    """Why a row is kept but not sent to the model, or None when it is codable.
+def is_trivial_passage(text: str, *, code_nonsubstantive: bool = True) -> bool:
+    """True when a passage is not sent to the model.
 
-    ``N/A`` and ``I don't know`` are exclusions under the default study policy.
-    They can be missingness or a real claim of uncertainty; the reason is stored
-    either way so a later policy can recode them.
+    Only empty or whitespace text is excluded when ``code_nonsubstantive`` is
+    true. Uncertainty, refusal, ``n/a``, and punctuation-only replies are data
+    and are coded. Set ``code_nonsubstantive`` false to exclude those as well.
+    A short substantive reply such as "yes" is kept either way.
+    """
+    return exclusion_reason(text, code_nonsubstantive=code_nonsubstantive) is not None
+
+
+def exclusion_reason(text: str, *, code_nonsubstantive: bool = True) -> str | None:
+    """Why a row stays out of the model, or None when it should be coded.
+
+    Empty or whitespace text is ``empty`` and is always excluded. Uncertainty,
+    refusal, ``n/a``, and punctuation-only text are coded when
+    ``code_nonsubstantive`` is true; :func:`nonsubstantive_kind` marks them so
+    a reader can filter. When ``code_nonsubstantive`` is false those rows are
+    excluded as ``non_answer`` or ``no_substantive_text``.
     """
     stripped = (text or "").strip()
     if not stripped:
         return "empty"
-    folded = re.sub(r"\s+", " ", stripped).casefold()
-    if folded in _TRIVIAL_EXACT:
-        return "non_answer"
-    if re.search(r"[A-Za-z0-9]", stripped) is None:
+    kind = nonsubstantive_kind(text)
+    if kind is None or code_nonsubstantive:
+        return None
+    if kind == "no_substantive_text":
         return "no_substantive_text"
-    return None
+    return "non_answer"
 
 
 _LEAK_STOP = frozenset(
@@ -1081,11 +1150,20 @@ def attribute_leak(text: str, metadata: dict | None) -> list[str]:
     return hits
 
 
-def review_passage_flags(passage_text: str, *, quote: str, long_passage_chars: int, low_confidence: bool, confidence: float) -> list[str]:
+def review_passage_flags(
+    passage_text: str,
+    *,
+    quote: str,
+    long_passage_chars: int,
+    low_confidence: bool,
+    confidence: float,
+    review_below: float = 0.5,
+) -> list[str]:
     reasons: list[str] = []
     if long_passage_chars and len(passage_text) >= long_passage_chars:
         reasons.append("long_passage")
-    if low_confidence or (isinstance(confidence, (int, float)) and confidence < 0.5):
+    # The number is the model's own diagnostic, not a probability.
+    if low_confidence or (isinstance(confidence, (int, float)) and confidence < review_below):
         reasons.append("low_confidence")
     if passage_text and quote == passage_text and len(passage_text) > 400:
         reasons.append("quote_is_whole_passage")

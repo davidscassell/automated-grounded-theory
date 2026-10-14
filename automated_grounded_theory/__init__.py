@@ -1,7 +1,8 @@
-"""LLM-assisted grounded theory: open coding, then focused coding into themes.
+"""Automated initial (open) coding, then a theme report.
 
 Codes are produced passage by passage from the corpus. The research context
-sensitizes attention and is not a codebook. Themes group those codes afterwards.
+sensitizes attention and is not a codebook. The theme report groups those
+codes afterwards for presentation. It does not reread the passages.
 """
 
 from automated_grounded_theory.api import (

@@ -1,8 +1,10 @@
-"""Focused coding: group open codes into themes, then count without a model.
+"""Theme report: group open codes for presentation, then count without a model.
 
-The LangGraph here only proposes and checks assignments. Prevalence, metadata
-breakdowns, representative quotes, and uncoded passages are computed from the
-open-coding result afterwards. Quotes are kept only when they occur in the passage.
+This is a descriptive grouping of codes that already exist. It does not reread
+the passages and it does not mint codes. The LangGraph only proposes and checks
+assignments. Prevalence, metadata breakdowns, representative quotes, and uncoded
+passages are computed from the open-coding result afterwards. Quotes are kept
+only when they occur in the passage.
 """
 
 from __future__ import annotations
@@ -51,7 +53,7 @@ _RESPONDENT_FIELDS = ("respondent_id", "respondent", "participant_id", "particip
 
 
 class ThemeError(RuntimeError):
-    """Focused coding did not assign every open code to one existing theme."""
+    """The theme report did not assign every open code to at least one existing theme."""
 
 
 class ThemeGraphState(TypedDict, total=False):
@@ -161,10 +163,13 @@ def assign_codes(
     *,
     review_below: float = 0.5,
 ) -> tuple[list[dict], dict[str, list[str]]]:
-    """Keep the first assignment of each real code. Drop unknown names.
+    """Keep every assignment of a real code. Drop unknown names.
 
-    Returns the themes that still have codes, plus missing, unknown, and
-    duplicate labels. Missing is empty only when every open code was named.
+    A code may sit in more than one theme. The first theme that names it, in
+    proposal order, is primary (``primary_codes`` on that theme). Returns the
+    themes that still have codes, plus missing, unknown, and duplicate labels.
+    Missing is empty only when every open code was named at least once.
+    Duplicates are kept. They are a warning, not a dropped membership.
     """
     by_key = {}
     for entry in codebook:
@@ -181,22 +186,28 @@ def assign_codes(
             continue
         name = display_label(str(raw.get("name") or ""))
         codes: list[str] = []
+        primary_codes: list[str] = []
         for label in raw.get("codes") or []:
             key = code_key(str(label))
             if not key or key not in by_key:
                 if str(label).strip():
                     unknown.append(str(label).strip())
                 continue
-            if key in seen and seen[key] != (name or key):
-                duplicates.append(by_key[key]["code"])
-            seen[key] = seen.get(key) or name or key
-            codes.append(str(by_key[key]["code"]))
+            label_text = str(by_key[key]["code"])
+            theme_name = name or key
+            if key in seen and seen[key] != theme_name:
+                duplicates.append(label_text)
+            if key not in seen:
+                seen[key] = theme_name
+                primary_codes.append(label_text)
+            codes.append(label_text)
         raw_themes.append(
             {
                 "name": name,
                 "definition": str(raw.get("definition") or "").strip(),
                 "properties": _clean_list(raw.get("properties")),
                 "codes": codes,
+                "primary_codes": primary_codes,
                 "rationale": str(raw.get("rationale") or "").strip()
                 or "These codes gather the same kind of incident.",
                 "confidence": confidence,
@@ -212,14 +223,17 @@ def assign_codes(
             continue
         if key in index:
             index[key]["codes"].extend(theme["codes"])
+            index[key]["primary_codes"].extend(theme.get("primary_codes") or [])
             if not index[key]["definition"]:
                 index[key]["definition"] = theme["definition"]
             index[key]["properties"] = _clean_list(index[key]["properties"] + theme["properties"])
         else:
+            theme.setdefault("primary_codes", [])
             index[key] = theme
             merged.append(theme)
     for theme in merged:
         theme["codes"] = _unique_labels(theme["codes"])
+        theme["primary_codes"] = _unique_labels(theme.get("primary_codes") or [])
     merged = [theme for theme in merged if theme["codes"]]
     missing = [str(entry["code"]) for key, entry in by_key.items() if key not in seen]
     return merged, {"missing": missing, "unknown": unknown, "duplicates": duplicates}
@@ -238,7 +252,10 @@ def assignment_feedback(report: Mapping[str, list[str]]) -> str:
         lines.append("These names are not in the codebook and were dropped:")
         lines.extend(f"- {label}" for label in report["unknown"])
     if report.get("duplicates"):
-        lines.append("These codes were assigned more than once. Only the first assignment was kept:")
+        lines.append(
+            "These codes sit in more than one theme. Every membership was kept. "
+            "The first theme in this proposal is primary:"
+        )
         lines.extend(f"- {label}" for label in report["duplicates"])
     return "\n".join(lines)
 
@@ -314,7 +331,8 @@ def themes_markdown(result: ThemeResult) -> str:
     lines = [
         "# Themes",
         "",
-        "Focused coding grouped the open codes into themes. A code may belong to more than one theme. "
+        "The theme report groups the open codes for presentation. It does not reread the passages. "
+        "A code may belong to more than one theme, and the first theme is primary. "
         "Counts are computed from the coded segments, not by the model. A passage counts toward a theme "
         "when any of its segments carries a member code. A document counts when any of its passages does. "
         "Respondents come from metadata when a respondent field is present, and otherwise each document is "
@@ -350,7 +368,10 @@ def themes_markdown(result: ThemeResult) -> str:
     n_passages = int(totals.get("n_passages") or 0)
     lines.append(f"## Uncoded passages ({len(result.uncoded)} of {n_passages})")
     lines.append("")
-    lines.append("Passages with no segment, including ones skipped before coding (empty or non-answers).")
+    lines.append(
+        "Passages with no segment, including empty text that was not sent to the model "
+        "and non-substantive replies that were coded and flagged."
+    )
     lines.append("")
     if not result.uncoded:
         lines.append("_Every passage has at least one segment._")
@@ -495,15 +516,17 @@ def build_themes(
     for about 6 to ``max_themes`` (default 12). After that, the model reviews
     the themes in alphabetical order and proposes duplicate groups, each with a
     reason. Token overlap, and embeddings when you pass them, are optional
-    hints. A fold that would put more than ``max_theme_share`` of the codes
-    (default 0.30) in one theme is not kept.
+    hints. ``max_theme_share`` (default 0.30) is a soft presentation target. A theme
+    that holds more than that share is noted. The fold is kept, and memberships
+    are not dropped.
     ``open_code_result`` may be an :class:`OpenCodeResult` or a directory written
     by ``open_code`` (see :func:`load_run`). ``seed`` shuffles the codebook order
     in the prompt. It does not pick quotes.
 
     The codebook is split into chunks of ``theme_chunk``. Those chunks are
     proposed concurrently (``concurrency`` caps in-flight calls), then reconciled
-    in chunk order so every open code lands in one theme. Quote checks for each
+    in chunk order so every open code lands in at least one theme. A code may
+    belong to more than one. Quote checks for each
     theme also run concurrently. Counts and breakdowns are computed from the
     segments. This wrapper works inside a running event loop.
     """
@@ -1446,6 +1469,14 @@ def _bundle_themes(
                 seen.add(key)
                 codes.append(str(label))
     codes.sort(key=code_key)
+    primary_codes: list[str] = []
+    seen_primary: set[str] = set()
+    for theme in members:
+        for label in theme.get("primary_codes") or []:
+            key = code_key(str(label))
+            if key and key in seen and key not in seen_primary:
+                seen_primary.add(key)
+                primary_codes.append(str(label))
     properties = _clean_list([prop for theme in members for prop in (theme.get("properties") or [])])
     kept_definition = definition if definition is not None else str(survivor.get("definition") or "").strip()
     if not kept_definition:
@@ -1456,6 +1487,7 @@ def _bundle_themes(
         "definition": kept_definition,
         "properties": properties,
         "codes": codes,
+        "primary_codes": primary_codes,
         "confidence": min(confidences) if confidences else 1.0,
     }
 
@@ -1542,7 +1574,7 @@ def _compile_theme_graph(
             except Exception as exc:
                 if is_transient(exc):
                     return index, messages, None, None, exc
-                raise ThemeError(f"Focused coding failed on chunk {index + 1}: {exc}") from exc
+                raise ThemeError(f"Theme report failed on chunk {index + 1}: {exc}") from exc
             return index, used_messages, payload, usage, None
 
         outcomes = sorted(await asyncio.gather(*(one(index) for index in indexes)), key=lambda item: item[0])
@@ -1733,6 +1765,9 @@ def _one_theme(
         "definition": theme.get("definition") or "",
         "properties": list(theme.get("properties") or []),
         "codes": labels,
+        "primary_codes": [
+            label for label in (theme.get("primary_codes") or []) if code_key(str(label)) in member_keys
+        ],
         "code_counts": code_counts,
         "n_passages": n_passages,
         "pct_passages": _pct(n_passages, totals["n_passages"]),
@@ -2166,7 +2201,7 @@ def _empty_result(
 
 def _metadata(**kwargs: Any) -> dict:
     return {
-        "protocol": "focused-coding-1",
+        "protocol": "theme-report-1",
         "version": __version__,
         "model": kwargs["model_name"],
         "n_themes_requested": kwargs["n_themes"],
