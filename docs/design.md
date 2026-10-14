@@ -1,7 +1,7 @@
-# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, 0.6.14, 0.6.15, and 0.6.16, focused coding in 0.7.0, fixes in 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, and 0.7.6)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, 0.6.14, 0.6.15, and 0.6.16, focused coding in 0.7.0, fixes in 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, 0.7.6, and 0.7.7)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
-Status: steps 1 and 2 of the v0.6 plan, plus focused coding in 0.7.0 and the 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, and 0.7.6 fixes. Axial coding, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
+Status: steps 1 and 2 of the v0.6 plan, plus focused coding in 0.7.0 and the 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, 0.7.6, and 0.7.7 fixes. Axial coding, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
 
 The default procedure is Charmaz-informed automated analysis: initial coding against a frozen snapshot, constant comparison with distinct operations, and `build_themes` as a descriptive reporting view. It is not an axial-coding template.
 
@@ -345,7 +345,9 @@ Focused coding is a new graph. It is not a node on `open_code`. Selection is det
 
 Package 0.7.6 keeps timed model calls on one shared loop, enforces the request timeout on the waiting side and with a graph-step watchdog, and records a timeout as incomplete. A claim is tested only against a passage that claim retrieved. An absence-of-mention pole is flagged and not tested. `claim_test_counts` accumulates. `proposal_stability` is undefined when there are no proposals. A compete round that returns only keep is flagged `compete_keep_only`. The token estimate stays a ceiling and is reported beside provider usage.
 
-`policy_version` is `0.7.6`.
+Package 0.7.7 keeps a provider that accepts a connection and sends no body inside the request timeout. The reported error keeps that attempt's duration. A timeout is not retried unless the wall budget can hold another full attempt, and a retry names that shared deadline. The checkpoint records status `incomplete`, stop `timeout`, the step, and a partial export when an output directory is set. A same-code passage is a claim test only when it also shares content or an embedding; an empty quote is not sent; `claim_test_relevance` reports the rate. `supports` against a pole that states a shortfall the passage does not state is `claim_test_invalid`. `proposal_stability` compares revise and drop of the same code and lists `cross_seed_conflicts`. Property stability reports how many properties each run named. The token ceiling is unchanged; `focused_tokens_calibrated` is the ceiling divided by 1.28 and is not the stopper.
+
+`policy_version` is `0.7.7`.
 
 ## 26. Out of scope
 

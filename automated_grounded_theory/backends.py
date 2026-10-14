@@ -8,6 +8,7 @@ them; otherwise the provider SDK reads its own environment variables.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from langchain_core.embeddings import Embeddings
@@ -286,6 +287,105 @@ def install_provider_http_timeout(model, seconds: float | None):
         except Exception:
             continue
     return model
+
+
+def _httpx_async_clients(root: Any):
+    """Pooled async HTTP clients hanging off a chat model or runnable."""
+    try:
+        import httpx
+    except ImportError:
+        return
+    seen: set[int] = set()
+    stack: list[tuple[Any, int]] = [(root, 0)]
+    names = (
+        "http_client",
+        "http_async_client",
+        "async_client",
+        "root_async_client",
+        "client",
+        "root_client",
+        "_client",
+        "bound",
+    )
+    while stack:
+        obj, depth = stack.pop()
+        if obj is None or id(obj) in seen or depth > 6:
+            continue
+        seen.add(id(obj))
+        if isinstance(obj, (str, bytes, int, float, bool)):
+            continue
+        if isinstance(obj, httpx.AsyncClient):
+            yield obj
+            continue
+        for name in names:
+            try:
+                child = getattr(obj, name, None)
+            except Exception:
+                child = None
+            if child is not None and child is not obj:
+                stack.append((child, depth + 1))
+        steps = getattr(obj, "steps", None)
+        if isinstance(steps, (list, tuple)):
+            for step in steps:
+                stack.append((step, depth + 1))
+
+
+def _transport_loop(client: Any):
+    transport = getattr(client, "_transport", None)
+    pool = getattr(transport, "_pool", None)
+    return getattr(pool, "_loop", None), transport
+
+
+async def arm_provider_clients(root: Any, seconds: float) -> None:
+    """Put pooled async clients on this loop and give every phase a deadline.
+
+    A client opened on the package loop keeps its socket there. The model loop
+    then sits idle with the connection open: the body is never delivered to the
+    loop that is awaiting it, and a missing read timeout never ends the wait.
+    A transport bound to some other loop is replaced so the next request opens
+    here. Connect, read, write, and pool each use ``seconds``.
+    """
+    if root is None or seconds is None or float(seconds) <= 0:
+        return
+    timeout = provider_http_timeout(float(seconds))
+    if timeout is None or isinstance(timeout, (int, float)):
+        return
+    try:
+        import httpx
+    except ImportError:
+        return
+    loop = asyncio.get_running_loop()
+    for client in _httpx_async_clients(root):
+        try:
+            client.timeout = timeout
+        except Exception:
+            pass
+        bound, transport = _transport_loop(client)
+        if bound is None or bound is loop or transport is None:
+            continue
+        try:
+            client._transport = httpx.AsyncHTTPTransport()
+        except Exception:
+            continue
+        if bound.is_running():
+            bound.call_soon_threadsafe(_close_transport_soon, bound, transport)
+
+
+def _close_transport_soon(loop: asyncio.AbstractEventLoop, transport: Any) -> None:
+    close = getattr(transport, "aclose", None)
+    if close is None:
+        return
+
+    async def _close() -> None:
+        try:
+            await close()
+        except Exception:
+            return
+
+    try:
+        loop.create_task(_close())
+    except RuntimeError:
+        return
 
 
 def resolve_chat_model(

@@ -36,9 +36,12 @@ class CallLimiter:
     waiting for the cancelled task to finish.
     ``wall_timeout``, when set above 0, is a single budget for the whole call:
     streaming, retries, and backoff share it, and a retry cannot start a fresh
-    ``request_timeout``. Timeouts and connection errors are retried the same
-    way as rate limits, up to ``max_retries``, and only while that budget
-    remains. Only a rate limit lowers the AIMD ceiling.
+    ``request_timeout``. A timeout is not retried unless the time still left
+    in that budget covers another full ``request_timeout``. The error keeps
+    the attempt's own duration. When a timeout was retried, the message also
+    names how many attempts ran and the deadline those attempts shared.
+    Connection errors and rate limits still retry while the budget remains.
+    Only a rate limit lowers the AIMD ceiling.
 
     ``ainvoke`` takes one slot from an AIMD limit (the configured concurrency
     is the ceiling; a rate limit halves it, and a streak of successes adds one
@@ -490,6 +493,40 @@ class CallLimiter:
             f"The model call exceeded the {budget:g}s wall-clock timeout, including streaming and retries."
         )
 
+    def _preserved_timeout(self, exc: BaseException, *, attempts: int) -> BaseException:
+        """Keep the attempt's own timeout text.
+
+        A wall-clock wrapper used to replace ``timed out after 120s`` with the
+        overall budget. One attempt returns that exception unchanged. A retry
+        that still fails names the attempt count and the shared deadline.
+        Only a real ``TimeoutError`` is rewritten. A message that merely
+        contains the word timeout (for example an oversized reservation) stays
+        the original exception.
+        """
+        if not isinstance(exc, TimeoutError):
+            return exc
+        if attempts <= 1:
+            return exc
+        original = str(exc).strip() or "timed out"
+        budget = None if self.wall_timeout is None else float(self.wall_timeout)
+        if budget and budget > 0:
+            return TimeoutError(f"{original} after {attempts} attempts; deadline {budget:g}s including retries")
+        return TimeoutError(f"{original} after {attempts} attempts")
+
+    def _timeout_retry_fits(self, deadline: float | None) -> bool:
+        """True when another full request timeout still fits in the wall budget.
+
+        No wall budget keeps the older retry behaviour for callers that do not
+        set one. A budget that cannot hold another ``request_timeout`` does not
+        start one: the attempt that just timed out already used its share.
+        """
+        if deadline is None:
+            return True
+        request = float(self.request_timeout or 0)
+        if request <= 0:
+            return False
+        return deadline - time.monotonic() >= request
+
     async def _retry(self, factory: Callable, deadline: float | None = None):
         for attempt in range(self.max_retries + 1):
             remaining = None if deadline is None else deadline - time.monotonic()
@@ -498,13 +535,25 @@ class CallLimiter:
             try:
                 return await factory(remaining)
             except Exception as exc:
-                if attempt >= self.max_retries or not is_transient(exc):
+                # is_timeout() also matches the word "timeout" in a message.
+                # OversizedReservation says the provider timeout would never
+                # start; that is not a provider read timeout and must not be
+                # retried or rewritten as TimeoutError.
+                real_timeout = isinstance(exc, TimeoutError)
+                if real_timeout and not self._timeout_retry_fits(deadline):
+                    raise self._preserved_timeout(exc, attempts=attempt + 1) from None
+                message_only = is_timeout(exc) and not real_timeout
+                if attempt >= self.max_retries or message_only or not is_transient(exc):
+                    if real_timeout:
+                        raise self._preserved_timeout(exc, attempts=attempt + 1) from None
                     raise
                 self._note_transient(exc)
                 wait = self._wait(attempt, exc)
                 if deadline is not None:
                     left = deadline - time.monotonic()
                     if left <= 0 or wait >= left:
+                        if real_timeout:
+                            raise self._preserved_timeout(exc, attempts=attempt + 1) from None
                         raise self._deadline_error()
                 # The attempt already released its slot. Sleep with the gate
                 # free so another passage or sweep can use it, then retry.
@@ -606,6 +655,12 @@ def oversized_request_message(kind: str, estimated: int, budget: int, passage_id
         f"over token_budget ({int(budget)}). "
         "The overflow was flagged and the request was sent."
     )
+
+
+def _timeout_message(seconds: float) -> str:
+    """Label for one attempt. Sub-millisecond float noise still reads as the configured duration."""
+    shown = round(float(seconds), 3)
+    return f"timed out after {shown:g}s"
 
 
 def is_timeout(exc: BaseException) -> bool:
@@ -1125,11 +1180,43 @@ def run_sync(coro, *, timeout: float | None = None):
         if timeout is not None and float(timeout) > 0:
             return future.result(timeout=float(timeout))
         return future.result()
-    except concurrent.futures.TimeoutError:
+    except TimeoutError:
+        # concurrent.futures.TimeoutError is TimeoutError on Python 3.11+.
+        # A coroutine that already raised TimeoutError is a finished future.
+        # Only an unfinished future means this wait itself expired. Rewriting
+        # a finished call timeout as the bridge budget dropped the real label
+        # (a 120s call was reported as the whole-run allowance).
+        if future.done():
+            return _propagate_finished(future)
         future.cancel()
-        raise TimeoutError(f"timed out after {float(timeout):g}s") from None
+        try:
+            return future.result(timeout=0.05)
+        except (TimeoutError, concurrent.futures.CancelledError):
+            if future.done() and not future.cancelled():
+                return _propagate_finished(future)
+        except BaseException:
+            if future.done() and not future.cancelled():
+                return _propagate_finished(future)
+        raise TimeoutError(f"sync bridge timed out after {float(timeout):g}s") from None
     except BaseException as exc:
         raise exc from None
+
+
+def _propagate_finished(future: concurrent.futures.Future):
+    """Return the finished future's value, or raise its exception.
+
+    A cancelled future has no result. ``exception()`` raises ``CancelledError``
+    in that case, which is not a call timeout.
+    """
+    if not future.done() or future.cancelled():
+        return None
+    try:
+        inner = future.exception()
+    except concurrent.futures.CancelledError:
+        return None
+    if inner is not None:
+        raise inner
+    return future.result()
 
 
 _ABANDONED_TIMEOUTS: set[asyncio.Task] = set()
@@ -1157,6 +1244,25 @@ def _hold_abandoned(task: asyncio.Task) -> None:
 
 _MODEL_LOOP: asyncio.AbstractEventLoop | None = None
 _MODEL_LOOP_LOCK = threading.Lock()
+_DEADLINE_EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
+_DEADLINE_LOCK = threading.Lock()
+
+
+def _deadline_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Threads that only block in ``future.result(timeout)``.
+
+    The package loop's default executor can also run a provider's sync read.
+    A deadline parked on that same pool does not start until the read returns,
+    so the call waits out the sync bridge instead of the request timeout.
+    """
+    global _DEADLINE_EXECUTOR
+    with _DEADLINE_LOCK:
+        if _DEADLINE_EXECUTOR is None:
+            _DEADLINE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=32,
+                thread_name_prefix="agt-call-deadline",
+            )
+        return _DEADLINE_EXECUTOR
 
 
 def _model_loop() -> asyncio.AbstractEventLoop:
@@ -1222,26 +1328,44 @@ def _submit_on_loop(loop: asyncio.AbstractEventLoop, coro, context: contextvars.
 async def _ainvoke_off_loop(runnable, payload, *, timeout: float):
     """Run one model call on the shared model loop.
 
-    The deadline is ``future.result(timeout)`` on a side thread. It does not
-    depend on the package loop waking up, and it does not run the provider
-    read on the package loop. A timeout of 0 or less is not passed here.
+    The deadline is ``future.result(timeout)`` on a private thread, not the
+    package loop's executor. It does not depend on the package loop waking up,
+    and it does not run the provider read on the package loop. Inside the
+    model loop the provider call is wrapped in :func:`await_with_wall_timeout`,
+    which cancels that task when the clock expires. A pooled async client is
+    given connect, read, write, and pool timeouts on this loop, and a transport
+    still bound to another loop is dropped so the read is not waited on a loop
+    that is not polling the socket. A timeout of 0 or less is not passed here.
     The model loop is not stopped between calls.
+
+    A finished future's ``TimeoutError`` is the call's own error. Python 3.11
+    aliases ``concurrent.futures.TimeoutError`` to ``TimeoutError``, so the
+    type alone cannot tell that error from this wait expiring.
     """
     loop = _model_loop()
     context = contextvars.copy_context()
 
     async def _call():
+        from automated_grounded_theory.backends import arm_provider_clients
+
+        await arm_provider_clients(runnable, timeout)
         return await await_with_wall_timeout(runnable.ainvoke(payload), timeout)
 
     future = _submit_on_loop(loop, _call(), context)
+    waiter = _deadline_executor().submit(future.result, float(timeout) + 0.05)
     try:
-        return await asyncio.to_thread(future.result, float(timeout) + 0.05)
-    except concurrent.futures.TimeoutError:
+        return await asyncio.wrap_future(waiter)
+    except TimeoutError:
+        if future.done():
+            exc = future.exception()
+            if exc is not None:
+                raise exc
+            return future.result()
         task = getattr(future, "task", None)
         future.cancel()
         if task is not None and loop.is_running():
             loop.call_soon_threadsafe(task.cancel)
-        raise TimeoutError(f"timed out after {float(timeout):g}s") from None
+        raise TimeoutError(_timeout_message(timeout)) from None
 
 
 async def await_with_wall_timeout(awaitable, timeout: float | None):
@@ -1268,4 +1392,4 @@ async def await_with_wall_timeout(awaitable, timeout: float | None):
     task.cancel()
     _hold_abandoned(task)
     await asyncio.sleep(0)
-    raise TimeoutError(f"timed out after {float(timeout):g}s")
+    raise TimeoutError(_timeout_message(timeout))

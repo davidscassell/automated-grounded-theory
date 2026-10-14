@@ -27,8 +27,8 @@ from tests.test_v070 import _entry, _passages, _source
 
 
 def test_version_is_074():
-    assert __version__ == "0.7.6"
-    assert POLICY_VERSION == "0.7.6"
+    assert __version__ == "0.7.7"
+    assert POLICY_VERSION == "0.7.7"
     assert FocusedAlternativeReading.model_fields["alternative_fit"].is_required()
 
 
@@ -103,7 +103,7 @@ def test_claim_search_pairs_a_claim_with_a_relevant_passage_only():
     state = _state(passages, segments, claims, reread=["p1"], codebook=book)
     found = _claim_compete_items(state, [], slots=4)
     sources = {item["passage_id"]: item["source"] for item in found}
-    assert sources["p2"] == "claim_same_code"
+    assert "p2" not in sources
     assert sources["p4"] == "claim_opposite_pole"
     assert sources["p3"] == "claim_similarity"
     assert sources["p5"] == "claim_similarity"
@@ -164,7 +164,7 @@ def test_claim_search_pairs_a_claim_with_a_relevant_passage_only():
 def test_claim_round_rereads_another_assignment_when_the_pole_is_absent():
     passages = [
         _passage("p1", "alpha bravo"),
-        _passage("p2", "charlie delta"),
+        _passage("p2", "alpha charlie"),
         _passage("p3", "echo foxtrot"),
     ]
     segments = [

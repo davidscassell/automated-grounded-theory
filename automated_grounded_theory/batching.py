@@ -26,17 +26,35 @@ from automated_grounded_theory.prompts import message_text
 _BROKEN_TOKENIZERS: set[int] = set()
 
 
+# Live focused runs reported estimate / provider total_tokens around 1.28.
+# The stopper stays the ceiling below. This factor is only a reported reading.
+TOKEN_ESTIMATE_CALIBRATION = 1.28
+
+
 def estimate_tokens(text: str) -> int:
     """Ceiling used before a call. About three characters per token.
 
     That is higher than a four-characters-per-token English count, so the
     estimate runs above provider usage. It is not calibrated down: the ceiling
     is what stops a reread. Empty text is zero. Any other text is at least one
-    token. Report this ceiling beside provider usage.
+    token. Report this ceiling beside provider usage. A separate calibrated
+    reading divides the ceiling by :data:`TOKEN_ESTIMATE_CALIBRATION` and is
+    not what stops the run.
     """
     if not text:
         return 0
     return max(1, (len(text) + 2) // 3)
+
+
+def calibrated_token_estimate(estimated: int) -> int:
+    """Lower reading of a ceiling, near observed provider usage.
+
+    Not the stopper. Allowances still use :func:`estimate_tokens`.
+    """
+    count = int(estimated or 0)
+    if count <= 0:
+        return 0
+    return max(1, int(round(count / TOKEN_ESTIMATE_CALIBRATION)))
 
 
 def resolve_tokenizer(model):
