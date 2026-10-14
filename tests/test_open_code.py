@@ -232,9 +232,17 @@ def test_trivial_passages_are_not_sent_to_the_model():
         batch_size=1,
         concurrency=1,
     )
-    assert model.call_count == 2
     assert len(result.segments) == 1
-    assert sum(1 for passage in result.passages if passage.get("skipped")) == 2
+    assert sum(1 for passage in result.passages if passage.get("skipped")) == 1
+    non_answer = next(passage for passage in result.passages if passage["text"].strip() == "n/a")
+    assert non_answer["nonsubstantive"] is True
+    assert non_answer["nonsubstantive_kind"] == "non_answer"
+    assert not non_answer["skipped"]
+    assert any(
+        "n/a" in json.dumps(item.get("messages"))
+        for item in result.prompt_log
+        if item.get("kind") == "code_passage"
+    )
     coded_ids = {segment["passage_id"] for segment in result.segments}
     assert not any(memo.get("passage_id") not in coded_ids and memo.get("kind") == "passage" for memo in result.memos)
 

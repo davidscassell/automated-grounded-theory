@@ -1,4 +1,4 @@
-# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, 0.6.14, and 0.6.15)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, 0.6.14, 0.6.15, and 0.6.16)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
 Status: steps 1 and 2 of the v0.6 plan. Category development, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
@@ -323,6 +323,22 @@ A successful embedding is published to the shared future before `_store_vector` 
 
 `policy_version` is `0.6.15`.
 
-## 24. Out of scope
+## 24. Corrections in 0.6.16
+
+A coding action below `review_below` is applied. `needs_review` records `low_confidence`, and the review operation stays on `review.json`. The score is not a probability. In-vivo clearing, definition rewrites, theme-assignment confidence, and `min_merge_confidence` are unchanged.
+
+`assign_codes` keeps every theme membership. `primary_codes` on a theme lists the codes for which that theme was first. `assignment_feedback` no longer says the first assignment was the only one kept. Theme prompts, including the codebook line, the request note, the review note, and the leftover note, say a code may belong to more than one theme and that the first theme is primary. The review prompt calls `max_theme_share` a soft presentation target. Exceeding it still only produces `_dominance_warning`. The protocol id is `theme-report-1`.
+
+`apply_sweep` still groups a component with union-find. The label that remains is `_survivor_choice`: the model's target, or the lexicographically smaller key when the merge is trivial, the judgment is missing, or the component's directions conflict (the tie-break is the smaller target, then the smaller member). Retired labels become aliases. Segment provenance is copied through and not rewritten. `clustering.union_roots` is a separate helper and still returns the lexicographically smaller key.
+
+`plan_coding(..., code_nonsubstantive=True)` queues uncertainty, refusal, `n/a`, and punctuation-only text and sets `nonsubstantive` and `nonsubstantive_kind`. Empty text stays `exclusion_reason=empty`. `code_nonsubstantive=False` restores exclusion. The flag is on run metadata and on the procedure manifest. A checkpoint that omits it compares as true. Incident rows carry the same two fields. Segments copy them from the passage.
+
+`memo_review_reasons` returns `None` for a blank note or a placeholder, `["thin"]` under 20 words, and `[]` otherwise. `commit_passage` stores a real memo either way and sets `needs_review` from those reasons. A low memo confidence adds `low_confidence` and a review operation. The memo is still stored.
+
+The README and [methodology.md](methodology.md) describe the package as automated initial coding plus a theme report. The speed table is a simulated fake-coder benchmark. Live accuracy against human coding for 0.6.x has not been measured. The last live numbers are 0.5.4. `pipeline=True` codes against the pre-merge snapshot.
+
+`policy_version` is `0.6.16`.
+
+## 25. Out of scope
 
 Category feedback, focused recoding of earlier negatives, relationship hypotheses, sampling briefs, and a Taguette project-file adapter. See the v0.6 plan steps 3–5.

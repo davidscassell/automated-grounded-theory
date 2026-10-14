@@ -30,9 +30,9 @@ from automated_grounded_theory.validation import (
     attribute_evidence,
     attributed_passage_ids,
     evidence_wholly_outside,
+    memo_review_reasons,
     review_passage_flags,
     split_joined_label,
-    substantive_memo,
 )
 
 _ACTION_ALIASES = {
@@ -95,6 +95,11 @@ def _fallback_rationale(op: str, reason: str) -> str:
         "opposite_valence": "These codes take opposite stances, so they stay separate.",
         "below_merge_confidence": "The agreement confidence is below the merge threshold, so the merge waits for review.",
         "below_review_threshold": "The confidence is below the review threshold, so this decision waits for a person.",
+        "low_confidence": (
+            "The model's confidence is below the review threshold. The action was applied and flagged. "
+            "The score is a diagnostic, not a probability."
+        ),
+        "thin": "The memo is analytic and shorter than the comfortable range. It was kept and flagged thin.",
         "in_vivo_below_review_threshold": "The in-vivo flag is not confident enough to apply, so the code stays a composed label.",
         "merge_cap": "This merge was past the cap for this sweep, so it was not applied.",
         "quote_split": "This quote does not fit the rewritten code, so it was split back out.",
@@ -821,8 +826,10 @@ def interpret_coding(
 ) -> dict[str, Any]:
     """Validate one model response. Does not mutate the codebook.
 
-    A decision whose confidence is below ``review_below`` is not applied.
-    It is returned on ``review``. Unknown code ids are rejected.
+    A coding action whose confidence is below ``review_below`` is applied and
+    flagged ``needs_review`` with reason ``low_confidence``. The same decision
+    stays on ``review``. The score is the model's diagnostic, not a probability.
+    Unknown code ids are rejected.
     A quote that cannot be anchored does not reject the code. The quote is
     flagged ``possibly_modified`` or ``unanchored`` and coding continues.
     ``quote_retries`` lists those flags so the caller can ask for a closer
@@ -1033,6 +1040,7 @@ def interpret_coding(
             long_passage_chars=long_passage_chars,
             low_confidence=low_confidence,
             confidence=confidence,
+            review_below=review_below,
         )
         flags.extend(reasons)
         if quote_flag:
@@ -1062,26 +1070,8 @@ def interpret_coding(
         ):
             review_flags.append("context_restatement")
         op_name = {"new": "create", "reuse": "reuse", "refine": "refine"}[action]
-        if confidence < review_below:
-            rejections.append(
-                {
-                    "code": fields.get("code") or label,
-                    "reason": "below_review_threshold",
-                    "quote": verbatim,
-                    "confidence": confidence,
-                }
-            )
-            held = _op(
-                op=op_name,
-                status="review",
-                confidence=confidence,
-                ids={"passage_id": passage_id, "code_id": sent_id},
-                reason="below_review_threshold",
-                rationale=str(proposal.get("rationale") or ""),
-            )
-            ops.append(held)
-            review.append(held)
-            continue
+        if confidence < review_below and "low_confidence" not in review_flags:
+            review_flags.append("low_confidence")
 
         key = fields["key"]
         if key in seen_keys and action == "new":
@@ -1158,6 +1148,17 @@ def interpret_coding(
             rationale=str(proposal.get("rationale") or ""),
         )
         ops.append(applied)
+        if confidence < review_below:
+            held_confidence = _op(
+                op=op_name,
+                status="review",
+                confidence=confidence,
+                ids={"passage_id": passage_id, "code_id": _code_id(key)},
+                reason="low_confidence",
+                rationale=str(proposal.get("rationale") or ""),
+            )
+            ops.append(held_confidence)
+            review.append(held_confidence)
         if quote_flag:
             held_quote = _op(
                 op="assign_quote",
@@ -1263,19 +1264,24 @@ def interpret_coding(
 
     memo_body = str(payload.get("memo") or "").strip()
     memo_confidence = bounded_unit(payload.get("memo_confidence"), 1.0)
-    if memo_body and memo_confidence < review_below:
-        held_memo = _op(
-            op="memo",
-            status="review",
-            confidence=memo_confidence,
-            ids={"passage_id": passage_id},
-            reason="below_review_threshold",
-            rationale=memo_body,
-        )
-        ops.append(held_memo)
-        review.append(held_memo)
+    memo_reasons = memo_review_reasons(memo_body)
+    if memo_reasons is None:
         memo_body = ""
-    elif memo_body:
+        memo_reasons = []
+    elif memo_body and memo_confidence < review_below and "low_confidence" not in memo_reasons:
+        memo_reasons.append("low_confidence")
+    if memo_body:
+        for reason in memo_reasons:
+            held_memo = _op(
+                op="memo",
+                status="review",
+                confidence=memo_confidence,
+                ids={"passage_id": passage_id},
+                reason=reason,
+                rationale=memo_body,
+            )
+            ops.append(held_memo)
+            review.append(held_memo)
         ops.append(
             _op(
                 op="memo",
@@ -1295,6 +1301,7 @@ def interpret_coding(
         "rejections": rejections,
         "memo": memo_body,
         "memo_confidence": memo_confidence,
+        "memo_reasons": memo_reasons,
         "low_confidence": low_confidence,
         "ops": ops,
         "review": review,
@@ -1347,8 +1354,18 @@ def commit_passage(
     appended: list[dict] = []
 
     memo_body = str(interpreted.get("memo") or "").strip()
-    if memo_body and not substantive_memo(memo_body):
-        memo_body = ""
+    memo_reasons = interpreted.get("memo_reasons")
+    if memo_reasons is None:
+        reviewed = memo_review_reasons(memo_body)
+        if reviewed is None:
+            memo_body = ""
+            memo_reasons = []
+        else:
+            memo_reasons = reviewed
+    else:
+        memo_reasons = [str(reason) for reason in memo_reasons if str(reason)]
+        if not memo_body:
+            memo_reasons = []
     memo_id = None
     if memo_body:
         memo_id = _next(counters, "memo", "m")
@@ -1360,6 +1377,8 @@ def commit_passage(
                 "passage_id": passage.get("passage_id"),
                 "sweep_index": None,
                 "text": memo_body,
+                "needs_review": bool(memo_reasons),
+                "review_reasons": list(memo_reasons),
             }
         )
 
@@ -1495,6 +1514,8 @@ def commit_passage(
             "confidence": item["confidence"],
             "needs_review": item["needs_review"],
             "review_reasons": list(item["review_reasons"]),
+            "nonsubstantive": bool(passage.get("nonsubstantive")),
+            "nonsubstantive_kind": str(passage.get("nonsubstantive_kind") or ""),
             "memo_id": memo_id,
         }
         targets = [pid for pid in attributed_ids if pid]
@@ -2201,7 +2222,8 @@ def plan_in_batch_aliases(
             continue
         source = code_key(str(merge.get("source") or ""))
         target = code_key(str(merge.get("target") or ""))
-        survivor = source if source <= target else target
+        post = applied["codebook"]
+        survivor = target if target in post else source if source in post else ""
         if survivor:
             definitions[survivor] = definition
     pairs = []
@@ -2220,6 +2242,56 @@ def plan_in_batch_aliases(
             }
         )
     return {"rewrites": rewrites, "definitions": definitions, "pairs": pairs}
+
+
+def _survivor_choice(
+    codebook: Mapping[str, Mapping[str, Any]],
+    find,
+    components: Mapping[str, set[str]],
+    preferred: Mapping[str, str],
+    conflicted: set[str],
+    directed_edges: Sequence[tuple[str, str]],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Map every code key to the label that should remain, plus the rule used.
+
+    A model merge keeps the target side. A component with no model direction
+    keeps the lexicographically smaller key. Directions that disagree inside
+    one component use that same lexicographic tie-break among the labels a
+    model named as a target.
+    """
+    edges_by_root: dict[str, list[tuple[str, str]]] = {}
+    for source, target in directed_edges:
+        if source not in codebook or target not in codebook:
+            continue
+        edges_by_root.setdefault(find(source), []).append((source, target))
+    survivor_of: dict[str, str] = {}
+    rules: dict[str, str] = {}
+    seen: set[str] = set()
+    for key in codebook:
+        root = find(key)
+        if root in seen:
+            continue
+        seen.add(root)
+        members = set(components.get(root) or {root})
+        edges = edges_by_root.get(root, [])
+        if root in conflicted:
+            targets = {target for _source, target in edges if target in members}
+            choice = min(targets or members)
+            rule = "tie_break"
+        elif edges:
+            choice = preferred.get(root, min(members))
+            if choice not in members:
+                choice = min(members)
+            rule = "target"
+        else:
+            choice = min(members)
+            rule = "lexicographic"
+        for member in members:
+            survivor_of[member] = choice
+        rules[choice] = rule
+    for key in codebook:
+        survivor_of.setdefault(key, key)
+    return survivor_of, rules
 
 
 def apply_sweep(
@@ -2365,6 +2437,7 @@ def apply_sweep(
                 record[flag] = merge.get(flag)
         decision, gate_reason = classify_comparison(merge, codebook)
         record["comparison_op"] = decision
+        record["trivial"] = bool(merge.get("trivial"))
         if decision != "alias_duplicate":
             rejected.append({**record, "reason": gate_reason, "decision": decision})
             ops.append(
@@ -2385,6 +2458,9 @@ def apply_sweep(
 
     eligible_pairs = {frozenset((source, target)) for _record, source, target in eligible}
     components: dict[str, set[str]] = {key: {key} for key in codebook}
+    preferred = {key: key for key in codebook}
+    conflicted: set[str] = set()
+    directed_edges: list[tuple[str, str]] = []
     lost: list[dict] = []
     cap = None if max_merges_per_sweep is None else max(0, int(max_merges_per_sweep))
     applied_count = 0
@@ -2405,6 +2481,12 @@ def apply_sweep(
             continue
         root_source, root_target = find(source), find(target)
         if root_source == root_target:
+            # A later judgment that would retire the label already chosen is a
+            # conflict. The component still merges; the survivor tie-breaks.
+            current = preferred.get(root_source, root_source)
+            if not record.get("trivial") and source == current and target != current:
+                conflicted.add(root_source)
+                directed_edges.append((source, target))
             rejected.append({**record, "reason": "already_merged"})
             continue
         group = set(components.get(root_source) or {root_source}) | set(components.get(root_target) or {root_target})
@@ -2430,15 +2512,27 @@ def apply_sweep(
                 )
             )
             continue
-        # The survivor is the lexicographically smaller code key. The model's
-        # source/target direction does not change which label remains.
+        # Group membership stays a union-find. The label that remains is chosen
+        # afterwards: the model's target, or a lexicographic tie-break when the
+        # judgment is missing or the component's directions conflict.
         if root_target < root_source:
             parent[root_source] = root_target
-            survivor_root, retired_root = root_target, root_source
+            group_root, retired_root = root_target, root_source
         else:
             parent[root_target] = root_source
-            survivor_root, retired_root = root_source, root_target
-        components[survivor_root] = group
+            group_root, retired_root = root_source, root_target
+        if record.get("trivial"):
+            left, right = preferred[root_source], preferred[root_target]
+            chosen = left if left <= right else right
+        else:
+            chosen = preferred[root_target]
+            directed_edges.append((source, target))
+        preferred[group_root] = chosen
+        preferred.pop(retired_root, None)
+        if retired_root in conflicted or group_root in conflicted:
+            conflicted.add(group_root)
+        conflicted.discard(retired_root)
+        components[group_root] = group
         components.pop(retired_root, None)
         record = {**record, "decision": "accept", "comparison_op": "alias_duplicate"}
         accepted.append(record)
@@ -2455,19 +2549,43 @@ def apply_sweep(
             )
         )
 
+    survivor_of, survivor_rule = _survivor_choice(codebook, find, components, preferred, conflicted, directed_edges)
     book: dict[str, dict] = {}
     merge_map: dict[str, str] = {}
     for key, entry in codebook.items():
-        root = find(key)
-        merge_map[key] = root
-        if root not in book:
-            survivor = deepcopy(codebook[root])
-            survivor["key"] = root
-            survivor["code"] = codebook[root]["code"]
+        choice = survivor_of[key]
+        merge_map[key] = choice
+        if choice not in book:
+            survivor = deepcopy(codebook[choice])
+            survivor["key"] = choice
+            survivor["code"] = codebook[choice]["code"]
             survivor["history"] = list(survivor.get("history") or [])
-            book[root] = survivor
-        if key != root:
-            book[root].setdefault("history", []).append(
+            survivor["aliases"] = [
+                str(alias)
+                for alias in (survivor.get("aliases") or [])
+                if str(alias).strip() and str(alias) != survivor["code"]
+            ]
+            book[choice] = survivor
+            members = [member for member, chosen in survivor_of.items() if chosen == choice]
+            if len(members) > 1:
+                survivor["history"].append(
+                    {
+                        "event": "survivor_chosen",
+                        "rule": survivor_rule.get(choice, "target"),
+                        "code": survivor["code"],
+                    }
+                )
+        if key != choice:
+            aliases = book[choice].setdefault("aliases", [])
+            label = str(entry.get("code") or key)
+            if label and label != book[choice]["code"] and label not in aliases:
+                aliases.append(label)
+            for prior in entry.get("aliases") or []:
+                prior_label = str(prior).strip()
+                if prior_label and prior_label != book[choice]["code"] and prior_label not in aliases:
+                    aliases.append(prior_label)
+            book[choice].setdefault("history", []).extend(entry.get("history") or [])
+            book[choice]["history"].append(
                 {
                     "event": "merged_from",
                     "code": entry.get("code"),
@@ -2478,6 +2596,7 @@ def apply_sweep(
                     ),
                 }
             )
+            book[choice]["aliases"] = sorted(book[choice].get("aliases") or [], key=code_key)
 
     for update in definitions or []:
         update_id = str(update.get("code_id") or "").strip()
@@ -2497,7 +2616,7 @@ def apply_sweep(
         if key not in parent:
             rejected.append({"source": update.get("code"), "target": None, "reason": "unknown_definition", "confidence": confidence})
             continue
-        root = find(key)
+        root = survivor_of.get(key, find(key))
         definition = str(update.get("definition") or "").strip()
         if key != root:
             # The post-merge rewrite owns the survivor wording. A definition
@@ -2541,7 +2660,7 @@ def apply_sweep(
         key = code_key(str(label))
         if key not in parent:
             continue
-        root = find(key)
+        root = survivor_of.get(key, find(key))
         if root in book:
             book[root]["flagged_overloaded"] = True
             book[root].setdefault("history", []).append({"event": "flagged_overloaded", "code": label})
@@ -2551,7 +2670,7 @@ def apply_sweep(
         updated = dict(segment)
         key = updated.get("code_key") or code_key(str(updated.get("code") or ""))
         if key in parent:
-            root = find(key)
+            root = survivor_of.get(key, find(key))
             updated["code_key"] = root
             updated["code"] = book[root]["code"]
         new_segments.append(updated)
@@ -2563,7 +2682,7 @@ def apply_sweep(
         target = code_key(str(hint.get("target") or ""))
         if source not in parent or target not in parent:
             continue
-        source_root, target_root = find(source), find(target)
+        source_root, target_root = survivor_of.get(source, find(source)), survivor_of.get(target, find(target))
         if source_root not in book or target_root not in book:
             continue
         record = {

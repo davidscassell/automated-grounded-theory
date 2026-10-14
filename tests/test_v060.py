@@ -30,7 +30,7 @@ from tests.fake_llm import FakeCoder
 
 
 def test_version_and_batch_size_default():
-    assert __version__ == "0.6.15"
+    assert __version__ == "0.6.16"
     assert inspect.signature(open_code).parameters["batch_size"].default == 1
     assert inspect.signature(aopen_code).parameters["batch_size"].default == 1
     assert RunConfig.__dataclass_fields__["batch_size"].default == 1
@@ -290,7 +290,13 @@ def test_incidents_keep_the_question_and_do_not_cut_mid_sentence():
         assert item["text"] in text
         assert not item["text"].startswith("Interviewer")
         assert len(item["text"]) <= 1200 or item["text"].count(".") <= 1
-    excluded = plan_coding([{"id": "n", "text": "n/a"}], unit="incident", seed=1)
+    coded = plan_coding([{"id": "n", "text": "n/a"}], unit="incident", seed=1)
+    assert coded.passages[0]["coverage_status"] == "pending"
+    assert coded.passages[0]["exclusion_reason"] == ""
+    assert coded.passages[0]["nonsubstantive"] is True
+    assert coded.passages[0]["nonsubstantive_kind"] == "non_answer"
+    assert coded.queue == [0]
+    excluded = plan_coding([{"id": "n", "text": "n/a"}], unit="incident", seed=1, code_nonsubstantive=False)
     assert excluded.passages[0]["coverage_status"] == "excluded"
     assert excluded.passages[0]["exclusion_reason"] == "non_answer"
     assert excluded.queue == []

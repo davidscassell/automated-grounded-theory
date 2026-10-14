@@ -1,4 +1,4 @@
-"""Focused coding with a fake model. No provider and no API key."""
+"""Theme report with a fake model. No provider and no API key."""
 
 import csv
 import json

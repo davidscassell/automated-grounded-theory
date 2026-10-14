@@ -443,8 +443,9 @@ def test_in_vivo_prompt_requires_a_vivid_phrase():
     assert "staying for the team" not in CODING_SYSTEM
     assert "set in_vivo true only when every one of these is true" in CODING_SYSTEM
     assert "participant's language" in CODING_SYSTEM
-    assert "50 to 120" in CODING_SYSTEM
-    assert "emerging question" in CODING_SYSTEM
+    assert "20 to 400" in CODING_SYSTEM
+    assert "analytically interesting" in CODING_SYSTEM
+    assert "50 to 120" not in CODING_SYSTEM
     assert "Prefer reuse" in CODING_SYSTEM
 
 
