@@ -36,18 +36,21 @@ when a stored comparison names the code with ``refine_definition``,
 ``record_dimension``, ``link_to_category``, or ``keep_distinct``. A memo the
 model wrote is the memo term, not a second score of importance.
 
-The reread allowance is split across three purposes and interleaved:
+The reread allowance is split across four purposes. Three are interleaved:
 developing existing assignments, testing competing interpretations, and
-examining passages outside the initial selection. Shares are
-``focused_share_develop``, ``focused_share_compete``, and
-``focused_share_outside``. Each purpose's queue is sized to its reserved
-share of ``max_focused_review_calls``. ``focused_neighbor_limit``,
+examining passages outside the initial selection. The fourth,
+``focused_share_claim_compete``, is reserved and not spent on that queue.
+After properties are written, that share tests them against other passages.
+Shares are ``focused_share_develop``, ``focused_share_compete``,
+``focused_share_outside``, and ``focused_share_claim_compete``. They sum to
+1. The default is one quarter each. Each of the first three queues is sized
+to its reserved share of ``max_focused_review_calls``. ``focused_neighbor_limit``,
 ``focused_outside_limit``, and ``focused_negative_case_limit`` are optional
 caps (``None`` does not cap; ``0`` adds none). They are not a default of 1.
-Coverage reports the share of calls actually used. ``seed`` shuffles queue
-order. When every candidate fits its slot, that seed does not change who is
-included. ``focused_sampling_seed`` chooses membership only when a candidate
-list is longer than its slot. Coverage is reported per purpose.
+Coverage reports the share of calls actually used, including claim compete.
+``seed`` shuffles queue order. When every candidate fits its slot, that seed
+does not change who is included. ``focused_sampling_seed`` chooses membership
+only when a candidate list is longer than its slot.
 
 A code is proposed by ``focused_selection_rule``. The default is ``top_k``:
 about half the codes, ties broken by ``code_id``, and never every code unless
@@ -80,11 +83,12 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, Send, interrupt
 from typing_extensions import TypedDict
 
-from automated_grounded_theory.async_support import CallLimiter, ainvoke_structured, run_sync
+from automated_grounded_theory.async_support import CallLimiter, ainvoke_structured, combine_usage, run_sync
 from automated_grounded_theory.batching import request_input_tokens, resolve_tokenizer
 from automated_grounded_theory.backends import chat_model_settings, describe_model
 from automated_grounded_theory.category_state import (
     ANALYTIC_FEATURES,
+    COVERAGE_PURPOSES,
     DEFAULT_SHARES,
     MEMO_COUNT_NOTE,
     REREAD_PURPOSES,
@@ -99,10 +103,12 @@ from automated_grounded_theory.category_state import (
     evidence_revision_id,
     interleave_queue,
     load_category_development,
+    merge_properties,
     negative_case_candidates,
     normalize_analytic_features,
     normalize_shares,
     parse_incidents,
+    property_stability_report,
     proposal_record_fields,
     purpose_coverage,
     view_notes,
@@ -121,7 +127,7 @@ from automated_grounded_theory.prompts import validation_feedback
 from automated_grounded_theory.records import POLICY_VERSION, freeze_snapshot, proposal_buffer_reducer, select_committable
 from automated_grounded_theory.results import OpenCodeResult, load_run
 from automated_grounded_theory.retrieval import code_text, jaccard
-from automated_grounded_theory.schemas import FocusedRecodeBatch
+from automated_grounded_theory.schemas import FocusedCompeteBatch, FocusedRecodeBatch
 from automated_grounded_theory.validation import (
     anchor_quote,
     code_key,
@@ -173,6 +179,7 @@ _PROCEDURE_KEYS = (
     "focused_share_develop",
     "focused_share_compete",
     "focused_share_outside",
+    "focused_share_claim_compete",
     "focused_analytic_features",
     "focused_sampling_seed",
     "focused_duplicate_similarity",
@@ -211,6 +218,25 @@ FOCUSED_SYSTEM = (
     "Do not decide that a category is saturated."
 )
 
+FOCUSED_COMPETE_SYSTEM = (
+    "You are testing a coding, not defending it. "
+    "The codes in this request are on equal footing. None is marked as preferred or raised. "
+    "For every passage, return one verdict for every initial code: keep, revise, or drop. "
+    "Do not omit an initial code. "
+    "Each verdict needs a rationale that states the disconfirming reading you considered. "
+    "revise means the definition should change. drop means the passage does not support the code. "
+    "keep, revise, and drop are equally available. Prefer revise or drop when the fit is doubtful. "
+    "revise and drop are proposals. They are not applied without review. "
+    "strongest_alternative is required on every passage, even when you keep the initial code. "
+    "Name the best other reading, using a code from the list when one fits. "
+    "Quote the target passage. "
+    "Name analytic properties and dimensions, each with a document id, passage id, and a quote. "
+    "Do not write a descriptive summary in place of a property. "
+    "Do not write relations between categories. Do not name a core category. "
+    "Do not decide that a category is saturated."
+)
+COMPETE_PURPOSES = frozenset({"compete", "claim_compete"})
+
 
 class FocusedError(RuntimeError):
     """The focused-coding run could not continue."""
@@ -240,6 +266,9 @@ class FocusedState(TypedDict, total=False):
     round_jobs: list
     focused_calls_used: int
     focused_tokens_used: int
+    focused_tokens_estimated: int
+    provider_token_usage: dict
+    purpose_provider_tokens: dict
     focused_not_reread: list
     focused_not_queued: list
     focused_reread: list
@@ -1008,14 +1037,14 @@ def _reallocate_shares(
 
 
 def call_targets(shares: Mapping[str, float], total: int) -> dict[str, int]:
-    """Largest-remainder split of ``total`` calls across the three reread purposes."""
+    """Largest-remainder split of ``total`` calls, including the reserved claim-compete share."""
     total = max(0, int(total))
-    raw = {purpose: float(shares[purpose]) * total for purpose in REREAD_PURPOSES}
-    base = {purpose: int(math.floor(raw[purpose] + 1e-9)) for purpose in REREAD_PURPOSES}
+    raw = {purpose: float(shares.get(purpose, 0) or 0) * total for purpose in COVERAGE_PURPOSES}
+    base = {purpose: int(math.floor(raw[purpose] + 1e-9)) for purpose in COVERAGE_PURPOSES}
     left = total - sum(base.values())
     order = sorted(
-        REREAD_PURPOSES,
-        key=lambda purpose: (-(raw[purpose] - base[purpose]), REREAD_PURPOSES.index(purpose)),
+        COVERAGE_PURPOSES,
+        key=lambda purpose: (-(raw[purpose] - base[purpose]), COVERAGE_PURPOSES.index(purpose)),
     )
     for purpose in order:
         if left <= 0:
@@ -1244,11 +1273,10 @@ def plan_recode_queue(
     order_rng = random.Random(int(seed))
     sample_rng = random.Random(int(seed if sampling_seed is None else sampling_seed))
     sized = max_calls is not None
-    passage_targets = (
-        {purpose: count * max(1, int(batch_size)) for purpose, count in call_targets(share_values, int(max_calls)).items()}
-        if sized
-        else {purpose: 0 for purpose in REREAD_PURPOSES}
-    )
+    call_plan = call_targets(share_values, int(max_calls)) if sized else {purpose: 0 for purpose in COVERAGE_PURPOSES}
+    passage_targets = {
+        purpose: int(call_plan.get(purpose) or 0) * max(1, int(batch_size)) for purpose in REREAD_PURPOSES
+    }
     neg_cap = _share_cap(negative_case_limit, passage_targets["compete"]) if sized else _legacy_cap(negative_case_limit)
     neighbor_cap = _share_cap(neighbor_limit, passage_targets["compete"]) if sized else _legacy_cap(neighbor_limit)
     outside_cap = _share_cap(outside_limit, passage_targets["outside"]) if sized else _legacy_cap(outside_limit)
@@ -1353,7 +1381,7 @@ def plan_recode_queue(
         "shares_applied": applied,
         "reallocation": reallocation,
         "purpose_counts": {purpose: len(groups[purpose]) for purpose in REREAD_PURPOSES},
-        "call_targets": call_targets(share_values, int(max_calls)) if sized else {},
+        "call_targets": call_plan if sized else {},
         "passage_targets": passage_targets if sized else {},
     }
 
@@ -2272,6 +2300,232 @@ def _compact_codes(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
     ]
 
 
+def _initial_code_rows(
+    passage_id: str,
+    segments: Sequence[Mapping[str, Any]],
+    book: Mapping[str, Mapping[str, Any]] | Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Codes already assigned on this passage, in assignment order."""
+    entries = book.values() if isinstance(book, Mapping) else book
+    by_id = {str(entry.get("code_id") or ""): entry for entry in entries}
+    rows = []
+    seen: set[str] = set()
+    for segment in segments:
+        homes = {str(segment.get("passage_id") or ""), str(segment.get("coded_passage_id") or "")}
+        if passage_id not in homes:
+            continue
+        code_id = str(segment.get("code_id") or "")
+        if not code_id or code_id in seen:
+            continue
+        seen.add(code_id)
+        entry = by_id.get(code_id) or {}
+        rows.append(
+            {
+                "code_id": code_id,
+                "code": entry.get("code") or segment.get("code") or "",
+                "definition": entry.get("definition") or "",
+            }
+        )
+    return rows
+
+
+def _equal_footing_codes(
+    raised: Sequence[Mapping[str, Any]],
+    other: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Non-raised codes first, with no field that says which were raised."""
+    return _compact_codes(list(other) + list(raised))
+
+
+def _compete_messages(
+    passages: Sequence[Mapping[str, Any]],
+    raised: Sequence[Mapping[str, Any]],
+    *,
+    other: Sequence[Mapping[str, Any]] | None = None,
+    initial_codes: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
+    feedback: str = "",
+) -> list:
+    codes = _equal_footing_codes(raised, other or [])
+    payload = {
+        "codes": codes,
+        "equal_footing": (
+            "These codes are listed with no preferred or raised subset. "
+            "Alternatives are first. Do not treat an earlier code as the one to defend."
+        ),
+        "verdict_required": (
+            "For each passage, verdicts must include every initial_code. "
+            "Each verdict is keep, revise, or drop and needs a rationale. "
+            "revise and drop are proposals and are not applied without review."
+        ),
+        "strongest_alternative_required": (
+            "Every passage needs strongest_alternative: the best other reading, "
+            "using a code from this list when one fits."
+        ),
+        "passages": [
+            {
+                "passage_id": item.get("passage_id"),
+                "doc_id": item.get("doc_id"),
+                "text": item.get("text"),
+                "initial_codes": list((initial_codes or {}).get(str(item.get("passage_id") or "")) or []),
+            }
+            for item in passages
+        ],
+        "feedback": feedback,
+    }
+    return [
+        SystemMessage(content=FOCUSED_COMPETE_SYSTEM),
+        HumanMessage(content=json.dumps(payload, ensure_ascii=False, indent=2)),
+    ]
+
+
+def _batch_is_compete(purposes: Mapping[str, str] | Sequence[str]) -> bool:
+    if isinstance(purposes, Mapping):
+        values = [str(item) for item in purposes.values()]
+    else:
+        values = [str(item) for item in purposes]
+    return bool(values) and all(item in COMPETE_PURPOSES for item in values)
+
+
+def _recode_request(
+    passages: Sequence[Mapping[str, Any]],
+    raised: Sequence[Mapping[str, Any]],
+    *,
+    other: Sequence[Mapping[str, Any]] | None = None,
+    purposes: Mapping[str, str] | None = None,
+    initial_codes: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
+    feedback: str = "",
+):
+    """Messages and schema for one batch. Compete uses the verdict schema."""
+    if _batch_is_compete(purposes or {}):
+        return (
+            _compete_messages(
+                passages,
+                raised,
+                other=other,
+                initial_codes=initial_codes,
+                feedback=feedback,
+            ),
+            FocusedCompeteBatch,
+        )
+    return _recode_messages(passages, raised, other=other, feedback=feedback), FocusedRecodeBatch
+
+
+def _verdicts_to_decisions(row: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Turn required compete verdicts into the decisions the commit path already flags."""
+    decisions = []
+    for verdict in row.get("verdicts") or []:
+        if not isinstance(verdict, Mapping):
+            continue
+        action = str(verdict.get("verdict") or verdict.get("action") or "keep")
+        decisions.append(
+            {
+                "action": action,
+                "code": verdict.get("code") or "",
+                "code_id": verdict.get("code_id") or "",
+                "definition": verdict.get("revised_definition") or verdict.get("definition") or "",
+                "quote": verdict.get("quote") or "",
+                "rationale": verdict.get("rationale") or "",
+                "confidence": verdict.get("confidence", 1.0),
+            }
+        )
+    return decisions
+
+
+def _row_decisions(row: Mapping[str, Any]) -> list[dict[str, Any]]:
+    if row.get("verdicts"):
+        return _verdicts_to_decisions(row)
+    return [dict(item) for item in (row.get("codes") or []) if isinstance(item, Mapping)]
+
+
+def _kept_code_ids(row: Mapping[str, Any], book: Mapping[str, Mapping[str, Any]]) -> set[str]:
+    kept = set()
+    for decision in _row_decisions(row):
+        action = str(decision.get("action") or decision.get("verdict") or "")
+        if action not in {"keep", "add", ""}:
+            continue
+        if action == "" and decision.get("verdict") not in {None, "", "keep"}:
+            continue
+        code_id = _known_code_id(decision, book)
+        if code_id and action == "keep":
+            kept.add(code_id)
+    return kept
+
+
+def _flag_alternative_not_chosen(
+    segments: list[dict],
+    passage_id: str,
+    row: Mapping[str, Any],
+    book: Mapping[str, Mapping[str, Any]],
+    raised_code_ids: Sequence[str],
+) -> None:
+    """Flag a kept raised code when the memo or the alternative names a different code."""
+    kept = _kept_code_ids(row, book)
+    raised = {str(item) for item in raised_code_ids}
+    kept_raised = kept & raised if raised else set(kept)
+    if not kept_raised:
+        return
+    named: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    alternative = row.get("strongest_alternative") or {}
+    if isinstance(alternative, Mapping):
+        alt_id = _known_code_id(alternative, book)
+        label = str(alternative.get("code") or "").strip()
+        if (alt_id and alt_id not in kept) or (label and code_key(label) not in {code_key(str(book[key].get("code") or "")) for key in book if str(book[key].get("code_id") or "") in kept}):
+            if label or alt_id:
+                token = (alt_id, "strongest_alternative")
+                if token not in seen and (not alt_id or alt_id not in kept):
+                    seen.add(token)
+                    named.append({"code_id": alt_id, "code": label, "source": "strongest_alternative"})
+    memo = str(row.get("memo") or "")
+    folded = memo.casefold()
+    if folded:
+        for entry in book.values():
+            code_id = str(entry.get("code_id") or "")
+            label = str(entry.get("code") or "").strip()
+            if not label or code_id in kept:
+                continue
+            if label.casefold() in folded:
+                token = (code_id, "memo")
+                if token in seen:
+                    continue
+                seen.add(token)
+                named.append({"code_id": code_id, "code": label, "source": "memo"})
+    if not named:
+        return
+    payload = {"alternatives": named, "kept_code_ids": sorted(kept_raised), "applied": False}
+    for code_id in sorted(kept_raised):
+        _flag_existing_code(
+            segments,
+            passage_id,
+            code_id,
+            reason="alternative_named_not_chosen",
+            payload=payload,
+        )
+
+
+def _empty_provider_usage() -> dict[str, int]:
+    return {"input_tokens": 0, "cached_tokens": 0, "output_tokens": 0, "total_tokens": 0, "reported_calls": 0, "unreported_calls": 0}
+
+
+def _add_provider_usage(total: Mapping[str, Any], usage: Mapping[str, Any] | None) -> dict[str, int]:
+    """Add one provider report. A response with no counts is unreported, not an estimate."""
+    current = _empty_provider_usage()
+    current.update({key: int(total.get(key) or 0) for key in current})
+    reported = bool(usage) and any(int((usage or {}).get(key) or 0) for key in ("input_tokens", "output_tokens", "total_tokens"))
+    if not reported:
+        current["unreported_calls"] += 1
+        return current
+    for key in ("input_tokens", "cached_tokens", "output_tokens", "total_tokens"):
+        current[key] += int((usage or {}).get(key) or 0)
+    if current["total_tokens"] == int(total.get("total_tokens") or 0):
+        added = int((usage or {}).get("total_tokens") or 0)
+        if added <= 0:
+            added = int((usage or {}).get("input_tokens") or 0) + int((usage or {}).get("output_tokens") or 0)
+        current["total_tokens"] += added
+    current["reported_calls"] += 1
+    return current
+
+
 def _recode_messages(
     passages: Sequence[Mapping[str, Any]],
     raised: Sequence[Mapping[str, Any]],
@@ -2313,7 +2567,7 @@ def _allowance_block(state: Mapping[str, Any]) -> tuple[str, list[str]] | None:
     max_calls = int(procedure.get("max_focused_review_calls") or 0)
     max_tokens = int(procedure.get("max_focused_review_tokens") or 0)
     calls = int(state.get("focused_calls_used") or 0)
-    tokens = int(state.get("focused_tokens_used") or 0)
+    tokens = int(state.get("focused_tokens_estimated") or 0)
     if calls >= max_calls:
         return "call_allowance", []
     queue = list(state.get("recode_queue") or [])
@@ -2322,13 +2576,19 @@ def _allowance_block(state: Mapping[str, Any]) -> tuple[str, list[str]] | None:
     if not remaining:
         return None
     batch_size = max(1, int(performance.get("batch_size") or 1))
-    batch_ids = _queue_passage_ids(remaining[:batch_size])
+    batch_items = [item if isinstance(item, Mapping) else {"passage_id": item, "purpose": "develop"} for item in remaining[:batch_size]]
+    batch_ids = _queue_passage_ids(batch_items)
     by_id = {str(item.get("passage_id") or ""): item for item in (state.get("passages") or [])}
     batch = [by_id[pid] for pid in batch_ids if pid in by_id]
     raised_ids = set(state.get("raised_code_ids") or [])
     raised, other = _split_codebook(state.get("codebook") or {}, raised_ids)
-    messages = _recode_messages(batch, raised, other=other)
-    estimate = request_input_tokens(messages, FocusedRecodeBatch, resolve_tokenizer(None))
+    purposes = {str(item.get("passage_id") or ""): str(item.get("purpose") or "develop") for item in batch_items}
+    initial = {
+        passage_id: _initial_code_rows(passage_id, state.get("segments") or [], state.get("codebook") or {})
+        for passage_id in batch_ids
+    }
+    messages, schema = _recode_request(batch, raised, other=other, purposes=purposes, initial_codes=initial)
+    estimate = request_input_tokens(messages, schema, resolve_tokenizer(None))
     if tokens + estimate > max_tokens:
         return "token_allowance", _queue_passage_ids(remaining)
     return None
@@ -2397,6 +2657,13 @@ def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
         "stop": stop,
         "focused_calls_used": int(state.get("focused_calls_used") or 0),
         "focused_tokens_used": int(state.get("focused_tokens_used") or 0),
+        "focused_tokens_estimated": int(state.get("focused_tokens_estimated") or 0),
+        "provider_token_usage": dict(state.get("provider_token_usage") or _empty_provider_usage()),
+        "token_accounting_note": (
+            "focused_tokens_estimated is a ceiling used to stop the reread before a call. "
+            "focused_tokens_used and provider_token_usage are provider-reported input, cached, and output tokens. "
+            "The estimate is not provider usage."
+        ),
         "max_focused_review_calls": int(procedure.get("max_focused_review_calls") or 0),
         "max_focused_review_tokens": int(procedure.get("max_focused_review_tokens") or 0),
         "focused_not_reread": not_reread,
@@ -2412,6 +2679,7 @@ def _shares_from_procedure(procedure: Mapping[str, Any]) -> dict[str, float]:
             "develop": procedure.get("focused_share_develop", DEFAULT_SHARES["develop"]),
             "compete": procedure.get("focused_share_compete", DEFAULT_SHARES["compete"]),
             "outside": procedure.get("focused_share_outside", DEFAULT_SHARES["outside"]),
+            "claim_compete": procedure.get("focused_share_claim_compete", DEFAULT_SHARES["claim_compete"]),
         }
     )
 
@@ -2427,7 +2695,8 @@ def _queue_passage_ids(queue: Sequence[Any]) -> list[str]:
 
 
 def _category_development(state: Mapping[str, Any]) -> dict[str, Any]:
-    properties = list(state.get("properties") or [])
+    raw_properties = list(state.get("properties") or [])
+    properties = merge_properties(raw_properties)
     dimensions = list(state.get("dimensions") or [])
     records = properties + dimensions
     return {
@@ -2442,6 +2711,7 @@ def _category_development(state: Mapping[str, Any]) -> dict[str, Any]:
         "citation_anchoring": citation_anchoring_report(records),
         "category_match": category_match_report(records),
         "claim_support": claim_support_report(records),
+        "property_stability": property_stability_report(raw_properties, properties),
         "purpose_coverage": (state.get("metadata") or {}).get("purpose_coverage")
         or state.get("purpose_coverage")
         or {},
@@ -2461,7 +2731,7 @@ def _incomplete_warning(fields: Mapping[str, Any]) -> str:
         ),
         "token_allowance": (
             f"the focused token allowance is {fields.get('max_focused_review_tokens')} "
-            f"and {fields.get('focused_tokens_used')} estimated tokens were used"
+            f"and the pre-call estimate reached {fields.get('focused_tokens_estimated')} tokens"
         ),
         "no_progress": "a focused reread returned no passage decisions",
     }
@@ -2667,7 +2937,7 @@ def _claim_compete_items(
         if not passage_id or passage_id in already or passage_id not in by_id:
             continue
         already.add(passage_id)
-        extra.append(_queue_item(passage_id, "compete", "claim_negative_case"))
+        extra.append(_queue_item(passage_id, "claim_compete", "claim_negative_case"))
         if len(extra) >= slots:
             break
     return extra
@@ -2727,8 +2997,12 @@ def _prepare_node(state: FocusedState) -> dict:
         max_calls = int(procedure.get("max_focused_review_calls") or 0)
         batch_size = max(1, int(performance.get("batch_size") or 1))
         updates["compete_round_done"] = True
-        if procedure.get("focused_claim_compete_round", True) is not False and calls < max_calls:
-            extra = _claim_compete_items(state, queue, slots=(max_calls - calls) * batch_size)
+        targets = ((state.get("metadata") or {}).get("reread_call_targets") or {})
+        reserved = int(targets.get("claim_compete") or 0)
+        remaining_calls = max(0, max_calls - calls)
+        claim_calls = min(remaining_calls, reserved)
+        if procedure.get("focused_claim_compete_round", True) is not False and claim_calls > 0:
+            extra = _claim_compete_items(state, queue, slots=claim_calls * batch_size)
             if extra:
                 queue = queue + extra
                 updates["recode_queue"] = queue
@@ -2759,24 +3033,40 @@ def _prepare_node(state: FocusedState) -> dict:
     raised, other = _split_codebook(codebook, raised_ids)
     chosen = []
     chosen_items = []
+    segments = list(state.get("segments") or [])
     for item in queue[cursor:]:
         passage_id = str(item.get("passage_id") or "") if isinstance(item, Mapping) else str(item)
         passage = by_id.get(passage_id)
         if passage is None:
             continue
         trial = chosen + [passage]
-        messages = _recode_messages(trial, raised, other=other)
-        estimate = request_input_tokens(messages, FocusedRecodeBatch, resolve_tokenizer(None))
+        trial_items = chosen_items + [item if isinstance(item, Mapping) else {"passage_id": passage_id, "purpose": "develop"}]
+        trial_purposes = {
+            str(row.get("passage_id") or ""): str(row.get("purpose") or "develop") for row in trial_items
+        }
+        trial_initial = {
+            str(row.get("passage_id") or ""): _initial_code_rows(str(row.get("passage_id") or ""), segments, codebook)
+            for row in trial_items
+        }
+        messages, schema = _recode_request(
+            trial, raised, other=other, purposes=trial_purposes, initial_codes=trial_initial
+        )
+        estimate = request_input_tokens(messages, schema, resolve_tokenizer(None))
         if chosen and estimate > token_budget:
             break
         chosen.append(passage)
-        chosen_items.append(item if isinstance(item, Mapping) else {"passage_id": passage_id, "purpose": "develop"})
+        chosen_items.append(trial_items[-1])
         if len(chosen) >= batch_size:
             break
-    messages = _recode_messages(chosen, raised, other=other)
-    estimate = request_input_tokens(messages, FocusedRecodeBatch, resolve_tokenizer(None))
+    purposes = {str(item.get("passage_id") or ""): str(item.get("purpose") or "develop") for item in chosen_items}
+    initial_codes = {
+        str(item.get("passage_id") or ""): _initial_code_rows(str(item.get("passage_id") or ""), segments, codebook)
+        for item in chosen_items
+    }
+    messages, schema = _recode_request(chosen, raised, other=other, purposes=purposes, initial_codes=initial_codes)
+    estimate = request_input_tokens(messages, schema, resolve_tokenizer(None))
     calls = int(state.get("focused_calls_used") or 0)
-    tokens = int(state.get("focused_tokens_used") or 0)
+    tokens = int(state.get("focused_tokens_estimated") or 0)
     max_calls = int(procedure.get("max_focused_review_calls") or 0)
     max_tokens = int(procedure.get("max_focused_review_tokens") or 0)
     allow_retry = calls + 1 < max_calls and tokens + estimate * 2 <= max_tokens
@@ -2795,13 +3085,12 @@ def _prepare_node(state: FocusedState) -> dict:
             "passages": chosen,
             "estimate": estimate,
             "allow_label_retry": allow_retry and int(procedure.get("validation_retries") or 0) > 0,
-            "purposes": {
-                str(item.get("passage_id") or ""): str(item.get("purpose") or "develop") for item in chosen_items
-            },
+            "purposes": purposes,
+            "initial_codes": initial_codes,
         }
     ]
-    purpose_calls = {purpose: int((state.get("purpose_calls") or {}).get(purpose) or 0) for purpose in REREAD_PURPOSES}
-    purpose_tokens = {purpose: int((state.get("purpose_tokens") or {}).get(purpose) or 0) for purpose in REREAD_PURPOSES}
+    purpose_calls = {purpose: int((state.get("purpose_calls") or {}).get(purpose) or 0) for purpose in COVERAGE_PURPOSES}
+    purpose_tokens = {purpose: int((state.get("purpose_tokens") or {}).get(purpose) or 0) for purpose in COVERAGE_PURPOSES}
     seen_purposes = []
     for item in chosen_items:
         purpose = str(item.get("purpose") or "develop")
@@ -2811,7 +3100,7 @@ def _prepare_node(state: FocusedState) -> dict:
             purpose_tokens[purpose] = purpose_tokens.get(purpose, 0) + estimate
     updates["recode_cursor"] = cursor + len(chosen)
     updates["focused_calls_used"] = calls + 1
-    updates["focused_tokens_used"] = tokens + estimate
+    updates["focused_tokens_estimated"] = tokens + estimate
     updates["purpose_calls"] = purpose_calls
     updates["purpose_tokens"] = purpose_tokens
     return updates
@@ -2844,11 +3133,15 @@ def _worker(runtime: FocusedRuntime):
         raised_ids = set(payload.get("worker_raised") or [])
         raised, other = _split_codebook(book, raised_ids)
         passages = list(job.get("passages") or [])
-        messages = _recode_messages(passages, raised, other=other)
+        purposes = dict(job.get("purposes") or {})
+        initial_codes = dict(job.get("initial_codes") or {})
+        messages, schema = _recode_request(
+            passages, raised, other=other, purposes=purposes, initial_codes=initial_codes
+        )
         raw_parts: list[str] = []
         (parsed, usage), sent = await ainvoke_structured(
             runtime.coder,
-            FocusedRecodeBatch,
+            schema,
             messages,
             runtime.limiter,
             use_cache=False,
@@ -2860,21 +3153,23 @@ def _worker(runtime: FocusedRuntime):
             probe = _probe_labels(parsed, passages, book, runtime)
             if probe:
                 feedback = "LABEL RETRY\n" + validation_feedback(probe)
-                retry_messages = _recode_messages(passages, raised, other=other, feedback=feedback)
+                retry_messages, retry_schema = _recode_request(
+                    passages,
+                    raised,
+                    other=other,
+                    purposes=purposes,
+                    initial_codes=initial_codes,
+                    feedback=feedback,
+                )
                 (parsed, retry_usage), sent = await ainvoke_structured(
                     runtime.coder,
-                    FocusedRecodeBatch,
+                    retry_schema,
                     retry_messages,
                     runtime.limiter,
                     use_cache=False,
                     raw_out=raw_parts,
                 )
-                usage = {
-                    "input_tokens": int((usage or {}).get("input_tokens") or 0)
-                    + int((retry_usage or {}).get("input_tokens") or 0),
-                    "output_tokens": int((usage or {}).get("output_tokens") or 0)
-                    + int((retry_usage or {}).get("output_tokens") or 0),
-                }
+                usage = combine_usage(usage, retry_usage)
                 calls = 2
                 interpreted_retry = True
         proposal = {
@@ -2883,6 +3178,7 @@ def _worker(runtime: FocusedRuntime):
             "passage_index": 0,
             "coding": parsed,
             "passage_ids": list(job.get("passage_ids") or []),
+            "purposes": purposes,
             "calls": calls,
             "usage": usage,
             "label_retry": interpreted_retry,
@@ -2908,7 +3204,7 @@ def _probe_labels(parsed: Mapping[str, Any], passages: Sequence[Mapping], book: 
         interpreted = interpret_coding(
             {
                 "passage_id": passage.get("passage_id"),
-                "codes": [_decision_to_coding(item, book) for item in (row.get("codes") or [])],
+                "codes": [_decision_to_coding(item, book) for item in _row_decisions(row)],
                 "memo": "",
             },
             passage,
@@ -2943,7 +3239,12 @@ def _commit_node(runtime: FocusedRuntime):
         reread = list(state.get("focused_reread") or [])
         warnings = list(state.get("warnings") or [])
         calls = int(state.get("focused_calls_used") or 0)
-        tokens = int(state.get("focused_tokens_used") or 0)
+        provider_usage = _empty_provider_usage()
+        stored_usage = state.get("provider_token_usage") or {}
+        provider_usage.update({key: int(stored_usage.get(key) or 0) for key in provider_usage})
+        purpose_provider = {
+            purpose: int((state.get("purpose_provider_tokens") or {}).get(purpose) or 0) for purpose in COVERAGE_PURPOSES
+        }
         passages = list(state.get("passages") or [])
         by_id = {str(item.get("passage_id") or ""): item for item in passages}
         raised = list(state.get("raised_code_ids") or [])
@@ -2970,9 +3271,19 @@ def _commit_node(runtime: FocusedRuntime):
                     "messages": list(proposal.get("messages") or []),
                 }
             )
-            actual = int(usage.get("input_tokens") or 0)
-            if actual:
-                tokens += 0
+            provider_usage = _add_provider_usage(provider_usage, usage)
+            purposes = proposal.get("purposes") or {}
+            if any(int((usage or {}).get(key) or 0) for key in ("input_tokens", "output_tokens", "total_tokens")):
+                added = int((usage or {}).get("total_tokens") or 0)
+                if added <= 0:
+                    added = int((usage or {}).get("input_tokens") or 0) + int((usage or {}).get("output_tokens") or 0)
+                seen_purposes = []
+                for passage_id in sent_ids:
+                    purpose = str(purposes.get(passage_id) or "develop")
+                    if purpose in seen_purposes:
+                        continue
+                    seen_purposes.append(purpose)
+                    purpose_provider[purpose] = purpose_provider.get(purpose, 0) + added
             for row in returned:
                 passage_id = str(row.get("passage_id") or "")
                 passage = by_id.get(passage_id)
@@ -2990,7 +3301,7 @@ def _commit_node(runtime: FocusedRuntime):
                     counters,
                     highlights,
                     passage,
-                    list(row.get("codes") or []),
+                    _row_decisions(row),
                     passages=passages,
                     raised_code_ids=raised,
                     require_gerund=runtime.require_gerund,
@@ -3011,6 +3322,7 @@ def _commit_node(runtime: FocusedRuntime):
                     )
                 book = applied["codebook"]
                 segments = applied["segments"]
+                _flag_alternative_not_chosen(segments, passage_id, row, book, raised)
                 memos = applied["memos"]
                 counters = applied["counters"]
                 highlights = applied["highlight_ids"]
@@ -3080,7 +3392,9 @@ def _commit_node(runtime: FocusedRuntime):
             "focused_reread": reread,
             "focused_not_reread": not_reread,
             "focused_calls_used": calls,
-            "focused_tokens_used": tokens,
+            "focused_tokens_used": int(provider_usage.get("total_tokens") or 0),
+            "provider_token_usage": provider_usage,
+            "purpose_provider_tokens": purpose_provider,
             "recode_stop": stop,
             "committed_ids": committed,
             "snapshot_version": version,
@@ -3122,12 +3436,21 @@ def _review_node(state: FocusedState) -> dict:
     )
     emptied = set(reallocation.get("purposes") or [])
     calls_used = int(state.get("focused_calls_used") or 0)
-    reserved = call_targets(requested, calls_used) if calls_used else {purpose: 0 for purpose in REREAD_PURPOSES}
-    for purpose in REREAD_PURPOSES:
+    planned = metadata.get("reread_call_targets") or {}
+    if calls_used and planned:
+        reserved = {purpose: int(planned.get(purpose) or 0) for purpose in COVERAGE_PURPOSES}
+    elif calls_used:
+        reserved = call_targets(requested, calls_used)
+    else:
+        reserved = {purpose: 0 for purpose in COVERAGE_PURPOSES}
+    provider_by_purpose = state.get("purpose_provider_tokens") or {}
+    for purpose in COVERAGE_PURPOSES:
         actual = int((state.get("purpose_calls") or {}).get(purpose) or 0)
         coverage[purpose]["requested_share"] = float(requested.get(purpose, 0))
         coverage[purpose]["reserved_calls"] = int(reserved[purpose])
         coverage[purpose]["applied_share"] = (actual / calls_used) if calls_used else 0.0
+        coverage[purpose]["tokens_estimated"] = int(coverage[purpose].get("tokens") or 0)
+        coverage[purpose]["tokens"] = int(provider_by_purpose.get(purpose) or 0)
         short = calls_used > 0 and actual < int(reserved[purpose])
         coverage[purpose]["reallocated_away"] = purpose in emptied or short
         if short:
@@ -3139,7 +3462,7 @@ def _review_node(state: FocusedState) -> dict:
                 warnings.append(note)
             emptied.add(purpose)
     reallocation = dict(reallocation)
-    reallocation["purposes"] = [purpose for purpose in REREAD_PURPOSES if purpose in emptied]
+    reallocation["purposes"] = [purpose for purpose in COVERAGE_PURPOSES if purpose in emptied]
     reallocation["reallocated"] = bool(reallocation["purposes"]) or bool(reallocation.get("reallocated"))
     coverage["reallocation"] = reallocation
     coverage["corpus"] = fields.get("coverage") or {}
@@ -3447,8 +3770,11 @@ def _initial_state(source: OpenCodeResult, metadata: dict, *, interrupt_enabled:
         "round_jobs": [],
         "focused_calls_used": 0,
         "focused_tokens_used": 0,
-        "purpose_calls": {purpose: 0 for purpose in REREAD_PURPOSES},
-        "purpose_tokens": {purpose: 0 for purpose in REREAD_PURPOSES},
+        "focused_tokens_estimated": 0,
+        "provider_token_usage": _empty_provider_usage(),
+        "purpose_calls": {purpose: 0 for purpose in COVERAGE_PURPOSES},
+        "purpose_tokens": {purpose: 0 for purpose in COVERAGE_PURPOSES},
+        "purpose_provider_tokens": {purpose: 0 for purpose in COVERAGE_PURPOSES},
         "purpose_coverage": {},
         "revision_cycles": [],
         "focused_not_reread": [],
@@ -3490,6 +3816,7 @@ def _result_from_state(
     metadata["policy_version"] = POLICY_VERSION
     metadata["package_version"] = __version__
     development = _category_development(state)
+    metadata["property_stability"] = development.get("property_stability") or {}
     return FocusedResult(
         raised_code_ids=list(state.get("raised_code_ids") or state.get("proposed_raised_code_ids") or []),
         not_raised_code_ids=list(state.get("not_raised_code_ids") or state.get("proposed_not_raised_code_ids") or []),
@@ -3611,6 +3938,7 @@ def _procedure(
         "focused_share_develop": share_values["develop"],
         "focused_share_compete": share_values["compete"],
         "focused_share_outside": share_values["outside"],
+        "focused_share_claim_compete": share_values["claim_compete"],
         "focused_analytic_features": features,
         "focused_sampling_seed": None if sampling_seed is None else int(sampling_seed),
         "focused_duplicate_similarity": float(duplicate_similarity),
@@ -3660,6 +3988,7 @@ async def afocused_code(
     focused_share_develop: float = DEFAULT_SHARES["develop"],
     focused_share_compete: float = DEFAULT_SHARES["compete"],
     focused_share_outside: float = DEFAULT_SHARES["outside"],
+    focused_share_claim_compete: float = DEFAULT_SHARES["claim_compete"],
     focused_analytic_features: Sequence[str] | None = None,
     max_focused_review_calls: int = DEFAULT_MAX_FOCUSED_REVIEW_CALLS,
     max_focused_review_tokens: int = DEFAULT_MAX_FOCUSED_REVIEW_TOKENS,
@@ -3712,6 +4041,7 @@ async def afocused_code(
             "develop": focused_share_develop,
             "compete": focused_share_compete,
             "outside": focused_share_outside,
+            "claim_compete": focused_share_claim_compete,
         },
         analytic_features=focused_analytic_features,
         validation_retries=validation_retries,

@@ -28,8 +28,8 @@ from tests.test_v070 import _book, _entry, _passages, _source
 
 
 def test_version_is_072():
-    assert __version__ == "0.7.2"
-    assert POLICY_VERSION == "0.7.2"
+    assert __version__ == "0.7.3"
+    assert POLICY_VERSION == "0.7.3"
 
 
 def _passages_for_shares():
@@ -100,6 +100,7 @@ def test_shares_size_the_queue_and_limits_are_caps():
     passages = _passages_for_shares()
     segments = _share_segments(passages)
     codes = [_entry("c1", "packing bags", 4, ["d1", "d2", "d3", "d4"])]
+    thirds = {"develop": 1 / 3, "compete": 1 / 3, "outside": 1 / 3}
     plan = plan_recode_queue(
         passages,
         segments,
@@ -109,9 +110,13 @@ def test_shares_size_the_queue_and_limits_are_caps():
         neighbor_limit=None,
         outside_limit=None,
         negative_case_limit=None,
+        shares=thirds,
         max_calls=6,
     )
-    assert plan["call_targets"] == {"develop": 2, "compete": 2, "outside": 2}
+    assert plan["call_targets"]["develop"] == 2
+    assert plan["call_targets"]["compete"] == 2
+    assert plan["call_targets"]["outside"] == 2
+    assert plan["call_targets"]["claim_compete"] == 0
     assert plan["purpose_counts"]["compete"] == 2
     assert plan["purpose_counts"]["outside"] == 2
     assert plan["purpose_counts"]["develop"] == 2
@@ -126,6 +131,7 @@ def test_shares_size_the_queue_and_limits_are_caps():
         neighbor_limit=0,
         outside_limit=1,
         negative_case_limit=0,
+        shares=thirds,
         max_calls=6,
     )
     assert capped["purpose_counts"]["outside"] == 1
@@ -288,8 +294,9 @@ def test_compete_seeds_before_claims_and_a_second_round_searches_them():
         interrupt=False,
     )
     assert coder.call_count >= 2
-    compete_ids = result.purpose_coverage["compete"]["passage_ids"]
-    assert "p2" in compete_ids
+    claim_ids = result.purpose_coverage["claim_compete"]["passage_ids"]
+    assert "p2" in claim_ids
+    assert result.purpose_coverage["claim_compete"]["calls"] >= 1
 
 
 def test_prompt_shows_the_full_codebook_and_flags_near_duplicates():

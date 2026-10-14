@@ -17,6 +17,7 @@ from automated_grounded_theory.api import (
 )
 from automated_grounded_theory.evaluate import aevaluate, chen_metrics, evaluate_run
 from automated_grounded_theory.context import PresetCodesError, ResearchContext
+from automated_grounded_theory.category_state import property_stability
 from automated_grounded_theory.focused import (
     FocusedError,
     FocusedResult,
@@ -66,5 +67,6 @@ __all__ = [
     "multi_seed_stability",
     "open_code",
     "plan_coding",
+    "property_stability",
     "strict_sequential_settings",
 ]

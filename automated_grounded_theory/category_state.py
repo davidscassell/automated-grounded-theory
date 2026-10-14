@@ -27,6 +27,9 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 REREAD_PURPOSES = ("develop", "compete", "outside")
+# claim_compete is reserved up front and run after properties exist. It is not
+# an incident purpose and it is not interleaved into the first queue.
+COVERAGE_PURPOSES = ("develop", "compete", "outside", "claim_compete")
 DISPOSITIONS = ("proposed", "accepted", "rejected", "superseded")
 EVIDENCE_CONDITIONS = ("anchored", "disputed", "insufficient")
 CLAIM_SUPPORTS = (
@@ -47,10 +50,21 @@ MEMO_COUNT_NOTE = (
 )
 
 DEFAULT_SHARES = {
-    "develop": 1 / 3,
-    "compete": 1 / 3,
-    "outside": 1 / 3,
+    "develop": 0.25,
+    "compete": 0.25,
+    "outside": 0.25,
+    "claim_compete": 0.25,
 }
+PROPERTY_STABILITY_NOTE = (
+    "Category-level stability is the Jaccard overlap of categories that received a property. "
+    "Name-level stability is the Jaccard overlap of (category_id, property_key) pairs. "
+    "property_key sorts the content words of the name, so 'timing of departure' and 'departure timing' match. "
+    "A single run leaves both scores empty. property_stability() compares two or more runs. "
+    "This is not claim support."
+)
+_PROPERTY_STOPWORDS = frozenset(
+    {"a", "an", "the", "of", "to", "and", "or", "in", "on", "for", "with", "at", "by", "from"}
+)
 
 
 def category_revision_id(entry: Mapping[str, Any]) -> str:
@@ -79,18 +93,178 @@ def evidence_revision_id(
 
 
 def normalize_shares(shares: Mapping[str, float] | None) -> dict[str, float]:
-    """Return develop, compete, and outside shares that sum to 1."""
-    incoming = dict(DEFAULT_SHARES if shares is None else shares)
-    unknown = set(incoming) - set(REREAD_PURPOSES)
+    """Return develop, compete, outside, and claim_compete shares that sum to 1.
+
+    A three-purpose mapping that already sums to 1 keeps ``claim_compete`` at 0,
+    so an older caller does not lose its split. The default reserves a quarter
+    for the claim round.
+    """
+    if shares is None:
+        incoming = dict(DEFAULT_SHARES)
+    else:
+        incoming = {str(key): value for key, value in dict(shares).items()}
+        unknown = set(incoming) - set(COVERAGE_PURPOSES)
+        if unknown:
+            raise ValueError(f"Unknown reread purpose: {sorted(unknown)}")
+        queue_total = sum(float(incoming.get(purpose, 0) or 0) for purpose in REREAD_PURPOSES)
+        if "claim_compete" not in incoming and abs(queue_total - 1.0) <= 1e-6:
+            incoming["claim_compete"] = 0.0
+    unknown = set(incoming) - set(COVERAGE_PURPOSES)
     if unknown:
         raise ValueError(f"Unknown reread purpose: {sorted(unknown)}")
-    values = {purpose: float(incoming.get(purpose, 0)) for purpose in REREAD_PURPOSES}
+    values = {purpose: float(incoming.get(purpose, 0) or 0) for purpose in COVERAGE_PURPOSES}
     if any(value < 0 for value in values.values()):
         raise ValueError("Focused reread shares must be zero or more.")
     total = sum(values.values())
     if abs(total - 1.0) > 1e-6:
         raise ValueError("Focused reread shares must sum to 1.")
     return values
+
+
+def property_key(name: str) -> str:
+    """Stable key for a property name. Word order and light plurals do not change it."""
+    tokens = []
+    for raw in str(name or "").casefold().replace("-", " ").replace("_", " ").split():
+        cleaned = "".join(character for character in raw if character.isalnum() or character == "'")
+        if not cleaned or cleaned in _PROPERTY_STOPWORDS:
+            continue
+        if cleaned.endswith("ies") and len(cleaned) > 4:
+            cleaned = cleaned[:-3] + "y"
+        elif cleaned.endswith("s") and not cleaned.endswith("ss") and len(cleaned) > 3:
+            cleaned = cleaned[:-1]
+        tokens.append(cleaned)
+    return " ".join(sorted(tokens))
+
+
+def _property_citation(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "entry_id": row.get("entry_id"),
+        "name": row.get("name"),
+        "document_id": row.get("document_id"),
+        "passage_id": row.get("passage_id"),
+        "quote": row.get("quote"),
+        "quote_status": row.get("quote_status"),
+    }
+
+
+def merge_properties(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse properties that share a category and a normalized name.
+
+    The first row keeps its text. Later rows add a citation. Dimensions are
+    not merged. A blank name is not merged with another blank name.
+    """
+    merged: list[dict[str, Any]] = []
+    index: dict[tuple[str, str], int] = {}
+    for row in records:
+        item = dict(row)
+        if str(item.get("kind") or "property") != "property":
+            merged.append(item)
+            continue
+        key = property_key(str(item.get("name") or ""))
+        item["property_key"] = key
+        slot = (str(item.get("category_id") or ""), key)
+        if not key or slot not in index:
+            item["citations"] = list(item.get("citations") or []) or [_property_citation(item)]
+            names = [str(name) for name in (item.get("merged_names") or []) if str(name)]
+            own = str(item.get("name") or "")
+            if own and own not in names:
+                names.append(own)
+            item["merged_names"] = names
+            if key:
+                index[slot] = len(merged)
+            merged.append(item)
+            continue
+        target = merged[index[slot]]
+        citations = list(target.get("citations") or [])
+        citations.extend(item.get("citations") or [_property_citation(item)])
+        target["citations"] = citations
+        names = list(target.get("merged_names") or [])
+        for name in list(item.get("merged_names") or []) + [str(item.get("name") or "")]:
+            if name and name not in names:
+                names.append(name)
+        target["merged_names"] = names
+        flags = list(target.get("flags") or [])
+        for flag in item.get("flags") or []:
+            if flag not in flags:
+                flags.append(flag)
+        target["flags"] = flags
+        if item.get("needs_review"):
+            target["needs_review"] = True
+            target["downstream_eligible"] = False
+    return merged
+
+
+def _property_rows(run: Any) -> list[Mapping[str, Any]]:
+    if isinstance(run, (list, tuple)):
+        return [row for row in run if isinstance(row, Mapping)]
+    if isinstance(run, Mapping):
+        rows = run.get("properties")
+        if rows is None and "category_development" in run:
+            rows = (run.get("category_development") or {}).get("properties")
+        return list(rows or [])
+    rows = getattr(run, "properties", None)
+    return list(rows or [])
+
+
+def _mean_jaccard(sets: Sequence[set]) -> float | None:
+    if len(sets) < 2:
+        return None
+    scores = []
+    for left_index in range(len(sets)):
+        for right in sets[left_index + 1 :]:
+            left = sets[left_index]
+            union = left | right
+            scores.append(1.0 if not union else len(left & right) / len(union))
+    return round(sum(scores) / len(scores), 6)
+
+
+def property_stability(runs: Sequence[Any]) -> dict[str, Any]:
+    """Category-level and name-level property overlap across runs, usually seeds.
+
+    Category-level compares the set of categories that have a property.
+    Name-level compares ``(category_id, property_key)``. Both are mean pairwise
+    Jaccard. One run has no pair, so both scores are empty.
+    """
+    category_sets = []
+    name_sets = []
+    for run in runs:
+        rows = [row for row in _property_rows(run) if str(row.get("kind") or "property") == "property"]
+        category_sets.append({str(row.get("category_id") or "") for row in rows if row.get("category_id")})
+        name_sets.append(
+            {
+                (str(row.get("category_id") or ""), str(row.get("property_key") or property_key(str(row.get("name") or ""))))
+                for row in rows
+                if row.get("property_key") or property_key(str(row.get("name") or ""))
+            }
+        )
+    return {
+        "name": "property_stability",
+        "runs": len(list(runs)),
+        "category_level": _mean_jaccard(category_sets),
+        "name_level": _mean_jaccard(name_sets),
+        "note": PROPERTY_STABILITY_NOTE,
+    }
+
+
+def property_stability_report(
+    raw: Sequence[Mapping[str, Any]],
+    merged: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """What one run can say before another seed is compared."""
+    rows = [row for row in merged if str(row.get("kind") or "property") == "property"]
+    return {
+        "name": "property_stability",
+        "runs": 1,
+        "category_level": None,
+        "name_level": None,
+        "raw_properties": len(list(raw)),
+        "merged_properties": len(rows),
+        "categories": sorted({str(row.get("category_id") or "") for row in rows if row.get("category_id")}),
+        "property_keys": sorted(
+            {str(row.get("property_key") or "") for row in rows if row.get("property_key")}
+        ),
+        "note": PROPERTY_STABILITY_NOTE,
+    }
 
 
 def normalize_analytic_features(features: Sequence[str] | None) -> tuple[str, ...]:
@@ -244,7 +418,7 @@ def purpose_coverage(
     """Queued, reread, and unsent passages, with calls and tokens, per purpose."""
     read = {str(item) for item in reread_ids}
     report: dict[str, Any] = {}
-    for purpose in REREAD_PURPOSES:
+    for purpose in COVERAGE_PURPOSES:
         ids = [str(item.get("passage_id") or "") for item in queue if item.get("purpose") == purpose]
         reread = [passage_id for passage_id in ids if passage_id in read]
         report[purpose] = {

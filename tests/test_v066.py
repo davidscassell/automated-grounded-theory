@@ -23,8 +23,8 @@ from tests.fake_llm import FakeCoder
 
 
 def test_version_is_0_6_6():
-    assert __version__ == "0.7.2"
-    assert POLICY_VERSION == "0.7.2"
+    assert __version__ == "0.7.3"
+    assert POLICY_VERSION == "0.7.3"
 
 
 def test_concurrent_batches_share_the_ceiling_and_report_the_peak():
@@ -156,8 +156,8 @@ def test_schema_repair_adds_the_failed_response_usage():
     assert usage["output_tokens"] == 7
     assert usage["total_tokens"] == 26
     assert usage["attempt_usage"] == [
-        {"input_tokens": 11, "output_tokens": 3, "total_tokens": 14},
-        {"input_tokens": 8, "output_tokens": 4, "total_tokens": 12},
+        {"input_tokens": 11, "cached_tokens": 0, "output_tokens": 3, "total_tokens": 14},
+        {"input_tokens": 8, "cached_tokens": 0, "output_tokens": 4, "total_tokens": 12},
     ]
 
 
