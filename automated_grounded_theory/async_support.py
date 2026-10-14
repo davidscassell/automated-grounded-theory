@@ -772,6 +772,14 @@ def _model_from_text(text: str, schema):
         start = index + 1
 
 
+def _record_raw(result: Any, holder: list | None) -> None:
+    """Append the provider message text. Structured parsing does not keep it."""
+    if holder is None:
+        return
+    raw = result.get("raw") if isinstance(result, dict) and "parsed" in result else result
+    holder.append(_raw_text(raw))
+
+
 def parse_structured(result, schema) -> tuple[dict, dict]:
     """Normalize ``ainvoke`` / ``abatch`` output to ``(payload, usage)``.
 
@@ -853,6 +861,7 @@ async def ainvoke_structured(
     passage_id: str = "",
     on_overflow: Callable[[OversizedRequest], None] | None = None,
     use_cache: bool = True,
+    raw_out: list | None = None,
 ) -> tuple[tuple[dict, dict], list]:
     """Invoke ``schema`` once, then repair a single malformed output.
 
@@ -884,6 +893,7 @@ async def ainvoke_structured(
     # The coding caller measures this payload and flags it when it is still over.
     # The repair below is a second invocation and is checked on its own.
     result = await limiter.ainvoke(runnable, sent, **extra)
+    _record_raw(result, raw_out)
     try:
         return parse_structured(result, schema), sent
     except ValueError as first:
@@ -916,6 +926,7 @@ async def ainvoke_structured(
         try:
             limiter.schema_repairs = int(getattr(limiter, "schema_repairs", 0) or 0) + 1
             repaired = await limiter.ainvoke(runnable, repair, **extra)
+            _record_raw(repaired, raw_out)
             payload, usage = parse_structured(repaired, schema)
             return (payload, combine_usage(failed_usage, usage)), repair
         except ValueError:

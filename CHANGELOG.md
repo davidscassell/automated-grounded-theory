@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.1
+
+- Focused selection no longer raises every code when scores tie at a median cutoff. The default rule is `top_k` (the upper half, ties broken by `code_id`). `focused_selection_rule=quantile` uses the same ceiling. The score rule does not raise every code unless `focused_raise_all` is set. An explicit `focused_min_score` stays a hard threshold. The result warns when the raised fraction reaches `focused_raise_warn_fraction` (default 0.75).
+- An empty `compete` queue is filled from assigned passages: another code on the passage, an opposite pole, or a raised code not yet applied. An empty `outside` queue is filled from passages not assigned to raised codes, then from the lowest-confidence raised assignments. A purpose that is still empty has its share reallocated explicitly, and the result warning and `purpose_coverage` say so.
+- Loading an open-coding folder restores segment, memo, highlight, and op id counters. New memos use `m00001`. A focused reread does not mint `s00001` again.
+- Re-applying a code on the same span records a confirmation on the existing assignment, with focused provenance. A different span is a separate `focused_span_proposal` and does not rewrite the stored quote.
+- The focused prompt asks for analytic properties and dimensions, cited quotes, and competing interpretations. It asks the model not to substitute a descriptive summary.
+- The focused output folder writes `coded_segments.json`, `assignments.json`, and `prompt_log.json` (parsed response and raw model text), along with `focused_claims.csv` and `downstream_claims.json`.
+- `policy_version` is `0.7.1`.
+
 ## 0.7.0
 
 - Focused coding is a separate graph, `get_graph("focused")`: `load_open_coding`, `select_candidates`, `researcher_checkpoint`, `prepare_recode`, `recode_worker`, `commit_focused`, `review_recode`, `export_focused`. It reads a finished open-coding run. It is not inserted into `open_code` or `themes`. `build_themes` still does not reread passages.
