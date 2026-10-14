@@ -714,11 +714,14 @@ class CodeMatchBatch(_LLMModel):
 
 
 class FocusedCodeDecision(_LLMModel):
-    """One code the focused reread keeps, adds, or revises for a passage."""
+    """One code the focused reread keeps, adds, or proposes to revise or drop."""
 
-    action: Literal["keep", "add", "revise"] = Field(
+    action: Literal["keep", "add", "revise", "drop"] = Field(
         default="keep",
-        description="keep an initial code, add a code the passage supports, or revise its definition.",
+        description=(
+            "keep an initial code, add a code the passage supports, or propose revise or drop. "
+            "revise and drop are proposals for the researcher. They are not applied without review."
+        ),
     )
     code: str = Field(default="", description="Label. Empty only when you cannot name the incident.")
     code_id: str = Field(

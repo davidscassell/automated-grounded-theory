@@ -28,10 +28,13 @@ logger = logging.getLogger("automated_grounded_theory")
 class CallLimiter:
     """Cap in-flight work, adapt on 429, and retry transient failures with full-jitter backoff.
 
-    Each call is cancelled when it runs longer than ``request_timeout`` (120
-    seconds unless you set another value; 0 waits with no deadline). Timeouts
-    and connection errors are retried the same way as rate limits. Only a rate
-    limit lowers the AIMD ceiling.
+    Each attempt is cancelled when it runs longer than ``request_timeout`` (120
+    seconds unless you set another value; 0 waits with no per-attempt deadline).
+    ``wall_timeout``, when set above 0, is a single budget for the whole call:
+    streaming, retries, and backoff share it, and a retry cannot start a fresh
+    ``request_timeout``. Timeouts and connection errors are retried the same
+    way as rate limits, up to ``max_retries``, and only while that budget
+    remains. Only a rate limit lowers the AIMD ceiling.
 
     ``ainvoke`` takes one slot from an AIMD limit (the configured concurrency
     is the ceiling; a rate limit halves it, and a streak of successes adds one
@@ -66,6 +69,7 @@ class CallLimiter:
         reserved_output_tokens: int = 0,
         cache: dict | None = None,
         request_timeout: float = 120.0,
+        wall_timeout: float | None = None,
     ) -> None:
         self.concurrency = max(1, int(concurrency))
         self.max_concurrency = self.concurrency
@@ -78,6 +82,7 @@ class CallLimiter:
         self.allow_oversized = bool(allow_oversized)
         self.reserved_output_tokens = max(0, int(reserved_output_tokens))
         self.request_timeout = float(request_timeout)
+        self.wall_timeout = None if wall_timeout is None else float(wall_timeout)
         self._tokens = self.tokens_per_minute
         self._token_stamp: float | None = None
         self._requests = self.requests_per_minute
@@ -137,7 +142,21 @@ class CallLimiter:
                 self.cache_hits += 1
                 return cached
         estimate = self._estimate(payload, reserved_output)
-        result = await self._retry(lambda: self._attempt(runnable, payload, timeout=timeout, estimate=estimate))
+        per_attempt = None if timeout is None else float(timeout)
+        deadline = None
+        if self.wall_timeout is not None and self.wall_timeout > 0:
+            deadline = time.monotonic() + float(self.wall_timeout)
+
+        async def once(remaining: float | None):
+            attempt_timeout = per_attempt
+            if remaining is not None:
+                cap = self.request_timeout if attempt_timeout is None else attempt_timeout
+                attempt_timeout = float(remaining) if not cap or cap <= 0 else min(float(cap), float(remaining))
+                if attempt_timeout <= 0:
+                    raise self._deadline_error()
+            return await self._attempt(runnable, payload, timeout=attempt_timeout, estimate=estimate)
+
+        result = await self._retry(once, deadline=deadline)
         if use_cache:
             self.cache[key] = result
         return result
@@ -457,15 +476,28 @@ class CallLimiter:
             return 0.0
         return random.uniform(0.0, cap)
 
-    async def _retry(self, factory: Callable):
+    def _deadline_error(self) -> TimeoutError:
+        budget = 0.0 if self.wall_timeout is None else float(self.wall_timeout)
+        return TimeoutError(
+            f"The model call exceeded the {budget:g}s wall-clock timeout, including streaming and retries."
+        )
+
+    async def _retry(self, factory: Callable, deadline: float | None = None):
         for attempt in range(self.max_retries + 1):
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise self._deadline_error()
             try:
-                return await factory()
+                return await factory(remaining)
             except Exception as exc:
                 if attempt >= self.max_retries or not is_transient(exc):
                     raise
                 self._note_transient(exc)
                 wait = self._wait(attempt, exc)
+                if deadline is not None:
+                    left = deadline - time.monotonic()
+                    if left <= 0 or wait >= left:
+                        raise self._deadline_error()
                 # The attempt already released its slot. Sleep with the gate
                 # free so another passage or sweep can use it, then retry.
                 self._mark("idle_sleep", seconds=round(wait, 4))

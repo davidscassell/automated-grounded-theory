@@ -40,7 +40,14 @@ The reread allowance is split across three purposes and interleaved:
 developing existing assignments, testing competing interpretations, and
 examining passages outside the initial selection. Shares are
 ``focused_share_develop``, ``focused_share_compete``, and
-``focused_share_outside``. Coverage is reported per purpose.
+``focused_share_outside``. Each purpose's queue is sized to its reserved
+share of ``max_focused_review_calls``. ``focused_neighbor_limit``,
+``focused_outside_limit``, and ``focused_negative_case_limit`` are optional
+caps (``None`` does not cap; ``0`` adds none). They are not a default of 1.
+Coverage reports the share of calls actually used. ``seed`` shuffles queue
+order. When every candidate fits its slot, that seed does not change who is
+included. ``focused_sampling_seed`` chooses membership only when a candidate
+list is longer than its slot. Coverage is reported per purpose.
 
 A code is proposed by ``focused_selection_rule``. The default is ``top_k``:
 about half the codes, ties broken by ``code_id``, and never every code unless
@@ -126,9 +133,12 @@ DEFAULT_FOCUSED_WEIGHT_DOCUMENTS = 1.0
 DEFAULT_FOCUSED_WEIGHT_ANALYTIC = 1.0
 DEFAULT_MAX_FOCUSED_REVIEW_CALLS = 8
 DEFAULT_MAX_FOCUSED_REVIEW_TOKENS = 24000
-DEFAULT_FOCUSED_NEIGHBOR_LIMIT = 1
-DEFAULT_FOCUSED_OUTSIDE_LIMIT = 1
-DEFAULT_FOCUSED_NEGATIVE_CASE_LIMIT = 1
+DEFAULT_FOCUSED_NEIGHBOR_LIMIT = None
+DEFAULT_FOCUSED_OUTSIDE_LIMIT = None
+DEFAULT_FOCUSED_NEGATIVE_CASE_LIMIT = None
+DEFAULT_FOCUSED_DUPLICATE_SIMILARITY = 0.5
+DEFAULT_FOCUSED_REQUEST_TIMEOUT = 120.0
+DEFAULT_FOCUSED_REQUEST_RETRIES = 4
 DEFAULT_FOCUSED_SELECTION_RULE = "top_k"
 DEFAULT_FOCUSED_SELECTION_QUANTILE = 0.5
 DEFAULT_FOCUSED_RAISE_WARN_FRACTION = 0.75
@@ -164,6 +174,11 @@ _PROCEDURE_KEYS = (
     "focused_share_compete",
     "focused_share_outside",
     "focused_analytic_features",
+    "focused_sampling_seed",
+    "focused_duplicate_similarity",
+    "focused_request_timeout",
+    "focused_request_retries",
+    "focused_claim_compete_round",
     "validation_retries",
 )
 _PERFORMANCE_KEYS = (
@@ -179,8 +194,13 @@ _RESUME_FORBIDDEN = frozenset(
 
 FOCUSED_SYSTEM = (
     "You are doing focused coding. The raised codes are a proposal the researcher can change. "
-    "Reread only the passages in this request. Keep, add, or revise codes the passage supports. "
+    "Reread only the passages in this request. Keep or add codes the passage supports. "
+    "Prefer a code already in the codebook, raised or not, over a new label. "
     "Quote the target passage. "
+    "Actively look for a disconfirming reading: the passage does not fit the raised code, "
+    "an opposite consequence fits better, or another existing code fits better. "
+    "You may propose revise or drop. A revise proposes a new definition. A drop proposes removing the code. "
+    "Neither is applied without review. "
     "For each passage, name analytic properties and analytic dimensions of the raised categories: "
     "what varies in the incident, and the poles of that variation. "
     "Do not write a descriptive summary of the passage in place of a property. "
@@ -221,7 +241,9 @@ class FocusedState(TypedDict, total=False):
     focused_calls_used: int
     focused_tokens_used: int
     focused_not_reread: list
+    focused_not_queued: list
     focused_reread: list
+    compete_round_done: bool
     recode_stop: str
     purpose_calls: dict
     purpose_tokens: dict
@@ -252,6 +274,7 @@ class FocusedRuntime:
     max_codes_per_passage: int = 6
     long_passage_chars: int = 2000
     review_below: float = 0.5
+    duplicate_similarity: float = DEFAULT_FOCUSED_DUPLICATE_SIMILARITY
 
     def __post_init__(self) -> None:
         if self.limiter is None:
@@ -275,6 +298,7 @@ class FocusedResult:
     focused_reread: list[str]
     purpose_coverage: dict
     metadata: dict
+    focused_not_queued: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     prompt_log: list[dict] = field(default_factory=list)
     export_paths: dict[str, str] = field(default_factory=dict)
@@ -297,6 +321,7 @@ class FocusedResult:
             "dimensions": self.dimensions,
             "category_development": self.category_development,
             "focused_not_reread": self.focused_not_reread,
+            "focused_not_queued": self.focused_not_queued,
             "focused_reread": self.focused_reread,
             "purpose_coverage": self.purpose_coverage,
             "metadata": self.metadata,
@@ -982,6 +1007,131 @@ def _reallocate_shares(
     )
 
 
+def call_targets(shares: Mapping[str, float], total: int) -> dict[str, int]:
+    """Largest-remainder split of ``total`` calls across the three reread purposes."""
+    total = max(0, int(total))
+    raw = {purpose: float(shares[purpose]) * total for purpose in REREAD_PURPOSES}
+    base = {purpose: int(math.floor(raw[purpose] + 1e-9)) for purpose in REREAD_PURPOSES}
+    left = total - sum(base.values())
+    order = sorted(
+        REREAD_PURPOSES,
+        key=lambda purpose: (-(raw[purpose] - base[purpose]), REREAD_PURPOSES.index(purpose)),
+    )
+    for purpose in order:
+        if left <= 0:
+            break
+        base[purpose] += 1
+        left -= 1
+    return base
+
+
+def _legacy_cap(limit: int | None) -> int:
+    """Missing limits keep the historical size of 1 when the allowance is not sizing the queue."""
+    if limit is None:
+        return 1
+    return max(0, int(limit))
+
+
+def _share_cap(limit: int | None, slots: int) -> int:
+    """``None`` fills the reserved slots. ``0`` adds none. A positive limit is a cap."""
+    slots = max(0, int(slots))
+    if limit is None:
+        return slots
+    return max(0, min(slots, int(limit)))
+
+
+def _order_take(
+    items: Sequence[str],
+    count: int,
+    order_rng: random.Random,
+    sample_rng: random.Random,
+) -> list[str]:
+    """Shuffle with ``order_rng``. Sample with ``sample_rng`` only when the list is longer than ``count``."""
+    rows = [str(item) for item in items]
+    count = max(0, int(count))
+    if len(rows) <= count:
+        order_rng.shuffle(rows)
+        return rows
+    sample_rng.shuffle(rows)
+    picked = rows[:count]
+    order_rng.shuffle(picked)
+    return picked
+
+
+def _segment_flagged(segment: Mapping[str, Any]) -> bool:
+    if segment.get("needs_review"):
+        return True
+    return bool(segment.get("review_reasons"))
+
+
+def _compete_seed_rows(
+    by_id: Mapping[str, Mapping[str, Any]],
+    segments: Sequence[Mapping[str, Any]],
+    codebook: Sequence[Mapping[str, Any]],
+    raised: set[str],
+    *,
+    memos: Sequence[Mapping[str, Any]] | None = None,
+    review_below: float = 0.5,
+) -> list[tuple[str, str]]:
+    """Disconfirming readings from initial codings, before any property claim exists."""
+    held = _codes_by_passage(segments)
+    valence_groups: dict[str, dict[str, list[str]]] = {}
+    for segment in list(segments) + list(memos or []):
+        code_id = str(segment.get("code_id") or "")
+        passage_id = str(segment.get("passage_id") or "")
+        if code_id not in raised or passage_id not in by_id:
+            continue
+        valence = _norm_pole(segment.get("valence"))
+        consequence = _norm_pole(segment.get("consequence"))
+        if not valence and not consequence:
+            continue
+        valence_groups.setdefault(code_id, {}).setdefault(f"v:{valence}|c:{consequence}", []).append(passage_id)
+    differing: list[str] = []
+    for groups in valence_groups.values():
+        if len(groups) < 2:
+            continue
+        for passage_ids in groups.values():
+            for passage_id in passage_ids:
+                if passage_id not in differing:
+                    differing.append(passage_id)
+    low: list[str] = []
+    flagged: list[str] = []
+    alternative: list[str] = []
+    opposite: list[str] = []
+    poles = _pole_index(codebook)
+    for passage_id in by_id:
+        codes = held.get(passage_id) or set()
+        if not (codes & raised):
+            continue
+        if len(codes) > 1:
+            alternative.append(passage_id)
+        if _passage_confidence(passage_id, segments, raised) < float(review_below):
+            low.append(passage_id)
+        if any(
+            _segment_flagged(segment)
+            for segment in segments
+            if str(segment.get("passage_id") or "") == passage_id and str(segment.get("code_id") or "") in raised
+        ):
+            flagged.append(passage_id)
+        if _has_opposite_pole(str(by_id[passage_id].get("text") or ""), codes & raised, poles):
+            opposite.append(passage_id)
+    ordered = (
+        [(passage_id, "differing_consequence") for passage_id in differing]
+        + [(passage_id, "low_confidence") for passage_id in low]
+        + [(passage_id, "flagged_assignment") for passage_id in flagged]
+        + [(passage_id, "alternative_code") for passage_id in alternative]
+        + [(passage_id, "opposite_pole") for passage_id in opposite]
+    )
+    seen: set[str] = set()
+    rows: list[tuple[str, str]] = []
+    for passage_id, source in ordered:
+        if passage_id in seen:
+            continue
+        seen.add(passage_id)
+        rows.append((passage_id, source))
+    return rows
+
+
 def build_recode_queue(
     passages: Sequence[Mapping[str, Any]],
     segments: Sequence[Mapping[str, Any]],
@@ -989,14 +1139,19 @@ def build_recode_queue(
     codebook: Sequence[Mapping[str, Any]],
     *,
     seed: int,
-    neighbor_limit: int,
-    outside_limit: int = DEFAULT_FOCUSED_OUTSIDE_LIMIT,
-    negative_case_limit: int = DEFAULT_FOCUSED_NEGATIVE_CASE_LIMIT,
+    neighbor_limit: int | None,
+    outside_limit: int | None = DEFAULT_FOCUSED_OUTSIDE_LIMIT,
+    negative_case_limit: int | None = DEFAULT_FOCUSED_NEGATIVE_CASE_LIMIT,
     shares: Mapping[str, float] | None = None,
     incidents: Sequence[Mapping[str, Any]] | None = None,
     claims: Sequence[Mapping[str, Any]] | None = None,
+    max_calls: int | None = None,
+    batch_size: int = 1,
+    sampling_seed: int | None = None,
+    review_below: float = 0.5,
+    memos: Sequence[Mapping[str, Any]] | None = None,
 ) -> list[dict[str, str]]:
-    """Interleave three reserved reread purposes. The same seed replays the queue."""
+    """Interleave three reserved reread purposes. The same seed replays the order."""
     return plan_recode_queue(
         passages,
         segments,
@@ -1009,6 +1164,11 @@ def build_recode_queue(
         shares=shares,
         incidents=incidents,
         claims=claims,
+        max_calls=max_calls,
+        batch_size=batch_size,
+        sampling_seed=sampling_seed,
+        review_below=review_below,
+        memos=memos,
     )["queue"]
 
 
@@ -1019,23 +1179,40 @@ def plan_recode_queue(
     codebook: Sequence[Mapping[str, Any]],
     *,
     seed: int,
-    neighbor_limit: int,
-    outside_limit: int = DEFAULT_FOCUSED_OUTSIDE_LIMIT,
-    negative_case_limit: int = DEFAULT_FOCUSED_NEGATIVE_CASE_LIMIT,
+    neighbor_limit: int | None,
+    outside_limit: int | None = DEFAULT_FOCUSED_OUTSIDE_LIMIT,
+    negative_case_limit: int | None = DEFAULT_FOCUSED_NEGATIVE_CASE_LIMIT,
     shares: Mapping[str, float] | None = None,
     incidents: Sequence[Mapping[str, Any]] | None = None,
     claims: Sequence[Mapping[str, Any]] | None = None,
+    max_calls: int | None = None,
+    batch_size: int = 1,
+    sampling_seed: int | None = None,
+    review_below: float = 0.5,
+    memos: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the reread queue and say when a reserved purpose was empty.
 
+    When ``max_calls`` is set, each purpose is sized to its reserved share of
+    that allowance. Limits are optional caps: ``None`` does not cap a source,
+    and ``0`` adds none from that source. When ``max_calls`` is omitted, a
+    limit is the size of that source and a missing limit stays at the
+    historical size of 1, so direct callers keep the older queue.
+
     ``develop`` holds passages already assigned to a raised code.
-    ``compete`` holds within-category negative cases and a bounded lexical
-    neighborhood. When that list is empty, assigned passages fill it:
-    another code on the passage, an opposite pole, or a raised code not yet
-    applied. ``outside`` holds passages outside that selection. When none
-    remain, the lowest-confidence raised assignments fill it. A purpose that
-    is still empty gives its share back explicitly, and the plan carries a
-    warning. Researcher incidents are not dropped to satisfy a limit.
+    ``compete`` holds within-category negative cases, disconfirming readings
+    from the initial codings (a different valence or consequence, a low
+    confidence or flagged assignment, another code on the passage, an opposite
+    pole), and a lexical neighborhood. ``outside`` holds passages outside that
+    selection. When none remain and the outside cap is positive, the
+    lowest-confidence raised assignments fill it. A purpose that is still
+    empty, or that cannot fill its reserved calls, gives those calls back
+    explicitly, and the plan carries a warning. Researcher incidents are not
+    dropped to satisfy a limit.
+
+    ``seed`` shuffles order. When a candidate list fits its slot, ``seed``
+    does not change membership. ``sampling_seed`` chooses which rows are kept
+    only when a list is longer than its slot. Omit it to sample with ``seed``.
     """
     share_values = normalize_shares(shares)
     raised = {str(item) for item in raised_code_ids}
@@ -1064,22 +1241,29 @@ def plan_recode_queue(
         if passage_id in by_id and purpose in researcher:
             researcher[purpose].append(passage_id)
     reserved = {passage_id for group in researcher.values() for passage_id in group}
-    compete_negative = [
-        passage_id
-        for passage_id in within
-        if passage_id not in reserved
-    ][: max(0, int(negative_case_limit))]
+    order_rng = random.Random(int(seed))
+    sample_rng = random.Random(int(seed if sampling_seed is None else sampling_seed))
+    sized = max_calls is not None
+    passage_targets = (
+        {purpose: count * max(1, int(batch_size)) for purpose, count in call_targets(share_values, int(max_calls)).items()}
+        if sized
+        else {purpose: 0 for purpose in REREAD_PURPOSES}
+    )
+    neg_cap = _share_cap(negative_case_limit, passage_targets["compete"]) if sized else _legacy_cap(negative_case_limit)
+    neighbor_cap = _share_cap(neighbor_limit, passage_targets["compete"]) if sized else _legacy_cap(neighbor_limit)
+    outside_cap = _share_cap(outside_limit, passage_targets["outside"]) if sized else _legacy_cap(outside_limit)
+    compete_negative = [passage_id for passage_id in within if passage_id not in reserved][:neg_cap]
     within_selected = set(compete_negative)
-    develop = [
+    develop_ids = [
         passage_id
         for passage_id in by_id
         if passage_id in assigned_ids and passage_id not in within_selected and passage_id not in reserved
     ]
-    neighbor_ids: list[str] = []
-    if neighbor_limit > 0 and raised:
+    neighbor_pool: list[str] = []
+    if neighbor_cap > 0 and raised:
         codes = [entry for entry in codebook if str(entry.get("code_id") or "") in raised]
         scored = []
-        blocked = set(develop) | set(compete_negative) | reserved | assigned_ids
+        blocked = set(develop_ids) | set(compete_negative) | reserved | assigned_ids
         for passage_id, passage in by_id.items():
             if passage_id in blocked:
                 continue
@@ -1090,14 +1274,13 @@ def plan_recode_queue(
             if best > 0:
                 scored.append((-best, passage_id))
         scored.sort()
-        neighbor_ids = [passage_id for _score, passage_id in scored[: int(neighbor_limit)]]
+        neighbor_pool = [passage_id for _score, passage_id in scored]
     outside_priority = [
         passage_id
         for passage_id in outside_hits
         if passage_id not in reserved
-        and passage_id not in develop
+        and passage_id not in develop_ids
         and passage_id not in compete_negative
-        and passage_id not in neighbor_ids
         and passage_id not in assigned_ids
     ]
     outside_rest = [
@@ -1105,33 +1288,121 @@ def plan_recode_queue(
         for passage_id in by_id
         if passage_id not in assigned_ids
         and passage_id not in reserved
-        and passage_id not in neighbor_ids
         and passage_id not in compete_negative
         and passage_id not in outside_priority
     ]
-    outside_auto = (outside_priority + outside_rest)[: max(0, int(outside_limit))]
-    rng = random.Random(int(seed))
-    rng.shuffle(develop)
+    if sized:
+        groups, extra_warnings = _size_purpose_groups(
+            by_id=by_id,
+            segments=segments,
+            codebook=codebook,
+            raised=raised,
+            assigned_ids=assigned_ids,
+            researcher=researcher,
+            reserved=reserved,
+            develop_ids=develop_ids,
+            compete_negative=compete_negative,
+            neighbor_pool=neighbor_pool,
+            outside_priority=outside_priority,
+            outside_rest=outside_rest,
+            targets=passage_targets,
+            neighbor_cap=neighbor_cap,
+            outside_cap=outside_cap,
+            outside_limit=outside_limit,
+            order_rng=order_rng,
+            sample_rng=sample_rng,
+            review_below=review_below,
+            memos=memos,
+        )
+    else:
+        groups = _legacy_purpose_groups(
+            by_id=by_id,
+            segments=segments,
+            codebook=codebook,
+            raised=raised,
+            assigned_ids=assigned_ids,
+            researcher=researcher,
+            reserved=reserved,
+            develop_ids=develop_ids,
+            compete_negative=compete_negative,
+            neighbor_pool=neighbor_pool[:neighbor_cap],
+            outside_priority=outside_priority,
+            outside_rest=outside_rest,
+            outside_cap=outside_cap,
+            neighbor_cap=neighbor_cap,
+            negative_cap=neg_cap,
+            order_rng=order_rng,
+        )
+        extra_warnings = []
+    applied, reallocation, warnings = _reallocate_shares(share_values, groups)
+    warnings = list(warnings) + [note for note in extra_warnings if note not in warnings]
+    if extra_warnings:
+        reallocation = dict(reallocation)
+        reallocation["reallocated"] = True
+        purposes = list(reallocation.get("purposes") or [])
+        for purpose in REREAD_PURPOSES:
+            if purpose not in purposes and len(groups.get(purpose) or []) < passage_targets.get(purpose, 0):
+                purposes.append(purpose)
+        reallocation["purposes"] = purposes
+        if not reallocation.get("note"):
+            reallocation["note"] = extra_warnings[0]
+    return {
+        "queue": interleave_queue(groups, applied),
+        "warnings": warnings,
+        "shares_requested": share_values,
+        "shares_applied": applied,
+        "reallocation": reallocation,
+        "purpose_counts": {purpose: len(groups[purpose]) for purpose in REREAD_PURPOSES},
+        "call_targets": call_targets(share_values, int(max_calls)) if sized else {},
+        "passage_targets": passage_targets if sized else {},
+    }
+
+
+def _legacy_purpose_groups(
+    *,
+    by_id,
+    segments,
+    codebook,
+    raised,
+    assigned_ids,
+    researcher,
+    reserved,
+    develop_ids,
+    compete_negative,
+    neighbor_pool,
+    outside_priority,
+    outside_rest,
+    outside_cap,
+    neighbor_cap,
+    negative_cap,
+    order_rng,
+) -> dict[str, list]:
+    """Limit-as-size queues used when the caller does not pass ``max_calls``."""
+    neighbor_ids = set(neighbor_pool)
+    outside_priority = [passage_id for passage_id in outside_priority if passage_id not in neighbor_ids]
+    outside_rest = [passage_id for passage_id in outside_rest if passage_id not in neighbor_ids]
+    develop = list(develop_ids)
+    outside_auto = (list(outside_priority) + list(outside_rest))[:outside_cap]
+    order_rng.shuffle(develop)
     compete_auto = list(compete_negative)
-    rng.shuffle(compete_auto)
-    neighbor_shuffled = list(neighbor_ids)
-    rng.shuffle(neighbor_shuffled)
+    order_rng.shuffle(compete_auto)
+    neighbor_shuffled = list(neighbor_pool)
+    order_rng.shuffle(neighbor_shuffled)
     outside_shuffled = list(outside_auto)
-    rng.shuffle(outside_shuffled)
+    order_rng.shuffle(outside_shuffled)
     compete_fallback: list[tuple[str, str]] = []
     outside_fallback: list[tuple[str, str]] = []
-    # Reserve outside first so a weak assignment is not swallowed by compete.
-    if not outside_shuffled and int(outside_limit) > 0:
+    if not outside_shuffled and outside_cap > 0:
         blocked = reserved | set(compete_auto) | set(neighbor_shuffled)
-        outside_fallback = _outside_fallback(by_id, segments, raised, blocked, assigned_ids)[: int(outside_limit)]
+        outside_fallback = _outside_fallback(by_id, segments, raised, blocked, assigned_ids)[:outside_cap]
     if not compete_auto and not neighbor_shuffled:
-        budget = max(0, int(negative_case_limit)) + max(0, int(neighbor_limit))
+        budget = max(0, int(negative_cap)) + max(0, int(neighbor_cap))
         if budget > 0:
             blocked = reserved | set(outside_shuffled) | {passage_id for passage_id, _source in outside_fallback}
             compete_fallback = _compete_fallback(by_id, segments, codebook, raised, blocked)[:budget]
     moved = {passage_id for passage_id, _source in compete_fallback + outside_fallback}
     develop = [passage_id for passage_id in develop if passage_id not in moved]
-    groups = {
+    return {
         "develop": [_queue_item(passage_id, "develop", "researcher") for passage_id in researcher["develop"]]
         + [_queue_item(passage_id, "develop", "assignment") for passage_id in develop],
         "compete": [_queue_item(passage_id, "compete", "researcher") for passage_id in researcher["compete"]]
@@ -1142,15 +1413,160 @@ def plan_recode_queue(
         + [_queue_item(passage_id, "outside", "outside") for passage_id in outside_shuffled]
         + [_queue_item(passage_id, "outside", source) for passage_id, source in outside_fallback],
     }
-    applied, reallocation, warnings = _reallocate_shares(share_values, groups)
-    return {
-        "queue": interleave_queue(groups, applied),
-        "warnings": warnings,
-        "shares_requested": share_values,
-        "shares_applied": applied,
-        "reallocation": reallocation,
-        "purpose_counts": {purpose: len(groups[purpose]) for purpose in REREAD_PURPOSES},
+
+
+def _size_purpose_groups(
+    *,
+    by_id,
+    segments,
+    codebook,
+    raised,
+    assigned_ids,
+    researcher,
+    reserved,
+    develop_ids,
+    compete_negative,
+    neighbor_pool,
+    outside_priority,
+    outside_rest,
+    targets,
+    neighbor_cap,
+    outside_cap,
+    outside_limit,
+    order_rng,
+    sample_rng,
+    review_below,
+    memos,
+) -> tuple[dict[str, list], list[str]]:
+    """Fill each purpose up to its reserved passages, then give unused slots away."""
+    compete_slots = max(0, int(targets["compete"]) - len(researcher["compete"]))
+    taken: set[str] = set(reserved)
+    compete_rows: list[tuple[str, str]] = []
+
+    def _push(passage_id: str, source: str) -> bool:
+        if len(compete_rows) >= compete_slots or passage_id in taken or passage_id not in by_id:
+            return False
+        compete_rows.append((passage_id, source))
+        taken.add(passage_id)
+        return True
+
+    for passage_id in compete_negative:
+        _push(passage_id, "negative_case")
+    seeds = _compete_seed_rows(
+        by_id,
+        segments,
+        codebook,
+        raised,
+        memos=memos,
+        review_below=review_below,
+    )
+    for passage_id, source in seeds:
+        if passage_id in reserved:
+            continue
+        _push(passage_id, source)
+    neighbor_added = 0
+    for passage_id in neighbor_pool:
+        if neighbor_added >= neighbor_cap:
+            break
+        if _push(passage_id, "neighbor"):
+            neighbor_added += 1
+    outside_slots = max(0, int(targets["outside"]) - len(researcher["outside"]))
+    outside_slots = min(outside_slots, outside_cap)
+    outside_ids: list[str] = []
+    outside_fallback: list[tuple[str, str]] = []
+    if outside_slots > 0:
+        priority = [passage_id for passage_id in outside_priority if passage_id not in taken]
+        rest = [passage_id for passage_id in outside_rest if passage_id not in taken and passage_id not in priority]
+        outside_ids = priority[:outside_slots]
+        # Membership of the overflow uses the sampling seed. Order uses ``seed``.
+        rest_take = _order_take(rest, outside_slots - len(outside_ids), order_rng, sample_rng)
+        outside_ids.extend(rest_take)
+        taken.update(outside_ids)
+        if not outside_ids:
+            blocked = set(taken)
+            outside_fallback = _outside_fallback(by_id, segments, raised, blocked, assigned_ids)[:outside_slots]
+            taken.update(passage_id for passage_id, _source in outside_fallback)
+    develop_slots = max(0, int(targets["develop"]) - len(researcher["develop"]))
+    develop_pool = [passage_id for passage_id in develop_ids if passage_id not in taken]
+    develop = _order_take(develop_pool, develop_slots, order_rng, sample_rng)
+    taken.update(develop)
+    groups = {
+        "develop": [_queue_item(passage_id, "develop", "researcher") for passage_id in researcher["develop"]]
+        + [_queue_item(passage_id, "develop", "assignment") for passage_id in develop],
+        "compete": [_queue_item(passage_id, "compete", "researcher") for passage_id in researcher["compete"]]
+        + [_queue_item(passage_id, "compete", source) for passage_id, source in compete_rows],
+        "outside": [_queue_item(passage_id, "outside", "researcher") for passage_id in researcher["outside"]]
+        + [_queue_item(passage_id, "outside", "outside") for passage_id in outside_ids]
+        + [_queue_item(passage_id, "outside", source) for passage_id, source in outside_fallback],
     }
+    leftovers = {
+        "develop": [
+            _queue_item(passage_id, "develop", "assignment")
+            for passage_id in develop_pool
+            if passage_id not in taken
+        ],
+        "compete": [],
+        "outside": [
+            _queue_item(passage_id, "outside", "outside")
+            for passage_id in list(outside_priority) + list(outside_rest)
+            if passage_id not in taken and passage_id not in assigned_ids
+        ]
+        if outside_limit is None
+        else [],
+    }
+    warnings = _absorb_unused_slots(groups, leftovers, targets)
+    return groups, warnings
+
+
+def _absorb_unused_slots(
+    groups: dict[str, list],
+    leftovers: Mapping[str, list],
+    targets: Mapping[str, int],
+) -> list[str]:
+    """Give a purpose's unused reserved passages to a purpose that still has candidates."""
+    pending = {purpose: list(leftovers.get(purpose) or []) for purpose in REREAD_PURPOSES}
+    short = [
+        purpose
+        for purpose in REREAD_PURPOSES
+        if len(groups[purpose]) < int(targets.get(purpose) or 0)
+    ]
+    if not short or not any(pending.values()):
+        if short:
+            note = (
+                "Focused reread "
+                + ", ".join(
+                    f"{purpose} reserved {int(targets[purpose])} and queued {len(groups[purpose])}"
+                    for purpose in short
+                )
+                + ", so those reserved calls were reallocated."
+            )
+            return [note]
+        return []
+    given = {purpose: 0 for purpose in REREAD_PURPOSES}
+    for purpose in list(short):
+        deficit = int(targets[purpose]) - len(groups[purpose])
+        while deficit > 0:
+            progressed = False
+            for donor in REREAD_PURPOSES:
+                if deficit <= 0 or not pending[donor]:
+                    continue
+                groups[donor].append(pending[donor].pop(0))
+                given[donor] += 1
+                deficit -= 1
+                progressed = True
+            if not progressed:
+                break
+    receivers = [purpose for purpose in REREAD_PURPOSES if given[purpose]]
+    if not receivers:
+        return []
+    note = (
+        "Focused reread "
+        + ", ".join(f"{purpose} (reserved {int(targets[purpose])}, queued {len(groups[purpose])})" for purpose in short)
+        + " could not fill its reserved calls, so unused slots were reallocated to "
+        + ", ".join(f"{purpose} +{given[purpose]}" for purpose in receivers)
+        + "."
+    )
+    return [note]
 
 
 def cite_note(
@@ -1161,12 +1577,15 @@ def cite_note(
     entry_id: str,
     coded_passage_id: str = "",
     codebook: Mapping[str, Mapping[str, Any]] | Sequence[Mapping[str, Any]] | None = None,
+    segments: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Keep a property or dimension and attach the passage that holds the quote.
 
     A quote found in a different passage than the one named is attributed to
     the passage that contains it and flagged. A quote found nowhere is kept,
     flagged ``unsupported``, and not assigned to the passage being coded.
+    A category that is not assigned on the cited passage is flagged
+    ``property_category_mismatch``. That flag does not change anchoring.
     """
     claimed_passage = str(note.get("passage_id") or "")
     claimed_doc = str(note.get("document_id") or "")
@@ -1216,8 +1635,15 @@ def cite_note(
     quote_status = anchor.status if quote else "unanchored"
     stored_quote = anchor.quote if anchor.status not in {"unanchored"} and anchor.quote else quote
     category_id = str(note.get("category_id") or "")
+    needs_review = False
+    if segments is not None and category_id:
+        home = passage_id or claimed_passage
+        assigned = _codes_by_passage(segments).get(home, set()) if home else set()
+        if home and category_id not in assigned:
+            flags.append("property_category_mismatch")
+            needs_review = True
     condition = evidence_condition_for(quote_status=quote_status, flags=flags, supported=supported)
-    fields = proposal_record_fields(evidence_condition=condition)
+    fields = proposal_record_fields(evidence_condition=condition, needs_review=needs_review)
     revision = _category_revision_for(category_id, codebook)
     return {
         "entry_id": entry_id,
@@ -1243,8 +1669,36 @@ def cite_note(
         "quote_status": quote_status,
         "flags": flags,
         "supported": supported,
-        "needs_review": False,
+        "needs_review": needs_review,
         **fields,
+    }
+
+
+def category_match_report(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Category fit beside citation anchoring. Anchoring is not category fit and not claim support."""
+    mismatch = 0
+    anchored = 0
+    anchored_mismatch = 0
+    for row in records:
+        flags = {str(item) for item in (row.get("flags") or [])}
+        located = str(row.get("quote_status") or "") in {"exact", "normalized_match", "fuzzy_match"}
+        if located:
+            anchored += 1
+        if "property_category_mismatch" in flags:
+            mismatch += 1
+            if located:
+                anchored_mismatch += 1
+    return {
+        "name": "category_match",
+        "records": len(list(records)),
+        "anchored_quotes": anchored,
+        "property_category_mismatch": mismatch,
+        "anchored_but_mismatched": anchored_mismatch,
+        "note": (
+            "Citation anchoring is whether the quote is in a passage. "
+            "It is not category fit and it is not claim support. "
+            "A quote can be anchored and still carry property_category_mismatch."
+        ),
     }
 
 
@@ -1382,7 +1836,7 @@ def _decision_to_coding(decision: Mapping[str, Any], book: Mapping[str, Mapping[
     known_key = by_id.get(sent_id) or by_label.get(code_key(label))
     action = str(decision.get("action") or "add")
     if known_key and action == "revise":
-        mapped = "refine"
+        mapped = "reuse"
     elif known_key:
         mapped = "reuse"
     else:
@@ -1489,6 +1943,152 @@ def _confirm_assignment(segment: Mapping[str, Any], item: Mapping[str, Any]) -> 
     return row
 
 
+def _quote_tokens(text: str) -> list[str]:
+    tokens = []
+    for token in str(text or "").casefold().split():
+        cleaned = "".join(character for character in token if character.isalnum() or character == "'")
+        if cleaned:
+            tokens.append(cleaned)
+    return tokens
+
+
+def _narrowed_span(original: str, proposed: str) -> bool:
+    """True when the proposal keeps a proper subsequence and drops words of the original."""
+    old = _quote_tokens(original)
+    new = _quote_tokens(proposed)
+    if not old or not new or len(new) >= len(old):
+        return False
+    index = 0
+    for token in old:
+        if index < len(new) and token == new[index]:
+            index += 1
+    return index == len(new)
+
+
+def _known_code_id(decision: Mapping[str, Any], book: Mapping[str, Mapping[str, Any]]) -> str:
+    sent = str(decision.get("code_id") or "")
+    label = code_key(str(decision.get("code") or ""))
+    for entry in book.values():
+        code_id = str(entry.get("code_id") or "")
+        if sent and code_id == sent:
+            return code_id
+        if label and code_key(str(entry.get("code") or "")) == label:
+            return code_id
+    return ""
+
+
+def _flag_existing_code(
+    segments: list[dict],
+    passage_id: str,
+    code_id: str,
+    *,
+    reason: str,
+    payload: Mapping[str, Any],
+) -> bool:
+    found = False
+    for index, segment in enumerate(segments):
+        if str(segment.get("code_id") or "") != code_id:
+            continue
+        homes = {str(segment.get("passage_id") or ""), str(segment.get("coded_passage_id") or "")}
+        if passage_id not in homes:
+            continue
+        row = dict(segment)
+        reasons = [str(item) for item in (row.get("review_reasons") or [])]
+        if reason not in reasons:
+            reasons.append(reason)
+        row["review_reasons"] = reasons
+        row["needs_review"] = True
+        row[reason] = dict(payload)
+        segments[index] = row
+        found = True
+    return found
+
+
+def _attach_span_proposal(segment: Mapping[str, Any], item: Mapping[str, Any]) -> dict[str, Any]:
+    """Nest a span proposal on the original assignment. It is not a second row."""
+    row = dict(segment)
+    proposed = str(item.get("quote") or item.get("model_quote") or "")
+    narrowed = _narrowed_span(str(row.get("quote") or ""), proposed)
+    flags = ["focused_span_proposal"]
+    if narrowed:
+        flags.append("narrowed_span")
+    proposal = {
+        "original_segment_id": str(row.get("segment_id") or ""),
+        "quote": proposed,
+        "model_quote": str(item.get("model_quote") or item.get("quote") or ""),
+        "quote_status": item.get("quote_status") or "",
+        "doc_start": item.get("doc_start"),
+        "doc_end": item.get("doc_end"),
+        "narrowed_span": narrowed,
+        "flags": flags,
+        "stage": "focused",
+        "applied": False,
+    }
+    nested = [dict(existing) for existing in (row.get("span_proposals") or []) if isinstance(existing, Mapping)]
+    nested.append(proposal)
+    row["span_proposals"] = nested
+    reasons = [str(reason) for reason in (row.get("review_reasons") or [])]
+    for flag in flags:
+        if flag not in reasons:
+            reasons.append(flag)
+    row["review_reasons"] = reasons
+    row["needs_review"] = True
+    row["quote"] = segment.get("quote")
+    row["doc_start"] = segment.get("doc_start")
+    row["doc_end"] = segment.get("doc_end")
+    return row
+
+
+def _duplicate_text(entry: Mapping[str, Any]) -> str:
+    """Label and definition only. A passage quote would dilute a near-duplicate label."""
+    return "\n".join(
+        part
+        for part in (str(entry.get("code") or ""), str(entry.get("definition") or ""))
+        if part
+    )
+
+
+def _flag_possible_duplicates(
+    book: dict[str, dict],
+    segments: list[dict],
+    before_keys: set[str],
+    threshold: float,
+) -> None:
+    for key, entry in book.items():
+        if key in before_keys:
+            continue
+        best_id = ""
+        best = 0.0
+        text = _duplicate_text(entry)
+        for other_key, other in book.items():
+            if other_key == key:
+                continue
+            score = jaccard(text, _duplicate_text(other))
+            if score > best:
+                best = score
+                best_id = str(other.get("code_id") or "")
+        if not best_id or best < float(threshold):
+            continue
+        entry["possible_duplicate"] = True
+        entry["similar_code_id"] = best_id
+        entry["duplicate_similarity"] = round(best, 4)
+        entry["needs_review"] = True
+        code_id = str(entry.get("code_id") or "")
+        for index, segment in enumerate(segments):
+            if str(segment.get("code_id") or "") != code_id:
+                continue
+            row = dict(segment)
+            reasons = [str(item) for item in (row.get("review_reasons") or [])]
+            if "possible_duplicate" not in reasons:
+                reasons.append("possible_duplicate")
+            row["review_reasons"] = reasons
+            row["needs_review"] = True
+            row["possible_duplicate"] = True
+            row["similar_code_id"] = best_id
+            row["duplicate_similarity"] = round(best, 4)
+            segments[index] = row
+
+
 def apply_passage_recode(
     book: dict[str, dict],
     segments: list[dict],
@@ -1504,18 +2104,42 @@ def apply_passage_recode(
     max_codes: int = 6,
     long_passage_chars: int = 2000,
     review_below: float = 0.5,
+    duplicate_similarity: float = DEFAULT_FOCUSED_DUPLICATE_SIMILARITY,
 ) -> dict[str, Any]:
     """Validate one reread and append assignments. Initial codes stay.
 
     An initial raised-code assignment that this reread does not repeat is kept
     and flagged ``focused_disagreement``. The same code and the same span is a
     confirmation on that assignment, with focused provenance. A different span
-    is a separate proposal and does not rewrite the stored quote. Quotes follow
-    the open-coding anchor.
+    is nested on that assignment as a span proposal and does not become a
+    second row. ``revise`` and ``drop`` are flagged proposals and are not
+    applied. Quotes follow the open-coding anchor.
     """
+    coded_id = str(passage.get("passage_id") or "")
+    actionable = []
+    proposal_ids: set[str] = set()
+    unmatched: list[dict[str, Any]] = []
+    for decision in decisions:
+        action = str(decision.get("action") or "add")
+        if action not in {"drop", "revise"}:
+            actionable.append(decision)
+            continue
+        code_id = _known_code_id(decision, book)
+        reason = "focused_drop_proposal" if action == "drop" else "focused_revise_proposal"
+        payload = {
+            "action": action,
+            "definition": str(decision.get("definition") or ""),
+            "quote": str(decision.get("quote") or ""),
+            "rationale": str(decision.get("rationale") or ""),
+            "applied": False,
+        }
+        if code_id and _flag_existing_code(segments, coded_id, code_id, reason=reason, payload=payload):
+            proposal_ids.add(code_id)
+        else:
+            unmatched.append({"passage_id": coded_id, "reason": reason, **payload, "code": decision.get("code")})
     coding = {
-        "passage_id": str(passage.get("passage_id") or ""),
-        "codes": [_decision_to_coding(item, book) for item in decisions],
+        "passage_id": coded_id,
+        "codes": [_decision_to_coding(item, book) for item in actionable],
         "memo": "",
     }
     interpreted = interpret_coding(
@@ -1529,18 +2153,26 @@ def apply_passage_recode(
         passages=passages,
         request_passages=passages,
     )
-    coded_id = str(passage.get("passage_id") or "")
     confirm_ids: dict[str, Mapping[str, Any]] = {}
-    span_proposal_ids: set[str] = set()
+    span_ids: dict[str, Mapping[str, Any]] = {}
     to_commit = []
     for item in interpreted.get("accepted") or []:
         code_id = _code_id_for_item(item, book)
         existing = _assignments_for(segments, coded_id, code_id) if code_id else []
+        if existing and (
+            item.get("evidence_outside_passage")
+            or "evidence_outside_passage" in (item.get("review_reasons") or [])
+        ):
+            to_commit.append(item)
+            continue
         if existing and _same_quoted_span(existing[0], item):
             confirm_ids[str(existing[0].get("segment_id") or "")] = item
             continue
         if existing:
-            span_proposal_ids.add(code_id)
+            span_ids[str(existing[0].get("segment_id") or "")] = item
+            if code_id:
+                proposal_ids.add(code_id)
+            continue
         to_commit.append(item)
     confirmed_code_ids = set()
     for index, segment in enumerate(segments):
@@ -1549,8 +2181,15 @@ def apply_passage_recode(
             continue
         segments[index] = _confirm_assignment(segment, confirm_ids[sid])
         confirmed_code_ids.add(str(segment.get("code_id") or ""))
+    for index, segment in enumerate(segments):
+        sid = str(segment.get("segment_id") or "")
+        if sid not in span_ids:
+            continue
+        segments[index] = _attach_span_proposal(segment, span_ids[sid])
+        confirmed_code_ids.add(str(segment.get("code_id") or ""))
     interpreted = {**interpreted, "accepted": to_commit}
     before_ids = {str(item.get("segment_id") or "") for item in segments}
+    before_keys = set(book)
     committed = commit_passage(
         book,
         segments,
@@ -1569,11 +2208,6 @@ def apply_passage_recode(
         reasons = [str(item) for item in (row.get("review_reasons") or [])]
         if "focused_recode" not in reasons:
             reasons.append("focused_recode")
-        if str(row.get("code_id") or "") in span_proposal_ids:
-            if "focused_span_proposal" not in reasons:
-                reasons.append("focused_span_proposal")
-            row["focused_span_proposal"] = True
-            row["needs_review"] = True
         row["review_reasons"] = reasons
         new_segments.append(row)
     replaced = {str(item.get("segment_id") or ""): item for item in new_segments}
@@ -1581,7 +2215,7 @@ def apply_passage_recode(
     for segment in committed["segments"]:
         sid = str(segment.get("segment_id") or "")
         merged.append(replaced.get(sid, segment))
-    accepted_ids = set(confirmed_code_ids)
+    accepted_ids = set(confirmed_code_ids) | set(proposal_ids)
     for item in interpreted.get("accepted") or []:
         key = str(item.get("key") or "")
         entry = committed["codebook"].get(key) or {}
@@ -1614,6 +2248,7 @@ def apply_passage_recode(
             disagreed.append(row)
         else:
             flagged.append(segment)
+    _flag_possible_duplicates(committed["codebook"], flagged, before_keys, duplicate_similarity)
     return {
         "codebook": committed["codebook"],
         "segments": flagged,
@@ -1622,24 +2257,35 @@ def apply_passage_recode(
         "highlight_ids": committed["highlight_ids"],
         "interpreted": interpreted,
         "disagreements": disagreed,
+        "unmatched_proposals": unmatched,
     }
+
+
+def _compact_codes(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "code_id": entry.get("code_id"),
+            "code": entry.get("code"),
+            "definition": entry.get("definition"),
+        }
+        for entry in entries
+    ]
 
 
 def _recode_messages(
     passages: Sequence[Mapping[str, Any]],
     raised: Sequence[Mapping[str, Any]],
     *,
+    other: Sequence[Mapping[str, Any]] | None = None,
     feedback: str = "",
 ) -> list:
     payload = {
-        "raised_codes": [
-            {
-                "code_id": entry.get("code_id"),
-                "code": entry.get("code"),
-                "definition": entry.get("definition"),
-            }
-            for entry in raised
-        ],
+        "raised_codes": _compact_codes(raised),
+        "other_codes": _compact_codes(other or []),
+        "prefer_existing_codes": (
+            "Prefer a code in raised_codes or other_codes. "
+            "Add a new label only when none of those codes fit the passage."
+        ),
         "passages": [
             {
                 "passage_id": item.get("passage_id"),
@@ -1680,28 +2326,70 @@ def _allowance_block(state: Mapping[str, Any]) -> tuple[str, list[str]] | None:
     by_id = {str(item.get("passage_id") or ""): item for item in (state.get("passages") or [])}
     batch = [by_id[pid] for pid in batch_ids if pid in by_id]
     raised_ids = set(state.get("raised_code_ids") or [])
-    raised = [entry for entry in (state.get("codebook") or {}).values() if str(entry.get("code_id") or "") in raised_ids]
-    messages = _recode_messages(batch, raised)
+    raised, other = _split_codebook(state.get("codebook") or {}, raised_ids)
+    messages = _recode_messages(batch, raised, other=other)
     estimate = request_input_tokens(messages, FocusedRecodeBatch, resolve_tokenizer(None))
     if tokens + estimate > max_tokens:
         return "token_allowance", _queue_passage_ids(remaining)
     return None
 
 
+def _corpus_passage_ids(state: Mapping[str, Any]) -> list[str]:
+    return [str(item.get("passage_id") or "") for item in (state.get("passages") or []) if item.get("passage_id")]
+
+
+def _queued_passage_ids(state: Mapping[str, Any]) -> list[str]:
+    return [passage_id for passage_id in _queue_passage_ids(state.get("recode_queue") or []) if passage_id]
+
+
+def _coverage_statement(state: Mapping[str, Any], not_reread: Sequence[str]) -> dict[str, Any]:
+    corpus = _corpus_passage_ids(state)
+    queued = _queued_passage_ids(state)
+    queued_set = set(queued)
+    reread = [str(item) for item in (state.get("focused_reread") or [])]
+    not_queued = [passage_id for passage_id in corpus if passage_id not in queued_set]
+    return {
+        "corpus_passages": len(corpus),
+        "queued": len(queued),
+        "reread": len(reread),
+        "not_queued": not_queued,
+        "not_queued_count": len(not_queued),
+        "not_reread": list(not_reread),
+        "not_reread_count": len(list(not_reread)),
+        "queue_complete": not list(not_reread),
+        "corpus_complete": not list(not_reread) and not not_queued,
+        "note": (
+            "complete means every corpus passage was reread. "
+            "complete_for_queue means the reread queue finished and names passages that were never queued. "
+            "focused_not_reread lists passages that were queued and not sent. "
+            "focused_not_queued lists passages that never entered the queue."
+        ),
+    }
+
+
 def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
     procedure = (state.get("metadata") or {}).get("procedure") or {}
     stop = str(state.get("recode_stop") or "")
     not_reread = [str(item) for item in (state.get("focused_not_reread") or [])]
+    coverage = _coverage_statement(state, not_reread)
+    not_queued = list(coverage["not_queued"])
     if stop in {"call_allowance", "token_allowance", "no_progress"}:
         status = "incomplete"
         complete = False
-    elif stop == "complete":
+    elif not not_reread and not not_queued:
         status = "complete"
         complete = True
+        stop = "complete"
+    elif not not_reread:
+        status = "complete_for_queue"
+        complete = False
+        stop = "complete_for_queue"
     else:
-        status = "incomplete" if not_reread else "complete"
-        complete = status == "complete"
-        stop = stop or ("complete" if complete else "incomplete")
+        status = "incomplete"
+        complete = False
+        stop = stop or "incomplete"
+    coverage["queue_complete"] = status in {"complete", "complete_for_queue"}
+    coverage["corpus_complete"] = status == "complete"
     return {
         "stage": "focused",
         "status": status,
@@ -1712,7 +2400,9 @@ def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
         "max_focused_review_calls": int(procedure.get("max_focused_review_calls") or 0),
         "max_focused_review_tokens": int(procedure.get("max_focused_review_tokens") or 0),
         "focused_not_reread": not_reread,
+        "focused_not_queued": not_queued,
         "focused_reread": [str(item) for item in (state.get("focused_reread") or [])],
+        "coverage": coverage,
     }
 
 
@@ -1750,6 +2440,7 @@ def _category_development(state: Mapping[str, Any]) -> dict[str, Any]:
         "revision_cycles": list(state.get("revision_cycles") or []),
         "views": view_notes(),
         "citation_anchoring": citation_anchoring_report(records),
+        "category_match": category_match_report(records),
         "claim_support": claim_support_report(records),
         "purpose_coverage": (state.get("metadata") or {}).get("purpose_coverage")
         or state.get("purpose_coverage")
@@ -1775,12 +2466,35 @@ def _incomplete_warning(fields: Mapping[str, Any]) -> str:
         "no_progress": "a focused reread returned no passage decisions",
     }
     why = reasons.get(stop, stop or "the reread stopped")
+    not_queued = list((fields.get("coverage") or {}).get("not_queued") or [])
+    queued_note = ""
+    if not_queued:
+        listed = ", ".join(not_queued[:30])
+        queued_note = f" Passages never queued: {listed}."
     return (
         "Focused coding is incomplete because "
         + why
-        + ". Passages not reread: "
+        + ". Passages queued and not reread: "
         + (shown or "(none)")
-        + ". Initial assignments on those passages are unchanged."
+        + "."
+        + queued_note
+        + " Initial assignments on those passages are unchanged."
+    )
+
+
+def _queue_finished_warning(fields: Mapping[str, Any]) -> str:
+    coverage = fields.get("coverage") or {}
+    ids = list(coverage.get("not_queued") or [])
+    shown = ", ".join(ids[:30])
+    if len(ids) > 30:
+        shown = f"{shown}, and {len(ids) - 30} more"
+    return (
+        "Focused coding finished the reread queue "
+        f"({coverage.get('reread', 0)} of {coverage.get('corpus_passages', 0)} corpus passages). "
+        "Status is complete_for_queue, which is not corpus coverage. "
+        "Passages never queued: "
+        + (shown or "(none)")
+        + "."
     )
 
 
@@ -1909,24 +2623,79 @@ def _researcher_node(state: FocusedState) -> dict:
     }
 
 
+def _split_codebook(codebook: Mapping[str, Mapping[str, Any]], raised_ids: set[str]) -> tuple[list, list]:
+    raised = []
+    other = []
+    for entry in codebook.values():
+        if str(entry.get("code_id") or "") in raised_ids:
+            raised.append(entry)
+        else:
+            other.append(entry)
+    return raised, other
+
+
+def _stored_limit(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
+
+
+def _claim_compete_items(
+    state: Mapping[str, Any],
+    queue: Sequence[Mapping[str, Any]],
+    *,
+    slots: int,
+) -> list[dict[str, str]]:
+    """A second compete pass against properties written by the first reread."""
+    if slots <= 0:
+        return []
+    claims = list(state.get("properties") or []) + list(state.get("dimensions") or [])
+    if not claims:
+        return []
+    passages = list(state.get("passages") or [])
+    by_id = {str(item.get("passage_id") or ""): item for item in passages if item.get("passage_id")}
+    already = set(_queue_passage_ids(queue)) | {str(item) for item in (state.get("focused_reread") or [])}
+    hits = negative_case_candidates(
+        passages,
+        state.get("segments") or [],
+        claims,
+        codebook=list((state.get("codebook") or {}).values()),
+    )
+    extra = []
+    for hit in hits:
+        passage_id = str(hit.get("passage_id") or "")
+        if not passage_id or passage_id in already or passage_id not in by_id:
+            continue
+        already.add(passage_id)
+        extra.append(_queue_item(passage_id, "compete", "claim_negative_case"))
+        if len(extra) >= slots:
+            break
+    return extra
+
+
 def _prepare_node(state: FocusedState) -> dict:
     updates: dict[str, Any] = {}
     codebook = state.get("codebook") or {}
     if not state.get("queue_ready"):
         meta = state.get("metadata") or {}
         procedure = meta.get("procedure") or {}
+        performance = meta.get("performance") or {}
         plan = plan_recode_queue(
             state.get("passages") or [],
             state.get("segments") or [],
             state.get("raised_code_ids") or [],
             list(codebook.values()),
             seed=int(procedure.get("seed") or 0),
-            neighbor_limit=int(procedure.get("focused_neighbor_limit") or 0),
-            outside_limit=int(procedure.get("focused_outside_limit") or 0),
-            negative_case_limit=int(procedure.get("focused_negative_case_limit") or 0),
+            neighbor_limit=_stored_limit(procedure.get("focused_neighbor_limit")),
+            outside_limit=_stored_limit(procedure.get("focused_outside_limit")),
+            negative_case_limit=_stored_limit(procedure.get("focused_negative_case_limit")),
             shares=_shares_from_procedure(procedure),
             incidents=(meta.get("researcher_incidents") or []),
             claims=list(state.get("properties") or []) + list(state.get("dimensions") or []),
+            max_calls=int(procedure.get("max_focused_review_calls") or 0),
+            batch_size=max(1, int(performance.get("batch_size") or 1)),
+            sampling_seed=procedure.get("focused_sampling_seed"),
+            memos=state.get("memos") or [],
         )
         queue = list(plan["queue"])
         warnings = list(state.get("warnings") or [])
@@ -1937,6 +2706,7 @@ def _prepare_node(state: FocusedState) -> dict:
         metadata["reread_shares_applied"] = plan.get("shares_applied") or {}
         metadata["reread_reallocation"] = plan.get("reallocation") or {}
         metadata["reread_purpose_counts"] = plan.get("purpose_counts") or {}
+        metadata["reread_call_targets"] = plan.get("call_targets") or {}
         updates["warnings"] = warnings
         updates["metadata"] = metadata
         updates["recode_queue"] = queue
@@ -1945,15 +2715,31 @@ def _prepare_node(state: FocusedState) -> dict:
         updates["focused_not_reread"] = []
         updates["focused_reread"] = list(state.get("focused_reread") or [])
         state = {**state, **updates}
-    if state.get("recode_stop") in {"call_allowance", "token_allowance", "no_progress", "complete"}:
+    if state.get("recode_stop") in {"call_allowance", "token_allowance", "no_progress", "complete", "complete_for_queue"}:
         updates["round_jobs"] = []
         return updates
     queue = list(state.get("recode_queue") or [])
     cursor = int(state.get("recode_cursor") or 0)
+    if cursor >= len(queue) and not state.get("compete_round_done"):
+        procedure = (state.get("metadata") or {}).get("procedure") or {}
+        performance = (state.get("metadata") or {}).get("performance") or {}
+        calls = int(state.get("focused_calls_used") or 0)
+        max_calls = int(procedure.get("max_focused_review_calls") or 0)
+        batch_size = max(1, int(performance.get("batch_size") or 1))
+        updates["compete_round_done"] = True
+        if procedure.get("focused_claim_compete_round", True) is not False and calls < max_calls:
+            extra = _claim_compete_items(state, queue, slots=(max_calls - calls) * batch_size)
+            if extra:
+                queue = queue + extra
+                updates["recode_queue"] = queue
+        state = {**state, **updates}
     if cursor >= len(queue):
+        procedure = (state.get("metadata") or {}).get("procedure") or {}
+        calls = int(state.get("focused_calls_used") or 0)
+        max_calls = int(procedure.get("max_focused_review_calls") or 0)
         updates["round_jobs"] = []
-        updates["recode_stop"] = "complete"
         updates["focused_not_reread"] = []
+        updates["recode_stop"] = "call_allowance" if max_calls <= 0 and calls == 0 else "complete"
         return updates
     blocked = _allowance_block(state)
     if blocked is not None:
@@ -1970,7 +2756,7 @@ def _prepare_node(state: FocusedState) -> dict:
     token_budget = int(performance.get("token_budget") or DEFAULT_FOCUSED_TOKEN_BUDGET)
     by_id = {str(item.get("passage_id") or ""): item for item in (state.get("passages") or [])}
     raised_ids = set(state.get("raised_code_ids") or [])
-    raised = [entry for entry in codebook.values() if str(entry.get("code_id") or "") in raised_ids]
+    raised, other = _split_codebook(codebook, raised_ids)
     chosen = []
     chosen_items = []
     for item in queue[cursor:]:
@@ -1979,7 +2765,7 @@ def _prepare_node(state: FocusedState) -> dict:
         if passage is None:
             continue
         trial = chosen + [passage]
-        messages = _recode_messages(trial, raised)
+        messages = _recode_messages(trial, raised, other=other)
         estimate = request_input_tokens(messages, FocusedRecodeBatch, resolve_tokenizer(None))
         if chosen and estimate > token_budget:
             break
@@ -1987,7 +2773,7 @@ def _prepare_node(state: FocusedState) -> dict:
         chosen_items.append(item if isinstance(item, Mapping) else {"passage_id": passage_id, "purpose": "develop"})
         if len(chosen) >= batch_size:
             break
-    messages = _recode_messages(chosen, raised)
+    messages = _recode_messages(chosen, raised, other=other)
     estimate = request_input_tokens(messages, FocusedRecodeBatch, resolve_tokenizer(None))
     calls = int(state.get("focused_calls_used") or 0)
     tokens = int(state.get("focused_tokens_used") or 0)
@@ -2056,9 +2842,9 @@ def _worker(runtime: FocusedRuntime):
         job = dict(payload.get("worker_job") or {})
         book = payload.get("worker_codebook") or {}
         raised_ids = set(payload.get("worker_raised") or [])
-        raised = [entry for entry in book.values() if str(entry.get("code_id") or "") in raised_ids]
+        raised, other = _split_codebook(book, raised_ids)
         passages = list(job.get("passages") or [])
-        messages = _recode_messages(passages, raised)
+        messages = _recode_messages(passages, raised, other=other)
         raw_parts: list[str] = []
         (parsed, usage), sent = await ainvoke_structured(
             runtime.coder,
@@ -2074,7 +2860,7 @@ def _worker(runtime: FocusedRuntime):
             probe = _probe_labels(parsed, passages, book, runtime)
             if probe:
                 feedback = "LABEL RETRY\n" + validation_feedback(probe)
-                retry_messages = _recode_messages(passages, raised, feedback=feedback)
+                retry_messages = _recode_messages(passages, raised, other=other, feedback=feedback)
                 (parsed, retry_usage), sent = await ainvoke_structured(
                     runtime.coder,
                     FocusedRecodeBatch,
@@ -2211,7 +2997,18 @@ def _commit_node(runtime: FocusedRuntime):
                     max_codes=runtime.max_codes_per_passage,
                     long_passage_chars=runtime.long_passage_chars,
                     review_below=runtime.review_below,
+                    duplicate_similarity=runtime.duplicate_similarity,
                 )
+                for missed in applied.get("unmatched_proposals") or []:
+                    warnings.append(
+                        "Focused recode proposed "
+                        + str(missed.get("reason") or "a change")
+                        + " for "
+                        + str(missed.get("code") or "a code")
+                        + " on "
+                        + str(missed.get("passage_id") or "a passage")
+                        + ", and that code is not on the passage. The proposal was not applied."
+                    )
                 book = applied["codebook"]
                 segments = applied["segments"]
                 memos = applied["memos"]
@@ -2235,6 +3032,7 @@ def _commit_node(runtime: FocusedRuntime):
                                 entry_id=entry_id,
                                 coded_passage_id=passage_id,
                                 codebook=book,
+                                segments=segments,
                             )
                         )
                 memo_text = str(row.get("memo") or "").strip()
@@ -2294,7 +3092,7 @@ def _commit_node(runtime: FocusedRuntime):
 
 
 def _route_commit(state: FocusedState) -> str:
-    if state.get("recode_stop") in {"call_allowance", "token_allowance", "no_progress", "complete"}:
+    if state.get("recode_stop") in {"call_allowance", "token_allowance", "no_progress", "complete", "complete_for_queue"}:
         return "review_recode"
     return "prepare_recode"
 
@@ -2304,6 +3102,10 @@ def _review_node(state: FocusedState) -> dict:
     warnings = list(state.get("warnings") or [])
     if fields["status"] == "incomplete":
         note = _incomplete_warning(fields)
+        if note not in warnings:
+            warnings.append(note)
+    if fields["status"] == "complete_for_queue":
+        note = _queue_finished_warning(fields)
         if note not in warnings:
             warnings.append(note)
     metadata = dict(state.get("metadata") or {})
@@ -2319,12 +3121,28 @@ def _review_node(state: FocusedState) -> dict:
         applied,
     )
     emptied = set(reallocation.get("purposes") or [])
+    calls_used = int(state.get("focused_calls_used") or 0)
+    reserved = call_targets(requested, calls_used) if calls_used else {purpose: 0 for purpose in REREAD_PURPOSES}
     for purpose in REREAD_PURPOSES:
+        actual = int((state.get("purpose_calls") or {}).get(purpose) or 0)
         coverage[purpose]["requested_share"] = float(requested.get(purpose, 0))
-        coverage[purpose]["applied_share"] = float(applied.get(purpose, 0))
-        coverage[purpose]["reallocated_away"] = purpose in emptied
-    if reallocation:
-        coverage["reallocation"] = reallocation
+        coverage[purpose]["reserved_calls"] = int(reserved[purpose])
+        coverage[purpose]["applied_share"] = (actual / calls_used) if calls_used else 0.0
+        short = calls_used > 0 and actual < int(reserved[purpose])
+        coverage[purpose]["reallocated_away"] = purpose in emptied or short
+        if short:
+            note = (
+                f"Focused reread purpose {purpose} was reserved {int(reserved[purpose])} "
+                f"of {calls_used} calls and used {actual}, so the unused calls were reallocated."
+            )
+            if note not in warnings:
+                warnings.append(note)
+            emptied.add(purpose)
+    reallocation = dict(reallocation)
+    reallocation["purposes"] = [purpose for purpose in REREAD_PURPOSES if purpose in emptied]
+    reallocation["reallocated"] = bool(reallocation["purposes"]) or bool(reallocation.get("reallocated"))
+    coverage["reallocation"] = reallocation
+    coverage["corpus"] = fields.get("coverage") or {}
     metadata.update(fields)
     metadata["purpose_coverage"] = coverage
     metadata["saturation_judgment"] = None
@@ -2333,6 +3151,7 @@ def _review_node(state: FocusedState) -> dict:
         "metadata": metadata,
         "recode_stop": fields["stop"],
         "focused_not_reread": fields["focused_not_reread"],
+        "focused_not_queued": fields["focused_not_queued"],
         "purpose_coverage": coverage,
     }
 
@@ -2526,9 +3345,11 @@ def export_focused_state(state: Mapping[str, Any], directory: str | Path) -> dic
 
 
 def _assignment_rows(segments: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """One row per segment. Confirmations stay on the original span."""
+    """One row per assignment. Span proposals stay nested on that row."""
     rows = []
     for segment in segments:
+        if segment.get("focused_span_proposal") and segment.get("span_proposal_only"):
+            continue
         rows.append(
             {
                 "segment_id": segment.get("segment_id"),
@@ -2542,6 +3363,9 @@ def _assignment_rows(segments: Sequence[Mapping[str, Any]]) -> list[dict[str, An
                 "doc_end": segment.get("doc_end"),
                 "focused_confirmation": bool(segment.get("focused_confirmation")),
                 "focused_span_proposal": bool(segment.get("focused_span_proposal")),
+                "span_proposals": [
+                    dict(item) for item in (segment.get("span_proposals") or []) if isinstance(item, Mapping)
+                ],
                 "needs_review": bool(segment.get("needs_review")),
                 "review_reasons": list(segment.get("review_reasons") or []),
                 "provenance": segment.get("provenance") or {},
@@ -2628,7 +3452,9 @@ def _initial_state(source: OpenCodeResult, metadata: dict, *, interrupt_enabled:
         "purpose_coverage": {},
         "revision_cycles": [],
         "focused_not_reread": [],
+        "focused_not_queued": [],
         "focused_reread": [],
+        "compete_round_done": False,
         "recode_stop": "",
         "properties": [],
         "dimensions": [],
@@ -2676,6 +3502,7 @@ def _result_from_state(
         category_development=development,
         focused_not_reread=[str(item) for item in (state.get("focused_not_reread") or [])],
         focused_reread=[str(item) for item in (state.get("focused_reread") or [])],
+        focused_not_queued=[str(item) for item in (metadata.get("focused_not_queued") or state.get("focused_not_queued") or [])],
         purpose_coverage=dict((state.get("metadata") or {}).get("purpose_coverage") or state.get("purpose_coverage") or {}),
         metadata=metadata,
         warnings=list(state.get("warnings") or []),
@@ -2713,9 +3540,9 @@ def _procedure(
     min_score: float | None,
     max_calls: int,
     max_tokens: int,
-    neighbor_limit: int,
-    outside_limit: int,
-    negative_case_limit: int,
+    neighbor_limit: int | None,
+    outside_limit: int | None,
+    negative_case_limit: int | None,
     shares: Mapping[str, float],
     analytic_features: Sequence[str] | None,
     validation_retries: int,
@@ -2724,6 +3551,11 @@ def _procedure(
     selection_quantile: float,
     raise_all: bool,
     warn_fraction: float,
+    sampling_seed: int | None = None,
+    duplicate_similarity: float = DEFAULT_FOCUSED_DUPLICATE_SIMILARITY,
+    request_timeout: float = DEFAULT_FOCUSED_REQUEST_TIMEOUT,
+    request_retries: int = DEFAULT_FOCUSED_REQUEST_RETRIES,
+    claim_compete_round: bool = True,
 ) -> dict[str, Any]:
     if coding_lens != "charmaz":
         raise ValueError(
@@ -2732,10 +3564,21 @@ def _procedure(
         )
     if max_calls < 0 or max_tokens < 0:
         raise ValueError("max_focused_review_calls and max_focused_review_tokens must be zero or more.")
-    if neighbor_limit < 0 or outside_limit < 0 or negative_case_limit < 0:
-        raise ValueError("Focused passage limits must be zero or more.")
+    for name, limit in (
+        ("focused_neighbor_limit", neighbor_limit),
+        ("focused_outside_limit", outside_limit),
+        ("focused_negative_case_limit", negative_case_limit),
+    ):
+        if limit is not None and int(limit) < 0:
+            raise ValueError(f"{name} must be zero or more.")
     if validation_retries < 0:
         raise ValueError("validation_retries must be zero or more.")
+    if float(request_timeout) < 0:
+        raise ValueError("focused_request_timeout must be zero or more. Zero waits with no deadline.")
+    if int(request_retries) < 0:
+        raise ValueError("focused_request_retries must be zero or more.")
+    if not 0 <= float(duplicate_similarity) <= 1:
+        raise ValueError("focused_duplicate_similarity must be between 0 and 1.")
     rule = str(selection_rule or DEFAULT_FOCUSED_SELECTION_RULE)
     if rule not in SELECTION_RULES:
         raise ValueError(f"focused_selection_rule must be one of {SELECTION_RULES}.")
@@ -2762,13 +3605,18 @@ def _procedure(
         "focused_raise_warn_fraction": float(warn_fraction),
         "max_focused_review_calls": int(max_calls),
         "max_focused_review_tokens": int(max_tokens),
-        "focused_neighbor_limit": int(neighbor_limit),
-        "focused_outside_limit": int(outside_limit),
-        "focused_negative_case_limit": int(negative_case_limit),
+        "focused_neighbor_limit": None if neighbor_limit is None else int(neighbor_limit),
+        "focused_outside_limit": None if outside_limit is None else int(outside_limit),
+        "focused_negative_case_limit": None if negative_case_limit is None else int(negative_case_limit),
         "focused_share_develop": share_values["develop"],
         "focused_share_compete": share_values["compete"],
         "focused_share_outside": share_values["outside"],
         "focused_analytic_features": features,
+        "focused_sampling_seed": None if sampling_seed is None else int(sampling_seed),
+        "focused_duplicate_similarity": float(duplicate_similarity),
+        "focused_request_timeout": float(request_timeout),
+        "focused_request_retries": int(request_retries),
+        "focused_claim_compete_round": bool(claim_compete_round),
         "validation_retries": int(validation_retries),
     }
 
@@ -2801,9 +3649,14 @@ async def afocused_code(
     focused_selection_quantile: float = DEFAULT_FOCUSED_SELECTION_QUANTILE,
     focused_raise_all: bool = False,
     focused_raise_warn_fraction: float = DEFAULT_FOCUSED_RAISE_WARN_FRACTION,
-    focused_neighbor_limit: int = DEFAULT_FOCUSED_NEIGHBOR_LIMIT,
-    focused_outside_limit: int = DEFAULT_FOCUSED_OUTSIDE_LIMIT,
-    focused_negative_case_limit: int = DEFAULT_FOCUSED_NEGATIVE_CASE_LIMIT,
+    focused_neighbor_limit: int | None = DEFAULT_FOCUSED_NEIGHBOR_LIMIT,
+    focused_outside_limit: int | None = DEFAULT_FOCUSED_OUTSIDE_LIMIT,
+    focused_negative_case_limit: int | None = DEFAULT_FOCUSED_NEGATIVE_CASE_LIMIT,
+    focused_sampling_seed: int | None = None,
+    focused_duplicate_similarity: float = DEFAULT_FOCUSED_DUPLICATE_SIMILARITY,
+    focused_request_timeout: float = DEFAULT_FOCUSED_REQUEST_TIMEOUT,
+    focused_request_retries: int = DEFAULT_FOCUSED_REQUEST_RETRIES,
+    focused_claim_compete_round: bool = True,
     focused_share_develop: float = DEFAULT_SHARES["develop"],
     focused_share_compete: float = DEFAULT_SHARES["compete"],
     focused_share_outside: float = DEFAULT_SHARES["outside"],
@@ -2862,6 +3715,11 @@ async def afocused_code(
         },
         analytic_features=focused_analytic_features,
         validation_retries=validation_retries,
+        sampling_seed=focused_sampling_seed,
+        duplicate_similarity=focused_duplicate_similarity,
+        request_timeout=focused_request_timeout,
+        request_retries=focused_request_retries,
+        claim_compete_round=focused_claim_compete_round,
         selection_rule=focused_selection_rule,
         selection_k=focused_selection_k,
         selection_quantile=focused_selection_quantile,
@@ -2895,8 +3753,14 @@ async def afocused_code(
         output_dir=None if output_dir is None else str(output_dir),
         batch_size=performance["batch_size"],
         token_budget=performance["token_budget"],
-        limiter=CallLimiter(performance["concurrency"]),
+        limiter=CallLimiter(
+            performance["concurrency"],
+            max_retries=int(procedure["focused_request_retries"]),
+            request_timeout=float(procedure["focused_request_timeout"]),
+            wall_timeout=float(procedure["focused_request_timeout"]),
+        ),
         validation_retries=validation_retries,
+        duplicate_similarity=float(procedure["focused_duplicate_similarity"]),
     )
     if isinstance(model, str):
         metadata["model"] = {
