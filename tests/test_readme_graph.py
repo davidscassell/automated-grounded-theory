@@ -20,6 +20,9 @@ def _render_graph():
 def test_readme_diagram_matches_compiled_graph():
     render = _render_graph()
     expected = render.diagram_mermaid()
+    assert "consolidate -.-> review_evidence;" in expected
+    assert "review_evidence -.-> review_evidence;" in expected
+    assert "consolidate --> export;" not in expected
     readme = render.README_PATH.read_text(encoding="utf-8")
     assert render.readme_mermaid(readme) == expected
     assert render.main(["--check"]) == 0
