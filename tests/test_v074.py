@@ -27,8 +27,8 @@ from tests.test_v070 import _entry, _passages, _source
 
 
 def test_version_is_074():
-    assert __version__ == "0.7.5"
-    assert POLICY_VERSION == "0.7.5"
+    assert __version__ == "0.7.6"
+    assert POLICY_VERSION == "0.7.6"
     assert FocusedAlternativeReading.model_fields["alternative_fit"].is_required()
 
 
@@ -71,7 +71,7 @@ def _state(passages, segments, claims, *, reread=None, codebook=None, seed: int 
     }
 
 
-def test_claim_search_uses_category_pole_similarity_and_flags_before_a_guarantee():
+def test_claim_search_pairs_a_claim_with_a_relevant_passage_only():
     passages = [
         _passage("p1", "alpha bravo"),
         _passage("p2", "charlie delta"),
@@ -121,8 +121,7 @@ def test_claim_search_uses_category_pole_similarity_and_flags_before_a_guarantee
         [],
         slots=1,
     )
-    assert flagged[0]["passage_id"] == "p2"
-    assert flagged[0]["source"] == "claim_flagged"
+    assert flagged == []
 
     low = _claim_compete_items(
         _state(
@@ -134,11 +133,7 @@ def test_claim_search_uses_category_pole_similarity_and_flags_before_a_guarantee
         [],
         slots=1,
     )
-    assert low[0]["passage_id"] == "p2"
-    assert low[0]["purpose"] == "claim_compete"
-    assert low[0]["source"] == "claim_low_confidence"
-    assert low[0]["claim"]["category_id"] == "c1"
-    assert low[0]["claim"]["text"] == "qqqq"
+    assert low == []
 
     guaranteed = _claim_compete_items(
         _state(
@@ -151,8 +146,7 @@ def test_claim_search_uses_category_pole_similarity_and_flags_before_a_guarantee
         [],
         slots=2,
     )
-    assert [item["source"] for item in guaranteed] == ["claim_unreread", "claim_unreread"]
-    assert {item["passage_id"] for item in guaranteed} == {"p2", "p3"}
+    assert guaranteed == []
 
     empty = _claim_compete_items(
         _state(

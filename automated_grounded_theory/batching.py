@@ -27,9 +27,12 @@ _BROKEN_TOKENIZERS: set[int] = set()
 
 
 def estimate_tokens(text: str) -> int:
-    """Conservative character estimate. About three characters per token.
+    """Ceiling used before a call. About three characters per token.
 
-    Empty text is zero. Any other text is at least one token.
+    That is higher than a four-characters-per-token English count, so the
+    estimate runs above provider usage. It is not calibrated down: the ceiling
+    is what stops a reread. Empty text is zero. Any other text is at least one
+    token. Report this ceiling beside provider usage.
     """
     if not text:
         return 0
