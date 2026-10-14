@@ -10,6 +10,8 @@ from langchain_core.runnables import RunnableLambda
 from automated_grounded_theory.prompts import extract_payload, message_text
 from automated_grounded_theory.schemas import (
     FocusedAlternativeReading,
+    FocusedClaimJudgment,
+    FocusedClaimTest,
     FocusedCodeDecision,
     FocusedCodeVerdict,
     FocusedCompeteBatch,
@@ -46,6 +48,8 @@ class FakeFocusedCoder(BaseChatModel):
             payload = extract_payload(text)
             if name == "FocusedCompeteBatch":
                 parsed = self.compete_batch(payload)
+            elif name == "FocusedClaimTest":
+                parsed = self.claim_test_batch(payload)
             elif name == "FocusedRecodeBatch":
                 parsed = self.batch(payload)
             else:
@@ -195,6 +199,24 @@ class FakeFocusedCoder(BaseChatModel):
                 )
             )
         return FocusedRecodeBatch(passages=rows)
+
+    def claim_test_batch(self, payload: dict) -> FocusedClaimTest:
+        """Judge the claim in the prompt. The default is supports, which is not a code change."""
+        if self.mode == "empty":
+            return FocusedClaimTest(passages=[])
+        rows = []
+        for passage in payload.get("passages") or []:
+            claim = passage.get("claim") or {}
+            rows.append(
+                FocusedClaimJudgment(
+                    passage_id=str(passage.get("passage_id") or ""),
+                    entry_id=str(claim.get("entry_id") or ""),
+                    judgment="supports",
+                    rationale="The passage is consistent with the supplied claim.",
+                    quote=str(passage.get("text") or ""),
+                )
+            )
+        return FocusedClaimTest(passages=rows)
 
     def compete_batch(self, payload: dict) -> FocusedCompeteBatch:
         """Explicit keep/revise/drop verdicts. The alternative is a different code and fits less well."""
