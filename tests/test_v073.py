@@ -20,8 +20,8 @@ from tests.test_v072 import _passages_for_shares, _share_segments
 
 
 def test_version_is_073():
-    assert __version__ == "0.7.3"
-    assert POLICY_VERSION == "0.7.3"
+    assert __version__ == "0.7.4"
+    assert POLICY_VERSION == "0.7.4"
 
 
 def test_claim_compete_has_a_reserved_share_and_its_own_coverage():
@@ -162,6 +162,7 @@ def test_compete_verdicts_name_an_alternative_and_do_not_apply_drop():
                             code="writing letters",
                             code_id="c-rare",
                             rationale="Writing letters is the stronger reading and was not chosen.",
+                            alternative_fit="stronger",
                             quote=passage["text"],
                         ),
                         memo="writing letters fits this passage better than packing bags.",
@@ -235,7 +236,8 @@ def test_compete_verdicts_name_an_alternative_and_do_not_apply_drop():
                         strongest_alternative=FocusedAlternativeReading(
                             code="writing letters",
                             code_id="c-rare",
-                            rationale="Writing letters was the strongest alternative and was not chosen.",
+                            rationale="Writing letters fits this passage better than the kept code.",
+                            alternative_fit="stronger",
                             quote=passage["text"],
                         ),
                         memo="The memo names writing letters as the alternative.",
@@ -284,7 +286,8 @@ def test_compete_verdicts_name_an_alternative_and_do_not_apply_drop():
     assert "alternative_named_not_chosen" in kept_segment["review_reasons"]
     named = kept_segment["alternative_named_not_chosen"]["alternatives"]
     assert any(item["code_id"] == "c-rare" for item in named)
-    assert any(item["source"] == "memo" for item in named)
+    assert any(item["source"] == "strongest_alternative" for item in named)
+    assert all(item["alternative_fit"] == "stronger" for item in named)
     assert kept_segment["alternative_named_not_chosen"]["applied"] is False
 
 

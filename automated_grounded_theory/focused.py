@@ -40,7 +40,12 @@ The reread allowance is split across four purposes. Three are interleaved:
 developing existing assignments, testing competing interpretations, and
 examining passages outside the initial selection. The fourth,
 ``focused_share_claim_compete``, is reserved and not spent on that queue.
-After properties are written, that share tests them against other passages.
+After properties are written, that share searches other passages for the
+property's category, an opposite pole, a similar passage, or a low-confidence
+or flagged assignment, and still queues an unreread passage when those searches
+miss. Reserved calls that are not spent, and are not given to another purpose,
+are unused. Calls that are given to another purpose and sent are reallocated.
+The warning's denominator is ``max_focused_review_calls``.
 Shares are ``focused_share_develop``, ``focused_share_compete``,
 ``focused_share_outside``, and ``focused_share_claim_compete``. They sum to
 1. The default is one quarter each. Each of the first three queues is sized
@@ -126,7 +131,7 @@ from automated_grounded_theory.export import _write_csv, _write_json
 from automated_grounded_theory.prompts import validation_feedback
 from automated_grounded_theory.records import POLICY_VERSION, freeze_snapshot, proposal_buffer_reducer, select_committable
 from automated_grounded_theory.results import OpenCodeResult, load_run
-from automated_grounded_theory.retrieval import code_text, jaccard
+from automated_grounded_theory.retrieval import code_text, cosine, jaccard
 from automated_grounded_theory.schemas import FocusedCompeteBatch, FocusedRecodeBatch
 from automated_grounded_theory.validation import (
     anchor_quote,
@@ -229,6 +234,9 @@ FOCUSED_COMPETE_SYSTEM = (
     "revise and drop are proposals. They are not applied without review. "
     "strongest_alternative is required on every passage, even when you keep the initial code. "
     "Name the best other reading, using a code from the list when one fits. "
+    "Do not name a code you kept as its own alternative. "
+    "Set alternative_fit to weaker, comparable, or stronger. "
+    "Use stronger only when that alternative fits the passage better than a code you kept. "
     "Quote the target passage. "
     "Name analytic properties and dimensions, each with a document id, passage id, and a quote. "
     "Do not write a descriptive summary in place of a property. "
@@ -994,13 +1002,15 @@ def _reallocate_shares(
         note = (
             "Focused reread purposes "
             + ", ".join(empty)
-            + " had no passages, and no other purpose had a queue to receive their shares."
+            + " had no passages, and no other purpose had a queue to receive their shares, "
+            "so those shares were unused."
         )
         return (
             dict(requested),
             {
-                "reallocated": True,
-                "purposes": empty,
+                "reallocated": False,
+                "purposes": [],
+                "unused_purposes": empty,
                 "note": note,
                 "shares_requested": dict(requested),
                 "shares_applied": dict(requested),
@@ -1365,13 +1375,15 @@ def plan_recode_queue(
     applied, reallocation, warnings = _reallocate_shares(share_values, groups)
     warnings = list(warnings) + [note for note in extra_warnings if note not in warnings]
     if extra_warnings:
+        moved = any("reallocated" in note for note in extra_warnings)
         reallocation = dict(reallocation)
-        reallocation["reallocated"] = True
-        purposes = list(reallocation.get("purposes") or [])
-        for purpose in REREAD_PURPOSES:
-            if purpose not in purposes and len(groups.get(purpose) or []) < passage_targets.get(purpose, 0):
-                purposes.append(purpose)
-        reallocation["purposes"] = purposes
+        if moved:
+            reallocation["reallocated"] = True
+            purposes = list(reallocation.get("purposes") or [])
+            for purpose in REREAD_PURPOSES:
+                if purpose not in purposes and len(groups.get(purpose) or []) < passage_targets.get(purpose, 0):
+                    purposes.append(purpose)
+            reallocation["purposes"] = purposes
         if not reallocation.get("note"):
             reallocation["note"] = extra_warnings[0]
     return {
@@ -1566,7 +1578,7 @@ def _absorb_unused_slots(
                     f"{purpose} reserved {int(targets[purpose])} and queued {len(groups[purpose])}"
                     for purpose in short
                 )
-                + ", so those reserved calls were reallocated."
+                + ", so those reserved calls were unused."
             )
             return [note]
         return []
@@ -2451,6 +2463,24 @@ def _kept_code_ids(row: Mapping[str, Any], book: Mapping[str, Mapping[str, Any]]
     return kept
 
 
+def _alternative_fit(alternative: Mapping[str, Any]) -> str:
+    fit = str(alternative.get("alternative_fit") or "").strip().casefold()
+    if fit in {"weaker", "comparable", "stronger"}:
+        return fit
+    return ""
+
+
+def _kept_labels(book: Mapping[str, Mapping[str, Any]], kept: set[str]) -> set[str]:
+    labels = set()
+    for entry in book.values():
+        code_id = str(entry.get("code_id") or "")
+        if code_id in kept:
+            label = code_key(str(entry.get("code") or ""))
+            if label:
+                labels.add(label)
+    return labels
+
+
 def _flag_alternative_not_chosen(
     segments: list[dict],
     passage_id: str,
@@ -2458,40 +2488,54 @@ def _flag_alternative_not_chosen(
     book: Mapping[str, Mapping[str, Any]],
     raised_code_ids: Sequence[str],
 ) -> None:
-    """Flag a kept raised code when the memo or the alternative names a different code."""
+    """Flag a self-referential alternative, or a stronger one that was not kept.
+
+    Naming an alternative is not itself a disagreement. ``alternative_fit``
+    must be ``stronger``, and the alternative must be a different code, before
+    a kept raised code is flagged ``alternative_named_not_chosen``. An
+    alternative that names the kept code is ``alternative_is_kept_code`` and
+    is recorded as invalid.
+    """
     kept = _kept_code_ids(row, book)
+    if not kept:
+        return
     raised = {str(item) for item in raised_code_ids}
     kept_raised = kept & raised if raised else set(kept)
-    if not kept_raised:
-        return
-    named: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
     alternative = row.get("strongest_alternative") or {}
-    if isinstance(alternative, Mapping):
-        alt_id = _known_code_id(alternative, book)
-        label = str(alternative.get("code") or "").strip()
-        if (alt_id and alt_id not in kept) or (label and code_key(label) not in {code_key(str(book[key].get("code") or "")) for key in book if str(book[key].get("code_id") or "") in kept}):
-            if label or alt_id:
-                token = (alt_id, "strongest_alternative")
-                if token not in seen and (not alt_id or alt_id not in kept):
-                    seen.add(token)
-                    named.append({"code_id": alt_id, "code": label, "source": "strongest_alternative"})
-    memo = str(row.get("memo") or "")
-    folded = memo.casefold()
-    if folded:
-        for entry in book.values():
-            code_id = str(entry.get("code_id") or "")
-            label = str(entry.get("code") or "").strip()
-            if not label or code_id in kept:
-                continue
-            if label.casefold() in folded:
-                token = (code_id, "memo")
-                if token in seen:
-                    continue
-                seen.add(token)
-                named.append({"code_id": code_id, "code": label, "source": "memo"})
-    if not named:
+    if not isinstance(alternative, Mapping):
         return
+    alt_id = _known_code_id(alternative, book)
+    label = str(alternative.get("code") or "").strip()
+    if not alt_id and not label:
+        return
+    labels = _kept_labels(book, kept)
+    self_reference = (bool(alt_id) and alt_id in kept) or (bool(label) and code_key(label) in labels)
+    if self_reference:
+        payload = {
+            "code_id": alt_id,
+            "code": label,
+            "applied": False,
+            "invalid": True,
+        }
+        for code_id in sorted(kept):
+            _flag_existing_code(
+                segments,
+                passage_id,
+                code_id,
+                reason="alternative_is_kept_code",
+                payload=payload,
+            )
+        return
+    if _alternative_fit(alternative) != "stronger" or not kept_raised:
+        return
+    named = [
+        {
+            "code_id": alt_id,
+            "code": label,
+            "source": "strongest_alternative",
+            "alternative_fit": "stronger",
+        }
+    ]
     payload = {"alternatives": named, "kept_code_ids": sorted(kept_raised), "applied": False}
     for code_id in sorted(kept_raised):
         _flag_existing_code(
@@ -2910,37 +2954,177 @@ def _stored_limit(value: Any) -> int | None:
     return int(value)
 
 
+def _stored_vector(row: Mapping[str, Any]) -> list[float] | None:
+    for key in ("embedding", "vector"):
+        value = row.get(key)
+        if isinstance(value, (list, tuple)) and value:
+            try:
+                return [float(item) for item in value]
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _claim_blob(claim: Mapping[str, Any]) -> str:
+    return " ".join(
+        str(claim.get(key) or "")
+        for key in ("name", "text", "pole", "description", "quote")
+    )
+
+
 def _claim_compete_items(
     state: Mapping[str, Any],
     queue: Sequence[Mapping[str, Any]],
     *,
     slots: int,
 ) -> list[dict[str, str]]:
-    """A second compete pass against properties written by the first reread."""
+    """Passages that can test properties written by the first reread.
+
+    Search order is the pole search, the property's category on other
+    passages, an opposite dimension pole, lexical or stored-embedding
+    similarity to the property text, then a low-confidence or flagged
+    assignment. When passages are still unreread, the remaining slots are
+    filled from those passages so a miss does not leave the reserved calls
+    unsent.
+    """
     if slots <= 0:
         return []
-    claims = list(state.get("properties") or []) + list(state.get("dimensions") or [])
-    if not claims:
-        return []
+    claims = [dict(item) for item in (state.get("properties") or []) if isinstance(item, Mapping)]
+    claims += [dict(item) for item in (state.get("dimensions") or []) if isinstance(item, Mapping)]
     passages = list(state.get("passages") or [])
     by_id = {str(item.get("passage_id") or ""): item for item in passages if item.get("passage_id")}
+    segments = [item for item in (state.get("segments") or []) if isinstance(item, Mapping)]
+    book = state.get("codebook") or {}
+    codebook = list(book.values()) if isinstance(book, Mapping) else list(book or [])
+    procedure = (state.get("metadata") or {}).get("procedure") or {}
+    try:
+        review_below = float(procedure.get("focused_review_below", 0.5))
+    except (TypeError, ValueError):
+        review_below = 0.5
     already = set(_queue_passage_ids(queue)) | {str(item) for item in (state.get("focused_reread") or [])}
-    hits = negative_case_candidates(
-        passages,
-        state.get("segments") or [],
-        claims,
-        codebook=list((state.get("codebook") or {}).values()),
-    )
-    extra = []
-    for hit in hits:
-        passage_id = str(hit.get("passage_id") or "")
-        if not passage_id or passage_id in already or passage_id not in by_id:
-            continue
-        already.add(passage_id)
-        extra.append(_queue_item(passage_id, "claim_compete", "claim_negative_case"))
+    extra: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(passage_id: str, source: str) -> None:
         if len(extra) >= slots:
-            break
+            return
+        passage_id = str(passage_id or "")
+        if not passage_id or passage_id in already or passage_id in seen or passage_id not in by_id:
+            return
+        seen.add(passage_id)
+        extra.append(_queue_item(passage_id, "claim_compete", source))
+
+    if claims:
+        hits = negative_case_candidates(passages, segments, claims, codebook=codebook)
+        for hit in hits:
+            add(str(hit.get("passage_id") or ""), "claim_negative_case")
+        categories = {str(claim.get("category_id") or "") for claim in claims} - {""}
+        written_on = {str(claim.get("passage_id") or "") for claim in claims} - {""}
+        for segment in segments:
+            code_id = str(segment.get("code_id") or "")
+            passage_id = str(segment.get("passage_id") or "")
+            if code_id in categories and passage_id not in written_on:
+                add(passage_id, "claim_same_code")
+        poles_by_name: dict[str, set[str]] = {}
+        for entry in codebook:
+            for dimension in entry.get("dimensions") or []:
+                name = _norm_pole(dimension.get("name"))
+                pole = _norm_pole(dimension.get("value") or dimension.get("pole"))
+                if name and pole:
+                    poles_by_name.setdefault(name, set()).add(pole)
+        for claim in claims:
+            name = _norm_pole(claim.get("name"))
+            pole = _norm_pole(claim.get("pole"))
+            if name and pole:
+                poles_by_name.setdefault(name, set()).add(pole)
+        opposite_codes: set[str] = set()
+        opposite_poles: set[str] = set()
+        for claim in claims:
+            name = _norm_pole(claim.get("name"))
+            pole = _norm_pole(claim.get("pole"))
+            others = set(poles_by_name.get(name, set())) - ({pole} if pole else set())
+            opposite_poles |= others
+        for entry in codebook:
+            code_id = str(entry.get("code_id") or "")
+            for dimension in entry.get("dimensions") or []:
+                pole = _norm_pole(dimension.get("value") or dimension.get("pole"))
+                if code_id and pole and pole in opposite_poles:
+                    opposite_codes.add(code_id)
+        for segment in segments:
+            if str(segment.get("code_id") or "") in opposite_codes:
+                add(str(segment.get("passage_id") or ""), "claim_opposite_pole")
+        for passage_id, passage in by_id.items():
+            text = str(passage.get("text") or "")
+            if any(_text_has_pole(text, pole) for pole in opposite_poles):
+                add(passage_id, "claim_opposite_pole")
+        ranked: list[tuple[float, str]] = []
+        for passage_id, passage in by_id.items():
+            if passage_id in already or passage_id in seen:
+                continue
+            text = str(passage.get("text") or "")
+            passage_vector = _stored_vector(passage)
+            score = 0.0
+            for claim in claims:
+                score = max(score, jaccard(text, _claim_blob(claim)))
+                claim_vector = _stored_vector(claim)
+                if passage_vector and claim_vector:
+                    score = max(score, cosine(passage_vector, claim_vector))
+            if score > 0:
+                ranked.append((score, passage_id))
+        for _score, passage_id in sorted(ranked, key=lambda item: (-item[0], item[1])):
+            add(passage_id, "claim_similarity")
+    for segment in segments:
+        passage_id = str(segment.get("passage_id") or "")
+        reasons = [str(item) for item in (segment.get("review_reasons") or []) if str(item)]
+        flagged = bool(segment.get("needs_review")) or bool(reasons)
+        confidence = segment.get("confidence")
+        low = False
+        if confidence is not None:
+            try:
+                low = float(confidence) < review_below
+            except (TypeError, ValueError):
+                low = False
+        if low or flagged:
+            add(passage_id, "claim_flagged" if flagged and not low else "claim_low_confidence")
+    if len(extra) < slots:
+        rest = sorted(passage_id for passage_id in by_id if passage_id not in already and passage_id not in seen)
+        random.Random(int(procedure.get("seed") or 0)).shuffle(rest)
+        for passage_id in rest:
+            add(passage_id, "claim_unreread")
     return extra
+
+
+def _reallocate_unspent_claim_calls(
+    state: Mapping[str, Any],
+    *,
+    calls: int,
+    batch_size: int,
+) -> list[dict[str, str]]:
+    """Queue outside or compete rereads so reserved claim calls are actually sent."""
+    if calls <= 0:
+        return []
+    passages = [
+        str(item.get("passage_id") or "")
+        for item in (state.get("passages") or [])
+        if item.get("passage_id")
+    ]
+    if not passages:
+        return []
+    shares = (state.get("metadata") or {}).get("reread_shares_applied") or {}
+    purpose = "outside"
+    try:
+        outside_share = float(shares.get("outside") or 0)
+        compete_share = float(shares.get("compete") or 0)
+    except (TypeError, ValueError):
+        outside_share = 0.0
+        compete_share = 0.0
+    if outside_share <= 0 and compete_share > 0:
+        purpose = "compete"
+    slots = calls * max(1, batch_size)
+    return [
+        _queue_item(passages[index % len(passages)], purpose, "reallocated_claim_compete")
+        for index in range(slots)
+    ]
 
 
 def _prepare_node(state: FocusedState) -> dict:
@@ -3003,6 +3187,25 @@ def _prepare_node(state: FocusedState) -> dict:
         claim_calls = min(remaining_calls, reserved)
         if procedure.get("focused_claim_compete_round", True) is not False and claim_calls > 0:
             extra = _claim_compete_items(state, queue, slots=claim_calls * batch_size)
+            if not extra:
+                extra = _reallocate_unspent_claim_calls(
+                    state,
+                    calls=claim_calls,
+                    batch_size=batch_size,
+                )
+                if extra:
+                    metadata = dict(state.get("metadata") or {})
+                    transfers = list(metadata.get("call_transfers") or [])
+                    transfers.append(
+                        {
+                            "from": "claim_compete",
+                            "to": str(extra[0].get("purpose") or "outside"),
+                            "calls": claim_calls,
+                        }
+                    )
+                    metadata["call_transfers"] = transfers
+                    updates["metadata"] = metadata
+                    state = {**state, "metadata": metadata}
             if extra:
                 queue = queue + extra
                 updates["recode_queue"] = queue
@@ -3434,15 +3637,27 @@ def _review_node(state: FocusedState) -> dict:
         state.get("purpose_tokens") or {},
         applied,
     )
-    emptied = set(reallocation.get("purposes") or [])
     calls_used = int(state.get("focused_calls_used") or 0)
+    allowance = int(procedure.get("max_focused_review_calls") or 0)
+    denominator = allowance if allowance > 0 else calls_used
     planned = metadata.get("reread_call_targets") or {}
     if calls_used and planned:
         reserved = {purpose: int(planned.get(purpose) or 0) for purpose in COVERAGE_PURPOSES}
     elif calls_used:
-        reserved = call_targets(requested, calls_used)
+        reserved = call_targets(requested, allowance or calls_used)
     else:
         reserved = {purpose: 0 for purpose in COVERAGE_PURPOSES}
+    transfers = [item for item in (metadata.get("call_transfers") or []) if isinstance(item, Mapping)]
+    transferred_to: dict[str, list[str]] = {}
+    for item in transfers:
+        origin = str(item.get("from") or "")
+        destination = str(item.get("to") or "")
+        if origin and destination:
+            transferred_to.setdefault(origin, [])
+            if destination not in transferred_to[origin]:
+                transferred_to[origin].append(destination)
+    plan_flag = bool(reallocation.get("reallocated"))
+    plan_purposes = set(reallocation.get("purposes") or []) if plan_flag else set()
     provider_by_purpose = state.get("purpose_provider_tokens") or {}
     for purpose in COVERAGE_PURPOSES:
         actual = int((state.get("purpose_calls") or {}).get(purpose) or 0)
@@ -3451,19 +3666,35 @@ def _review_node(state: FocusedState) -> dict:
         coverage[purpose]["applied_share"] = (actual / calls_used) if calls_used else 0.0
         coverage[purpose]["tokens_estimated"] = int(coverage[purpose].get("tokens") or 0)
         coverage[purpose]["tokens"] = int(provider_by_purpose.get(purpose) or 0)
+        gave_calls = purpose in transferred_to or purpose in plan_purposes
+        coverage[purpose]["reallocated_away"] = gave_calls
         short = calls_used > 0 and actual < int(reserved[purpose])
-        coverage[purpose]["reallocated_away"] = purpose in emptied or short
-        if short:
+        if not short:
+            continue
+        unused = int(reserved[purpose]) - actual
+        if purpose in transferred_to:
+            dest = ", ".join(transferred_to[purpose])
             note = (
                 f"Focused reread purpose {purpose} was reserved {int(reserved[purpose])} "
-                f"of {calls_used} calls and used {actual}, so the unused calls were reallocated."
+                f"of {denominator} calls and used {actual}, so {unused} calls were reallocated to {dest}."
             )
-            if note not in warnings:
-                warnings.append(note)
-            emptied.add(purpose)
+        elif purpose in plan_purposes:
+            note = (
+                f"Focused reread purpose {purpose} was reserved {int(reserved[purpose])} "
+                f"of {denominator} calls and used {actual}, so {unused} calls were reallocated."
+            )
+        else:
+            note = (
+                f"Focused reread purpose {purpose} was reserved {int(reserved[purpose])} "
+                f"of {denominator} calls and used {actual}, so {unused} calls were unused."
+            )
+        if note not in warnings:
+            warnings.append(note)
     reallocation = dict(reallocation)
-    reallocation["purposes"] = [purpose for purpose in COVERAGE_PURPOSES if purpose in emptied]
-    reallocation["reallocated"] = bool(reallocation["purposes"]) or bool(reallocation.get("reallocated"))
+    reallocation["purposes"] = [
+        purpose for purpose in COVERAGE_PURPOSES if purpose in plan_purposes or purpose in transferred_to
+    ]
+    reallocation["reallocated"] = bool(plan_flag or transferred_to)
     coverage["reallocation"] = reallocation
     coverage["corpus"] = fields.get("coverage") or {}
     metadata.update(fields)
@@ -4220,10 +4451,32 @@ async def _invoke(
     return result
 
 
+def _focused_sync_timeout(kwargs: Mapping[str, Any]) -> float | None:
+    """Wall clock for the sync bridge. Each call already has its own deadline.
+
+    The bridge has to outlast a full allowance of calls. It must not be one
+    request timeout, or a legitimate multi-call run would be cut off. A
+    request timeout of 0 or less keeps the bridge unbounded.
+    """
+    raw = kwargs.get("focused_request_timeout", DEFAULT_FOCUSED_REQUEST_TIMEOUT)
+    try:
+        request = float(raw)
+    except (TypeError, ValueError):
+        request = float(DEFAULT_FOCUSED_REQUEST_TIMEOUT)
+    if request <= 0:
+        return None
+    calls = kwargs.get("max_focused_review_calls", DEFAULT_MAX_FOCUSED_REVIEW_CALLS)
+    try:
+        call_budget = int(calls or 0)
+    except (TypeError, ValueError):
+        call_budget = int(DEFAULT_MAX_FOCUSED_REVIEW_CALLS)
+    return request * max(1, call_budget) + 1.0
+
+
 @wraps(afocused_code)
 def focused_code(*args: Any, **kwargs: Any) -> FocusedResult:
     """Synchronous wrapper for :func:`afocused_code`."""
-    return run_sync(afocused_code(*args, **kwargs))
+    return run_sync(afocused_code(*args, **kwargs), timeout=_focused_sync_timeout(kwargs))
 
 
 async def aread_focused_interrupt(checkpointer: Any, thread_id: str) -> dict[str, Any]:

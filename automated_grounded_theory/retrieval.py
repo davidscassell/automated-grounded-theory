@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Iterator, Mapping, Protocol, Sequence
 
+from automated_grounded_theory.async_support import await_with_wall_timeout
 from automated_grounded_theory.validation import code_key
 
 
@@ -1388,7 +1389,7 @@ async def _retry_embedding(limiter, embed):
     for attempt in range(limiter.max_retries + 1):
         try:
             if limiter.request_timeout and limiter.request_timeout > 0:
-                return await asyncio.wait_for(embed(), limiter.request_timeout)
+                return await await_with_wall_timeout(embed(), limiter.request_timeout)
             return await embed()
         except Exception as exc:
             if attempt >= limiter.max_retries or not _transient(exc):

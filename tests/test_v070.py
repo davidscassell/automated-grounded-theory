@@ -40,8 +40,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_version_and_batch_size_stay_split_from_procedure():
-    assert __version__ == "0.7.3"
-    assert POLICY_VERSION == "0.7.3"
+    assert __version__ == "0.7.4"
+    assert POLICY_VERSION == "0.7.4"
     assert inspect.signature(focused_code).parameters["batch_size"].default == 1
     assert inspect.signature(afocused_code).parameters["batch_size"].default == 1
     assert DEFAULT_FOCUSED_BATCH_SIZE == 1
@@ -385,11 +385,12 @@ def _run(mode="echo", *, passages=None, segments=None, interrupt=False, **kwargs
 
 def test_recoding_keeps_quotes_and_writes_cited_properties(tmp_path):
     coder, result = _run(segments=_segments_for_raised(), output_dir=tmp_path, max_focused_review_calls=8)
-    assert coder.call_count == 3
-    assert result.metadata["status"] == "complete_for_queue"
-    assert result.metadata["stop"] == "complete_for_queue"
-    assert result.metadata["coverage"]["corpus_complete"] is False
-    assert "p4" in result.metadata["focused_not_queued"]
+    assert coder.call_count == 4
+    assert result.metadata["status"] == "complete"
+    assert result.metadata["stop"] == "complete"
+    assert result.metadata["coverage"]["corpus_complete"] is True
+    assert result.focused_not_queued == []
+    assert "p4" in result.purpose_coverage["claim_compete"]["passage_ids"]
     assert result.metadata["performance"]["batch_size"] == 1
     assert "batch_size" not in result.metadata["procedure"]
     assert result.saturation_report["judgment"] is None
@@ -607,7 +608,7 @@ def test_api_resume_records_a_performance_continuation():
 
 def test_label_retry_then_keeps_a_valid_code():
     coder, result = _run("retry_label", segments=_segments_for_raised()[:1], max_focused_review_calls=4)
-    assert coder.call_count == 2
+    assert coder.call_count == 3
     labels = {entry["code"] for entry in result.codebook}
     assert "packing bags" in labels
     assert not any(entry["code"] == "(empty label)" for entry in result.codebook)

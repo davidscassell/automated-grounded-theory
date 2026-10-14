@@ -197,7 +197,7 @@ class FakeFocusedCoder(BaseChatModel):
         return FocusedRecodeBatch(passages=rows)
 
     def compete_batch(self, payload: dict) -> FocusedCompeteBatch:
-        """Explicit keep/revise/drop verdicts. The alternative names the kept code unless a test overrides this."""
+        """Explicit keep/revise/drop verdicts. The alternative is a different code and fits less well."""
         if self.mode == "empty":
             return FocusedCompeteBatch(passages=[])
         rows = []
@@ -228,14 +228,28 @@ class FakeFocusedCoder(BaseChatModel):
                 for code in initial
             ]
             first = initial[0]
+            kept_ids = {str(code.get("code_id") or "") for code in initial}
+            other = next(
+                (
+                    code
+                    for code in (payload.get("codes") or [])
+                    if str(code.get("code_id") or "") not in kept_ids and str(code.get("code") or "")
+                ),
+                None,
+            )
+            if other is None:
+                alt_code, alt_id = "a competing reading", ""
+            else:
+                alt_code, alt_id = str(other.get("code") or ""), str(other.get("code_id") or "")
             rows.append(
                 FocusedCompetePassage(
                     passage_id=passage_id,
                     verdicts=verdicts,
                     strongest_alternative=FocusedAlternativeReading(
-                        code=str(first.get("code") or ""),
-                        code_id=str(first.get("code_id") or ""),
-                        rationale="No stronger alternative reading is in this passage.",
+                        code=alt_code,
+                        code_id=alt_id,
+                        rationale="This alternative fits the passage less well than the kept code.",
+                        alternative_fit="weaker",
                         quote=quote,
                     ),
                     properties=[

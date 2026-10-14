@@ -838,6 +838,13 @@ class FocusedAlternativeReading(_LLMModel):
     rationale: str = Field(
         description="Required. Why this alternative fits the passage, including when you do not adopt it."
     )
+    alternative_fit: Literal["weaker", "comparable", "stronger"] = Field(
+        description=(
+            "Required. weaker, comparable, or stronger than the code you kept. "
+            "stronger means this alternative fits the passage better than that kept code. "
+            "Do not name the kept code as its own alternative."
+        )
+    )
     quote: str = Field(default="", description="Words from this passage that support the alternative.")
 
 
