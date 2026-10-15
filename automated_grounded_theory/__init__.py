@@ -3,10 +3,20 @@
 Codes are produced passage by passage from the corpus. The research context
 sensitizes attention and is not a codebook. The theme report groups those
 codes afterwards for presentation. It does not reread the passages. Focused
-coding is a separate graph that rereads passages against a proposed subset of
-codes already earned. It is not the theme report.
+coding, axial coding, and selective coding are separate graphs. They are not
+the theme report. Saturation indicators do not set ``judgment``.
 """
 
+from automated_grounded_theory.axial import (
+    AxialError,
+    AxialResult,
+    aaxial_code,
+    aselective_code,
+    axial_code,
+    read_axial_interrupt,
+    relation_stability,
+    selective_code,
+)
 from automated_grounded_theory.api import (
     amulti_seed_stability,
     aopen_code,
@@ -41,12 +51,15 @@ from automated_grounded_theory.retrieval import (
     EmbeddingCodeRetriever,
     LexicalCodeRetriever,
 )
+from automated_grounded_theory.saturation import thematic_saturation_report
 from automated_grounded_theory.segment import plan_coding
 from automated_grounded_theory.stability import StabilityReport
 from automated_grounded_theory.themes import ThemeError, ThemeResult, abuild_themes, build_themes
 from automated_grounded_theory.version import __version__
 
 __all__ = [
+    "AxialError",
+    "AxialResult",
     "ClaimDecision",
     "ClaimDecisions",
     "CodeRetriever",
@@ -64,9 +77,12 @@ __all__ = [
     "ThemeError",
     "ThemeResult",
     "__version__",
+    "aaxial_code",
     "abuild_themes",
     "aevaluate",
     "afocused_code",
+    "aselective_code",
+    "axial_code",
     "apply_model_claim_decisions",
     "claims_payload",
     "amulti_seed_stability",
@@ -78,12 +94,16 @@ __all__ = [
     "focused_code",
     "get_graph",
     "load_run",
+    "read_axial_interrupt",
     "read_focused_interrupt",
+    "relation_stability",
     "multi_seed_stability",
     "open_code",
     "plan_coding",
     "property_stability",
     "proposal_stability",
+    "selective_code",
     "selection_payload",
     "strict_sequential_settings",
+    "thematic_saturation_report",
 ]

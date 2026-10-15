@@ -1,7 +1,7 @@
-# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, 0.6.14, 0.6.15, and 0.6.16, focused coding in 0.7.0, fixes in 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, 0.7.6, 0.7.7, 0.7.8, and 0.7.9)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, 0.6.14, 0.6.15, and 0.6.16, focused coding in 0.7.0, fixes in 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, 0.7.6, 0.7.7, 0.7.8, and 0.7.9, axial coding and saturation indicators in 0.8.0)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
-Status: steps 1 and 2 of the v0.6 plan, plus focused coding in 0.7.0 and the 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, 0.7.6, 0.7.7, 0.7.8, and 0.7.9 fixes. Axial coding, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
+Status: steps 1 and 2 of the v0.6 plan, plus focused coding in 0.7.0 and the 0.7.1 through 0.7.9 fixes. Axial coding, saturation indicators, and optional selective coding are separate graphs in 0.8.0. See [design-axial-0800.md](design-axial-0800.md). Theoretical sampling is not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
 
 The default procedure is Charmaz-informed automated analysis: initial coding against a frozen snapshot, constant comparison with distinct operations, and `build_themes` as a descriptive reporting view. It is not an axial-coding template.
 
@@ -351,7 +351,11 @@ Package 0.7.8 accepts a claim-test judgment only for the requested passage and c
 
 Package 0.7.9 cuts off a provider that holds a connection open with a monotonic deadline thread that does not depend on an asyncio loop. On expiry the model loop is abandoned and the waiter is unblocked; `process_isolation` still kills a picklable child. httpx clients built during the call get a socket timeout. A timeout returns an incomplete result (`raise_on_timeout=True` still raises). `focused_calls_used` counts logged calls, and `focused_not_reread` lists queued passages that were not committed. A claim call needs overlap with the claim's evidence, not only its code. Counterevidence is preferred. Low-relevance pairs are skipped and the calls are reallocated. An irrelevant judgment with an empty quote is valid. `focused_synthetic_counterexample` injects one labeled passage for live evals and keeps it out of research exports. Keep-only compete rounds stay flagged. Property-name stability stays the measured score. The 1.28 token adjustment is the v23 total-token condition; the v24 input-token ratio was about 1.38. Neither is general.
 
-`policy_version` is `0.7.9`.
+`policy_version` was `0.7.9` in that release.
+
+Package 0.8.0 adds `get_graph("axial")` and `get_graph("selective")`. They are not nodes on open coding, themes, or focused coding. Relationships use the five paradigm roles, cite a passage, and stay proposals until a researcher resumes `interrupt()`. `decision_mode="llm"` writes model fields and an audit row, and leaves human `claim_support`, `researcher_saturation`, and `researcher_core_id` unset. Saturation indicators are a curve. `judgment` stays null. A timeout returns an incomplete result unless `raise_on_timeout=True`. The design of this slice is [design-axial-0800.md](design-axial-0800.md).
+
+`policy_version` is `0.8.0`.
 
 ## 26. Out of scope
 

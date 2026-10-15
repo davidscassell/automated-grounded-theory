@@ -40,8 +40,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_version_and_batch_size_stay_split_from_procedure():
-    assert __version__ == "0.7.9"
-    assert POLICY_VERSION == "0.7.9"
+    assert __version__ == "0.8.0"
+    assert POLICY_VERSION == "0.8.0"
     assert inspect.signature(focused_code).parameters["batch_size"].default == 1
     assert inspect.signature(afocused_code).parameters["batch_size"].default == 1
     assert DEFAULT_FOCUSED_BATCH_SIZE == 1
@@ -623,7 +623,7 @@ def test_label_retry_then_keeps_a_valid_code():
     assert not any(entry["code"] == "(empty label)" for entry in result.codebook)
 
 
-def test_later_graphs_and_theme_report_stay_out_of_this_pr():
+def test_focused_graph_stays_separate_and_axial_graphs_exist():
     focused = get_graph("focused")
     assert "select_candidates" in focused.nodes
     assert "researcher_checkpoint" in focused.nodes
@@ -633,10 +633,19 @@ def test_later_graphs_and_theme_report_stay_out_of_this_pr():
     themes = get_graph("themes")
     assert "recode_worker" not in open_code.nodes
     assert "select_candidates" not in themes.nodes
-    with pytest.raises(ValueError):
-        get_graph("axial")
-    with pytest.raises(ValueError):
-        get_graph("selective")
+    assert "propose_relations" not in open_code.nodes
+    assert "propose_relations" not in themes.nodes
+    axial = get_graph("axial")
+    assert "propose_relations" in axial.nodes
+    assert "relation_checkpoint" in axial.nodes
+    assert "saturation_checkpoint" in axial.nodes
+    assert "export_axial" in axial.nodes
+    selective = get_graph("selective")
+    assert "score_candidates" in selective.nodes
+    assert "core_checkpoint" in selective.nodes
+    assert "draft_memos" in selective.nodes
+    assert "draft_storyline" in selective.nodes
+    assert "export_selective" in selective.nodes
     compared = apply_comparisons(
         {"speaking": {"code": "speaking", "code_id": "speaking"}},
         [],

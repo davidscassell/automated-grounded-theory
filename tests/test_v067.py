@@ -41,7 +41,7 @@ DISTRUST = "not trusting managers to share information"
 
 
 def test_version_is_0_6_7():
-    assert __version__ == "0.7.9"
+    assert __version__ == "0.8.0"
 
 
 def test_oversized_token_reservation_fails_instead_of_waiting():
