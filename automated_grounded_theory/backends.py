@@ -9,6 +9,7 @@ them; otherwise the provider SDK reads its own environment variables.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import weakref
 from typing import Any
 
@@ -250,6 +251,115 @@ def provider_http_timeout(seconds: float):
     except ImportError:
         return seconds
     return httpx.Timeout(connect=min(10.0, seconds), read=seconds, write=seconds, pool=seconds)
+
+
+def provider_socket_timeout(seconds: float) -> float:
+    """Read/pool backstop slightly past the call deadline.
+
+    The monotonic watchdog is the deadline. This socket timeout is what closes
+    a connection the watchdog already abandoned, including a client the SDK
+    builds during the call. It sits a little past the watchdog so a healthy
+    loop still reports the configured request timeout.
+    """
+    seconds = float(seconds)
+    if seconds <= 0:
+        return 0.0
+    cushion = max(0.5, min(5.0, seconds * 0.1))
+    return seconds + cushion
+
+
+_HTTP_TIMEOUT_CAP: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "agt_http_timeout_cap",
+    default=None,
+)
+_HTTPX_PATCHED = False
+
+
+def _tighten_timeout(given: Any, seconds: float):
+    """Return an httpx timeout no looser than ``seconds``.
+
+    ``None`` and an httpx timeout with an unset phase are not left open.
+    A shorter caller timeout is kept.
+    """
+    cap = provider_http_timeout(seconds)
+    if cap is None or isinstance(cap, (int, float)):
+        return given
+    try:
+        import httpx
+    except ImportError:
+        return given
+    if given is None or given is getattr(httpx, "USE_CLIENT_DEFAULT", None):
+        return cap
+    if isinstance(given, (int, float)):
+        if float(given) <= 0:
+            return cap
+        return provider_http_timeout(min(float(given), seconds)) or cap
+    if isinstance(given, httpx.Timeout):
+
+        def phase(name: str) -> float:
+            value = getattr(given, name, None)
+            limit = float(getattr(cap, name))
+            if value is None:
+                return limit
+            return min(float(value), limit)
+
+        return httpx.Timeout(connect=phase("connect"), read=phase("read"), write=phase("write"), pool=phase("pool"))
+    return cap
+
+
+def install_httpx_timeout_cap() -> None:
+    """Make httpx clients created or used during a timed call honor the cap.
+
+    The xAI and OpenAI-compatible SDKs often build the httpx client inside
+    ``ainvoke``, or pass ``timeout=None`` on the request, which overrides the
+    client default. Patching construction and ``request`` applies the cap to
+    that client. The cap is a context variable, so a call that did not set one
+    is unchanged.
+    """
+    global _HTTPX_PATCHED
+    if _HTTPX_PATCHED:
+        return
+    try:
+        import httpx
+    except ImportError:
+        return
+
+    def wrap_init(original):
+        def __init__(self, *args, **kwargs):
+            seconds = _HTTP_TIMEOUT_CAP.get()
+            if seconds:
+                kwargs["timeout"] = _tighten_timeout(kwargs.get("timeout"), float(seconds))
+            return original(self, *args, **kwargs)
+
+        return __init__
+
+    def wrap_request(original):
+        def request(self, method, url, *args, **kwargs):
+            seconds = _HTTP_TIMEOUT_CAP.get()
+            if seconds:
+                current = kwargs.get("timeout", httpx.USE_CLIENT_DEFAULT)
+                if current is httpx.USE_CLIENT_DEFAULT:
+                    current = getattr(self, "timeout", None)
+                kwargs["timeout"] = _tighten_timeout(current, float(seconds))
+            return original(self, method, url, *args, **kwargs)
+
+        return request
+
+    httpx.Client.__init__ = wrap_init(httpx.Client.__init__)
+    httpx.AsyncClient.__init__ = wrap_init(httpx.AsyncClient.__init__)
+    httpx.Client.request = wrap_request(httpx.Client.request)
+    httpx.AsyncClient.request = wrap_request(httpx.AsyncClient.request)
+    _HTTPX_PATCHED = True
+
+
+def bind_http_timeout_cap(seconds: float):
+    """Set the socket-timeout cap for clients built in this context. Returns the token."""
+    install_httpx_timeout_cap()
+    return _HTTP_TIMEOUT_CAP.set(provider_socket_timeout(seconds))
+
+
+def reset_http_timeout_cap(token) -> None:
+    _HTTP_TIMEOUT_CAP.reset(token)
 
 
 def install_provider_http_timeout(model, seconds: float | None):

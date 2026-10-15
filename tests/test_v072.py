@@ -28,8 +28,8 @@ from tests.test_v070 import _book, _entry, _passages, _source
 
 
 def test_version_is_072():
-    assert __version__ == "0.7.8"
-    assert POLICY_VERSION == "0.7.8"
+    assert __version__ == "0.7.9"
+    assert POLICY_VERSION == "0.7.9"
 
 
 def _passages_for_shares():
@@ -573,5 +573,6 @@ def test_wall_clock_timeout_stops_a_hanging_model():
             focused_request_retries=4,
             max_focused_review_calls=2,
             interrupt=False,
+            raise_on_timeout=True,
         )
     assert time.perf_counter() - started < 2

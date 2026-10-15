@@ -167,7 +167,13 @@ class CallLimiter:
                 attempt_timeout = float(remaining) if not cap or cap <= 0 else min(float(cap), float(remaining))
                 if attempt_timeout <= 0:
                     raise self._deadline_error()
-            return await self._attempt(runnable, payload, timeout=attempt_timeout, estimate=estimate)
+            return await self._attempt(
+                runnable,
+                payload,
+                timeout=attempt_timeout,
+                estimate=estimate,
+                deadline=deadline,
+            )
 
         result = await self._retry(once, deadline=deadline)
         if use_cache:
@@ -223,13 +229,21 @@ class CallLimiter:
         reserve = self.reserved_output_tokens if reserved_output is None else max(0, int(reserved_output))
         return estimate_input_tokens(payload) + reserve
 
-    async def _attempt(self, runnable, payload, *, timeout: float | None, estimate: int):
+    async def _attempt(
+        self,
+        runnable,
+        payload,
+        *,
+        timeout: float | None,
+        estimate: int,
+        deadline: float | None = None,
+    ):
         """One provider attempt: reserve budgets, hold one shared slot, reconcile."""
         record = {"queue_wait": 0.0, "latency": None, "reserved": 0.0, "usage": None}
         held = False
         try:
-            await self._reserve_budgets(record, estimate)
-            await self._acquire_slot(record)
+            await self._reserve_budgets(record, estimate, deadline=deadline)
+            await self._acquire_slot(record, deadline=deadline)
             held = True
             result = await self._invoke(runnable, payload, timeout=timeout, record=record)
             record["usage"] = usage_from_result(result)
@@ -241,19 +255,38 @@ class CallLimiter:
             if held:
                 await self._release_async()
 
-    async def _reserve_budgets(self, record: dict, estimate: int) -> None:
+    async def _reserve_budgets(self, record: dict, estimate: int, *, deadline: float | None = None) -> None:
         started = self._clock()
-        await self._take_amount(1, kind="requests")
+        await self._take_amount(1, kind="requests", deadline=deadline)
         if self.tokens_per_minute > 0 and estimate > 0:
-            taken = await self._take_amount(estimate, kind="tokens")
+            taken = await self._take_amount(estimate, kind="tokens", deadline=deadline)
             record["reserved"] = float(taken)
         record["queue_wait"] = max(0.0, self._clock() - started)
 
-    async def _acquire_slot(self, record: dict) -> None:
+    async def _acquire_slot(self, record: dict, *, deadline: float | None = None) -> None:
+        """Take one in-flight slot. The wait uses one monotonic deadline.
+
+        ``deadline`` is the caller's wall clock when one was set. Otherwise a
+        positive ``request_timeout`` is the cap, measured once. The wait is not
+        restarted when the condition wakes early.
+        """
         started = self._clock()
+        cap = deadline
+        limit = float(self.request_timeout or 0)
+        if cap is None and limit > 0:
+            cap = time.monotonic() + limit
         async with self._gate:
             while self._in_flight >= self.limit:
-                await self._gate.wait()
+                if cap is None:
+                    await self._gate.wait()
+                    continue
+                remaining = cap - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(_timeout_message(limit))
+                try:
+                    await asyncio.wait_for(self._gate.wait(), remaining)
+                except TimeoutError:
+                    raise TimeoutError(_timeout_message(limit)) from None
             self._enter()
         record["queue_wait"] = float(record.get("queue_wait") or 0) + max(0.0, self._clock() - started)
 
@@ -262,7 +295,7 @@ class CallLimiter:
             self._leave()
             self._gate.notify()
 
-    async def _take_amount(self, amount: float, *, kind: str) -> float:
+    async def _take_amount(self, amount: float, *, kind: str, deadline: float | None = None) -> float:
         """Wait until ``kind`` (``tokens`` or ``requests``) can spare ``amount``.
 
         Returns the units actually removed from the bucket. A request larger
@@ -286,7 +319,7 @@ class CallLimiter:
                     f"Raise {setting} to at least {amount:g}, send a smaller request, "
                     "or set allow_oversized=True to wait until the bucket is full and then drain it."
                 )
-            return await self._drain_full_bucket(kind)
+            return await self._drain_full_bucket(kind, deadline=deadline)
         while True:
             async with self._budget_lock:
                 self._refill(self._clock(), kind)
@@ -298,9 +331,18 @@ class CallLimiter:
                         self._requests = level - amount
                     return amount
                 delay = (amount - level) * 60.0 / cap
+            self._raise_if_past_deadline(delay, deadline)
             await self._sleep(max(0.0, delay))
 
-    async def _drain_full_bucket(self, kind: str) -> float:
+    def _raise_if_past_deadline(self, delay: float, deadline: float | None) -> None:
+        """A bucket refill must not wait past the call's monotonic deadline."""
+        if deadline is None:
+            return
+        left = deadline - time.monotonic()
+        if left <= 0 or float(delay) > left:
+            raise TimeoutError(_timeout_message(float(self.request_timeout or 0)))
+
+    async def _drain_full_bucket(self, kind: str, *, deadline: float | None = None) -> float:
         """Wait until ``kind`` is full, then take the whole bucket."""
         cap = self.tokens_per_minute if kind == "tokens" else self.requests_per_minute
         while True:
@@ -314,6 +356,7 @@ class CallLimiter:
                         self._requests = 0.0
                     return float(cap)
                 delay = (cap - level) * 60.0 / cap
+            self._raise_if_past_deadline(delay, deadline)
             await self._sleep(max(0.0, delay))
 
     def _refill(self, now: float, kind: str) -> None:
@@ -1189,16 +1232,19 @@ def run_sync(coro, *, timeout: float | None = None):
     future = asyncio.run_coroutine_threadsafe(coro, loop)
     try:
         if timeout is not None and float(timeout) > 0:
-            return future.result(timeout=float(timeout))
+            return _result_with_deadline_watch(future, loop, float(timeout))
         return future.result()
-    except TimeoutError:
+    except TimeoutError as exc:
         # concurrent.futures.TimeoutError is TimeoutError on Python 3.11+.
         # A coroutine that already raised TimeoutError is a finished future.
         # Only an unfinished future means this wait itself expired. Rewriting
         # a finished call timeout as the bridge budget dropped the real label
-        # (a 120s call was reported as the whole-run allowance).
-        if future.done():
+        # (a 120s call was reported as the whole-run allowance). A hard
+        # deadline the loop never resumed is also that call timeout.
+        if future.done() and not future.cancelled():
             return _propagate_finished(future)
+        if "timed out after" in str(exc) and "sync bridge" not in str(exc):
+            raise
         future.cancel()
         try:
             return future.result(timeout=0.05)
@@ -1211,6 +1257,86 @@ def run_sync(coro, *, timeout: float | None = None):
         raise TimeoutError(f"sync bridge timed out after {float(timeout):g}s") from None
     except BaseException as exc:
         raise exc from None
+
+
+def _result_with_deadline_watch(future: concurrent.futures.Future, loop, timeout: float):
+    """Wait out ``timeout`` and surface a call deadline the loop did not.
+
+    ``future.result`` on this thread is already independent of the package
+    loop. A per-call watchdog that fired and was not observed within a short
+    grace means that loop did not resume the waiter. This wait then raises the
+    call's own timeout and abandons the loop, instead of sitting until the
+    bridge budget. A healthy timeout still arrives as the coroutine's exception.
+    """
+    deadline = time.monotonic() + float(timeout)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            return future.result(timeout=min(0.25, remaining))
+        except TimeoutError:
+            if future.done() and not future.cancelled():
+                return _propagate_finished(future)
+            late = _take_stale_deadline()
+            if late is not None and not future.done():
+                _abandon_package_loop(loop)
+                raise late
+            continue
+    if future.done() and not future.cancelled():
+        return _propagate_finished(future)
+    future.cancel()
+    try:
+        return future.result(timeout=0.05)
+    except (TimeoutError, concurrent.futures.CancelledError):
+        if future.done() and not future.cancelled():
+            return _propagate_finished(future)
+    except BaseException:
+        if future.done() and not future.cancelled():
+            return _propagate_finished(future)
+    raise TimeoutError(f"sync bridge timed out after {float(timeout):g}s") from None
+
+
+def _abandon_package_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Stop using ``loop`` for later sync calls. Do not join its thread."""
+    global _LOOP
+    with _LOOP_LOCK:
+        if _LOOP is loop:
+            _LOOP = None
+    if loop is None or not loop.is_running():
+        return
+    try:
+        loop.call_soon_threadsafe(loop.stop)
+    except RuntimeError:
+        return
+
+
+_DEADLINE_NOTICES: list[dict[str, Any]] = []
+_DEADLINE_NOTICE_LOCK = threading.Lock()
+_DEADLINE_GRACE = 0.75
+
+
+def _notice_unobserved_deadline(exc: BaseException) -> None:
+    """Record a call deadline that the waiter has not resumed yet."""
+    with _DEADLINE_NOTICE_LOCK:
+        _DEADLINE_NOTICES.append({"at": time.monotonic(), "exc": exc})
+
+
+def _clear_deadline_notice() -> None:
+    with _DEADLINE_NOTICE_LOCK:
+        _DEADLINE_NOTICES.clear()
+
+
+def _take_stale_deadline() -> BaseException | None:
+    """Return a deadline notice older than the grace, and drop the list."""
+    now = time.monotonic()
+    with _DEADLINE_NOTICE_LOCK:
+        stale = [item for item in _DEADLINE_NOTICES if now - float(item["at"]) >= _DEADLINE_GRACE]
+        if not stale:
+            return None
+        exc = stale[0]["exc"]
+        _DEADLINE_NOTICES.clear()
+        return exc
 
 
 def _propagate_finished(future: concurrent.futures.Future):
@@ -1362,53 +1488,156 @@ def _submit_on_loop(loop: asyncio.AbstractEventLoop, coro, context: contextvars.
     return future
 
 
+# A live loop cancels the provider from its own wait at ``timeout``. This
+# thread waits a little longer so that cancel is delivered before the loop is
+# abandoned. A blocked loop never runs that wait, and this thread still fires.
+_WATCHDOG_SLACK = 0.2
+
+
+class _MonotonicDeadline:
+    """One hard deadline on its own thread. It does not use an asyncio loop.
+
+    The timer is ``threading.Event.wait``, which is a single monotonic wait.
+    It is not ``future.result`` (that wait shares the future's condition with
+    the loop that must resolve it) and it is not ``asyncio.sleep`` (that wait
+    never runs while its loop is blocked). The clock is the request timeout
+    plus a short slack, so a responsive loop can cancel the provider and raise
+    its own ``TimeoutError`` first. On expiry the model loop is abandoned, a
+    configured child process is killed, and ``gate`` is completed from this
+    thread so a waiter blocked in ``future.result`` can resume without that
+    loop. The error still names the request timeout, not the slack.
+    """
+
+    def __init__(self, timeout: float):
+        self.timeout = float(timeout)
+        self.deadline = time.monotonic() + self.timeout + _WATCHDOG_SLACK
+        self.gate: concurrent.futures.Future = concurrent.futures.Future()
+        self._wake = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="agt-hard-deadline", daemon=True)
+        self.work: concurrent.futures.Future | None = None
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.process = None
+
+    def arm(self, work: concurrent.futures.Future, loop, process=None) -> None:
+        self.work = work
+        self.loop = loop
+        self.process = process
+        work.add_done_callback(lambda _future: self._wake.set())
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if self._wake.wait(remaining):
+                work = self.work
+                if work is not None and work.done():
+                    self._finish_from(work)
+                    return
+                continue
+            break
+        work = self.work
+        if work is not None and work.done():
+            self._finish_from(work)
+            return
+        self._expire()
+
+    def _finish_from(self, work: concurrent.futures.Future) -> None:
+        if self.gate.done():
+            return
+        try:
+            exc = work.exception()
+        except concurrent.futures.CancelledError:
+            if not self.gate.done():
+                self.gate.cancel()
+            return
+        if self.gate.done():
+            return
+        if exc is not None:
+            self.gate.set_exception(exc)
+        else:
+            self.gate.set_result(work.result())
+
+    def _expire(self) -> None:
+        loop = self.loop
+        work = self.work
+        task = getattr(work, "task", None) if work is not None else None
+        if task is not None and loop is not None and loop.is_running():
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass
+        if work is not None and not work.done():
+            work.cancel()
+        if loop is not None:
+            _abandon_model_loop(loop)
+        process = self.process
+        if process is not None and getattr(process, "is_alive", lambda: False)():
+            process.terminate()
+            process.join(0.5)
+            if process.is_alive():
+                process.kill()
+                process.join(0.5)
+        exc = TimeoutError(_timeout_message(self.timeout))
+        _notice_unobserved_deadline(exc)
+        if not self.gate.done():
+            self.gate.set_exception(exc)
+
+
 async def _ainvoke_off_loop(runnable, payload, *, timeout: float):
     """Run one model call on the current model loop.
 
-    The deadline is ``future.result(timeout)`` on a private thread, not the
-    package loop's executor. It does not depend on the package loop waking up,
-    and it does not run the provider read on the package loop. Inside the
-    model loop the provider call is wrapped in :func:`await_with_wall_timeout`,
-    which cancels that task when the clock expires. A pooled async client is
-    constructed for this loop, with connect, read, write, and pool timeouts.
-    A timeout of 0 or less is not passed here.
+    The deadline is a dedicated thread waiting on ``time.monotonic``. It does
+    not wait on the call's future, and it does not sleep on either asyncio
+    loop. When the clock expires the model loop is abandoned and ``gate`` is
+    failed from that thread. A pooled async client is constructed for this
+    loop. httpx clients the provider builds during the call get a socket
+    timeout slightly past this deadline, so an open connection does not stay
+    open after the loop is abandoned. A timeout of 0 or less is not passed here.
 
-    A finished future's ``TimeoutError`` is the call's own error. Python 3.11
-    aliases ``concurrent.futures.TimeoutError`` to ``TimeoutError``, so the
-    type alone cannot tell that error from this wait expiring. An unfinished
-    future means the loop thread did not reach the deadline. That loop is
-    abandoned so the next call is not queued behind the blocker. The blocked
-    thread is not killed.
+    A finished call's ``TimeoutError`` is that call's own error. An unfinished
+    call means the loop thread did not reach the deadline. That loop is
+    abandoned. The blocked thread is not killed. ``process_isolation`` is the
+    path that can kill the provider.
     """
+    from automated_grounded_theory.backends import (
+        arm_provider_clients,
+        bind_http_timeout_cap,
+        provider_socket_timeout,
+        reset_http_timeout_cap,
+    )
+
     loop = _model_loop()
-    context = contextvars.copy_context()
+    token = bind_http_timeout_cap(timeout)
+    try:
+        context = contextvars.copy_context()
+    finally:
+        reset_http_timeout_cap(token)
+    socket_timeout = provider_socket_timeout(timeout)
 
     async def _call():
-        from automated_grounded_theory.backends import arm_provider_clients
-
-        await arm_provider_clients(runnable, timeout)
+        await arm_provider_clients(runnable, socket_timeout)
         return await await_with_wall_timeout(runnable.ainvoke(payload), timeout)
 
     future = _submit_on_loop(loop, _call(), context)
-    waiter = _deadline_executor().submit(future.result, float(timeout) + 0.05)
+    watch = _MonotonicDeadline(timeout)
+    watch.arm(future, loop)
     try:
-        return await asyncio.wrap_future(waiter)
+        return await asyncio.wrap_future(watch.gate)
     except TimeoutError:
-        if future.done():
+        _clear_deadline_notice()
+        if future.done() and not future.cancelled():
             exc = future.exception()
             if exc is not None:
                 raise exc
             return future.result()
         task = getattr(future, "task", None)
-        future.cancel()
         if task is not None and loop.is_running():
             try:
                 loop.call_soon_threadsafe(task.cancel)
             except RuntimeError:
                 pass
-        # The loop did not finish the call. A blocked thread will not run the
-        # cancel until the block ends, and every later call on this loop waits
-        # behind it.
         _abandon_model_loop(loop)
         raise TimeoutError(_timeout_message(timeout)) from None
 
@@ -1463,7 +1692,9 @@ def run_provider_in_subprocess(runnable, payload, *, timeout: float):
         if process.is_alive():
             process.kill()
             process.join(1)
-        raise TimeoutError(_timeout_message(timeout))
+        exc = TimeoutError(_timeout_message(timeout))
+        _notice_unobserved_deadline(exc)
+        raise exc
     if result_queue.empty():
         raise RuntimeError("The provider process ended without a result.")
     message = result_queue.get()
@@ -1481,8 +1712,16 @@ def run_provider_in_subprocess(runnable, payload, *, timeout: float):
 
 
 async def _ainvoke_in_subprocess(runnable, payload, *, timeout: float):
-    """Blocking process wait, off the caller's loop."""
-    return await asyncio.to_thread(run_provider_in_subprocess, runnable, payload, timeout=timeout)
+    """Blocking process wait, off the caller's loop.
+
+    ``run_provider_in_subprocess`` joins the child until the monotonic deadline
+    and then terminates it. That is the configured process-isolation path.
+    """
+    try:
+        return await asyncio.to_thread(run_provider_in_subprocess, runnable, payload, timeout=timeout)
+    except TimeoutError:
+        _clear_deadline_notice()
+        raise
 
 
 async def await_with_wall_timeout(awaitable, timeout: float | None):

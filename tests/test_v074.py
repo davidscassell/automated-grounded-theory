@@ -27,8 +27,8 @@ from tests.test_v070 import _entry, _passages, _source
 
 
 def test_version_is_074():
-    assert __version__ == "0.7.8"
-    assert POLICY_VERSION == "0.7.8"
+    assert __version__ == "0.7.9"
+    assert POLICY_VERSION == "0.7.9"
     assert FocusedAlternativeReading.model_fields["alternative_fit"].is_required()
 
 
@@ -104,8 +104,8 @@ def test_claim_search_pairs_a_claim_with_a_relevant_passage_only():
     found = _claim_compete_items(state, [], slots=4)
     sources = {item["passage_id"]: item["source"] for item in found}
     assert "p2" not in sources
+    assert "p3" not in sources
     assert sources["p4"] == "claim_opposite_pole"
-    assert sources["p3"] == "claim_similarity"
     assert sources["p5"] == "claim_similarity"
     assert "p6" not in sources
     assert "p1" not in sources
@@ -164,7 +164,7 @@ def test_claim_search_pairs_a_claim_with_a_relevant_passage_only():
 def test_claim_round_rereads_another_assignment_when_the_pole_is_absent():
     passages = [
         _passage("p1", "alpha bravo"),
-        _passage("p2", "alpha charlie"),
+        _passage("p2", "alpha bravo stayed put"),
         _passage("p3", "echo foxtrot"),
     ]
     segments = [
@@ -394,6 +394,7 @@ def test_wall_clock_timeout_cancels_a_model_that_swallows_cancellation():
             focused_request_retries=4,
             max_focused_review_calls=4,
             interrupt=False,
+            raise_on_timeout=True,
         )
     assert time.perf_counter() - started < 1.0
     assert coder.cancelled >= 1

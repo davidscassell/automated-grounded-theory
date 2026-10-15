@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.9
+
+- A provider that holds a connection open is cut off by a dedicated thread waiting on a monotonic clock. The timer is not `future.result` and not `asyncio.sleep`, so it does not depend on the call's future or on either event loop. The thread waits 0.2s past the request timeout so a live loop can cancel the provider first and raise that request's own timeout. A blocked loop never runs that cancel, and the thread then abandons the model loop and unblocks the waiter. The error still names the request timeout. `process_isolation` still terminates a picklable child. Slot waits, budget waits, and shared embedding futures are bounded. httpx clients the SDK builds during the call get a socket timeout slightly past that deadline.
+- A timeout returns the incomplete result (`status` `incomplete`, `stop` `timeout`, `timeout_step`, partial export when an output directory is set). `raise_on_timeout=True` raises `TimeoutError` as before.
+- `focused_calls_used` counts calls written to the prompt log. A job that was only prepared is not counted. `focused_not_reread` lists queued passages that were not committed, including the passage in flight when the timeout fired.
+- A claim call requires overlap with the claim's evidence (pole, text, or quote), not only the code: two content tokens, or a stored embedding at or above 0.55. Opposite-pole wording and hedges or exceptions are preferred. Pairs with no overlap or only weak overlap are skipped and logged. Unspent claim calls are reallocated to compete or outside. `claim_test_relevance` reports queued, skipped, and `relevance_rate`.
+- An irrelevant judgment with an empty quote is valid. A quote is required only for supports, contradicts, or qualifies.
+- `focused_synthetic_counterexample` injects one passage labeled `[synthetic counterexample]` so a live eval can check detection. It is not research data and is omitted from research exports.
+- v24 compete rounds were mostly keep-only (4 of 6 passes). The two revise passes both revised R023_q2 and agreed (stability 1.0). `compete_keep_only` stays flagged. No procedure change.
+- Property stability on that eval was low (name 0.10, category 0.25) because runs named different properties. The score stays as measured. No procedure change.
+- The token heuristic is unchanged. 1.28 is the v23 condition (heuristic / provider total tokens about 1.27–1.29). v24 measured heuristic / provider input tokens at about 1.38, and the adjusted figure was reported within 0.3% of those input tokens. Neither number is a general calibration.
+- Offline fixtures cover `decision_stop_detail`, `omitted_context`, `degenerate_absence_pole`, and `possible_direction_mismatch`. No procedure change.
+- `policy_version` is `0.7.9`.
+
 ## 0.7.8
 
 - A claim-test response is accepted only for the requested `(passage_id, claim_id)` pair, and only when the quote anchors in that passage. An unrequested pair or an unanchored quote is kept in the prompt log as `claim_test_invalid` with reason `unrequested_pair` or `unanchored_quote`. It is not a negative case and it does not dispute the claim.

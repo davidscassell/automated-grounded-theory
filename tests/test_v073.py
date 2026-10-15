@@ -20,8 +20,8 @@ from tests.test_v072 import _passages_for_shares, _share_segments
 
 
 def test_version_is_073():
-    assert __version__ == "0.7.8"
-    assert POLICY_VERSION == "0.7.8"
+    assert __version__ == "0.7.9"
+    assert POLICY_VERSION == "0.7.9"
 
 
 def test_claim_compete_has_a_reserved_share_and_its_own_coverage():

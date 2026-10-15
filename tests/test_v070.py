@@ -40,8 +40,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_version_and_batch_size_stay_split_from_procedure():
-    assert __version__ == "0.7.8"
-    assert POLICY_VERSION == "0.7.8"
+    assert __version__ == "0.7.9"
+    assert POLICY_VERSION == "0.7.9"
     assert inspect.signature(focused_code).parameters["batch_size"].default == 1
     assert inspect.signature(afocused_code).parameters["batch_size"].default == 1
     assert DEFAULT_FOCUSED_BATCH_SIZE == 1
@@ -612,7 +612,12 @@ def test_api_resume_records_a_performance_continuation():
 
 def test_label_retry_then_keeps_a_valid_code():
     coder, result = _run("retry_label", segments=_segments_for_raised()[:1], max_focused_review_calls=4)
-    assert coder.call_count == 3
+    # The other packing passage shares one evidence token, so the claim slot is
+    # not spent. That call is reallocated to outside, and the empty label is
+    # retried there too: develop attempt + retry, outside attempt + retry.
+    assert coder.call_count == 4
+    assert result.purpose_coverage["claim_compete"]["calls"] == 0
+    assert result.purpose_coverage["outside"]["calls"] == 1
     labels = {entry["code"] for entry in result.codebook}
     assert "packing bags" in labels
     assert not any(entry["code"] == "(empty label)" for entry in result.codebook)
@@ -741,7 +746,10 @@ def test_researcher_incident_can_enter_any_purpose(tmp_path):
     )
     assert resumed.interrupt_payload["kind"] == "focused_claims"
     compete = resumed.purpose_coverage["compete"]["passage_ids"]
-    assert compete == ["p4"]
+    # p4 is the incident. The claim slot has no evidence overlap, so that call
+    # is reallocated onto compete and p1 is queued after the incident.
+    assert compete == ["p4", "p1"]
+    assert resumed.metadata["claim_test_relevance"]["reallocated_calls"] == 1
 
 
 def test_negative_cases_include_the_supporting_category():

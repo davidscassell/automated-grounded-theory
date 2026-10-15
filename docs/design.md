@@ -1,7 +1,7 @@
-# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, 0.6.14, 0.6.15, and 0.6.16, focused coding in 0.7.0, fixes in 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, 0.7.6, 0.7.7, and 0.7.8)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, 0.6.14, 0.6.15, and 0.6.16, focused coding in 0.7.0, fixes in 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, 0.7.6, 0.7.7, 0.7.8, and 0.7.9)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
-Status: steps 1 and 2 of the v0.6 plan, plus focused coding in 0.7.0 and the 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, 0.7.6, 0.7.7, and 0.7.8 fixes. Axial coding, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
+Status: steps 1 and 2 of the v0.6 plan, plus focused coding in 0.7.0 and the 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, 0.7.6, 0.7.7, 0.7.8, and 0.7.9 fixes. Axial coding, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
 
 The default procedure is Charmaz-informed automated analysis: initial coding against a frozen snapshot, constant comparison with distinct operations, and `build_themes` as a descriptive reporting view. It is not an axial-coding template.
 
@@ -349,7 +349,9 @@ Package 0.7.7 keeps a provider that accepts a connection and sends no body insid
 
 Package 0.7.8 accepts a claim-test judgment only for the requested passage and claim, and only when the quote anchors in that passage. Anything else is logged as `claim_test_invalid` and does not dispute the claim. A blocked model-loop thread is abandoned so the next call can run; killing that thread requires process isolation. httpx clients are built on the loop that uses them. A shortfall comparison is `possible_direction_mismatch`, not an automatic invalidation. Claim review packs into the remaining token allowance. The reviewer sees challenging passages within an evidence budget. The token figure is a heuristic. The 1.28 adjustment is empirical, and the ratio uses provider input tokens. Revise and drop proposals stay unapplied. A run that does not interrupt can leave a disputed claim pending.
 
-`policy_version` is `0.7.8`.
+Package 0.7.9 cuts off a provider that holds a connection open with a monotonic deadline thread that does not depend on an asyncio loop. On expiry the model loop is abandoned and the waiter is unblocked; `process_isolation` still kills a picklable child. httpx clients built during the call get a socket timeout. A timeout returns an incomplete result (`raise_on_timeout=True` still raises). `focused_calls_used` counts logged calls, and `focused_not_reread` lists queued passages that were not committed. A claim call needs overlap with the claim's evidence, not only its code. Counterevidence is preferred. Low-relevance pairs are skipped and the calls are reallocated. An irrelevant judgment with an empty quote is valid. `focused_synthetic_counterexample` injects one labeled passage for live evals and keeps it out of research exports. Keep-only compete rounds stay flagged. Property-name stability stays the measured score. The 1.28 token adjustment is the v23 total-token condition; the v24 input-token ratio was about 1.38. Neither is general.
+
+`policy_version` is `0.7.9`.
 
 ## 26. Out of scope
 

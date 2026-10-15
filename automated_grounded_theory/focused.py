@@ -205,6 +205,7 @@ _PROCEDURE_KEYS = (
     "focused_request_timeout",
     "focused_request_retries",
     "focused_claim_compete_round",
+    "focused_synthetic_counterexample",
     "validation_retries",
     "decision_mode",
     "decision_model",
@@ -2835,8 +2836,20 @@ def _allowance_block(state: Mapping[str, Any]) -> tuple[str, list[str]] | None:
     return None
 
 
+def _is_synthetic_passage(item: Mapping[str, Any] | str) -> bool:
+    if isinstance(item, str):
+        return item == SYNTHETIC_PASSAGE_ID
+    return bool(item.get("synthetic")) or str(item.get("passage_id") or "") == SYNTHETIC_PASSAGE_ID
+
+
 def _corpus_passage_ids(state: Mapping[str, Any]) -> list[str]:
-    return [str(item.get("passage_id") or "") for item in (state.get("passages") or []) if item.get("passage_id")]
+    """Research passages. A synthetic counterexample is not part of the corpus."""
+    ids = []
+    for item in state.get("passages") or []:
+        if not isinstance(item, Mapping) or not item.get("passage_id") or _is_synthetic_passage(item):
+            continue
+        ids.append(str(item.get("passage_id") or ""))
+    return ids
 
 
 def _queued_passage_ids(state: Mapping[str, Any]) -> list[str]:
@@ -2927,8 +2940,10 @@ def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
             "Without a provider tokenizer the heuristic is about three characters per token, plus schema and "
             "message framing. It often runs higher than provider input usage. It is what stops the reread. "
             "focused_tokens_adjusted (also stored as focused_tokens_calibrated) divides that heuristic by 1.28. "
-            "The divisor is an empirical adjustment from focused-coding live runs where the heuristic divided by "
-            "provider total tokens was about 1.27 to 1.29. It is not a general calibration and it is not the stopper. "
+            "The divisor is the v23 condition: heuristic divided by provider total tokens was about 1.27 to 1.29. "
+            "On the v24 live eval the raw heuristic divided by provider input tokens was about 1.38, and the "
+            "adjusted figure was reported within 0.3% of those input tokens. Neither 1.28 nor 1.38 is a general "
+            "calibration, and the adjusted figure is not the stopper. "
             "provider_token_usage keeps input_tokens, output_tokens, and cached_tokens separate. "
             "token_estimate_ratio is the heuristic divided by provider input_tokens when the provider reported "
             "input tokens, and null otherwise. Output length is not in that ratio."
@@ -2956,6 +2971,8 @@ def _shares_from_procedure(procedure: Mapping[str, Any]) -> dict[str, float]:
 def _queue_passage_ids(queue: Sequence[Any]) -> list[str]:
     ids = []
     for item in queue:
+        if _is_synthetic_passage(item if isinstance(item, Mapping) else str(item)):
+            continue
         if isinstance(item, Mapping):
             ids.append(str(item.get("passage_id") or ""))
         else:
@@ -3247,9 +3264,39 @@ _RELEVANT_CLAIM_SOURCES = frozenset(
         "claim_same_code",
         "claim_opposite_pole",
         "claim_similarity",
+        "claim_synthetic_counterexample",
     }
 )
 _CLAIM_SIMILARITY_COSINE = 0.5
+# Measured on stored embeddings. A pair at or above this is semantic overlap
+# with the claim. It is not a general similarity cutoff.
+_CLAIM_EVIDENCE_COSINE = 0.55
+_MIN_EVIDENCE_TOKENS = 2
+_COUNTER_MARKERS = (
+    " however ",
+    " although ",
+    " though ",
+    " except ",
+    " unless ",
+    " instead ",
+    " rather than ",
+    " not always ",
+    " rarely ",
+    " seldom ",
+    " no issues ",
+    " did not ",
+    " didn't ",
+    " does not ",
+    " doesn't ",
+    " was not ",
+    " wasn't ",
+    " exception ",
+    " contrary ",
+    " on the other hand ",
+    " but ",
+)
+SYNTHETIC_PASSAGE_ID = "synthetic-counterexample"
+SYNTHETIC_MARKER = "[synthetic counterexample]"
 
 
 def _absence_pole(value: Any) -> bool:
@@ -3374,21 +3421,95 @@ def _claim_content_tokens(claim: Mapping[str, Any]) -> set[str]:
     return _content_tokens(" ".join(str(claim.get(key) or "") for key in ("name", "text", "pole", "quote")))
 
 
-def _claim_similarity_score(passage: Mapping[str, Any], claim: Mapping[str, Any]) -> float:
-    """Shared content or a strong embedding match. Zero means the passage is not about this claim."""
+def _claim_evidence_tokens(claim: Mapping[str, Any]) -> set[str]:
+    """Tokens of the claim's pole, text, and quote. Not the code label."""
+    return _content_tokens(" ".join(str(claim.get(key) or "") for key in ("pole", "text", "quote")))
+
+
+def _claim_evidence_overlap(passage: Mapping[str, Any], claim: Mapping[str, Any]) -> tuple[int, float]:
     text = str(passage.get("text") or "")
-    if not text.strip():
-        return 0.0
-    score = 0.0
-    if _claim_content_tokens(claim) & _content_tokens(text):
-        overlap = jaccard(text, _claim_blob(claim))
-        score = max(score, overlap if overlap > 0 else 0.01)
+    shared = len(_claim_evidence_tokens(claim) & _content_tokens(text))
+    semantic = 0.0
     passage_vector = _stored_vector(passage)
     claim_vector = _stored_vector(claim)
     if passage_vector and claim_vector:
-        similarity = cosine(passage_vector, claim_vector)
-        if similarity >= _CLAIM_SIMILARITY_COSINE:
-            score = max(score, similarity)
+        semantic = cosine(passage_vector, claim_vector)
+    return shared, semantic
+
+
+def _passage_counterevidence(text: Any, claim: Mapping[str, Any]) -> bool:
+    """Hedge, exception, or opposite-leaning wording about this claim's evidence."""
+    folded = " ".join(str(text or "").casefold().split())
+    padded = f" {folded} "
+    if not any(marker in padded for marker in _COUNTER_MARKERS):
+        return False
+    return bool(_claim_evidence_tokens(claim) & _content_tokens(folded))
+
+
+def _synthetic_counterexample_passage(claims: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+    """One labeled passage that contradicts a claim. It is not research data.
+
+    The text names itself as synthetic. Research exports omit it. A live eval
+    turns this on with ``focused_synthetic_counterexample`` so a run can show
+    whether a contradicting passage is detected.
+    """
+    claim = next((dict(item) for item in claims if item.get("entry_id")), None)
+    if claim is None:
+        return None
+    pole = str(claim.get("pole") or claim.get("text") or "the claim")
+    return {
+        "passage_id": SYNTHETIC_PASSAGE_ID,
+        "doc_id": "synthetic",
+        "text": (
+            f"{SYNTHETIC_MARKER} Injected for evaluation. Not research data. "
+            f"This account contradicts ({pole}): the reported pattern does not hold, "
+            "however there is an exception, and the opposite was observed."
+        ),
+        "synthetic": True,
+        "synthetic_label": "counterexample",
+    }
+
+
+def _claim_pair_relevant(
+    passage: Mapping[str, Any],
+    claim: Mapping[str, Any],
+    *,
+    same_category: bool,
+    opposite: bool,
+) -> bool:
+    """True when the passage is worth a claim call.
+
+    A shared code is not enough. The passage needs two content tokens in
+    common with the claim's pole, text, or quote, or an embedding at or above
+    the measured threshold. One shared token is not enough, including inside
+    the same category. An embedding at the threshold is itself the semantic
+    check and does not also need those tokens. Opposite-pole text and
+    counterevidence wording (a hedge or an exception about the claim) qualify
+    ahead of a same-category match.
+    """
+    if opposite or _passage_counterevidence(passage.get("text"), claim):
+        return True
+    shared, semantic = _claim_evidence_overlap(passage, claim)
+    if semantic >= _CLAIM_EVIDENCE_COSINE:
+        return True
+    return shared >= _MIN_EVIDENCE_TOKENS
+
+
+def _claim_similarity_score(passage: Mapping[str, Any], claim: Mapping[str, Any]) -> float:
+    """Evidence overlap. Zero means the passage is not about this claim.
+
+    One shared token is not overlap. The code label is not the evidence.
+    """
+    text = str(passage.get("text") or "")
+    if not text.strip():
+        return 0.0
+    shared, semantic = _claim_evidence_overlap(passage, claim)
+    score = 0.0
+    if shared >= _MIN_EVIDENCE_TOKENS:
+        overlap = jaccard(text, " ".join(str(claim.get(key) or "") for key in ("pole", "text", "quote")))
+        score = max(score, overlap if overlap > 0 else 0.01 * shared)
+    if semantic >= _CLAIM_EVIDENCE_COSINE:
+        score = max(score, semantic)
     return score
 
 
@@ -3433,16 +3554,19 @@ def _claim_compete_items(
     """Passages relevant to a specific claim.
 
     A passage is queued only with the claim that retrieved it. Sharing the
-    claim's category is not enough: that passage also needs shared content or
-    an embedding match. An opposite pole, a content-token or embedding match,
-    or a negative-case hit for that claim still qualifies. An empty quote is
-    not sent. Passages that share a code and nothing else are counted and
-    skipped. Absence-pole claims are not tested. Unspent calls are reallocated
-    by the caller.
+    claim's category is not enough. The pair also needs overlap with the
+    claim's evidence (pole, text, or quote): two content tokens, or an
+    embedding at or above the measured threshold. Opposite-pole wording and
+    hedges or exceptions about that evidence are preferred, because a claim
+    test is looking for counterevidence. An empty quote is not sent. Pairs
+    with no overlap, and same-category pairs with only a weak overlap, are
+    counted and skipped. Absence-pole claims are not tested. Unspent calls
+    are reallocated by the caller.
     """
     stats = {
         "queued": 0,
         "skipped_no_relevant_passage": 0,
+        "skipped_low_relevance": 0,
         "empty_quote_skipped": 0,
         "notes": [],
     }
@@ -3455,6 +3579,12 @@ def _claim_compete_items(
                 "Claim test skipped "
                 f"{stats['skipped_no_relevant_passage']} same-code passages with no shared content "
                 "and no embedding match. Unrelated passages were not sent."
+            )
+        if stats["skipped_low_relevance"]:
+            notes.append(
+                "Claim test skipped "
+                f"{stats['skipped_low_relevance']} passages with only weak overlap "
+                "against the claim's evidence. Low-relevance pairs were not sent."
             )
         if stats["empty_quote_skipped"]:
             notes.append(
@@ -3499,34 +3629,17 @@ def _claim_compete_items(
 
     if not claims:
         return finish([])
-    hits = negative_case_candidates(passages, segments, claims, codebook=codebook)
-    for hit in hits:
-        add(
-            str(hit.get("passage_id") or ""),
-            "claim_negative_case",
-            by_entry.get(str(hit.get("claim_id") or "")),
-        )
-    for claim in claims:
-        category_id = str(claim.get("category_id") or "")
-        written = str(claim.get("passage_id") or "")
-        if not category_id:
-            continue
-        for segment in segments:
-            passage_id = str(segment.get("passage_id") or "")
-            if str(segment.get("code_id") or "") != category_id or passage_id == written:
-                continue
-            passage = by_id.get(passage_id)
-            if passage is None:
-                continue
-            if not _passage_quote(passage):
-                if passage_id not in empty_ids:
-                    empty_ids.add(passage_id)
-                    stats["empty_quote_skipped"] += 1
-                continue
-            if _claim_similarity_score(passage, claim) <= 0:
-                stats["skipped_no_relevant_passage"] += 1
-                continue
-            add(passage_id, "claim_same_code", claim)
+    procedure = (state.get("metadata") or {}).get("procedure") or {}
+    if procedure.get("focused_synthetic_counterexample") and SYNTHETIC_PASSAGE_ID in by_id:
+        add(SYNTHETIC_PASSAGE_ID, "claim_synthetic_counterexample", claims[0])
+
+    def reject(passage: Mapping[str, Any], claim: Mapping[str, Any]) -> None:
+        shared, semantic = _claim_evidence_overlap(passage, claim)
+        if shared == 0 and semantic < _CLAIM_EVIDENCE_COSINE:
+            stats["skipped_no_relevant_passage"] += 1
+        else:
+            stats["skipped_low_relevance"] += 1
+
     poles_by_name: dict[str, set[str]] = {}
     for entry in codebook:
         for dimension in entry.get("dimensions") or []:
@@ -3560,24 +3673,58 @@ def _claim_compete_items(
             text = str(passage.get("text") or "")
             if any(_text_has_pole(text, other) for other in others):
                 add(passage_id, "claim_opposite_pole", claim)
+    for passage_id, passage in by_id.items():
+        text = str(passage.get("text") or "")
+        if not text.strip():
+            continue
+        for claim in claims:
+            if _passage_counterevidence(text, claim):
+                add(passage_id, "claim_negative_case", claim)
+    hits = negative_case_candidates(passages, segments, claims, codebook=codebook)
+    for hit in hits:
+        claim = by_entry.get(str(hit.get("claim_id") or ""))
+        passage = by_id.get(str(hit.get("passage_id") or ""))
+        if claim is None or passage is None:
+            continue
+        if _claim_pair_relevant(passage, claim, same_category=True, opposite=False):
+            add(str(hit.get("passage_id") or ""), "claim_negative_case", claim)
+    for claim in claims:
+        category_id = str(claim.get("category_id") or "")
+        written = str(claim.get("passage_id") or "")
+        if not category_id:
+            continue
+        for segment in segments:
+            passage_id = str(segment.get("passage_id") or "")
+            if str(segment.get("code_id") or "") != category_id or passage_id == written:
+                continue
+            passage = by_id.get(passage_id)
+            if passage is None:
+                continue
+            if not _passage_quote(passage):
+                if passage_id not in empty_ids:
+                    empty_ids.add(passage_id)
+                    stats["empty_quote_skipped"] += 1
+                continue
+            if not _claim_pair_relevant(passage, claim, same_category=True, opposite=False):
+                reject(passage, claim)
+                continue
+            add(passage_id, "claim_same_code", claim)
     ranked: list[tuple[float, str, Mapping[str, Any]]] = []
     for passage_id, passage in by_id.items():
         if passage_id in already or passage_id in seen:
             continue
         text = str(passage.get("text") or "")
-        passage_tokens = _content_tokens(text)
-        passage_vector = _stored_vector(passage)
+        if not text.strip():
+            continue
         best_score = 0.0
         best_claim: Mapping[str, Any] | None = None
         for claim in claims:
-            score = 0.0
-            if _claim_content_tokens(claim) & passage_tokens:
-                score = max(score, jaccard(text, _claim_blob(claim)))
-            claim_vector = _stored_vector(claim)
-            if passage_vector and claim_vector:
-                similarity = cosine(passage_vector, claim_vector)
-                if similarity >= _CLAIM_SIMILARITY_COSINE:
-                    score = max(score, similarity)
+            if not _claim_pair_relevant(passage, claim, same_category=False, opposite=False):
+                continue
+            shared, semantic = _claim_evidence_overlap(passage, claim)
+            score = semantic if semantic >= _CLAIM_EVIDENCE_COSINE else 0.0
+            if shared >= _MIN_EVIDENCE_TOKENS:
+                score = max(score, jaccard(text, " ".join(str(claim.get(key) or "") for key in ("pole", "text", "quote"))))
             if score > best_score:
                 best_score = score
                 best_claim = claim
@@ -3600,7 +3747,10 @@ def _reallocate_unspent_claim_calls(
     passages = [
         str(item.get("passage_id") or "")
         for item in (state.get("passages") or [])
-        if item.get("passage_id") and str(item.get("text") or "").strip()
+        if item.get("passage_id")
+        and str(item.get("text") or "").strip()
+        and not item.get("synthetic")
+        and str(item.get("passage_id") or "") != SYNTHETIC_PASSAGE_ID
     ]
     if not passages:
         return []
@@ -3686,6 +3836,13 @@ def _prepare_node(state: FocusedState) -> dict:
             updates["dimensions"] = dimensions
             state = {**state, "properties": properties, "dimensions": dimensions}
             relevance: dict[str, Any] = {}
+            if procedure.get("focused_synthetic_counterexample"):
+                synthetic = _synthetic_counterexample_passage(properties + dimensions)
+                passages = list(state.get("passages") or [])
+                if synthetic is not None and not any(_is_synthetic_passage(item) for item in passages):
+                    passages = passages + [synthetic]
+                    updates["passages"] = passages
+                    state = {**state, "passages": passages}
             extra = _claim_compete_items(
                 state,
                 queue,
@@ -4069,7 +4226,15 @@ def _claim_response_reason(
     expected = pair_by_passage.get(passage_id)
     if expected is None or entry_id != expected:
         return "unrequested_pair"
-    if not _quote_anchored_in_passage(str(row.get("quote") or ""), passage_text):
+    judgment = str(row.get("judgment") or "").strip().casefold()
+    quote = str(row.get("quote") or "").strip()
+    # An irrelevant judgment does not need a quote. supports, contradicts,
+    # and qualifies do: an empty or unanchored quote is not evidence.
+    if judgment == "irrelevant":
+        return ""
+    if judgment in {"supports", "contradicts", "qualifies"} and not _quote_anchored_in_passage(quote, passage_text):
+        return "unanchored_quote"
+    if quote and not _quote_anchored_in_passage(quote, passage_text):
         return "unanchored_quote"
     return ""
 
@@ -4128,6 +4293,15 @@ def _apply_claim_test(
         if target is not None:
             break
     if target is None:
+        return record
+    synthetic = passage_id == SYNTHETIC_PASSAGE_ID or bool(row.get("synthetic"))
+    if synthetic:
+        record["synthetic"] = True
+        record["excluded_from_research_outputs"] = True
+        record["flagged"] = False
+        tests = [dict(item) for item in (target.get("claim_tests") or []) if isinstance(item, Mapping)]
+        tests.append(record)
+        target["claim_tests"] = tests
         return record
     if target.get("degenerate_absence_pole"):
         valid = False
@@ -4255,6 +4429,7 @@ def _commit_node(runtime: FocusedRuntime):
         addressed = False
         extra_calls = 0
         prior_meta = state.get("metadata") or {}
+        synthetic_result: dict[str, Any] | None = None
         prior_claims = prior_meta.get("claim_test_counts") or {}
         claim_counts = {
             key: int(prior_claims.get(key) or 0)
@@ -4329,6 +4504,17 @@ def _commit_node(runtime: FocusedRuntime):
                     )
                     if recorded and invalid_reason:
                         prompt_log[-1].setdefault("claim_test_rejections", []).append(recorded)
+                    if recorded and recorded.get("synthetic"):
+                        synthetic_result = {
+                            "passage_id": passage_id,
+                            "label": SYNTHETIC_MARKER,
+                            "excluded_from_research_outputs": True,
+                            "judgment": recorded.get("judgment"),
+                            "entry_id": recorded.get("entry_id"),
+                            "detected": recorded.get("judgment") in {"contradicts", "qualifies"},
+                        }
+                    if passage_id == SYNTHETIC_PASSAGE_ID:
+                        continue
                     if passage_id not in reread:
                         reread.append(passage_id)
                     continue
@@ -4425,6 +4611,8 @@ def _commit_node(runtime: FocusedRuntime):
         version = int(state.get("snapshot_version") or 0) + 1
         consolidation = consolidate_code_proposals(segments)
         metadata = dict(state.get("metadata") or {})
+        if synthetic_result is not None:
+            metadata["synthetic_counterexample"] = synthetic_result
         metadata["claim_test_counts"] = claim_counts
         metadata["claim_test_relevance"] = _claim_test_relevance(
             properties,
@@ -4737,10 +4925,59 @@ def _selected_ids(state, key):
     return state.get("proposed_" + key) or []
 
 
+def _drop_synthetic(value: Any) -> Any:
+    """Remove the synthetic counterexample from a research export value."""
+    if isinstance(value, list):
+        kept = []
+        for item in value:
+            if item == SYNTHETIC_PASSAGE_ID:
+                continue
+            if isinstance(item, Mapping) and _is_synthetic_passage(item):
+                continue
+            kept.append(_drop_synthetic(item))
+        return kept
+    if isinstance(value, Mapping):
+        if _is_synthetic_passage(value):
+            return None
+        return {key: _drop_synthetic(item) for key, item in value.items()}
+    return value
+
+
+def _research_development(development: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop synthetic counterexample rows from a research export."""
+
+    def clean(rows: list) -> list:
+        cleaned = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            item = dict(row)
+            item["claim_tests"] = [
+                test
+                for test in (item.get("claim_tests") or [])
+                if isinstance(test, Mapping) and not test.get("synthetic") and not _is_synthetic_passage(test)
+            ]
+            item["negative_cases"] = [
+                case
+                for case in (item.get("negative_cases") or [])
+                if isinstance(case, Mapping) and not case.get("synthetic") and not _is_synthetic_passage(case)
+            ]
+            if _is_synthetic_passage(item):
+                continue
+            cleaned.append(item)
+        return cleaned
+
+    payload = dict(development)
+    payload["properties"] = clean(list(development.get("properties") or []))
+    payload["dimensions"] = clean(list(development.get("dimensions") or []))
+    dropped = _drop_synthetic(payload)
+    return dropped if isinstance(dropped, dict) else payload
+
+
 def export_focused_state(state: Mapping[str, Any], directory: str | Path) -> dict[str, str]:
     place = Path(directory)
     place.mkdir(parents=True, exist_ok=True)
-    development = _category_development(state)
+    development = _research_development(_category_development(state))
     selection = list(state.get("selection") or [])
     raised = set(_selected_ids(state, "raised_code_ids"))
     _write_json(place / "category_development.json", development)
@@ -4849,7 +5086,11 @@ def export_focused_state(state: Mapping[str, Any], directory: str | Path) -> dic
         ],
     )
     _write_json(place / "code_id_sidecar.json", code_id_sidecar(list((state.get("codebook") or {}).values())))
-    segments = list(state.get("segments") or [])
+    segments = [
+        segment
+        for segment in (state.get("segments") or [])
+        if not _is_synthetic_passage(segment if isinstance(segment, Mapping) else "")
+    ]
     assignments = _assignment_rows(segments)
     _write_json(place / "coded_segments.json", segments)
     _write_json(place / "assignments.json", assignments)
@@ -5131,6 +5372,7 @@ def _procedure(
     request_timeout: float = DEFAULT_FOCUSED_REQUEST_TIMEOUT,
     request_retries: int = DEFAULT_FOCUSED_REQUEST_RETRIES,
     claim_compete_round: bool = True,
+    synthetic_counterexample: bool = False,
 ) -> dict[str, Any]:
     if coding_lens != "charmaz":
         raise ValueError(
@@ -5193,6 +5435,7 @@ def _procedure(
         "focused_request_timeout": float(request_timeout),
         "focused_request_retries": int(request_retries),
         "focused_claim_compete_round": bool(claim_compete_round),
+        "focused_synthetic_counterexample": bool(synthetic_counterexample),
         "validation_retries": int(validation_retries),
     }
 
@@ -5233,6 +5476,7 @@ async def afocused_code(
     focused_request_timeout: float = DEFAULT_FOCUSED_REQUEST_TIMEOUT,
     focused_request_retries: int = DEFAULT_FOCUSED_REQUEST_RETRIES,
     focused_claim_compete_round: bool = True,
+    focused_synthetic_counterexample: bool = False,
     focused_share_develop: float = DEFAULT_SHARES["develop"],
     focused_share_compete: float = DEFAULT_SHARES["compete"],
     focused_share_outside: float = DEFAULT_SHARES["outside"],
@@ -5259,6 +5503,7 @@ async def afocused_code(
     allow_changes: bool = False,
     continuation: bool = False,
     recursion_limit: int | None = None,
+    raise_on_timeout: bool = False,
 ) -> FocusedResult:
     """Run focused coding over a finished open-coding result.
 
@@ -5268,7 +5513,10 @@ async def afocused_code(
     Model support is stored separately as ``model_claim_support``; human
     ``claim_support`` and the saturation judgment are not fabricated.
     Decision calls and estimated input tokens have independent allowances;
-    failures export incomplete results. ``interrupt=False`` in human mode
+    failures export incomplete results. A model or step timeout returns this
+    incomplete result, with ``stop`` ``timeout`` and a partial export when
+    ``output_dir`` is set. ``raise_on_timeout=True`` raises ``TimeoutError``
+    instead. ``interrupt=False`` in human mode
     retains the legacy behavior: accept the selection and skip claim review.
 
     ``interrupt`` defaults to true. The graph pauses inside
@@ -5321,6 +5569,7 @@ async def afocused_code(
         request_timeout=focused_request_timeout,
         request_retries=focused_request_retries,
         claim_compete_round=focused_claim_compete_round,
+        synthetic_counterexample=focused_synthetic_counterexample,
         selection_rule=focused_selection_rule,
         selection_k=focused_selection_k,
         selection_quantile=focused_selection_quantile,
@@ -5422,6 +5671,7 @@ async def afocused_code(
                 allow_changes=allow_changes or continuation,
                 recursion_limit=limit,
                 output_dir=output_dir,
+                raise_on_timeout=raise_on_timeout,
             )
     saver = checkpointer if checkpointer is not None else _memory_saver()
     if thread_id is None:
@@ -5438,6 +5688,7 @@ async def afocused_code(
         allow_changes=allow_changes or continuation,
         recursion_limit=limit,
         output_dir=output_dir,
+        raise_on_timeout=raise_on_timeout,
     )
 
 
@@ -5508,12 +5759,46 @@ def _timeout_step(exc: BaseException, snapshot: Any) -> str:
     return ""
 
 
+def _logged_focused_calls(state: Mapping[str, Any]) -> int:
+    """Model calls that were committed to the prompt log.
+
+    Preparing a job increments the counter before the worker finishes. A timeout
+    on that in-flight call must not count it. A label retry is a second call on
+    the same log row.
+    """
+    total = 0
+    for entry in state.get("prompt_log") or []:
+        if not isinstance(entry, Mapping):
+            continue
+        if str(entry.get("stage") or "focused") != "focused":
+            continue
+        total += 1
+        if entry.get("label_retry"):
+            total += 1
+    return total
+
+
+def _not_reread_ids(state: Mapping[str, Any]) -> list[str]:
+    """Queued research passages that were not committed as reread."""
+    reread = {str(item) for item in (state.get("focused_reread") or [])}
+    ids = []
+    seen: set[str] = set()
+    for passage_id in _queue_passage_ids(state.get("recode_queue") or []):
+        if not passage_id or passage_id in reread or passage_id in seen:
+            continue
+        seen.add(passage_id)
+        ids.append(passage_id)
+    return ids
+
+
 async def _record_timeout(graph, config, exc: BaseException, output_dir: str | Path | None = None) -> None:
     """Keep work already written and mark the checkpoint incomplete.
 
-    The exception still propagates. A later reader sees ``stop`` ``timeout``,
-    which step stopped, and status ``incomplete``. When an output directory is
-    set, the same state is written as a partial export.
+    A later reader sees ``stop`` ``timeout``, which step stopped, and status
+    ``incomplete``. ``focused_calls_used`` is the calls that were logged, not
+    the job that was only prepared. ``focused_not_reread`` is the queued
+    passages that were not committed. When an output directory is set, the
+    same state is written as a partial export.
     """
     try:
         snapshot = await graph.aget_state(config)
@@ -5525,6 +5810,8 @@ async def _record_timeout(graph, config, exc: BaseException, output_dir: str | P
     metadata = dict(state.get("metadata") or {})
     warnings = list(state.get("warnings") or [])
     step = _timeout_step(exc, snapshot)
+    logged_calls = _logged_focused_calls(state)
+    not_reread = _not_reread_ids(state)
     note = (
         "Focused coding is incomplete because a model call or graph step exceeded its timeout. "
         "Work already written is kept. Stop is timeout."
@@ -5546,7 +5833,14 @@ async def _record_timeout(graph, config, exc: BaseException, output_dir: str | P
     if place:
         try:
             exported = export_focused_state(
-                {**state, "metadata": metadata, "warnings": warnings, "recode_stop": "timeout"},
+                {
+                    **state,
+                    "metadata": metadata,
+                    "warnings": warnings,
+                    "recode_stop": "timeout",
+                    "focused_calls_used": logged_calls,
+                    "focused_not_reread": not_reread,
+                },
                 place,
             )
             export_paths = exported
@@ -5561,6 +5855,8 @@ async def _record_timeout(graph, config, exc: BaseException, output_dir: str | P
                 "warnings": warnings,
                 "recode_stop": "timeout",
                 "export_paths": export_paths,
+                "focused_calls_used": logged_calls,
+                "focused_not_reread": not_reread,
             },
         )
     except Exception:
@@ -5580,6 +5876,7 @@ async def _invoke(
     allow_changes: bool,
     recursion_limit: int,
     output_dir: str | Path | None,
+    raise_on_timeout: bool = False,
 ) -> FocusedResult:
     graph = build_focused_graph(runtime).compile(checkpointer=saver)
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": recursion_limit}
@@ -5621,17 +5918,28 @@ async def _invoke(
         if not _is_timeout(exc):
             raise
         await _record_timeout(graph, config, exc, output_dir)
-        if isinstance(exc, TimeoutError):
-            raise
-        # A call timeout nested under a step timeout keeps its own duration.
-        cause: BaseException | None = exc
-        seen: set[int] = set()
-        while cause is not None and id(cause) not in seen:
-            seen.add(id(cause))
-            if isinstance(cause, TimeoutError) and "timed out after" in str(cause):
-                raise cause
-            cause = cause.__cause__
-        raise TimeoutError(str(exc)) from exc
+        if raise_on_timeout:
+            if isinstance(exc, TimeoutError):
+                raise
+            # A call timeout nested under a step timeout keeps its own duration.
+            cause: BaseException | None = exc
+            seen: set[int] = set()
+            while cause is not None and id(cause) not in seen:
+                seen.add(id(cause))
+                if isinstance(cause, TimeoutError) and "timed out after" in str(cause):
+                    raise cause
+                cause = cause.__cause__
+            raise TimeoutError(str(exc)) from exc
+        snapshot = await graph.aget_state(config)
+        state = dict(getattr(snapshot, "values", None) or {})
+        return _result_from_state(
+            state,
+            interrupted=False,
+            payload=None,
+            thread_id=thread_id,
+            resumable=False,
+            checkpointer=saver,
+        )
     snapshot = await graph.aget_state(config)
     payloads = _interrupt_payloads(snapshot)
     interrupted = bool(payloads) or bool(getattr(snapshot, "next", ()))
