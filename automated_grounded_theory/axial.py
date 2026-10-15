@@ -1295,12 +1295,27 @@ def _note_review_outcome(metadata: dict[str, Any], *, audit: Mapping[str, Any] |
     _note_stage(metadata, "decision_review", required=True, status="incomplete", reason=reason or "review_error")
 
 
+_NOT_RECEIVED = {"omitted", "refused", "not_sent", "deferred"}
+
+
+def _record_audit_usage(metadata: dict[str, Any], audit: Mapping[str, Any] | None) -> None:
+    """Count one received provider response. Refusals and preservation rows are not responses."""
+    if not isinstance(audit, Mapping) or audit.get("received") is False:
+        return
+    if str(audit.get("status") or "") in _NOT_RECEIVED:
+        return
+    usage = audit.get("usage")
+    if not isinstance(usage, Mapping):
+        return
+    if not any(int(usage.get(key) or 0) for key in ("input_tokens", "output_tokens", "total_tokens")):
+        return
+    _record_usage(metadata, usage)
+
+
 def _account_responses(metadata: dict[str, Any], audits: Sequence[Mapping[str, Any]]) -> None:
-    """Count each provider response once. A refusal was not sent."""
+    """Count each received provider response once, whether or not it parsed."""
     for audit in audits:
-        if str(audit.get("status") or "") == "refused":
-            continue
-        _record_usage(metadata, audit.get("usage") if isinstance(audit.get("usage"), Mapping) else None)
+        _record_audit_usage(metadata, audit)
 
 
 def _log_call_audits(logs: list, audits: Sequence[Mapping[str, Any]], *, extra: Mapping[str, Any] | None = None) -> None:
@@ -1316,6 +1331,8 @@ def _log_call_audits(logs: list, audits: Sequence[Mapping[str, Any]], *, extra: 
         }
         if audit.get("raw_response"):
             row_extra["raw_response"] = audit.get("raw_response")
+        if "received" in audit:
+            row_extra["received"] = bool(audit.get("received"))
         if extra:
             row_extra.update(dict(extra))
         logs.append(
@@ -1624,6 +1641,50 @@ def _allocate_evidence(
     }
 
 
+def _pairs_missing_evidence(
+    window: Sequence[Mapping[str, Any]],
+    evidence: Sequence[Mapping[str, Any]],
+) -> tuple[list[Mapping[str, Any]], list[dict[str, Any]]]:
+    """Pairs whose from or to category has no passage in this request."""
+    covered: set[str] = set()
+    for row in evidence:
+        for code_id in row.get("code_ids") or []:
+            if code_id:
+                covered.add(str(code_id))
+    supported: list[Mapping[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    for pair in window:
+        ends = [str(pair.get("from_id") or ""), str(pair.get("to_id") or "")]
+        gap = [code_id for code_id in ends if code_id and code_id not in covered]
+        if gap:
+            record = _pair_record(pair)
+            record["unsupported_code_ids"] = gap
+            missing.append(record)
+        else:
+            supported.append(pair)
+    return supported, missing
+
+
+def _proposals_continue(metadata: Mapping[str, Any], pending: Sequence[Any], used: int) -> bool:
+    """Another proposal request still fits this round and was not stopped.
+
+    A recorded timeout does not discard the remaining round. The allowance
+    restored from the checkpoint still refuses a request that does not fit,
+    including the attempt that timed out.
+    """
+    if str(metadata.get("axial_stop") or "") in {"timeout", "schema_unparsed"}:
+        return False
+    procedure = metadata.get("procedure") or {}
+    return bool(pending) and used < int(procedure.get("propose_calls") or 0)
+
+
+def _route_proposals(state: AxialState) -> str:
+    metadata = state.get("metadata") or {}
+    if _proposals_continue(metadata, state.get("relation_round") or [], int(state.get("axial_calls_used") or 0)):
+        return "propose_relations"
+    return "relation_checkpoint"
+
+
 def _propose_node(runtime: AxialRuntime):
     async def propose_relations(state: AxialState) -> dict:
         metadata = dict(state.get("metadata") or {})
@@ -1667,11 +1728,11 @@ def _propose_node(runtime: AxialRuntime):
                     "omitted_evidence": omitted,
                     "paradigm_roles": list(PARADIGM_ROLES) if procedure.get("coding_lens") == "paradigm" else ["unspecified"],
                 }
-                if not evidence:
+                supported, unsupported = _pairs_missing_evidence(window, evidence)
+                if unsupported:
                     metadata["axial_stop"] = "missing_category_evidence"
                     missing = list(metadata.get("missing_category_evidence") or [])
-                    for pair in window:
-                        row = _pair_record(pair)
+                    for row in unsupported:
                         if row not in missing:
                             missing.append(row)
                     metadata["missing_category_evidence"] = missing
@@ -1684,13 +1745,18 @@ def _propose_node(runtime: AxialRuntime):
                                 "status": "deferred",
                                 "reason": "missing_category_evidence",
                                 "estimated_input_tokens": request_input_tokens(_messages("axial_proposal", payload), AxialProposalBatch),
-                                "pairs": [_pair_record(pair) for pair in window],
+                                "pairs": unsupported,
+                                "unsupported_code_ids": sorted({code_id for row in unsupported for code_id in row.get("unsupported_code_ids") or []}),
                                 "needs_review": True,
                                 "flagged": True,
                             },
                         )
                     )
-                    _remember_pairs(accounting["omitted"], window)
+                    _remember_pairs(accounting["omitted"], unsupported)
+                    # Checkpoint the defer before any provider call. Supported
+                    # pairs go back on the round for the next graph step.
+                    if supported:
+                        pending = list(supported) + list(pending)
                     window = []
                     break
                 estimate = _trim_surplus_passages(payload, window, AxialProposalBatch, token_budget)
@@ -1713,6 +1779,11 @@ def _propose_node(runtime: AxialRuntime):
                     window = window[:-1]
                     continue
                 reason = "evidence_does_not_fit" if over_request else "token_allowance"
+                allowance = getattr(runtime.limiter, "provider_allowance", None)
+                if reason == "token_allowance" and allowance is not None:
+                    preview_reason = str(allowance.preview(estimate, stage="coding").get("reason") or "")
+                    if preview_reason == "call_allowance":
+                        reason = "call_allowance"
                 metadata["axial_stop"] = reason if reason != "evidence_does_not_fit" else "request_budget"
                 logs.append(
                     _prompt_row(
@@ -1732,15 +1803,17 @@ def _propose_node(runtime: AxialRuntime):
                 )
                 _remember_pairs(accounting["omitted"], window)
                 window = []
-                if reason == "token_allowance":
-                    allowance = getattr(runtime.limiter, "provider_allowance", None)
+                if reason == "call_allowance":
+                    _remember_pairs(accounting["omitted"], pending)
+                    pending = []
+                elif reason == "token_allowance":
                     remaining = None if allowance is None else allowance.remaining_tokens()
                     if remaining == 0 or (allowance is None and estimated >= max_tokens):
                         _remember_pairs(accounting["omitted"], pending)
                         pending = []
                 break
             if not sent_chunk:
-                continue
+                break
             result = await _structured_call(
                 runtime,
                 AxialProposalBatch,
@@ -1776,7 +1849,7 @@ def _propose_node(runtime: AxialRuntime):
                 if result["refused"] and result["reason"] in {"call_allowance", "token_allowance"}:
                     _remember_pairs(accounting["omitted"], pending)
                     pending = []
-                continue
+                break
             used += 1
             _remember_pairs(accounting["attempted"], sent_chunk)
             _remember_pairs(accounting["completed"], sent_chunk)
@@ -1802,23 +1875,25 @@ def _propose_node(runtime: AxialRuntime):
                         lens=str(procedure.get("coding_lens") or "paradigm"),
                     )
                 )
+            break
         unexamined = _finalize_pair_accounting(metadata, pending)
         _sync_allowance(metadata, runtime)
         if "axial_tokens_estimated" not in metadata:
             metadata["axial_tokens_estimated"] = estimated
         accounted = metadata.get("pair_accounting") or {}
-        propose_required = int(procedure.get("propose_calls") or 0) > 0 and int(accounted.get("planned_count") or 0) > 0
-        propose_stop = str(metadata.get("axial_stop") or "")
-        attempted_n = int(accounted.get("attempted_count") or 0)
-        completed_n = int(accounted.get("completed_count") or 0)
-        if not propose_required:
-            _note_stage(metadata, "proposals", required=False, status="skipped")
-        elif attempted_n > completed_n or propose_stop == "schema_unparsed":
-            _note_stage(metadata, "proposals", required=True, status="incomplete", reason=propose_stop or "schema_unparsed")
-        elif propose_stop in _BUDGET_STOPS or propose_stop == "missing_category_evidence" or int(accounted.get("remaining_count") or 0) > 0:
-            _note_stage(metadata, "proposals", required=True, status="budget_limited", reason=propose_stop or "budget_limited")
-        else:
-            _note_stage(metadata, "proposals", required=True, status="complete")
+        if not _proposals_continue(metadata, pending, used):
+            propose_required = int(procedure.get("propose_calls") or 0) > 0 and int(accounted.get("planned_count") or 0) > 0
+            propose_stop = str(metadata.get("axial_stop") or "")
+            attempted_n = int(accounted.get("attempted_count") or 0)
+            completed_n = int(accounted.get("completed_count") or 0)
+            if not propose_required:
+                _note_stage(metadata, "proposals", required=False, status="skipped")
+            elif attempted_n > completed_n or propose_stop == "schema_unparsed":
+                _note_stage(metadata, "proposals", required=True, status="incomplete", reason=propose_stop or "schema_unparsed")
+            elif propose_stop in _BUDGET_STOPS or propose_stop == "missing_category_evidence" or int(accounted.get("remaining_count") or 0) > 0:
+                _note_stage(metadata, "proposals", required=True, status="budget_limited", reason=propose_stop or "budget_limited")
+            else:
+                _note_stage(metadata, "proposals", required=True, status="complete")
         return {
             "relationships": relationships,
             "prompt_log": logs,
@@ -1861,8 +1936,7 @@ def _relation_checkpoint(runtime: AxialRuntime):
             parsed, audit = await runtime.reviewer.decide(payload, AxialRelationDecisions, metadata)
             if audit:
                 logs.append(audit)
-                if audit.get("status") == "validated":
-                    _record_usage(metadata, audit.get("usage") if isinstance(audit, Mapping) else None)
+                _record_audit_usage(metadata, audit)
             _note_review_outcome(metadata, audit=audit, parsed=parsed)
             _sync_allowance(metadata, runtime)
             if parsed:
@@ -2140,8 +2214,7 @@ def _saturation_checkpoint(runtime: AxialRuntime):
             )
             if audit:
                 logs.append(audit)
-                if audit.get("status") == "validated":
-                    _record_usage(metadata, audit.get("usage") if isinstance(audit, Mapping) else None)
+                _record_audit_usage(metadata, audit)
             _note_review_outcome(metadata, audit=audit, parsed=parsed)
             _sync_allowance(metadata, runtime)
             if parsed:
@@ -2202,8 +2275,9 @@ def _apply_run_status(metadata: dict[str, Any]) -> None:
     axial planner left pairs unexamined.
     """
     if metadata.get("stop") == "timeout" or metadata.get("status") == "incomplete" and metadata.get("stop") == "timeout":
+        metadata["status"] = "incomplete"
         metadata["complete"] = False
-        metadata["graph_finished"] = False
+        metadata["graph_finished"] = True
         metadata["analytical_coverage"] = "incomplete"
         return
     metadata["graph_finished"] = True
@@ -2281,7 +2355,11 @@ def build_axial_graph(runtime: AxialRuntime | None = None, *, output_dir: str | 
     builder.add_edge(START, "load_focused")
     builder.add_edge("load_focused", "plan_relations")
     builder.add_edge("plan_relations", "propose_relations")
-    builder.add_edge("propose_relations", "relation_checkpoint")
+    builder.add_conditional_edges(
+        "propose_relations",
+        _route_proposals,
+        ["propose_relations", "relation_checkpoint"],
+    )
     builder.add_edge("relation_checkpoint", "counterexample_worker")
     builder.add_edge("counterexample_worker", "commit_relations")
     builder.add_edge("commit_relations", "saturation_indicators")
@@ -2332,8 +2410,7 @@ def _core_checkpoint(runtime: AxialRuntime):
             )
             if audit:
                 logs.append(audit)
-                if audit.get("status") == "validated":
-                    _record_usage(metadata, audit.get("usage") if isinstance(audit, Mapping) else None)
+                _record_audit_usage(metadata, audit)
             _note_review_outcome(metadata, audit=audit, parsed=parsed)
             _sync_allowance(metadata, runtime)
             review = (metadata.get("stage_outcomes") or {}).get("decision_review") or {}
@@ -2472,8 +2549,16 @@ def _memo_node(runtime: AxialRuntime):
                             },
                         )
                     )
-                if result["refused"]:
-                    pending = list(chunk) + list(pending)
+                # The current chunk was taken off pending before the call.
+                # A failure leaves it unresolved instead of treating it as done.
+                pending = list(chunk) + list(pending)
+                if result["unparsed"]:
+                    failed = list(metadata.get("memo_failed_ids") or [])
+                    for relationship in chunk:
+                        relationship_id = str(relationship.get("relationship_id") or "")
+                        if relationship_id and relationship_id not in failed:
+                            failed.append(relationship_id)
+                    metadata["memo_failed_ids"] = failed
                 break
             used += 1
             parsed = result["parsed"]
@@ -2504,11 +2589,42 @@ def _memo_node(runtime: AxialRuntime):
             if note not in warnings:
                 warnings.append(note)
         metadata["axial_tokens_estimated"] = estimated
+        requested_ids = [str(row.get("relationship_id") or "") for row in relationships if str(row.get("relationship_id") or "")]
+        failed_ids = [item for item in (metadata.get("memo_failed_ids") or []) if item]
+        empty_ids = [
+            str(row.get("relationship_id") or "")
+            for row in memos
+            if not str(row.get("text") or "").strip() or "memo_empty" in set(row.get("flags") or [])
+        ]
+        produced_ids = [
+            str(row.get("relationship_id") or "")
+            for row in memos
+            if str(row.get("text") or "").strip() and "memo_empty" not in set(row.get("flags") or [])
+        ]
+        pending_ids = [str(row.get("relationship_id") or "") for row in pending if str(row.get("relationship_id") or "")]
+        omitted_ids = [item for item in pending_ids if item not in set(failed_ids)]
+        metadata["memo_accounting"] = {
+            "requested": len(requested_ids),
+            "produced": len(produced_ids),
+            "omitted": len(omitted_ids),
+            "failed": len(failed_ids),
+            "empty": len(empty_ids),
+        }
         memo_stop = str(metadata.get("axial_stop") or "")
-        if pending and memo_stop == "schema_unparsed":
-            _note_stage(metadata, "memos", required=True, status="incomplete", reason=memo_stop)
-        elif pending:
+        if not requested_ids:
+            _note_stage(metadata, "memos", required=False, status="skipped")
+        elif failed_ids or empty_ids:
+            _note_stage(
+                metadata,
+                "memos",
+                required=True,
+                status="incomplete",
+                reason=memo_stop or ("schema_unparsed" if failed_ids else "memo_empty"),
+            )
+        elif pending or omitted_ids:
             _note_stage(metadata, "memos", required=True, status="budget_limited", reason=memo_stop or "call_allowance")
+        elif len(produced_ids) < len(requested_ids):
+            _note_stage(metadata, "memos", required=True, status="incomplete", reason="memo_empty")
         else:
             _note_stage(metadata, "memos", required=True, status="complete")
         return {"memos": memos, "prompt_log": logs, "selective_calls_used": used, "warnings": warnings, "metadata": metadata}
@@ -2798,7 +2914,7 @@ def _timeout_step(exc: BaseException, snapshot: Any) -> str:
     return nxt[0] if len(nxt) == 1 else ""
 
 
-async def _record_timeout(graph, config, exc: BaseException, output_dir: str | Path | None) -> None:
+async def _record_timeout(graph, config, exc: BaseException, output_dir: str | Path | None, runtime: AxialRuntime | None = None) -> None:
     try:
         snapshot = await graph.aget_state(config)
     except Exception:
@@ -2814,8 +2930,31 @@ async def _record_timeout(graph, config, exc: BaseException, output_dir: str | P
         note = f"Axial coding is incomplete because step {step} exceeded its timeout. Work already written is kept."
     if note not in warnings:
         warnings.append(note)
-    metadata.update(status="incomplete", complete=False, stop="timeout", timeout_error=str(exc), timeout_step=step, saturation_judgment=None)
-    state = {**state, "metadata": metadata, "warnings": warnings}
+    logs = list(state.get("prompt_log") or [])
+    if runtime is not None:
+        before_calls = int((metadata.get("provider_budget") or {}).get("calls_used") or 0)
+        before_tokens = int((metadata.get("provider_budget") or {}).get("tokens_estimated") or 0)
+        _sync_allowance(metadata, runtime)
+        after_calls = int((metadata.get("provider_budget") or {}).get("calls_used") or 0)
+        after_tokens = int(metadata.get("axial_tokens_estimated") or before_tokens)
+        if after_calls > before_calls:
+            logs.append(
+                _prompt_row(
+                    "provider",
+                    [],
+                    {},
+                    extra={
+                        "status": "timeout",
+                        "reason": "timeout",
+                        "estimated_input_tokens": max(0, after_tokens - before_tokens),
+                        "needs_review": True,
+                        "flagged": True,
+                        "calls": after_calls - before_calls,
+                    },
+                )
+            )
+    metadata.update(status="incomplete", complete=False, stop="timeout", timeout_error=str(exc), timeout_step=step, saturation_judgment=None, graph_finished=False)
+    state = {**state, "metadata": metadata, "warnings": warnings, "prompt_log": logs}
     paths = dict(state.get("export_paths") or {})
     place = output_dir or metadata.get("output_dir")
     if place:
@@ -2824,8 +2963,13 @@ async def _record_timeout(graph, config, exc: BaseException, output_dir: str | P
             metadata["partial_export"] = True
         except Exception:
             logger.warning("Partial axial export failed after a timeout", exc_info=True)
+    update = {"metadata": metadata, "warnings": warnings, "prompt_log": logs, "export_paths": paths}
     try:
-        await graph.aupdate_state(config, {"metadata": metadata, "warnings": warnings, "export_paths": paths})
+        nodes = getattr(graph, "nodes", {})
+        if step and step in nodes:
+            await graph.aupdate_state(config, update, as_node=step)
+        else:
+            await graph.aupdate_state(config, update)
     except Exception:
         return
 
@@ -2908,7 +3052,7 @@ async def _invoke(builder, saver, initial: AxialState | None, *, thread_id: str,
             raise
         if not _is_timeout(exc):
             raise
-        await _record_timeout(graph, config, exc, output_dir)
+        await _record_timeout(graph, config, exc, output_dir, runtime)
         if raise_on_timeout:
             if isinstance(exc, TimeoutError):
                 raise

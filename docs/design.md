@@ -367,7 +367,11 @@ Package 0.8.2 keeps a paraphrased contradiction as a negative case. Missing subj
 
 Package 0.8.3 keeps the same budget across a human checkpoint. Consumed calls and estimated tokens are stored on the graph state and restored into a new runtime before any resumed node runs, including a resume in a new process. Coding calls and reviewer calls have separate ceilings. They share one token allowance. A repair spends the stage that originated it, so an LLM reviewer does not give coding a larger call budget. `complete` requires every requested stage to finish its work. A skipped review, an omitted storyline, or a selective failure after successful proposals is `budget_limited` or `incomplete`, with a status for each stage. Provider usage is recorded for every response, including a repair that fails to parse. A pair with no segment evidence is deferred as `missing_category_evidence` instead of raising inside the packer.
 
-`policy_version` is `0.8.3`.
+`policy_version` was `0.8.3` in that release.
+
+Package 0.8.4 checkpoints each proposal request before the next one is sent. A timeout keeps the responses already written and the allowance already consumed, including the attempt that timed out. A resume continues inside that ceiling. Memos record how many were requested, produced, omitted, failed, and empty. A failed chunk stays unresolved, and a memo with no text does not make the stage `complete`. Usage is added once for each response the provider actually returned. A repair that does not fit the request budget is a preservation record: it does not reuse the failed response's token counts, and the warning says it was not sent. A decision-review response is counted when it fails to parse. Each requested pair is deferred when either category has no passage in that request, and the row names those category ids.
+
+`policy_version` is `0.8.4`.
 
 ## 26. Out of scope
 

@@ -7,6 +7,7 @@ import pickle
 import subprocess
 import sys
 from collections import defaultdict
+from pathlib import Path
 
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
@@ -22,8 +23,8 @@ from tests.test_v082 import _RepairCoder, _install_estimates
 
 
 def test_version_is_083():
-    assert __version__ == "0.8.3"
-    assert POLICY_VERSION == "0.8.3"
+    assert __version__ == "0.8.4"
+    assert POLICY_VERSION == "0.8.4"
 
 
 def _plain(value):
@@ -152,11 +153,12 @@ def test_pause_and_uninterrupted_keep_the_same_ceiling(monkeypatch, tmp_path):
     assert _view(resumed)["tokens"] == 600
     assert _view(resumed)["stages"]["coding"] == 1
     assert _view(resumed)["status"] == "budget_limited"
+    root = Path(__file__).resolve().parents[1]
     script = tmp_path / "resume_fresh.py"
     script.write_text(
         f"""
 import json, sys
-sys.path.insert(0, "/workspace")
+sys.path.insert(0, {str(root)!r})
 import automated_grounded_theory.axial as axial
 import automated_grounded_theory.batching as batching
 from tests.test_v083 import _finish_axial, _load_saver, _sized_estimate, _view
@@ -168,7 +170,7 @@ result = _finish_axial(saver, "budget", seed=3, max_axial_review_calls=4, axial_
 print(json.dumps(_view(result)))
 """
     )
-    completed = subprocess.run([sys.executable, str(script)], cwd="/workspace", capture_output=True, text=True, check=False)
+    completed = subprocess.run([sys.executable, str(script)], cwd=str(root), capture_output=True, text=True, check=False)
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout) == _view(straight)
 

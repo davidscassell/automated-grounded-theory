@@ -891,14 +891,15 @@ class OversizedRequest(RuntimeError):
         self.budget = int(budget)
 
 
-def oversized_request_message(kind: str, estimated: int, budget: int, passage_id: str = "") -> str:
+def oversized_request_message(kind: str, estimated: int, budget: int, passage_id: str = "", *, sent: bool = True) -> str:
     """Warning text for a request that is still over ``token_budget``."""
     label = {"coding": "Coding request", "schema_repair": "Schema repair"}.get(kind, kind)
     target = f" for {passage_id}" if passage_id else ""
+    outcome = "was sent" if sent else "was not sent"
     return (
         f"{label}{target} is {int(estimated)} estimated tokens, "
         f"over token_budget ({int(budget)}). "
-        "The overflow was flagged and the request was sent."
+        f"The overflow was flagged and the request {outcome}."
     )
 
 
@@ -1255,7 +1256,7 @@ async def ainvoke_structured(
         if call_audits is not None:
             call_audits.append(audit)
 
-    def _preserved(error: BaseException, usage: dict, *, reason: str, sent_messages: list, raw_text: str = "") -> tuple[tuple[dict, dict], list]:
+    def _preserved(error: BaseException, usage: dict, *, reason: str, sent_messages: list, raw_text: str = "", received: bool = True) -> tuple[tuple[dict, dict], list]:
         if not raw_text and raw_out:
             raw_text = str(raw_out[-1] or "")
         payload = {
@@ -1266,15 +1267,18 @@ async def ainvoke_structured(
             "error": str(error),
             "raw_response": raw_text,
         }
+        # A repair that was not sent is a preservation record. It must not
+        # carry the original response's usage, or that response is counted twice.
         _remember(
             {
                 "kind": "schema_repair",
                 "messages": sent_messages,
                 "estimated_input_tokens": 0,
-                "usage": usage,
-                "status": "schema_unparsed",
+                "usage": usage if received else {},
+                "status": "schema_unparsed" if received else "not_sent",
                 "reason": reason,
                 "parsed": payload,
+                "received": received,
             }
         )
         return (payload, usage), sent_messages
@@ -1347,11 +1351,28 @@ async def ainvoke_structured(
             passage_id=passage_id,
         )
         if overflow is not None:
-            logger.warning("%s", overflow)
             if on_overflow is not None:
                 on_overflow(overflow)
             if not send_repair_overflow:
-                return _preserved(first, failed_usage, reason="request_budget", sent_messages=sent, raw_text=failed_raw)
+                logger.warning(
+                    "%s",
+                    oversized_request_message(
+                        "schema_repair",
+                        overflow.estimated,
+                        overflow.budget,
+                        passage_id,
+                        sent=False,
+                    ),
+                )
+                return _preserved(
+                    first,
+                    failed_usage,
+                    reason="request_budget",
+                    sent_messages=sent,
+                    raw_text=failed_raw,
+                    received=False,
+                )
+            logger.warning("%s", overflow)
         try:
             limiter.schema_repairs = int(getattr(limiter, "schema_repairs", 0) or 0) + 1
             repaired = await limiter.ainvoke(
