@@ -371,7 +371,11 @@ Package 0.8.3 keeps the same budget across a human checkpoint. Consumed calls an
 
 Package 0.8.4 checkpoints each proposal request before the next one is sent. A timeout keeps the responses already written and the allowance already consumed, including the attempt that timed out. A resume continues inside that ceiling. Memos record how many were requested, produced, omitted, failed, and empty. A failed chunk stays unresolved, and a memo with no text does not make the stage `complete`. Usage is added once for each response the provider actually returned. A repair that does not fit the request budget is a preservation record: it does not reuse the failed response's token counts, and the warning says it was not sent. A decision-review response is counted when it fails to parse. Each requested pair is deferred when either category has no passage in that request, and the row names those category ids.
 
-`policy_version` is `0.8.4`.
+`policy_version` was `0.8.4` in that release.
+
+Package 0.8.5 requires a quote to name both categories before `citation_anchoring_rate` is 1, and reports `endpoint_anchoring_rate` when the quote names only one side. The storyline packs categories and relationships into `axial_token_budget`, sends the passages those rows cite, and records what was omitted. Rejected relationships are excluded or flagged, and `storyline.json` carries the core and its provenance. An empty core is `unset`. Memos and the storyline have separate call counts inside `max_selective_review_calls`, with one call reserved for the storyline when both run. A memo that outruns its quote is flagged `memo_quote_unsupported`. A combined run keeps the coding calls on `provider_budget`. Negative-case search is the share of relationships that received a judgment. Axial counterexample verdicts use the same irrelevance check as focused claim tests. `code_frequency_shift` names the total variation sent to the saturation reviewer; 1 is maximal change, and the model assessment does not set `judgment`. A zero property or relationship rate is `undefined_partial_coverage` when pairs remain. Obvious pairs rotate with the seed, and selective calls use their own prompt and stage. Focused claim candidates need a subject stem when the claim has one. Reallocation counts the calls that moved. Focused metadata records `stage_outcomes` and a focused budget stage. An automated saturation resume is actor `automated`.
+
+`policy_version` is `0.8.5`.
 
 ## 26. Out of scope
 

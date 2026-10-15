@@ -2901,6 +2901,22 @@ def _token_estimate_ratio(estimated: int, usage: Mapping[str, Any]) -> float | N
     return round(int(estimated) / reported, 4)
 
 
+def _focused_stage_outcomes(status: str, stop: str) -> dict[str, Any]:
+    """One focused stage. A call or token ceiling is budget_limited, not a moved-call count."""
+    reason = str(stop or "")
+    budget = reason in {"call_allowance", "token_allowance"} or (
+        reason.startswith("decision_") and ("call_allowance" in reason or "token_allowance" in reason)
+    )
+    if budget:
+        outcome = "budget_limited"
+    elif status == "complete":
+        outcome = "complete"
+        reason = ""
+    else:
+        outcome = "incomplete"
+    return {"focused": {"required": True, "status": outcome, "reason": reason}}
+
+
 def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
     procedure = (state.get("metadata") or {}).get("procedure") or {}
     stop = str(state.get("recode_stop") or "")
@@ -2955,6 +2971,7 @@ def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
             "token_estimate_ratio is the heuristic divided by provider input_tokens when the provider reported "
             "input tokens, and null otherwise. Output length is not in that ratio."
         ),
+        "stage_outcomes": _focused_stage_outcomes(status, stop),
         "max_focused_review_calls": int(procedure.get("max_focused_review_calls") or 0),
         "max_focused_review_tokens": int(procedure.get("max_focused_review_tokens") or 0),
         "focused_not_reread": not_reread,
@@ -3509,6 +3526,10 @@ _IRRELEVANCE_CUES = (
     "doesn't address",
     "does not mention",
     "doesn't mention",
+    "does not discuss",
+    "doesn't discuss",
+    "not linked",
+    "no link",
     "irrelevant",
     "unrelated",
 )
@@ -3625,19 +3646,29 @@ def _claim_pair_relevant(
 ) -> bool:
     """True when the passage is worth a claim call.
 
-    A shared code is not enough. The passage needs two content tokens in
-    common with the claim's pole, text, or quote, or an embedding at or above
-    the measured threshold. One shared token is not enough, including inside
-    the same category. An embedding at the threshold is itself the semantic
-    check and does not also need those tokens. Opposite-pole text and
-    counterevidence wording (a hedge or an exception about the claim) qualify
-    ahead of a same-category match.
+    A shared code is not enough. Opposite-pole text and counterevidence
+    wording (a hedge or an exception about the claim) qualify first. When the
+    claim names a subject, a passage qualifies when it shares one of those
+    stems, or when it shares two content tokens with the claim's pole or
+    quote. The claim's prose alone does not qualify, and an embedding match
+    does not qualify unless the subject is also present. One shared token is
+    not enough. A claim with no subject stems keeps the token or embedding bar.
     """
     if opposite or _passage_counterevidence(passage.get("text"), claim):
         return True
+    passage_text = str(passage.get("text") or "")
+    subject = _claim_subject_tokens(claim)
+    passage_stems = {_stem_token(token) for token in _content_tokens(passage_text)}
+    quoted = _content_tokens(" ".join(str(claim.get(key) or "") for key in ("pole", "quote")))
+    quote_overlap = len(quoted & _content_tokens(passage_text))
+    subject_hit = bool(subject and (passage_stems & subject))
+    if subject and not subject_hit and quote_overlap < _MIN_EVIDENCE_TOKENS:
+        return False
     shared, semantic = _claim_evidence_overlap(passage, claim)
-    if semantic >= _CLAIM_EVIDENCE_COSINE:
+    if semantic >= _CLAIM_EVIDENCE_COSINE and (not subject or subject_hit):
         return True
+    if subject and not subject_hit:
+        return quote_overlap >= _MIN_EVIDENCE_TOKENS
     return shared >= _MIN_EVIDENCE_TOKENS
 
 
@@ -5063,6 +5094,7 @@ def _review_node(state: FocusedState) -> dict:
         reserved = {purpose: 0 for purpose in COVERAGE_PURPOSES}
     transfers = [item for item in (metadata.get("call_transfers") or []) if isinstance(item, Mapping)]
     transferred_to: dict[str, list[str]] = {}
+    moved_calls: dict[str, int] = {}
     for item in transfers:
         origin = str(item.get("from") or "")
         destination = str(item.get("to") or "")
@@ -5070,6 +5102,7 @@ def _review_node(state: FocusedState) -> dict:
             transferred_to.setdefault(origin, [])
             if destination not in transferred_to[origin]:
                 transferred_to[origin].append(destination)
+            moved_calls[origin] = moved_calls.get(origin, 0) + int(item.get("calls") or 0)
     plan_flag = bool(reallocation.get("reallocated"))
     plan_purposes = set(reallocation.get("purposes") or []) if plan_flag else set()
     provider_by_purpose = state.get("purpose_provider_tokens") or {}
@@ -5088,9 +5121,11 @@ def _review_node(state: FocusedState) -> dict:
         unused = int(reserved[purpose]) - actual
         if purpose in transferred_to:
             dest = ", ".join(transferred_to[purpose])
+            moved = int(moved_calls.get(purpose) or 0)
+            coverage[purpose]["calls_moved"] = moved
             note = (
                 f"Focused reread purpose {purpose} was reserved {int(reserved[purpose])} "
-                f"of {denominator} calls and used {actual}, so {unused} calls were reallocated to {dest}."
+                f"of {denominator} calls and used {actual}, so {moved} calls were reallocated to {dest}."
             )
         elif purpose in plan_purposes:
             note = (
@@ -5108,6 +5143,7 @@ def _review_node(state: FocusedState) -> dict:
     reallocation["purposes"] = [
         purpose for purpose in COVERAGE_PURPOSES if purpose in plan_purposes or purpose in transferred_to
     ]
+    reallocation["calls_moved"] = sum(moved_calls.values())
     reallocation["reallocated"] = bool(plan_flag or transferred_to)
     coverage["reallocation"] = reallocation
     metadata["reread_reallocation"] = reallocation
@@ -5977,6 +6013,7 @@ async def afocused_code(
             provider_allowance=ProviderAllowance(
                 max_calls=int(procedure["max_focused_review_calls"]),
                 max_tokens=int(procedure["max_focused_review_tokens"]),
+                stages={"focused": int(procedure["max_focused_review_calls"])},
             ),
         ),
         validation_retries=validation_retries,

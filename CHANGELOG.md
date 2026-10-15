@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.5
+
+- A relationship quote anchors an endpoint only when it shares a content token with that category. `citation_anchoring_rate` is 1 only when both endpoints are anchored, and otherwise null. `endpoint_anchoring_rate` is the share of endpoints the quote names.
+- The storyline sends the categories and relationships that fit `axial_token_budget`, and the passages those rows cite. Omitted ids are reported. Rejected and merged relationships are left out, and a statement that cites only those rows is flagged. `storyline.json` includes `core_id` and `core_provenance`. An empty core is `unset`.
+- When memos and the storyline are both requested, one selective call is reserved for the storyline. A memo that names a category the quote does not name is kept and flagged `memo_quote_unsupported`.
+- A combined axial-then-selective run keeps the coding stage on `provider_budget` and adds the selective calls to the same counter.
+- `relationships_with_negative_case_search` counts relationships that received a counterexample judgment, over all relationships. An axial supports, contradicts, or qualifies verdict whose rationale says the passage is irrelevant is not a negative case.
+- `code_frequency_shift` is the total variation between the last two documents. 0 is the same mix and 1 is maximal change. The saturation prompt uses that name. A model assessment stays a model judgment, and `judgment` stays null. A zero property or relationship rate under partial pair coverage is `undefined_partial_coverage`.
+- Obvious pairs rotate with the seed. `pair_coverage` reports how many pairs were examined. Selective calls use their own prompt and the stage label `selective`.
+- Focused claim tests require a subject stem when the claim has one. Reallocation warnings use the calls that were moved. Focused runs record `stage_outcomes` and a focused stage on `provider_budget`. An automated saturation resume is stored with actor `automated`.
+- `policy_version` is `0.8.5`.
+
 ## 0.8.4
 
 - A proposal request is one graph step. The response and the allowance it consumed are checkpointed before the next request. A timeout keeps those responses and counts the timed-out attempt, so a resume cannot spend the ceiling again.

@@ -64,6 +64,12 @@ def _total_variation(left: Mapping[str, float], right: Mapping[str, float]) -> f
     return 0.5 * sum(abs(float(left.get(key, 0.0)) - float(right.get(key, 0.0))) for key in keys)
 
 
+CODE_FREQUENCY_SHIFT_LABEL = (
+    "Total variation between the last two documents' code mixes. "
+    "0 is the same mix. 1 is maximal change. This is not a stabilization score."
+)
+
+
 def thematic_saturation_report(
     windows: Sequence[Mapping],
     *,
@@ -74,9 +80,11 @@ def thematic_saturation_report(
 
     Each window is one document. Batch size stays 1, so a rate is the count of
     new codes, properties, or relationships first evidenced in that document.
-    ``code_frequency_stabilization`` is the total variation between the last
-    two documents' normalized assignment distributions. The figure describes
-    the difference between those documents. It does not establish theoretical
+    ``code_frequency_shift`` is the total variation between the last two
+    documents' normalized assignment distributions. 0 is the same mix and 1 is
+    maximal change. It is not a stabilization score. ``code_frequency_stabilization``
+    stores that same number for older readers. The figure describes the
+    difference between those documents. It does not establish theoretical
     saturation, and it is separate from a human confirmation. It is undefined
     with fewer than two documents, or when either of those documents has no
     assignments. A 0.8.0 report stored presence bits and is not comparable.
@@ -123,18 +131,21 @@ def thematic_saturation_report(
     relationship_level = None if not relationship_stability_report else relationship_stability_report.get("role_level")
     notes = [
         "These figures are a saturation curve, not a verdict. judgment stays null. "
-        "A researcher may record a decision separately. A model assessment is not that decision.",
-        "code_frequency_stabilization is the total variation between consecutive documents' "
-        "normalized code-assignment distributions. It describes how those documents differ. "
-        "A low figure does not establish theoretical saturation and is not a human confirmation. "
+        "A researcher may record a decision separately. A model assessment is a model judgment "
+        "and does not set judgment.",
+        "code_frequency_shift is the total variation between consecutive documents' "
+        "normalized code-assignment distributions. 0 is the same mix. 1 is maximal change. "
+        "This is not a stabilization score. A low figure does not establish theoretical saturation "
+        "and is not a human confirmation. "
+        "code_frequency_stabilization stores that same total variation for older readers. "
         "A 0.8.0 report stored presence bits (1 once a code had been seen) and is not comparable.",
     ]
     if not rows:
         notes.append("Saturation rates are undefined: there are no documents.")
     elif too_few:
-        notes.append("Code-frequency stabilization is undefined: fewer than two documents.")
+        notes.append("Code-frequency shift is undefined: fewer than two documents.")
     elif empty_comparison:
-        notes.append("Code-frequency stabilization is undefined: a document has no code assignments.")
+        notes.append("Code-frequency shift is undefined: a document has no code assignments.")
     if property_stability_report is None or property_stability_report.get("name_level") is None:
         notes.append("Property stability across passes is undefined until two runs name properties.")
     if relationship_stability_report is None or relationship_stability_report.get("role_level") is None:
@@ -147,6 +158,8 @@ def thematic_saturation_report(
         "new_property_rate": None if not rows else rows[-1]["new_property_rate"],
         "new_relationship_rate": None if not rows else rows[-1]["new_relationship_rate"],
         "code_frequency_comparison": "total_variation",
+        "code_frequency_shift": None if too_few or empty_comparison else rows[-1]["code_frequency_shift"],
+        "code_frequency_shift_label": CODE_FREQUENCY_SHIFT_LABEL,
         "code_frequency_stabilization": None if too_few or empty_comparison else rows[-1]["code_frequency_shift"],
         "property_stability": None if property_stability_report is None else dict(property_stability_report),
         "relationship_stability": None if relationship_stability_report is None else dict(relationship_stability_report),

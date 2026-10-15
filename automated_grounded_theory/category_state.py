@@ -1351,6 +1351,10 @@ def plan_relation_pairs(
         return [pair for pair in rows if tuple(sorted(pair)) not in examined_keys]
     obvious_pending = pending(obvious)
     less_pending = pending(less)
+    if obvious_pending:
+        offset = int(seed) % len(obvious_pending)
+        if offset:
+            obvious_pending = obvious_pending[offset:] + obvious_pending[:offset]
     take_obvious = int(round(round_size * obvious_share))
     take_less = round_size - take_obvious
     chosen_obvious = obvious_pending[:take_obvious]
@@ -1364,8 +1368,11 @@ def plan_relation_pairs(
     chosen = [("obvious", pair) for pair in chosen_obvious] + [("less_obvious", pair) for pair in chosen_less]
     chosen_keys = {tuple(sorted(pair)) for _band, pair in chosen}
     unexamined = [pair for pair in pairs if tuple(sorted(pair)) not in examined_keys | chosen_keys]
+    examined_count = len(examined_keys | chosen_keys)
     return {
         "pair_count": len(pairs),
+        "examined_count": examined_count,
+        "pair_coverage": None if not pairs else round(examined_count / len(pairs), 4),
         "round": [
             {"from_id": left, "to_id": right, "band": band}
             for band, (left, right) in chosen
