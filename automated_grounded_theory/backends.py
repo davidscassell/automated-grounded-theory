@@ -9,6 +9,7 @@ them; otherwise the provider SDK reads its own environment variables.
 from __future__ import annotations
 
 import asyncio
+import weakref
 from typing import Any
 
 from langchain_core.embeddings import Embeddings
@@ -289,14 +290,97 @@ def install_provider_http_timeout(model, seconds: float | None):
     return model
 
 
-def _httpx_async_clients(root: Any):
-    """Pooled async HTTP clients hanging off a chat model or runnable."""
+_OWNER_ATTR = "_agt_owner_loop"
+_CLIENTS_BY_LOOP: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _client_signature(client: Any) -> tuple:
+    try:
+        base = str(client.base_url)
+    except Exception:
+        base = ""
+    try:
+        headers = tuple(sorted((str(key), str(value)) for key, value in client.headers.items()))
+    except Exception:
+        headers = ()
+    return (base, headers)
+
+
+def _fresh_async_client(template: Any, timeout: Any) -> Any:
+    """Build a new client on the running loop. Do not copy a transport."""
+    import httpx
+
+    kwargs: dict[str, Any] = {"timeout": timeout}
+    redirects = getattr(template, "follow_redirects", None)
+    if isinstance(redirects, bool):
+        kwargs["follow_redirects"] = redirects
+    limits = getattr(template, "limits", None)
+    if limits is not None:
+        kwargs["limits"] = limits
+    try:
+        headers = dict(template.headers)
+    except Exception:
+        headers = None
+    if headers:
+        kwargs["headers"] = headers
+    try:
+        base = str(template.base_url or "")
+    except Exception:
+        base = ""
+    if base:
+        kwargs["base_url"] = template.base_url
+    try:
+        return httpx.AsyncClient(**kwargs)
+    except Exception:
+        return httpx.AsyncClient(timeout=timeout)
+
+
+def client_for_running_loop(template: Any, timeout: Any) -> Any:
+    """Return an async client constructed on the running loop.
+
+    httpx 0.28.1 does not store the loop on ``transport._pool``. A client that
+    has already completed a request keeps its locks on that loop, and the next
+    loop raises ``Event is bound to a different event loop``. Ownership is
+    recorded on the client this function builds. A later call on the same loop
+    reuses that client. A different loop gets its own. Private pool attributes
+    are not consulted.
+    """
+    loop = asyncio.get_running_loop()
+    owned = getattr(template, _OWNER_ATTR, None)
+    if owned is loop:
+        try:
+            if not template.is_closed:
+                template.timeout = timeout
+                return template
+        except Exception:
+            pass
+    bucket = _CLIENTS_BY_LOOP.setdefault(loop, {})
+    key = _client_signature(template)
+    cached = bucket.get(key)
+    if cached is not None:
+        try:
+            if not cached.is_closed:
+                cached.timeout = timeout
+                return cached
+        except Exception:
+            pass
+    client = _fresh_async_client(template, timeout)
+    try:
+        setattr(client, _OWNER_ATTR, loop)
+    except Exception:
+        pass
+    bucket[key] = client
+    return client
+
+
+def _httpx_client_slots(root: Any):
+    """``(owner, name, client)`` for each pooled async client under ``root``."""
     try:
         import httpx
     except ImportError:
         return
     seen: set[int] = set()
-    stack: list[tuple[Any, int]] = [(root, 0)]
+    stack: list[tuple[Any, Any, Any, int]] = [(None, None, root, 0)]
     names = (
         "http_client",
         "http_async_client",
@@ -308,42 +392,35 @@ def _httpx_async_clients(root: Any):
         "bound",
     )
     while stack:
-        obj, depth = stack.pop()
+        owner, name, obj, depth = stack.pop()
         if obj is None or id(obj) in seen or depth > 6:
             continue
         seen.add(id(obj))
         if isinstance(obj, (str, bytes, int, float, bool)):
             continue
         if isinstance(obj, httpx.AsyncClient):
-            yield obj
+            if owner is not None and name is not None:
+                yield owner, name, obj
             continue
-        for name in names:
+        for attr in names:
             try:
-                child = getattr(obj, name, None)
+                child = getattr(obj, attr, None)
             except Exception:
                 child = None
             if child is not None and child is not obj:
-                stack.append((child, depth + 1))
+                stack.append((obj, attr, child, depth + 1))
         steps = getattr(obj, "steps", None)
-        if isinstance(steps, (list, tuple)):
-            for step in steps:
-                stack.append((step, depth + 1))
-
-
-def _transport_loop(client: Any):
-    transport = getattr(client, "_transport", None)
-    pool = getattr(transport, "_pool", None)
-    return getattr(pool, "_loop", None), transport
+        if isinstance(steps, list):
+            for index, step in enumerate(steps):
+                stack.append((steps, index, step, depth + 1))
 
 
 async def arm_provider_clients(root: Any, seconds: float) -> None:
-    """Put pooled async clients on this loop and give every phase a deadline.
+    """Give each pooled async client to the running loop and set phase timeouts.
 
-    A client opened on the package loop keeps its socket there. The model loop
-    then sits idle with the connection open: the body is never delivered to the
-    loop that is awaiting it, and a missing read timeout never ends the wait.
-    A transport bound to some other loop is replaced so the next request opens
-    here. Connect, read, write, and pool each use ``seconds``.
+    A client that already served a request on another loop is not reused here.
+    This loop gets a client constructed on it. Connect, read, write, and pool
+    each use ``seconds``.
     """
     if root is None or seconds is None or float(seconds) <= 0:
         return
@@ -351,41 +428,27 @@ async def arm_provider_clients(root: Any, seconds: float) -> None:
     if timeout is None or isinstance(timeout, (int, float)):
         return
     try:
-        import httpx
+        import httpx  # noqa: F401
     except ImportError:
         return
-    loop = asyncio.get_running_loop()
-    for client in _httpx_async_clients(root):
+    for owner, name, client in _httpx_client_slots(root):
         try:
             client.timeout = timeout
         except Exception:
             pass
-        bound, transport = _transport_loop(client)
-        if bound is None or bound is loop or transport is None:
-            continue
         try:
-            client._transport = httpx.AsyncHTTPTransport()
+            replacement = client_for_running_loop(client, timeout)
         except Exception:
             continue
-        if bound.is_running():
-            bound.call_soon_threadsafe(_close_transport_soon, bound, transport)
-
-
-def _close_transport_soon(loop: asyncio.AbstractEventLoop, transport: Any) -> None:
-    close = getattr(transport, "aclose", None)
-    if close is None:
-        return
-
-    async def _close() -> None:
+        if replacement is client:
+            continue
         try:
-            await close()
+            if isinstance(owner, list):
+                owner[name] = replacement
+            else:
+                setattr(owner, name, replacement)
         except Exception:
-            return
-
-    try:
-        loop.create_task(_close())
-    except RuntimeError:
-        return
+            continue
 
 
 def resolve_chat_model(

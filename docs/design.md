@@ -1,7 +1,7 @@
-# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, 0.6.14, 0.6.15, and 0.6.16, focused coding in 0.7.0, fixes in 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, 0.7.6, and 0.7.7)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, 0.6.14, 0.6.15, and 0.6.16, focused coding in 0.7.0, fixes in 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, 0.7.6, 0.7.7, and 0.7.8)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
-Status: steps 1 and 2 of the v0.6 plan, plus focused coding in 0.7.0 and the 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, 0.7.6, and 0.7.7 fixes. Axial coding, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
+Status: steps 1 and 2 of the v0.6 plan, plus focused coding in 0.7.0 and the 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, 0.7.6, 0.7.7, and 0.7.8 fixes. Axial coding, theoretical sampling, and theory integration are not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
 
 The default procedure is Charmaz-informed automated analysis: initial coding against a frozen snapshot, constant comparison with distinct operations, and `build_themes` as a descriptive reporting view. It is not an axial-coding template.
 
@@ -347,7 +347,9 @@ Package 0.7.6 keeps timed model calls on one shared loop, enforces the request t
 
 Package 0.7.7 keeps a provider that accepts a connection and sends no body inside the request timeout. The reported error keeps that attempt's duration. A timeout is not retried unless the wall budget can hold another full attempt, and a retry names that shared deadline. The checkpoint records status `incomplete`, stop `timeout`, the step, and a partial export when an output directory is set. A same-code passage is a claim test only when it also shares content or an embedding; an empty quote is not sent; `claim_test_relevance` reports the rate. `supports` against a pole that states a shortfall the passage does not state is `claim_test_invalid`. `proposal_stability` compares revise and drop of the same code and lists `cross_seed_conflicts`. Property stability reports how many properties each run named. The token ceiling is unchanged; `focused_tokens_calibrated` is the ceiling divided by 1.28 and is not the stopper.
 
-`policy_version` is `0.7.7`.
+Package 0.7.8 accepts a claim-test judgment only for the requested passage and claim, and only when the quote anchors in that passage. Anything else is logged as `claim_test_invalid` and does not dispute the claim. A blocked model-loop thread is abandoned so the next call can run; killing that thread requires process isolation. httpx clients are built on the loop that uses them. A shortfall comparison is `possible_direction_mismatch`, not an automatic invalidation. Claim review packs into the remaining token allowance. The reviewer sees challenging passages within an evidence budget. The token figure is a heuristic. The 1.28 adjustment is empirical, and the ratio uses provider input tokens. Revise and drop proposals stay unapplied. A run that does not interrupt can leave a disputed claim pending.
+
+`policy_version` is `0.7.8`.
 
 ## 26. Out of scope
 

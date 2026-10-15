@@ -356,8 +356,8 @@ def test_property_key_drops_function_words_and_the_estimate_is_a_ceiling():
     assert property_key("Timing of the departure") == property_key("departure timings")
     assert property_key("timing during departure") != property_key("pace")
     assert _token_estimate_ratio(0, {}) is None
-    assert _token_estimate_ratio(128, {"total_tokens": 0}) is None
-    assert _token_estimate_ratio(128, {"total_tokens": 100}) == 1.28
+    assert _token_estimate_ratio(128, {"total_tokens": 100}) is None
+    assert _token_estimate_ratio(128, {"input_tokens": 100, "output_tokens": 40, "total_tokens": 140}) == 1.28
     fields = _status_fields(
         {
             "metadata": {"procedure": {}},
@@ -369,13 +369,15 @@ def test_property_key_drops_function_words_and_the_estimate_is_a_ceiling():
             "focused_calls_used": 0,
             "focused_tokens_used": 100,
             "focused_tokens_estimated": 128,
-            "provider_token_usage": {"input_tokens": 80, "output_tokens": 20, "total_tokens": 100},
+            "provider_token_usage": {"input_tokens": 100, "output_tokens": 20, "cached_tokens": 4, "total_tokens": 120},
         }
     )
     assert fields["token_estimate_ratio"] == 1.28
     assert fields["focused_tokens_estimated"] == 128
-    assert fields["provider_token_usage"]["total_tokens"] == 100
-    assert "ceiling" in fields["token_accounting_note"]
+    assert fields["provider_token_usage"]["input_tokens"] == 100
+    assert fields["provider_token_usage"]["output_tokens"] == 20
+    assert "heuristic" in fields["token_accounting_note"]
+    assert "input_tokens" in fields["token_accounting_note"]
 
 
 def test_llm_decision_mode_runs_both_checkpoints_offline():

@@ -42,6 +42,10 @@ class CallLimiter:
     names how many attempts ran and the deadline those attempts shared.
     Connection errors and rate limits still retry while the budget remains.
     Only a rate limit lowers the AIMD ceiling.
+    Timed calls share one model loop until a call fails to finish. That loop
+    is then abandoned and the next call uses a new one. The abandoned thread
+    is not killed. ``process_isolation=True`` runs a picklable provider in a
+    child process that is terminated when the request timeout expires.
 
     ``ainvoke`` takes one slot from an AIMD limit (the configured concurrency
     is the ceiling; a rate limit halves it, and a streak of successes adds one
@@ -77,6 +81,7 @@ class CallLimiter:
         cache: dict | None = None,
         request_timeout: float = 120.0,
         wall_timeout: float | None = None,
+        process_isolation: bool = False,
     ) -> None:
         self.concurrency = max(1, int(concurrency))
         self.max_concurrency = self.concurrency
@@ -90,6 +95,7 @@ class CallLimiter:
         self.reserved_output_tokens = max(0, int(reserved_output_tokens))
         self.request_timeout = float(request_timeout)
         self.wall_timeout = None if wall_timeout is None else float(wall_timeout)
+        self.process_isolation = bool(process_isolation)
         self._tokens = self.tokens_per_minute
         self._token_stamp: float | None = None
         self._requests = self.requests_per_minute
@@ -462,10 +468,15 @@ class CallLimiter:
         try:
             if limit and limit > 0:
                 # A sync HTTP read inside the provider call must not run on this
-                # loop. The call runs on one long-lived model loop so a pooled
-                # async client stays bound to that loop. The wait itself is
+                # loop. The call runs on the model loop. A pooled client is
+                # constructed on that loop. The wait itself is
                 # future.result(timeout) on a side thread: an idle loop cannot
-                # skip the deadline.
+                # skip the deadline. A call that does not finish is abandoned
+                # with its loop so the next provider is not stuck behind it.
+                # process_isolation runs the call in a child that can be killed.
+                # That is the only way to stop code blocked in sleep or C.
+                if self.process_isolation:
+                    return await _ainvoke_in_subprocess(runnable, payload, timeout=limit)
                 return await _ainvoke_off_loop(runnable, payload, timeout=limit)
             return await runnable.ainvoke(payload)
         finally:
@@ -1265,13 +1276,18 @@ def _deadline_executor() -> concurrent.futures.ThreadPoolExecutor:
         return _DEADLINE_EXECUTOR
 
 
-def _model_loop() -> asyncio.AbstractEventLoop:
-    """One loop for every timed model call.
+_ABANDONED_MODEL_LOOPS: list[asyncio.AbstractEventLoop] = []
 
-    A fresh loop per call drops the pooled httpx/xAI connection: the socket
-    stays bound to the loop that opened it, and the next call raises
-    ``Event is bound to a different event loop``. Callers do not keep the
-    client alive. This loop stays up for the process.
+
+def _model_loop() -> asyncio.AbstractEventLoop:
+    """The live loop for timed model calls.
+
+    Successful calls share one loop so a client built for that loop can be
+    reused. A call that does not finish (the loop thread is blocked in
+    synchronous provider code) abandons this loop. The next call starts
+    another. The abandoned thread is not killed: ``time.sleep`` and a blocked
+    C extension keep running until they return. Hard termination needs
+    :func:`run_provider_in_subprocess`.
     """
     global _MODEL_LOOP
     with _MODEL_LOOP_LOCK:
@@ -1290,6 +1306,27 @@ def _model_loop() -> asyncio.AbstractEventLoop:
             raise TimeoutError("The model-call loop did not start within 2s.")
         _MODEL_LOOP = loop
         return loop
+
+
+def _abandon_model_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Stop scheduling new work on ``loop``. Do not join its thread.
+
+    Cancelling a task does not interrupt synchronous code running on the loop
+    thread. Leaving that loop in place makes every later call wait behind the
+    blocker. The thread is abandoned. It is a daemon, and it is not killed.
+    """
+    global _MODEL_LOOP
+    with _MODEL_LOOP_LOCK:
+        if _MODEL_LOOP is loop:
+            _MODEL_LOOP = None
+        if loop not in _ABANDONED_MODEL_LOOPS:
+            _ABANDONED_MODEL_LOOPS.append(loop)
+    if not loop.is_running():
+        return
+    try:
+        loop.call_soon_threadsafe(loop.stop)
+    except RuntimeError:
+        return
 
 
 def _submit_on_loop(loop: asyncio.AbstractEventLoop, coro, context: contextvars.Context):
@@ -1326,21 +1363,22 @@ def _submit_on_loop(loop: asyncio.AbstractEventLoop, coro, context: contextvars.
 
 
 async def _ainvoke_off_loop(runnable, payload, *, timeout: float):
-    """Run one model call on the shared model loop.
+    """Run one model call on the current model loop.
 
     The deadline is ``future.result(timeout)`` on a private thread, not the
     package loop's executor. It does not depend on the package loop waking up,
     and it does not run the provider read on the package loop. Inside the
     model loop the provider call is wrapped in :func:`await_with_wall_timeout`,
     which cancels that task when the clock expires. A pooled async client is
-    given connect, read, write, and pool timeouts on this loop, and a transport
-    still bound to another loop is dropped so the read is not waited on a loop
-    that is not polling the socket. A timeout of 0 or less is not passed here.
-    The model loop is not stopped between calls.
+    constructed for this loop, with connect, read, write, and pool timeouts.
+    A timeout of 0 or less is not passed here.
 
     A finished future's ``TimeoutError`` is the call's own error. Python 3.11
     aliases ``concurrent.futures.TimeoutError`` to ``TimeoutError``, so the
-    type alone cannot tell that error from this wait expiring.
+    type alone cannot tell that error from this wait expiring. An unfinished
+    future means the loop thread did not reach the deadline. That loop is
+    abandoned so the next call is not queued behind the blocker. The blocked
+    thread is not killed.
     """
     loop = _model_loop()
     context = contextvars.copy_context()
@@ -1364,8 +1402,87 @@ async def _ainvoke_off_loop(runnable, payload, *, timeout: float):
         task = getattr(future, "task", None)
         future.cancel()
         if task is not None and loop.is_running():
-            loop.call_soon_threadsafe(task.cancel)
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass
+        # The loop did not finish the call. A blocked thread will not run the
+        # cancel until the block ends, and every later call on this loop waits
+        # behind it.
+        _abandon_model_loop(loop)
         raise TimeoutError(_timeout_message(timeout)) from None
+
+
+def _subprocess_provider_main(blob: bytes, result_queue) -> None:
+    """Child entry. ``runnable`` and ``payload`` were pickled by the parent."""
+    import pickle
+
+    try:
+        runnable, payload = pickle.loads(blob)
+        result = asyncio.run(runnable.ainvoke(payload))
+        result_queue.put(("ok", pickle.dumps(result)))
+    except BaseException as exc:
+        try:
+            import pickle as _pickle
+
+            result_queue.put(("err", f"{type(exc).__name__}: {exc}", _pickle.dumps(exc)))
+        except Exception:
+            result_queue.put(("err", f"{type(exc).__name__}: {exc}", None))
+
+
+def run_provider_in_subprocess(runnable, payload, *, timeout: float):
+    """Run ``runnable.ainvoke(payload)`` in a child process and kill it on timeout.
+
+    Abandoning a loop thread does not stop ``time.sleep`` or a blocked C
+    extension. A subprocess can be terminated. ``runnable`` and ``payload``
+    must be picklable. A live HTTP client, a closure, or most chat-model
+    instances are not: this raises ``TypeError`` instead of running them on
+    the shared loop. The child uses ``spawn``, so it does not inherit this
+    process's event loop.
+    """
+    import multiprocessing
+    import pickle
+
+    try:
+        blob = pickle.dumps((runnable, payload))
+    except Exception as exc:
+        raise TypeError(
+            "process_isolation needs a picklable provider and payload. "
+            "A live HTTP client is not picklable. "
+            "Abandoning a blocked loop thread does not kill that thread; "
+            "only this subprocess can."
+        ) from exc
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    process = ctx.Process(target=_subprocess_provider_main, args=(blob, result_queue), daemon=True)
+    process.start()
+    process.join(float(timeout))
+    if process.is_alive():
+        process.terminate()
+        process.join(1)
+        if process.is_alive():
+            process.kill()
+            process.join(1)
+        raise TimeoutError(_timeout_message(timeout))
+    if result_queue.empty():
+        raise RuntimeError("The provider process ended without a result.")
+    message = result_queue.get()
+    kind = message[0]
+    if kind == "ok":
+        return pickle.loads(message[1])
+    text = message[1] if len(message) > 1 else "provider process failed"
+    loaded = message[2] if len(message) > 2 else None
+    if loaded:
+        try:
+            raise pickle.loads(loaded)
+        except Exception:
+            pass
+    raise RuntimeError(text)
+
+
+async def _ainvoke_in_subprocess(runnable, payload, *, timeout: float):
+    """Blocking process wait, off the caller's loop."""
+    return await asyncio.to_thread(run_provider_in_subprocess, runnable, payload, timeout=timeout)
 
 
 async def await_with_wall_timeout(awaitable, timeout: float | None):

@@ -20,8 +20,8 @@ from tests.test_v072 import _passages_for_shares, _share_segments
 
 
 def test_version_is_073():
-    assert __version__ == "0.7.7"
-    assert POLICY_VERSION == "0.7.7"
+    assert __version__ == "0.7.8"
+    assert POLICY_VERSION == "0.7.8"
 
 
 def test_claim_compete_has_a_reserved_share_and_its_own_coverage():
@@ -338,7 +338,7 @@ def test_provider_usage_is_separate_from_the_estimate():
     assert usage["total_tokens"] == 48
     assert result.metadata["focused_tokens_used"] == 48
     assert result.metadata["focused_tokens_estimated"] > result.metadata["focused_tokens_used"]
-    assert "ceiling" in result.metadata["token_accounting_note"]
+    assert "heuristic" in result.metadata["token_accounting_note"]
     assert "not provider usage" in result.metadata["token_accounting_note"]
 
 
