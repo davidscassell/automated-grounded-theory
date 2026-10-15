@@ -4,8 +4,9 @@ request plus reserved output fits.
 ``token_budget`` is the whole call: instructions, retrieved definitions,
 examples, neighbors, metadata, schema, the passages, and room for the model's
 answer. When a tokenizer with ``encode`` is available it is used. Otherwise
-tokens are estimated as characters / 3, which is deliberately higher than the
+tokens are estimated as characters / 3, a heuristic that is deliberately higher than the
 old characters / 4 average so JSON keys and instructions are not under-counted.
+It is not a guaranteed ceiling.
 
 A single passage that cannot fit is split on whitespace into pieces that do.
 If no piece fits, that passage is sent alone and named in a warning.
@@ -26,35 +27,53 @@ from automated_grounded_theory.prompts import message_text
 _BROKEN_TOKENIZERS: set[int] = set()
 
 
-# Live focused runs reported estimate / provider total_tokens around 1.28.
-# The stopper stays the ceiling below. This factor is only a reported reading.
-TOKEN_ESTIMATE_CALIBRATION = 1.28
+# Live focused runs on the corpora used for those evals reported the character
+# heuristic divided by provider *total* tokens around 1.27–1.29. That ratio
+# mixes output length into the denominator, so it is not a tokenizer
+# calibration and it is not portable to other models or corpora. The figure
+# below is only an empirical adjustment for that observed condition.
+# Allowances still use the unadjusted heuristic.
+TOKEN_ESTIMATE_ADJUSTMENT = 1.28
+TOKEN_ESTIMATE_CALIBRATION = TOKEN_ESTIMATE_ADJUSTMENT
+TOKEN_ESTIMATE_ADJUSTMENT_NOTE = (
+    "Empirical adjustment from focused-coding live runs where the character "
+    "heuristic divided by provider total tokens was about 1.27 to 1.29. "
+    "It is not a general calibration and it is not a guaranteed ceiling. "
+    "Compare the heuristic to provider input tokens. Output length is separate."
+)
 
 
 def estimate_tokens(text: str) -> int:
-    """Ceiling used before a call. About three characters per token.
+    """Heuristic of about three characters per token. Not a guaranteed ceiling.
 
     That is higher than a four-characters-per-token English count, so the
-    estimate runs above provider usage. It is not calibrated down: the ceiling
-    is what stops a reread. Empty text is zero. Any other text is at least one
-    token. Report this ceiling beside provider usage. A separate calibrated
-    reading divides the ceiling by :data:`TOKEN_ESTIMATE_CALIBRATION` and is
-    not what stops the run.
+    estimate often runs above provider input usage. It is what stops a reread
+    when no provider tokenizer is available. Empty text is zero. Any other
+    text is at least one token. Report it beside provider input, output, and
+    cached counts. Do not treat it as those counts. An adjusted reading divides
+    the heuristic by :data:`TOKEN_ESTIMATE_ADJUSTMENT` under the conditions in
+    :data:`TOKEN_ESTIMATE_ADJUSTMENT_NOTE` and is not what stops the run.
     """
     if not text:
         return 0
     return max(1, (len(text) + 2) // 3)
 
 
-def calibrated_token_estimate(estimated: int) -> int:
-    """Lower reading of a ceiling, near observed provider usage.
+def adjusted_token_estimate(estimated: int) -> int:
+    """Heuristic divided by :data:`TOKEN_ESTIMATE_ADJUSTMENT`.
 
-    Not the stopper. Allowances still use :func:`estimate_tokens`.
+    Not the stopper. Not provider usage. The divisor is the empirical
+    adjustment described in :data:`TOKEN_ESTIMATE_ADJUSTMENT_NOTE`.
     """
     count = int(estimated or 0)
     if count <= 0:
         return 0
-    return max(1, int(round(count / TOKEN_ESTIMATE_CALIBRATION)))
+    return max(1, int(round(count / TOKEN_ESTIMATE_ADJUSTMENT)))
+
+
+def calibrated_token_estimate(estimated: int) -> int:
+    """Alias of :func:`adjusted_token_estimate`. Not a general calibration."""
+    return adjusted_token_estimate(estimated)
 
 
 def resolve_tokenizer(model):

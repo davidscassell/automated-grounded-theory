@@ -125,15 +125,138 @@ def selection_payload(state):
             "evidence_scope": "Up to two quote excerpts per code; not the full corpus."}
 
 
-def claims_payload(state, claims):
-    ids = {c.get("passage_id") for c in claims}
-    category_ids = {c.get("category_id") for c in claims}
-    return {"kind": "focused_claims", "context": state.get("metadata", {}).get("context"),
-            "claims": claims,
-            "passages": [{k: p.get(k) for k in ("passage_id", "doc_id", "text", "question")}
-                         for p in state.get("passages", []) if p.get("passage_id") in ids],
-            "categories": [{k: c.get(k) for k in ("code_id", "code", "definition")}
-                           for c in state.get("codebook", {}).values() if c.get("code_id") in category_ids]}
+# Characters of passage text included with a claim review. Primary passages
+# come first. Further evidence is omitted once this budget is spent, and the
+# payload names what was left out.
+EVIDENCE_CHAR_BUDGET = 24000
+
+
+def evidence_passage_ids(claims):
+    """Passage ids the reviewer needs: the claim's own, then challenging evidence.
+
+    Order is the claim's ``passage_id``, then cited and coded passages,
+    citations, negative cases, and claim tests. Duplicates are dropped.
+    """
+    primary = []
+    extra = []
+
+    def add(bucket, passage_id):
+        passage_id = str(passage_id or "")
+        if passage_id:
+            bucket.append(passage_id)
+
+    for claim in claims or []:
+        if not isinstance(claim, dict) and not hasattr(claim, "get"):
+            continue
+        add(primary, claim.get("passage_id"))
+        for key in ("cited_passage_id", "coded_passage_id"):
+            add(extra, claim.get(key))
+        for citation in claim.get("citations") or []:
+            if isinstance(citation, dict) or hasattr(citation, "get"):
+                add(extra, citation.get("passage_id"))
+        for bucket_name in ("negative_cases", "claim_tests"):
+            for row in claim.get(bucket_name) or []:
+                if isinstance(row, dict) or hasattr(row, "get"):
+                    add(extra, row.get("passage_id"))
+    ordered = []
+    seen = set()
+    for passage_id in primary + extra:
+        if passage_id not in seen:
+            seen.add(passage_id)
+            ordered.append(passage_id)
+    return ordered
+
+
+def claims_payload(state, claims, *, evidence_char_budget=EVIDENCE_CHAR_BUDGET):
+    """Claims plus the passages that support or challenge them.
+
+    ``evidence_char_budget`` is a character budget for passage text, not the
+    decision token allowance. Passages that do not fit are listed in
+    ``omitted_context`` and are not sent. A single passage longer than the
+    budget is truncated and still reported as omitted context.
+    """
+    by_id = {
+        str(passage.get("passage_id") or ""): passage
+        for passage in state.get("passages", [])
+        if passage.get("passage_id")
+    }
+    included = []
+    omitted = []
+    used = 0
+    budget = max(0, int(evidence_char_budget))
+    for passage_id in evidence_passage_ids(claims):
+        passage = by_id.get(passage_id)
+        if passage is None:
+            omitted.append({"passage_id": passage_id, "reason": "missing_passage"})
+            continue
+        text = str(passage.get("text") or "")
+        row = {key: passage.get(key) for key in ("passage_id", "doc_id", "text", "question")}
+        if included and used + len(text) > budget:
+            omitted.append({"passage_id": passage_id, "reason": "evidence_budget", "characters": len(text)})
+            continue
+        if not included and len(text) > budget:
+            row = dict(row)
+            row["text"] = text[:budget]
+            row["truncated"] = True
+            included.append(row)
+            used += min(len(text), budget)
+            omitted.append({"passage_id": passage_id, "reason": "truncated_to_budget", "characters": len(text)})
+            continue
+        included.append(row)
+        used += len(text)
+    category_ids = {claim.get("category_id") for claim in claims}
+    return {
+        "kind": "focused_claims",
+        "context": state.get("metadata", {}).get("context"),
+        "claims": claims,
+        "passages": included,
+        "omitted_context": omitted,
+        "evidence_char_budget": budget,
+        "evidence_characters": used,
+        "categories": [
+            {key: code.get(key) for key in ("code_id", "code", "definition")}
+            for code in state.get("codebook", {}).values()
+            if code.get("code_id") in category_ids
+        ],
+    }
+
+
+def next_claim_batch(reviewer, state, records, cursor, tokens_used):
+    """Pack the next claim review against the request budget and what remains.
+
+    The limit is ``min(token_budget, remaining allowance)``. A batch that does
+    not fit is shrunk to the prefix that does. One claim that is larger than
+    ``token_budget`` stops as ``request_budget``. One claim that fits a
+    request but not the remaining allowance stops as ``token_allowance``.
+    Those two are not the same as a batch that was only too big together.
+
+    Returns ``(batch, stop, detail)``. ``batch`` is empty when ``stop`` is set.
+    ``detail`` is ``single_claim_exceeds_request_budget``,
+    ``single_claim_exceeds_remaining_allowance``, ``batch_shrunk_to_fit``,
+    or ``None``.
+    """
+    if cursor >= len(records):
+        return [], None, None
+    remaining = int(reviewer.max_tokens) - int(tokens_used)
+    per_request = int(reviewer.token_budget)
+    limit = min(per_request, remaining)
+    first = [records[cursor]]
+    first_estimate = reviewer.estimate(claims_payload(state, first), ClaimDecisions)
+    if first_estimate > per_request:
+        return [], "request_budget", "single_claim_exceeds_request_budget"
+    if first_estimate > remaining:
+        return [], "token_allowance", "single_claim_exceeds_remaining_allowance"
+    batch = list(first)
+    shrunk = False
+    while cursor + len(batch) < len(records):
+        candidate = batch + [records[cursor + len(batch)]]
+        estimate = reviewer.estimate(claims_payload(state, candidate), ClaimDecisions)
+        if estimate > limit:
+            shrunk = True
+            break
+        batch = candidate
+    detail = "batch_shrunk_to_fit" if shrunk else None
+    return batch, None, detail
 
 
 def apply_model_claim_decisions(claims, decisions, audit):

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.8
+
+- A claim-test response is accepted only for the requested `(passage_id, claim_id)` pair, and only when the quote anchors in that passage. An unrequested pair or an unanchored quote is kept in the prompt log as `claim_test_invalid` with reason `unrequested_pair` or `unanchored_quote`. It is not a negative case and it does not dispute the claim.
+- A provider that blocks the model-loop thread times out, and that loop is abandoned so the next call is not stuck behind it. The blocked thread is not killed. Hard termination is `process_isolation` (a picklable provider in a subprocess). Pooled httpx clients are constructed on the loop that uses them. httpx 0.28 does not expose the pool's loop, so ownership is explicit.
+- A shortfall pole versus a passage is `possible_direction_mismatch`, a diagnostic that asks for inspection. It is not automatic `claim_test_invalid`. A paraphrase such as `visits too rarely` is not a mismatch. A shortfall phrase in a clause about something else does not suppress the diagnostic.
+- LLM claim review packs against `min(decision_token_budget, remaining allowance)`. One claim that exceeds the request budget is `request_budget`. One claim that exceeds what remains is `token_allowance`. A batch that is only too big together is shrunk.
+- `claims_payload` includes passages from the claim, its citations, negative cases, and claim tests, deduped, within `evidence_char_budget`. Omitted passages are `omitted_context`.
+- `focused_tokens_estimated` is a character heuristic, not a guaranteed ceiling. `focused_tokens_adjusted` divides it by 1.28, an empirical adjustment from focused-coding live runs where that heuristic over provider total tokens was about 1.27–1.29. It is not a general calibration and it is not the stopper. `token_estimate_ratio` compares the heuristic to provider input tokens. Input, output, and cached usage stay separate.
+- Revise and drop proposals stay unapplied. A run that does not interrupt can leave a disputed claim pending.
+- `policy_version` is `0.7.8`.
+
 ## 0.7.7
 
 - A provider that accepts a connection and never sends a body is cut off at the request timeout, on the shared model loop. The deadline thread is not the package loop's executor. Pooled async clients get connect, read, write, and pool timeouts on that loop, and a transport still bound to another loop is replaced so the read is not waited where the socket is not polled. `asyncio.wait` cancels the provider task when the clock expires. A timeout is not retried unless the wall budget can hold another full request timeout. The error keeps the attempt's own duration. A retry that still fails also names the attempt count and that shared deadline. Python 3.11 aliases `concurrent.futures.TimeoutError` to `TimeoutError`; a finished call timeout is no longer rewritten as the sync-bridge budget. The graph records status `incomplete`, stop `timeout`, `timeout_step`, and writes a partial export when an output directory is set. A watched step does not retry its own node timeout.

@@ -150,7 +150,7 @@ from automated_grounded_theory.version import __version__
 logger = logging.getLogger("automated_grounded_theory")
 from automated_grounded_theory.decision_review import (
     DecisionReviewer, SelectionDecision, ClaimDecisions, selection_payload,
-    claims_payload, apply_model_claim_decisions,
+    claims_payload, apply_model_claim_decisions, next_claim_batch,
 )
 
 DEFAULT_FOCUSED_WEIGHT_FREQUENCY = 1.0
@@ -2869,8 +2869,13 @@ def _coverage_statement(state: Mapping[str, Any], not_reread: Sequence[str]) -> 
 
 
 def _token_estimate_ratio(estimated: int, usage: Mapping[str, Any]) -> float | None:
-    """Estimated ceiling divided by provider total. Null when the provider reported nothing."""
-    reported = int(usage.get("total_tokens") or 0)
+    """Heuristic estimate divided by provider input tokens.
+
+    Null when the provider reported no input tokens. Output and cached tokens
+    stay in ``provider_token_usage`` and are not part of this ratio: a long
+    answer would otherwise change a comparison of the input estimate.
+    """
+    reported = int(usage.get("input_tokens") or 0)
     if reported <= 0 or int(estimated) <= 0:
         return None
     return round(int(estimated) / reported, 4)
@@ -2910,6 +2915,7 @@ def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
         "focused_calls_used": int(state.get("focused_calls_used") or 0),
         "focused_tokens_used": int(state.get("focused_tokens_used") or 0),
         "focused_tokens_estimated": int(state.get("focused_tokens_estimated") or 0),
+        "focused_tokens_adjusted": calibrated_token_estimate(int(state.get("focused_tokens_estimated") or 0)),
         "focused_tokens_calibrated": calibrated_token_estimate(int(state.get("focused_tokens_estimated") or 0)),
         "provider_token_usage": dict(state.get("provider_token_usage") or _empty_provider_usage()),
         "token_estimate_ratio": _token_estimate_ratio(
@@ -2917,14 +2923,15 @@ def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
             dict(state.get("provider_token_usage") or {}),
         ),
         "token_accounting_note": (
-            "focused_tokens_estimated is a pre-call ceiling, not a bill, not provider usage, and not a calibrated tokenizer count. "
-            "Without a provider tokenizer the ceiling is about three characters per token, plus schema and "
-            "message framing, which runs higher than provider usage. "
-            "focused_tokens_calibrated divides that ceiling by 1.28, near the live estimate-to-provider ratio. "
-            "It is not what stops the reread. "
-            "focused_tokens_used and provider_token_usage are the provider's counts. "
-            "token_estimate_ratio is estimated divided by provider total_tokens when the provider reported "
-            "tokens, and null otherwise. The ceiling is what stops the reread. It is not lowered to match the bill."
+            "focused_tokens_estimated is a pre-call heuristic, not a bill and not provider usage. "
+            "Without a provider tokenizer the heuristic is about three characters per token, plus schema and "
+            "message framing. It often runs higher than provider input usage. It is what stops the reread. "
+            "focused_tokens_adjusted (also stored as focused_tokens_calibrated) divides that heuristic by 1.28. "
+            "The divisor is an empirical adjustment from focused-coding live runs where the heuristic divided by "
+            "provider total tokens was about 1.27 to 1.29. It is not a general calibration and it is not the stopper. "
+            "provider_token_usage keeps input_tokens, output_tokens, and cached_tokens separate. "
+            "token_estimate_ratio is the heuristic divided by provider input_tokens when the provider reported "
+            "input tokens, and null otherwise. Output length is not in that ratio."
         ),
         "max_focused_review_calls": int(procedure.get("max_focused_review_calls") or 0),
         "max_focused_review_tokens": int(procedure.get("max_focused_review_tokens") or 0),
@@ -3263,18 +3270,95 @@ def _has_gap_language(value: Any) -> bool:
     return bool(set(text.split()) & _GAP_WORDS)
 
 
-def _pole_direction_mismatch(pole: Any, passage: Any) -> bool:
-    """True when ``supports`` would treat a contrast as the same direction.
+_SHORTFALL_PARAPHRASES = (
+    "too rarely",
+    "rarely",
+    "seldom",
+    "too little",
+    "too few",
+    "insufficient",
+    "not often",
+    "hardly",
+    "lack of",
+    "lacking",
+    "short of",
+    "too infrequent",
+)
+_SUBJECT_SKIP = _GAP_WORDS | frozenset(
+    {
+        "needs",
+        "need",
+        "needed",
+        "should",
+        "ought",
+        "actually",
+        "really",
+        "during",
+        "with",
+        "from",
+        "that",
+        "this",
+        "they",
+        "them",
+        "have",
+        "does",
+    }
+)
 
-    A pole that says someone needs to do more is not the same claim as a
-    passage that says they already do the activity. Bare ``absent`` is not a
-    gap marker. A passage that states the same shortfall is not a mismatch.
+
+def _stem_token(token: str) -> str:
+    if len(token) > 4 and token.endswith("s"):
+        return token[:-1]
+    return token
+
+
+def _subject_tokens(text: Any) -> set[str]:
+    """Content stems of a pole or clause, without shortfall wording."""
+    tokens = set()
+    for token in _content_tokens(str(text or "")):
+        stem = _stem_token(token)
+        if token in _SUBJECT_SKIP or stem in _SUBJECT_SKIP:
+            continue
+        tokens.add(stem)
+    return tokens
+
+
+def _clauses(text: Any) -> list[str]:
+    return [part.strip() for part in re.split(r"[.;!?]+|\n+|\bbut\b", str(text or ""), flags=re.IGNORECASE) if part.strip()]
+
+
+def _states_shortfall(text: Any) -> bool:
+    """Gap wording or a paraphrase such as ``too rarely`` in this clause."""
+    if _has_gap_language(text):
+        return True
+    folded = " ".join(str(text or "").casefold().split())
+    return any(phrase in folded for phrase in _SHORTFALL_PARAPHRASES)
+
+
+def _possible_direction_mismatch(pole: Any, passage: Any) -> bool:
+    """Diagnostic: the pole states a shortfall this passage may not share.
+
+    A compatible paraphrase (``needs to visit more`` and ``visits too rarely``)
+    is not a mismatch. A shortfall phrase in a clause about something else does
+    not count as the passage stating this pole. This does not by itself make
+    the judgment ``claim_test_invalid``.
     """
     if not _has_gap_language(pole):
         return False
-    if _has_gap_language(passage):
+    text = str(passage or "").strip()
+    if not text:
         return False
-    return bool(str(passage or "").strip())
+    subject = _subject_tokens(pole)
+    clauses = _clauses(text) or [text]
+    about = [clause for clause in clauses if subject and (_subject_tokens(clause) & subject)]
+    if about:
+        return not any(_states_shortfall(clause) for clause in about)
+    return True
+
+
+def _pole_direction_mismatch(pole: Any, passage: Any) -> bool:
+    """Alias of :func:`_possible_direction_mismatch`."""
+    return _possible_direction_mismatch(pole, passage)
 
 
 def _content_tokens(text: str) -> set[str]:
@@ -3723,13 +3807,14 @@ def _prepare_node(state: FocusedState) -> dict:
         str(item.get("passage_id") or ""): _initial_code_rows(str(item.get("passage_id") or ""), segments, codebook)
         for item in chosen_items
     }
+    claim_by_passage = _claims_by_passage(chosen_items)
     messages, schema = _recode_request(
         chosen,
         raised,
         other=other,
         purposes=purposes,
         initial_codes=initial_codes,
-        claims=_claims_by_passage(chosen_items),
+        claims=claim_by_passage,
     )
     estimate = request_input_tokens(messages, schema, resolve_tokenizer(None))
     calls = int(state.get("focused_calls_used") or 0)
@@ -3754,7 +3839,8 @@ def _prepare_node(state: FocusedState) -> dict:
             "allow_label_retry": allow_retry and int(procedure.get("validation_retries") or 0) > 0,
             "purposes": purposes,
             "initial_codes": initial_codes,
-            "claims": _claims_by_passage(chosen_items),
+            "claims": claim_by_passage,
+            "claim_pairs": _claim_pairs(claim_by_passage),
             "claim_sources": {
                 str(item.get("passage_id") or ""): str(item.get("source") or "") for item in chosen_items
             },
@@ -3857,6 +3943,7 @@ def _worker(runtime: FocusedRuntime):
             "coding": parsed,
             "passage_ids": list(job.get("passage_ids") or []),
             "purposes": purposes,
+            "claim_pairs": list(job.get("claim_pairs") or _claim_pairs(claims)),
             "claim_sources": dict(job.get("claim_sources") or {}),
             "calls": calls,
             "usage": usage,
@@ -3930,7 +4017,6 @@ def _claim_test_relevance(
                 if (
                     str(row.get("judgment") or "") in {"supports", "contradicts", "qualifies"}
                     and row.get("valid_test")
-                    and not row.get("direction_mismatch")
                 ):
                     relevant += 1
     merged = {key: value for key, value in dict(prior or {}).items() if key != "notes"}
@@ -3938,6 +4024,54 @@ def _claim_test_relevance(
     merged["relevant_judgments"] = relevant
     merged["relevance_rate"] = None if judgments == 0 else round(relevant / judgments, 4)
     return merged
+
+
+def _quote_anchored_in_passage(quote: str, passage_text: str) -> bool:
+    """True when ``quote`` is an exact or normalized span of this passage.
+
+    A fuzzy, modified, or missing quote is not enough to dispute a claim.
+    Neighbor and document hits are not this passage.
+    """
+    if not str(quote or "").strip() or not str(passage_text or "").strip():
+        return False
+    anchor = anchor_quote(str(quote), str(passage_text))
+    return anchor.status in {"exact", "normalized_match"} and anchor.source == "passage"
+
+
+def _claim_pairs(claims: Mapping[str, Any] | None) -> list[dict[str, str]]:
+    """Requested ``(passage_id, claim_id)`` pairs for one claim-test call."""
+    pairs = []
+    for passage_id, claim in (claims or {}).items():
+        if not isinstance(claim, Mapping):
+            continue
+        pairs.append(
+            {
+                "passage_id": str(passage_id),
+                "claim_id": str(claim.get("entry_id") or ""),
+            }
+        )
+    return pairs
+
+
+def _claim_response_reason(
+    row: Mapping[str, Any],
+    passage_id: str,
+    passage_text: str,
+    pair_by_passage: Mapping[str, str],
+) -> str:
+    """Why a returned judgment must not dispute a claim.
+
+    ``unrequested_pair`` means the ``(passage_id, entry_id)`` was not in the
+    request. ``unanchored_quote`` means the quote is not in that passage.
+    Empty means the pair was requested and the quote anchors.
+    """
+    entry_id = str(row.get("entry_id") or "")
+    expected = pair_by_passage.get(passage_id)
+    if expected is None or entry_id != expected:
+        return "unrequested_pair"
+    if not _quote_anchored_in_passage(str(row.get("quote") or ""), passage_text):
+        return "unanchored_quote"
+    return ""
 
 
 def _apply_claim_test(
@@ -3949,20 +4083,29 @@ def _apply_claim_test(
     *,
     valid: bool,
     passage_text: str = "",
-) -> None:
+    invalid_reason: str = "",
+) -> dict[str, Any] | None:
     """Record a claim-test judgment. Only a valid contradicts or qualifies disputes the claim.
 
-    A valid test retrieved the passage for this claim and the claim is not an
-    absence pole. Any other contradicts or qualifies is stored and flagged,
-    and does not become a negative case. ``supports`` for a pole that states a
-    shortfall, when the passage does not, is ``claim_test_invalid``. Human
-    ``claim_support`` and ``review_actor`` stay untouched.
+    A valid test was requested for this ``(passage_id, claim_id)``, the quote
+    anchors in the passage, the passage was retrieved for this claim, and the
+    claim is not an absence pole. ``unrequested_pair`` and ``unanchored_quote``
+    are stored as ``claim_test_invalid`` and do not become negative cases.
+    A possible direction mismatch is a diagnostic on ``supports``. It asks for
+    inspection. It does not by itself invalidate the test or dispute the claim.
+    Human ``claim_support`` and ``review_actor`` stay untouched.
+
+    Returns the record. The caller keeps a copy on the prompt log when the
+    reason is set, including when the named claim does not exist.
     """
     judgment = str(row.get("judgment") or "").strip().casefold()
     if judgment not in {"supports", "contradicts", "qualifies", "irrelevant"}:
-        return
+        return None
     counts[judgment] = int(counts.get(judgment) or 0) + 1
     entry_id = str(row.get("entry_id") or "")
+    reason = str(invalid_reason or "")
+    if reason:
+        valid = False
     record = {
         "entry_id": entry_id,
         "passage_id": passage_id,
@@ -3970,10 +4113,11 @@ def _apply_claim_test(
         "rationale": str(row.get("rationale") or ""),
         "quote": str(row.get("quote") or ""),
         "applied": False,
-        "flagged": judgment in {"contradicts", "qualifies"},
+        "flagged": judgment in {"contradicts", "qualifies"} or bool(reason),
         "valid_test": bool(valid),
         "source": "claim_test",
         "actor": "model",
+        "reason": reason,
     }
     target = None
     for bucket in (properties, dimensions):
@@ -3984,17 +4128,23 @@ def _apply_claim_test(
         if target is not None:
             break
     if target is None:
-        return
+        return record
     if target.get("degenerate_absence_pole"):
         valid = False
         record["valid_test"] = False
+        if not reason:
+            reason = "degenerate_absence_pole"
+            record["reason"] = reason
     statement = str(target.get("pole") or "") or str(target.get("text") or "")
-    if judgment == "supports" and _pole_direction_mismatch(statement, passage_text):
-        valid = False
-        record["valid_test"] = False
-        record["direction_mismatch"] = True
+    if not reason and judgment == "supports" and _possible_direction_mismatch(statement, passage_text):
+        record["possible_direction_mismatch"] = True
         record["flagged"] = True
-    if judgment in {"contradicts", "qualifies"} and valid:
+        record["direction_note"] = (
+            "Possible direction mismatch: the pole states a shortfall and this passage "
+            "does not state that shortfall about the same subject. Inspect the pair. "
+            "This is not claim_test_invalid by itself."
+        )
+    if judgment in {"contradicts", "qualifies"} and valid and not reason:
         cases = [dict(item) for item in (target.get("negative_cases") or []) if isinstance(item, Mapping)]
         cases.append(record)
         target["negative_cases"] = cases
@@ -4005,17 +4155,25 @@ def _apply_claim_test(
         if "claim_test_negative" not in flags:
             flags.append("claim_test_negative")
         target["flags"] = flags
-        return
-    if not valid and (judgment in {"contradicts", "qualifies"} or record.get("direction_mismatch")):
+        return record
+    if reason or (not valid and judgment in {"contradicts", "qualifies"}):
         record["flagged"] = True
+        record["valid_test"] = False
         flags = [str(item) for item in (target.get("flags") or [])]
         if "claim_test_invalid" not in flags:
             flags.append("claim_test_invalid")
         target["flags"] = flags
         target["needs_review"] = True
+    elif record.get("possible_direction_mismatch"):
+        flags = [str(item) for item in (target.get("flags") or [])]
+        if "possible_direction_mismatch" not in flags:
+            flags.append("possible_direction_mismatch")
+        target["flags"] = flags
+        target["needs_review"] = True
     tests = [dict(item) for item in (target.get("claim_tests") or []) if isinstance(item, Mapping)]
     tests.append(record)
     target["claim_tests"] = tests
+    return record
 
 
 def consolidate_code_proposals(segments: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -4152,15 +4310,25 @@ def _commit_node(runtime: FocusedRuntime):
                 if purpose == "claim_compete" or row.get("judgment"):
                     sources = proposal.get("claim_sources") or {}
                     source = str(sources.get(passage_id) or "")
-                    _apply_claim_test(
+                    passage_text = str((passage or {}).get("text") or "")
+                    pair_by_passage = {
+                        str(item.get("passage_id") or ""): str(item.get("claim_id") or "")
+                        for item in (proposal.get("claim_pairs") or [])
+                        if isinstance(item, Mapping)
+                    }
+                    invalid_reason = _claim_response_reason(row, passage_id, passage_text, pair_by_passage)
+                    recorded = _apply_claim_test(
                         properties,
                         dimensions,
                         row,
                         passage_id,
                         claim_counts,
-                        valid=source in _RELEVANT_CLAIM_SOURCES,
-                        passage_text=str((passage or {}).get("text") or ""),
+                        valid=source in _RELEVANT_CLAIM_SOURCES and not invalid_reason,
+                        passage_text=passage_text,
+                        invalid_reason=invalid_reason,
                     )
+                    if recorded and invalid_reason:
+                        prompt_log[-1].setdefault("claim_test_rejections", []).append(recorded)
                     if passage_id not in reread:
                         reread.append(passage_id)
                     continue
@@ -4512,13 +4680,14 @@ def _decision_node(runtime: FocusedRuntime, *, claims: bool):
         reviewed = {}
         cursor = 0
         while cursor < len(records):
-            batch = [records[cursor]]
-            # Greedy packing shares category and passage context within a request.
-            while cursor + len(batch) < len(records):
-                candidate = batch + [records[cursor + len(batch)]]
-                if reviewer.estimate(claims_payload(state, candidate), ClaimDecisions) > reviewer.token_budget:
-                    break
-                batch = candidate
+            tokens_used = int(metadata.get("decision_tokens_used") or 0)
+            batch, stop, detail = next_claim_batch(reviewer, state, records, cursor, tokens_used)
+            if detail:
+                metadata["decision_batch_detail"] = detail
+            if stop:
+                metadata["decision_stop"] = stop
+                metadata["decision_stop_detail"] = detail
+                break
             parsed, audit = await reviewer.decide(claims_payload(state, batch), ClaimDecisions, metadata)
             if audit:
                 logs.append(audit)

@@ -220,10 +220,14 @@ def test_same_code_without_shared_content_is_not_a_claim_test():
     assert any("no shared content" in note for note in report["notes"])
 
 
-def test_supports_against_a_gap_pole_is_claim_test_invalid():
+def test_supports_against_a_gap_pole_is_a_direction_diagnostic():
     assert _pole_direction_mismatch(
         "needs to visit the sites more and actually listen",
         "The CEO actually walks the floor.",
+    )
+    assert not _pole_direction_mismatch(
+        "needs to visit more",
+        "The CEO visits too rarely.",
     )
     assert not _pole_direction_mismatch("during", "The CEO actually walks the floor.")
     assert not _absence_pole("zzzz-absent")
@@ -255,9 +259,10 @@ def test_supports_against_a_gap_pole_is_claim_test_invalid():
         passage_text="The CEO actually walks the floor.",
     )
     assert counts["supports"] == 1
-    assert "claim_test_invalid" in props[0]["flags"]
-    assert props[0]["claim_tests"][-1]["direction_mismatch"] is True
-    assert props[0]["claim_tests"][-1]["valid_test"] is False
+    assert "possible_direction_mismatch" in props[0]["flags"]
+    assert "claim_test_invalid" not in props[0]["flags"]
+    assert props[0]["claim_tests"][-1]["possible_direction_mismatch"] is True
+    assert props[0]["claim_tests"][-1]["valid_test"] is True
     assert props[0].get("evidence_condition") != "disputed"
 
 
@@ -368,15 +373,17 @@ def test_absence_pole_and_direction_mismatch_fire_on_a_run():
         max_focused_review_calls=4,
         interrupt=False,
     )
-    invalid = [row for row in contrast.dimensions if "claim_test_invalid" in (row.get("flags") or [])]
-    assert invalid
-    assert invalid[0]["claim_tests"][-1]["judgment"] == "supports"
-    assert invalid[0]["claim_tests"][-1]["direction_mismatch"] is True
-    assert invalid[0].get("evidence_condition") != "disputed"
-    assert invalid[0].get("claim_support", "undefined") == "undefined"
+    flagged = [row for row in contrast.dimensions if "possible_direction_mismatch" in (row.get("flags") or [])]
+    assert flagged
+    assert "claim_test_invalid" not in (flagged[0].get("flags") or [])
+    assert flagged[0]["claim_tests"][-1]["judgment"] == "supports"
+    assert flagged[0]["claim_tests"][-1]["possible_direction_mismatch"] is True
+    assert flagged[0]["claim_tests"][-1]["valid_test"] is True
+    assert flagged[0].get("evidence_condition") != "disputed"
+    assert flagged[0].get("claim_support", "undefined") == "undefined"
     relevance = contrast.metadata["claim_test_relevance"]
     assert relevance["judgments"] >= 1
-    assert relevance["relevance_rate"] == 0.0
+    assert relevance["relevance_rate"] == 1.0
 
 
 def test_proposal_stability_reads_exports_and_surfaces_revise_drop_conflicts(tmp_path):
