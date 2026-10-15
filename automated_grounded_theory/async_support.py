@@ -241,9 +241,17 @@ class CallLimiter:
         """One provider attempt: reserve budgets, hold one shared slot, reconcile."""
         record = {"queue_wait": 0.0, "latency": None, "reserved": 0.0, "usage": None}
         held = False
-        try:
+        limit = float(timeout or 0)
+
+        async def _before_call() -> None:
             await self._reserve_budgets(record, estimate, deadline=deadline)
             await self._acquire_slot(record, deadline=deadline)
+
+        try:
+            if limit > 0:
+                await _await_with_hard_deadline(_before_call(), limit)
+            else:
+                await _before_call()
             held = True
             result = await self._invoke(runnable, payload, timeout=timeout, record=record)
             record["usage"] = usage_from_result(result)
@@ -1722,6 +1730,52 @@ async def _ainvoke_in_subprocess(runnable, payload, *, timeout: float):
     except TimeoutError:
         _clear_deadline_notice()
         raise
+
+
+async def _await_with_hard_deadline(awaitable, timeout: float):
+    """Run ``awaitable`` on this loop under the monotonic deadline thread.
+
+    Slot waits, budget waits, embedding, and client setup happen before
+    ``_ainvoke_off_loop`` arms that thread. A stall there used to sit until the
+    sync bridge, which is one request timeout times the call allowance. This
+    wait uses the same clock as one model call. A live loop still finishes the
+    awaitable itself. The thread is the backstop when this loop does not resume.
+    """
+    if timeout is None or float(timeout) <= 0:
+        return await awaitable
+    loop = asyncio.get_running_loop()
+    future: concurrent.futures.Future = concurrent.futures.Future()
+    task = asyncio.ensure_future(awaitable)
+
+    def _done(done_task: asyncio.Task) -> None:
+        if future.done():
+            return
+        if done_task.cancelled():
+            if not future.done():
+                future.cancel()
+            return
+        exc = done_task.exception()
+        if exc is not None:
+            future.set_exception(exc)
+        else:
+            future.set_result(done_task.result())
+
+    task.add_done_callback(_done)
+    future.task = task  # type: ignore[attr-defined]
+    watch = _MonotonicDeadline(float(timeout))
+    watch.arm(future, loop)
+    try:
+        return await asyncio.wrap_future(watch.gate)
+    except TimeoutError:
+        _clear_deadline_notice()
+        if future.done() and not future.cancelled():
+            exc = future.exception()
+            if exc is not None:
+                raise exc
+            return future.result()
+        task.cancel()
+        _abandon_model_loop(loop)
+        raise TimeoutError(_timeout_message(float(timeout))) from None
 
 
 async def await_with_wall_timeout(awaitable, timeout: float | None):

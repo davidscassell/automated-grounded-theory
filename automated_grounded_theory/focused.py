@@ -3359,6 +3359,69 @@ def _stem_token(token: str) -> str:
     return token
 
 
+_CLAIM_SUBJECT_SKIP = _SUBJECT_SKIP | frozenset(
+    {
+        "passage",
+        "passages",
+        "uses",
+        "using",
+        "only",
+        "generic",
+        "term",
+        "terms",
+        "quote",
+        "quotes",
+        "text",
+        "claim",
+        "claims",
+        "statement",
+        "about",
+        "says",
+        "said",
+        "mention",
+        "mentions",
+        "mentioned",
+        "without",
+        "through",
+        "because",
+        "there",
+        "these",
+        "those",
+        "which",
+        "where",
+        "while",
+        "would",
+        "could",
+        "other",
+        "same",
+        "just",
+        "like",
+        "some",
+        "very",
+        "also",
+        "then",
+        "been",
+        "being",
+        "were",
+        "will",
+        "each",
+        "every",
+        "many",
+        "most",
+        "much",
+        "such",
+        "what",
+        "your",
+        "more",
+        "less",
+        "gets",
+        "done",
+        "things",
+        "thing",
+    }
+)
+
+
 def _subject_tokens(text: Any) -> set[str]:
     """Content stems of a pole or clause, without shortfall wording."""
     tokens = set()
@@ -3419,6 +3482,58 @@ def _content_tokens(text: str) -> set[str]:
 
 def _claim_content_tokens(claim: Mapping[str, Any]) -> set[str]:
     return _content_tokens(" ".join(str(claim.get(key) or "") for key in ("name", "text", "pole", "quote")))
+
+
+def _claim_subject_tokens(claim: Mapping[str, Any]) -> set[str]:
+    """Stems that name what the claim is about. Function words and 'passage' are not the subject."""
+    raw = " ".join(str(claim.get(key) or "") for key in ("name", "pole"))
+    tokens = set()
+    for token in _content_tokens(raw):
+        stem = _stem_token(token)
+        if token in _CLAIM_SUBJECT_SKIP or stem in _CLAIM_SUBJECT_SKIP:
+            continue
+        tokens.add(stem)
+    return tokens
+
+
+_IRRELEVANCE_CUES = (
+    "irrelevant",
+    "unrelated",
+    "not about",
+    "isn't about",
+    "is about",
+    "about the",
+    "different subject",
+    "does not address",
+    "doesn't address",
+    "off topic",
+    "off-topic",
+)
+
+
+def _rationale_indicates_irrelevance(rationale: str) -> bool:
+    """True when the rationale says the passage is about a different subject."""
+    folded = " ".join(str(rationale or "").casefold().split())
+    return any(cue in folded for cue in _IRRELEVANCE_CUES)
+
+
+def _subject_engagement(claim: Mapping[str, Any], quote: str, rationale: str) -> str:
+    """``engaged``, ``irrelevant``, or ``uncertain``.
+
+    A quote or rationale that shares a subject stem with the claim engages it.
+    A rationale that says the passage is about something else, and does not
+    share a subject stem, is not a dispute. Missing overlap without that cue
+    stays a diagnostic. A claim with no subject stems left stays a diagnostic.
+    """
+    subject = _claim_subject_tokens(claim)
+    if not subject:
+        return "uncertain"
+    used = {_stem_token(token) for token in _content_tokens(f"{quote} {rationale}")}
+    if used & subject:
+        return "engaged"
+    if _rationale_indicates_irrelevance(rationale):
+        return "irrelevant"
+    return "uncertain"
 
 
 def _claim_evidence_tokens(claim: Mapping[str, Any]) -> set[str]:
@@ -3771,6 +3886,66 @@ def _reallocate_unspent_claim_calls(
     ]
 
 
+def _queue_batch_estimate(state: Mapping[str, Any], items: Sequence[Any]) -> int:
+    """Estimated input tokens for one reallocated batch. Same builder as the allowance check."""
+    batch_items = [item if isinstance(item, Mapping) else {"passage_id": item, "purpose": "develop"} for item in items]
+    batch_ids = _queue_passage_ids(batch_items)
+    by_id = {str(item.get("passage_id") or ""): item for item in (state.get("passages") or [])}
+    batch = [by_id[passage_id] for passage_id in batch_ids if passage_id in by_id]
+    if not batch:
+        return 0
+    raised_ids = set(state.get("raised_code_ids") or [])
+    raised, other = _split_codebook(state.get("codebook") or {}, raised_ids)
+    purposes = {str(item.get("passage_id") or ""): str(item.get("purpose") or "develop") for item in batch_items}
+    initial = {
+        passage_id: _initial_code_rows(passage_id, state.get("segments") or [], state.get("codebook") or {})
+        for passage_id in batch_ids
+    }
+    messages, schema = _recode_request(
+        batch,
+        raised,
+        other=other,
+        purposes=purposes,
+        initial_codes=initial,
+        claims=_claims_by_passage(batch_items),
+    )
+    return request_input_tokens(messages, schema, resolve_tokenizer(None))
+
+
+def _fit_unspent_claim_calls(
+    state: Mapping[str, Any],
+    *,
+    calls: int,
+    batch_size: int,
+) -> dict[str, Any]:
+    """Move only the unspent claim calls whose next prompt still fits the token allowance."""
+    procedure = (state.get("metadata") or {}).get("procedure") or {}
+    max_tokens = int(procedure.get("max_focused_review_tokens") or 0)
+    used = int(state.get("focused_tokens_estimated") or 0)
+    remaining = max_tokens - used
+    probe = _reallocate_unspent_claim_calls(state, calls=1, batch_size=batch_size) if calls > 0 else []
+    estimate = _queue_batch_estimate(state, probe) if probe else 0
+    if calls <= 0 or not probe:
+        fit = 0
+    elif estimate <= 0:
+        fit = calls
+    elif remaining < estimate:
+        fit = 0
+    else:
+        fit = min(calls, remaining // estimate)
+    blocked = max(0, calls - fit)
+    moved = _reallocate_unspent_claim_calls(state, calls=fit, batch_size=batch_size) if fit else []
+    return {
+        "moved": moved,
+        "moved_calls": fit if moved else 0,
+        "not_moved_calls": blocked if calls else 0,
+        "estimate_per_call": estimate,
+        "tokens_estimated": used,
+        "max_focused_review_tokens": max_tokens,
+        "reason": "token_allowance" if blocked else "",
+    }
+
+
 def _prepare_node(state: FocusedState) -> dict:
     updates: dict[str, Any] = {}
     codebook = state.get("codebook") or {}
@@ -3856,23 +4031,51 @@ def _prepare_node(state: FocusedState) -> dict:
             filled_calls = 0 if not extra else min(claim_calls, (len(extra) + batch_size - 1) // batch_size)
             unspent_calls = claim_calls - filled_calls
             if unspent_calls > 0:
-                moved = _reallocate_unspent_claim_calls(
+                fitted = _fit_unspent_claim_calls(
                     state,
                     calls=unspent_calls,
                     batch_size=batch_size,
                 )
+                moved = list(fitted.get("moved") or [])
+                metadata = dict(updates.get("metadata") or state.get("metadata") or {})
+                if int(fitted.get("not_moved_calls") or 0):
+                    note = (
+                        f"{int(fitted['not_moved_calls'])} unspent claim calls were not reallocated: "
+                        f"the next prompt is {int(fitted.get('estimate_per_call') or 0)} estimated tokens "
+                        f"and {int(fitted.get('tokens_estimated') or 0)} of "
+                        f"{int(fitted.get('max_focused_review_tokens') or 0)} are already estimated."
+                    )
+                    if note not in warnings:
+                        warnings.append(note)
+                    metadata["token_reallocation"] = {
+                        "requested_calls": unspent_calls,
+                        "moved_calls": int(fitted.get("moved_calls") or 0),
+                        "not_moved_calls": int(fitted.get("not_moved_calls") or 0),
+                        "reason": "token_allowance",
+                        "estimate_per_call": int(fitted.get("estimate_per_call") or 0),
+                    }
                 if moved:
-                    metadata = dict(updates.get("metadata") or state.get("metadata") or {})
                     transfers = list(metadata.get("call_transfers") or [])
                     transfers.append(
                         {
                             "from": "claim_compete",
                             "to": str(moved[0].get("purpose") or "outside"),
-                            "calls": unspent_calls,
+                            "calls": int(fitted.get("moved_calls") or 0),
                         }
                     )
                     metadata["call_transfers"] = transfers
-                    relevance["reallocated_calls"] = unspent_calls
+                    relevance["reallocated_calls"] = int(fitted.get("moved_calls") or 0)
+                    reallocation = dict(metadata.get("reread_reallocation") or {})
+                    reallocation["reallocated"] = True
+                    purposes = [str(item) for item in (reallocation.get("purposes") or [])]
+                    if "claim_compete" not in purposes:
+                        purposes.append("claim_compete")
+                    reallocation["purposes"] = purposes
+                    reallocation["note"] = (
+                        f"{int(fitted.get('moved_calls') or 0)} calls moved from claim_compete "
+                        f"to {moved[0].get('purpose') or 'outside'}."
+                    )
+                    metadata["reread_reallocation"] = reallocation
                     metadata["claim_test_relevance"] = {
                         key: value for key, value in relevance.items() if key != "notes"
                     }
@@ -3881,7 +4084,6 @@ def _prepare_node(state: FocusedState) -> dict:
                     state = {**state, "metadata": metadata, "warnings": warnings}
                     extra = extra + moved
                 else:
-                    metadata = dict(updates.get("metadata") or state.get("metadata") or {})
                     metadata["claim_test_relevance"] = {
                         key: value for key, value in relevance.items() if key != "notes"
                     }
@@ -4318,6 +4520,16 @@ def _apply_claim_test(
             "does not state that shortfall about the same subject. Inspect the pair. "
             "This is not claim_test_invalid by itself."
         )
+    if judgment in {"contradicts", "qualifies"} and valid and not reason:
+        engagement = _subject_engagement(target, record["quote"], record["rationale"])
+        if engagement == "irrelevant":
+            reason = "rationale_indicates_irrelevance"
+            valid = False
+            record["reason"] = reason
+            record["valid_test"] = False
+        elif engagement == "uncertain":
+            record["claim_subject_uncertain"] = True
+            record["flagged"] = True
     if judgment in {"contradicts", "qualifies"} and valid and not reason:
         cases = [dict(item) for item in (target.get("negative_cases") or []) if isinstance(item, Mapping)]
         cases.append(record)
@@ -4766,6 +4978,7 @@ def _review_node(state: FocusedState) -> dict:
     ]
     reallocation["reallocated"] = bool(plan_flag or transferred_to)
     coverage["reallocation"] = reallocation
+    metadata["reread_reallocation"] = reallocation
     coverage["corpus"] = fields.get("coverage") or {}
     metadata.update(fields)
     metadata["purpose_coverage"] = coverage
