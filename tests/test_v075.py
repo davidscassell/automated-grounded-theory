@@ -48,7 +48,7 @@ def _prompt_text(result) -> str:
 def _claim_source():
     passages = [
         _passage("p1", "I spent the morning packing my suitcase."),
-        _passage("p2", "Packing bags up with boxes took all night."),
+        _passage("p2", "Packing the suitcase took all night."),
     ]
     return _source(
         passages=passages,

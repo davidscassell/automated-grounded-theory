@@ -1241,7 +1241,7 @@ def run_sync(coro, *, timeout: float | None = None):
         # a finished call timeout as the bridge budget dropped the real label
         # (a 120s call was reported as the whole-run allowance). A hard
         # deadline the loop never resumed is also that call timeout.
-        if future.done():
+        if future.done() and not future.cancelled():
             return _propagate_finished(future)
         if "timed out after" in str(exc) and "sync bridge" not in str(exc):
             raise
@@ -1276,14 +1276,14 @@ def _result_with_deadline_watch(future: concurrent.futures.Future, loop, timeout
         try:
             return future.result(timeout=min(0.25, remaining))
         except TimeoutError:
-            if future.done():
+            if future.done() and not future.cancelled():
                 return _propagate_finished(future)
             late = _take_stale_deadline()
             if late is not None and not future.done():
                 _abandon_package_loop(loop)
                 raise late
             continue
-    if future.done():
+    if future.done() and not future.cancelled():
         return _propagate_finished(future)
     future.cancel()
     try:
@@ -1488,21 +1488,29 @@ def _submit_on_loop(loop: asyncio.AbstractEventLoop, coro, context: contextvars.
     return future
 
 
+# A live loop cancels the provider from its own wait at ``timeout``. This
+# thread waits a little longer so that cancel is delivered before the loop is
+# abandoned. A blocked loop never runs that wait, and this thread still fires.
+_WATCHDOG_SLACK = 0.2
+
+
 class _MonotonicDeadline:
     """One hard deadline on its own thread. It does not use an asyncio loop.
 
     The timer is ``threading.Event.wait``, which is a single monotonic wait.
     It is not ``future.result`` (that wait shares the future's condition with
     the loop that must resolve it) and it is not ``asyncio.sleep`` (that wait
-    never runs while its loop is blocked). On expiry the model loop is
-    abandoned, a configured child process is killed, and ``gate`` is completed
-    from this thread so a waiter blocked in ``future.result`` can resume
-    without that loop.
+    never runs while its loop is blocked). The clock is the request timeout
+    plus a short slack, so a responsive loop can cancel the provider and raise
+    its own ``TimeoutError`` first. On expiry the model loop is abandoned, a
+    configured child process is killed, and ``gate`` is completed from this
+    thread so a waiter blocked in ``future.result`` can resume without that
+    loop. The error still names the request timeout, not the slack.
     """
 
     def __init__(self, timeout: float):
         self.timeout = float(timeout)
-        self.deadline = time.monotonic() + self.timeout
+        self.deadline = time.monotonic() + self.timeout + _WATCHDOG_SLACK
         self.gate: concurrent.futures.Future = concurrent.futures.Future()
         self._wake = threading.Event()
         self._thread = threading.Thread(target=self._run, name="agt-hard-deadline", daemon=True)

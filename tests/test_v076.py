@@ -235,8 +235,8 @@ class _TwoJudgments(FakeFocusedCoder):
 def test_claim_test_counts_accumulate_across_calls():
     passages = [
         _passage("p1", "I spent the morning packing my suitcase."),
-        _passage("p2", "Packing bags up with boxes took all night."),
-        _passage("p3", "The suitcase and the boxes were by the door at dawn."),
+        _passage("p2", "Packing the suitcase took all night."),
+        _passage("p3", "Packing the suitcase waited by the door at dawn."),
     ]
     result = focused_code(
         _source(

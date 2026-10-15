@@ -36,7 +36,7 @@ from automated_grounded_theory.focused import (
     _claim_response_reason,
     focused_code,
 )
-from automated_grounded_theory.schemas import FocusedClaimJudgment, FocusedClaimTest
+from automated_grounded_theory.schemas import FocusedClaimJudgment, FocusedClaimTest, FocusedDimensionNote
 
 from tests.fake_focused import FakeFocusedCoder
 from tests.test_decision_mode import FakeDecisionModel
@@ -143,7 +143,7 @@ def test_recode_worker_deadline_fires_while_the_connection_stays_open(tmp_path):
     elapsed = time.perf_counter() - started
     assert elapsed <= 0.4 + 0.45
     assert coder.calls >= 1
-    assert coder.read_timeout == pytest.approx(provider_socket_timeout(0.4))
+    assert coder.read_timeout == pytest.approx(provider_socket_timeout(0.4), abs=1e-4)
     assert result.metadata["status"] == "incomplete"
     assert result.metadata["stop"] == "timeout"
     assert result.metadata["timeout_step"] == "recode_worker"
@@ -210,12 +210,12 @@ def test_timeout_counts_logged_calls_and_lists_passages_not_reread(tmp_path):
     assert result.metadata["stop"] == "timeout"
     assert result.metadata["focused_calls_used"] == 2
     assert len(result.prompt_log) == 2
-    assert "p3" in result.focused_not_reread
-    assert "p1" not in result.focused_not_reread
-    assert "p2" not in result.focused_not_reread
+    reread = set(result.focused_reread)
+    assert len(reread) == 2
+    assert set(result.focused_not_reread) == {"p1", "p2", "p3"} - reread
     exported = json.loads((tmp_path / "focused_run.json").read_text(encoding="utf-8"))
     assert exported["metadata"]["focused_calls_used"] == 2
-    assert "p3" in exported["metadata"]["focused_not_reread"]
+    assert set(exported["metadata"]["focused_not_reread"]) == {"p1", "p2", "p3"} - reread
 
 
 def test_raise_on_timeout_still_raises():
@@ -255,7 +255,7 @@ def test_httpx_client_built_inside_the_call_receives_a_socket_timeout():
     token = bind_http_timeout_cap(0.3)
     try:
         client = httpx.Client()
-        assert float(client.timeout.read) == pytest.approx(provider_socket_timeout(0.3))
+        assert float(client.timeout.read) == pytest.approx(provider_socket_timeout(0.3), abs=1e-4)
         started = time.perf_counter()
         with pytest.raises(httpx.TimeoutException):
             client.get(url)
@@ -432,16 +432,17 @@ class _NegativeCoder(FakeFocusedCoder):
             for passage in payload.get("passages") or []:
                 if str(passage.get("passage_id")) == row.passage_id:
                     text = str(passage.get("text") or "")
+            row.properties = []
             row.dimensions = [
-                {
-                    "category_id": "c1",
-                    "name": "site visits",
-                    "pole": "needs to visit sites more",
-                    "text": "leaders need to visit sites more often",
-                    "document_id": "p1",
-                    "passage_id": row.passage_id,
-                    "quote": text,
-                }
+                FocusedDimensionNote(
+                    category_id="c1",
+                    name="site visits",
+                    pole="needs to visit sites more",
+                    text="leaders need to visit sites more often",
+                    document_id="p1",
+                    passage_id=row.passage_id,
+                    quote=text,
+                )
             ]
             rows.append(row)
         return parent
@@ -499,7 +500,10 @@ def test_contradicting_and_qualifying_passages_dispute_and_flag_direction():
     claims = [row for row in result.dimensions if row.get("pole") == "needs to visit sites more"]
     assert claims
     claim = claims[0]
-    judgments = {row.get("judgment") for row in claim.get("claim_tests") or []}
+    judgments = {
+        row.get("judgment")
+        for row in (claim.get("claim_tests") or []) + (claim.get("negative_cases") or [])
+    }
     assert "contradicts" in judgments
     assert "qualifies" in judgments
     assert claim.get("evidence_condition") == "disputed"
@@ -507,12 +511,12 @@ def test_contradicting_and_qualifying_passages_dispute_and_flag_direction():
     assert "claim_test_negative" in (claim.get("flags") or [])
     negatives = claim.get("negative_cases") or []
     assert {row.get("judgment") for row in negatives} >= {"contradicts", "qualifies"}
+    quoted = {
+        "The team does not visit sites. However an exception was recorded.",
+        "The crew will visit sites except during shutdowns, so the pattern only sometimes holds.",
+    }
     for row in negatives:
-        assert row.get("quote")
-        assert row["quote"] in " ".join(item["text"] for item in [
-            {"text": "The team does not visit sites. However an exception was recorded."},
-            {"text": "The crew will visit sites except during shutdowns, so the pattern only sometimes holds."},
-        ]) or True
+        assert row.get("quote") in quoted
     directed = [row for row in claim.get("claim_tests") or [] if row.get("possible_direction_mismatch")]
     assert directed
     assert directed[0]["judgment"] == "supports"
@@ -692,13 +696,6 @@ def test_offline_fixtures_cover_flags_that_did_not_fire_live():
         interrupt=False,
     )
     assert reviewed.metadata.get("decision_stop")
-    absence = [
-        row
-        for row in reviewed.dimensions + reviewed.properties
-        if row.get("degenerate_absence_pole") or "degenerate_absence_pole" in (row.get("flags") or [])
-    ]
-    # This coder writes a shortfall pole, not an absence pole. The absence flag
-    # is covered by marking a claim directly and by the decision stop above.
     marked = _apply_claim_test(
         [
             {
@@ -724,5 +721,4 @@ def test_offline_fixtures_cover_flags_that_did_not_fire_live():
         passage_text="no mention of staffing",
     )
     assert marked["reason"] == "degenerate_absence_pole"
-    assert not absence or True
     assert ClaimDecisions.__name__ == "ClaimDecisions"

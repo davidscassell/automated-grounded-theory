@@ -3479,21 +3479,20 @@ def _claim_pair_relevant(
 ) -> bool:
     """True when the passage is worth a claim call.
 
-    A shared code is not enough. The passage also needs lexical overlap with
-    the claim's pole, text, or quote (at least two content tokens) or an
-    embedding at or above the measured threshold. An embedding at that
-    threshold is itself the semantic check. Opposite-pole text and
+    A shared code is not enough. The passage needs two content tokens in
+    common with the claim's pole, text, or quote, or an embedding at or above
+    the measured threshold. One shared token is not enough, including inside
+    the same category. An embedding at the threshold is itself the semantic
+    check and does not also need those tokens. Opposite-pole text and
     counterevidence wording (a hedge or an exception about the claim) qualify
     ahead of a same-category match.
     """
     if opposite or _passage_counterevidence(passage.get("text"), claim):
         return True
     shared, semantic = _claim_evidence_overlap(passage, claim)
-    lexical = shared >= _MIN_EVIDENCE_TOKENS
-    embedding = semantic >= _CLAIM_EVIDENCE_COSINE
-    if same_category and (lexical or embedding):
+    if semantic >= _CLAIM_EVIDENCE_COSINE:
         return True
-    return bool(embedding)
+    return shared >= _MIN_EVIDENCE_TOKENS
 
 
 def _claim_similarity_score(passage: Mapping[str, Any], claim: Mapping[str, Any]) -> float:
@@ -4926,6 +4925,24 @@ def _selected_ids(state, key):
     return state.get("proposed_" + key) or []
 
 
+def _drop_synthetic(value: Any) -> Any:
+    """Remove the synthetic counterexample from a research export value."""
+    if isinstance(value, list):
+        kept = []
+        for item in value:
+            if item == SYNTHETIC_PASSAGE_ID:
+                continue
+            if isinstance(item, Mapping) and _is_synthetic_passage(item):
+                continue
+            kept.append(_drop_synthetic(item))
+        return kept
+    if isinstance(value, Mapping):
+        if _is_synthetic_passage(value):
+            return None
+        return {key: _drop_synthetic(item) for key, item in value.items()}
+    return value
+
+
 def _research_development(development: Mapping[str, Any]) -> dict[str, Any]:
     """Drop synthetic counterexample rows from a research export."""
 
@@ -4953,7 +4970,8 @@ def _research_development(development: Mapping[str, Any]) -> dict[str, Any]:
     payload = dict(development)
     payload["properties"] = clean(list(development.get("properties") or []))
     payload["dimensions"] = clean(list(development.get("dimensions") or []))
-    return payload
+    dropped = _drop_synthetic(payload)
+    return dropped if isinstance(dropped, dict) else payload
 
 
 def export_focused_state(state: Mapping[str, Any], directory: str | Path) -> dict[str, str]:

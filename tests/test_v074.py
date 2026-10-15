@@ -104,8 +104,8 @@ def test_claim_search_pairs_a_claim_with_a_relevant_passage_only():
     found = _claim_compete_items(state, [], slots=4)
     sources = {item["passage_id"]: item["source"] for item in found}
     assert "p2" not in sources
+    assert "p3" not in sources
     assert sources["p4"] == "claim_opposite_pole"
-    assert sources["p3"] == "claim_similarity"
     assert sources["p5"] == "claim_similarity"
     assert "p6" not in sources
     assert "p1" not in sources
@@ -164,7 +164,7 @@ def test_claim_search_pairs_a_claim_with_a_relevant_passage_only():
 def test_claim_round_rereads_another_assignment_when_the_pole_is_absent():
     passages = [
         _passage("p1", "alpha bravo"),
-        _passage("p2", "alpha charlie"),
+        _passage("p2", "alpha bravo stayed put"),
         _passage("p3", "echo foxtrot"),
     ]
     segments = [
