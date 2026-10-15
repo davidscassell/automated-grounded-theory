@@ -154,6 +154,7 @@ def test_a_silent_graph_step_records_the_step_and_a_partial_export(tmp_path):
             checkpointer=saver,
             thread_id="timeout-077",
             output_dir=tmp_path,
+            raise_on_timeout=True,
         )
     elapsed = time.perf_counter() - started
     assert elapsed <= 1.5

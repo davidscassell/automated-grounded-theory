@@ -27,8 +27,8 @@ from tests.test_v070 import _entry, _passages, _source
 
 
 def test_version_is_074():
-    assert __version__ == "0.7.8"
-    assert POLICY_VERSION == "0.7.8"
+    assert __version__ == "0.7.9"
+    assert POLICY_VERSION == "0.7.9"
     assert FocusedAlternativeReading.model_fields["alternative_fit"].is_required()
 
 
@@ -394,6 +394,7 @@ def test_wall_clock_timeout_cancels_a_model_that_swallows_cancellation():
             focused_request_retries=4,
             max_focused_review_calls=4,
             interrupt=False,
+            raise_on_timeout=True,
         )
     assert time.perf_counter() - started < 1.0
     assert coder.cancelled >= 1

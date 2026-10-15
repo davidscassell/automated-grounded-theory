@@ -144,6 +144,7 @@ def test_a_hung_graph_step_records_incomplete_timeout():
             interrupt=False,
             checkpointer=saver,
             thread_id="timeout-076",
+            raise_on_timeout=True,
         )
     assert time.perf_counter() - started < 1.5
     assert coder.connection_open is True

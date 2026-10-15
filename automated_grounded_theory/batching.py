@@ -27,19 +27,22 @@ from automated_grounded_theory.prompts import message_text
 _BROKEN_TOKENIZERS: set[int] = set()
 
 
-# Live focused runs on the corpora used for those evals reported the character
-# heuristic divided by provider *total* tokens around 1.27–1.29. That ratio
-# mixes output length into the denominator, so it is not a tokenizer
-# calibration and it is not portable to other models or corpora. The figure
-# below is only an empirical adjustment for that observed condition.
-# Allowances still use the unadjusted heuristic.
+# v23 live runs: character heuristic / provider total tokens was about 1.27–1.29.
+# That ratio mixes output length into the denominator. v24 (first live run of
+# 0.7.7+0.7.8): heuristic / provider input tokens was about 1.38, and dividing
+# by 1.28 left an adjusted reading reported within 0.3% of those input tokens.
+# Neither figure is a general calibration. Allowances still use the unadjusted
+# heuristic.
 TOKEN_ESTIMATE_ADJUSTMENT = 1.28
 TOKEN_ESTIMATE_CALIBRATION = TOKEN_ESTIMATE_ADJUSTMENT
 TOKEN_ESTIMATE_ADJUSTMENT_NOTE = (
-    "Empirical adjustment from focused-coding live runs where the character "
-    "heuristic divided by provider total tokens was about 1.27 to 1.29. "
-    "It is not a general calibration and it is not a guaranteed ceiling. "
-    "Compare the heuristic to provider input tokens. Output length is separate."
+    "Empirical adjustment, not a general calibration. v23 focused-coding live "
+    "runs had the character heuristic divided by provider total tokens at about "
+    "1.27 to 1.29, which is why the divisor is 1.28. v24 measured the heuristic "
+    "divided by provider input tokens at about 1.38; the adjusted figure "
+    "(heuristic / 1.28) was reported within 0.3% of those input tokens. "
+    "Neither 1.28 nor 1.38 is portable to other models or corpora. "
+    "It is not a guaranteed ceiling. Output length is separate."
 )
 
 

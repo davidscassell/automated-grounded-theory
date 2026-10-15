@@ -33,8 +33,8 @@ from tests.test_v074 import _passage, _segment
 
 
 def test_version_is_075():
-    assert __version__ == "0.7.8"
-    assert POLICY_VERSION == "0.7.8"
+    assert __version__ == "0.7.9"
+    assert POLICY_VERSION == "0.7.9"
 
 
 def _prompt_text(result) -> str:
@@ -251,6 +251,7 @@ def test_sync_read_on_the_call_thread_hits_the_request_timeout():
             focused_request_retries=4,
             max_focused_review_calls=4,
             interrupt=False,
+            raise_on_timeout=True,
         )
     # The outer bridge is request_timeout * call allowance + 1s (2.2s here).
     assert time.perf_counter() - started < 1.0

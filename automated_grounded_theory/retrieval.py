@@ -15,11 +15,11 @@ import re
 import sys
 import threading
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from typing import Any, Iterator, Mapping, Protocol, Sequence
 
-from automated_grounded_theory.async_support import await_with_wall_timeout
+from automated_grounded_theory.async_support import _timeout_message, await_with_wall_timeout
 from automated_grounded_theory.validation import code_key
 
 
@@ -561,6 +561,41 @@ def _first_task_error(pairs: Sequence[tuple[asyncio.Task, Sequence[tuple[str, st
     return None
 
 
+# Sibling settlement waits for tasks that already have a per-attempt deadline.
+# This cap is only the backstop when a task swallows cancellation.
+_SETTLE_WAIT = 180.0
+
+
+async def _await_shared(awaitable, timeout: float):
+    """Wait on a shared future. A positive ``timeout`` is one monotonic cap.
+
+    ``shield`` keeps a sibling's provider task running when this waiter is
+    cancelled. The wait itself still ends at ``timeout``.
+    """
+    shielded = asyncio.shield(awaitable)
+    if timeout is None or float(timeout) <= 0:
+        return await shielded
+    return await await_with_wall_timeout(shielded, float(timeout))
+
+
+@asynccontextmanager
+async def _embed_slot(limiter):
+    """Acquire the embedding semaphore with the limiter's request timeout."""
+    timeout = float(getattr(limiter, "request_timeout", 0) or 0)
+    if timeout <= 0:
+        async with limiter.embed_semaphore:
+            yield
+        return
+    try:
+        await asyncio.wait_for(limiter.embed_semaphore.acquire(), timeout)
+    except TimeoutError:
+        raise TimeoutError(_timeout_message(timeout)) from None
+    try:
+        yield
+    finally:
+        limiter.embed_semaphore.release()
+
+
 async def _settle_query_siblings(
     pairs: Sequence[tuple[asyncio.Task, Sequence[tuple[str, str]]]],
     *,
@@ -590,7 +625,7 @@ async def _settle_query_siblings(
         # this wait is in progress must not cancel a shared provider task,
         # and dropping the gather future would cancel its children on collection.
         gather = _retain(asyncio.gather(*pending, return_exceptions=True))
-        await asyncio.shield(gather)
+        await _await_shared(gather, _SETTLE_WAIT)
     for task in pending:
         _consume_task(task)
 
@@ -756,7 +791,7 @@ async def cached_aembed_texts(
                 raise
         for index, future, _key in waiting:
             # shield: cancelling this waiter must not cancel the shared call.
-            result[index] = list(await asyncio.shield(future))
+            result[index] = list(await _await_shared(future, float(getattr(limiter, "request_timeout", 0) or 0)))
         with _VECTOR_CACHE.lock:
             for index, key in enumerate(keys):
                 if result[index] is None:
@@ -803,7 +838,7 @@ async def shared_codebook_vectors(
             _VECTOR_CACHE.snapshot_inflight[snap] = waiter
             owner = True
     if not owner:
-        shared = await asyncio.shield(waiter)
+        shared = await _await_shared(waiter, float(getattr(limiter, "request_timeout", 0) or 0))
         return [list(vector) for vector in shared]
     with _VECTOR_CACHE.lock:
         # Keep this snapshot's vectors through the embed. The cap must not drop
@@ -1431,7 +1466,7 @@ async def _embed_query_batch(embeddings, texts: Sequence[str], *, batch_size: in
 
     async def one(chunk: list[str], keys: list[tuple[str, str]]) -> None:
         try:
-            async with limiter.embed_semaphore:
+            async with _embed_slot(limiter):
                 # A previous chunk, or a concurrent caller, may have filled these.
                 needed = [text for text in chunk if _cached_vector(embeddings, text, "query") is None]
                 if not needed:
@@ -1487,7 +1522,7 @@ async def _embed_queries_one_by_one(embeddings, texts: Sequence[str], limiter) -
         try:
             if _cached_vector(embeddings, text, "query") is not None:
                 return
-            async with limiter.embed_semaphore:
+            async with _embed_slot(limiter):
                 if _cached_vector(embeddings, text, "query") is not None:
                     return
 
@@ -1568,7 +1603,7 @@ async def _embed_document_batches(
 
     async def one(chunk: list[str], keys: list[tuple[str, str]]) -> None:
         try:
-            async with limiter.embed_semaphore:
+            async with _embed_slot(limiter):
                 needed = [text for text in chunk if _cached_vector(embeddings, text, role) is None]
                 if not needed:
                     return
