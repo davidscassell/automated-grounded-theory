@@ -630,6 +630,9 @@ def _coverage(state: Mapping[str, Any]) -> dict[str, Any]:
         "unsupported_statements": unsupported,
         "empty_paradigm_slots": len(list(state.get("empty_slots") or [])),
         "pair_accounting": dict((state.get("metadata") or {}).get("pair_accounting") or {}),
+        "stage_outcomes": dict((state.get("metadata") or {}).get("stage_outcomes") or {}),
+        "missing_category_evidence": list((state.get("metadata") or {}).get("missing_category_evidence") or []),
+        "provider_budget": dict((state.get("metadata") or {}).get("provider_budget") or {}),
         "note": (
             "Rates are null when there is nothing to score. They are not claim support. "
             "Pair counts distinguish pairs that were planned, sent, completed, omitted, and still remaining."
@@ -1236,18 +1239,68 @@ def _pair_key(pair: Mapping[str, Any]) -> tuple[str, str]:
 
 
 def _sync_allowance(metadata: dict[str, Any], runtime: AxialRuntime) -> None:
+    """Write the live allowance into metadata so the next checkpoint keeps it."""
     allowance = getattr(runtime.limiter, "provider_allowance", None)
     if allowance is None:
         return
     metadata["axial_tokens_estimated"] = allowance.tokens_estimated
     metadata["provider_calls_used"] = allowance.calls_used
+    metadata["provider_budget"] = allowance.snapshot()
+    if allowance.stage_used.get("review"):
+        metadata["decision_calls_used"] = allowance.stage_used["review"]
+        metadata["decision_tokens_used"] = allowance.tokens_estimated
 
 
-def _allowance_refuses(runtime: AxialRuntime, estimate: int, *, estimated: int, max_tokens: int) -> bool:
+def _allowance_refuses(
+    runtime: AxialRuntime,
+    estimate: int,
+    *,
+    estimated: int,
+    max_tokens: int,
+    stage: str = "coding",
+) -> bool:
     allowance = getattr(runtime.limiter, "provider_allowance", None)
     if allowance is not None:
-        return allowance.would_refuse(estimate)
+        return allowance.would_refuse(estimate, stage=stage)
     return estimated + int(estimate) > int(max_tokens)
+
+
+_STAGE_RANK = {"skipped": 0, "complete": 1, "budget_limited": 2, "incomplete": 3}
+_BUDGET_STOPS = {"token_allowance", "call_allowance", "request_budget"}
+
+
+def _note_stage(metadata: dict[str, Any], name: str, *, required: bool, status: str, reason: str = "") -> None:
+    """Record one stage. A later worse outcome replaces a better one."""
+    outcomes = dict(metadata.get("stage_outcomes") or {})
+    current = dict(outcomes.get(name) or {})
+    if current:
+        required = bool(current.get("required") or required)
+        if _STAGE_RANK.get(str(current.get("status") or ""), 0) > _STAGE_RANK.get(status, 0):
+            status = str(current.get("status") or status)
+            reason = str(current.get("reason") or reason)
+    outcomes[name] = {"required": bool(required), "status": status, "reason": reason or ""}
+    metadata["stage_outcomes"] = outcomes
+
+
+def _note_review_outcome(metadata: dict[str, Any], *, audit: Mapping[str, Any] | None, parsed: Mapping[str, Any] | None) -> None:
+    """LLM review is required. Human review is not a model stage."""
+    reason = str(metadata.get("decision_stop") or (audit or {}).get("reason") or "")
+    status_name = str((audit or {}).get("status") or "")
+    if status_name == "validated" or parsed:
+        _note_stage(metadata, "decision_review", required=True, status="complete")
+        return
+    if reason in _BUDGET_STOPS or status_name == "omitted":
+        _note_stage(metadata, "decision_review", required=True, status="budget_limited", reason=reason or "token_allowance")
+        return
+    _note_stage(metadata, "decision_review", required=True, status="incomplete", reason=reason or "review_error")
+
+
+def _account_responses(metadata: dict[str, Any], audits: Sequence[Mapping[str, Any]]) -> None:
+    """Count each provider response once. A refusal was not sent."""
+    for audit in audits:
+        if str(audit.get("status") or "") == "refused":
+            continue
+        _record_usage(metadata, audit.get("usage") if isinstance(audit.get("usage"), Mapping) else None)
 
 
 def _log_call_audits(logs: list, audits: Sequence[Mapping[str, Any]], *, extra: Mapping[str, Any] | None = None) -> None:
@@ -1276,8 +1329,16 @@ def _log_call_audits(logs: list, audits: Sequence[Mapping[str, Any]], *, extra: 
         )
 
 
-async def _structured_call(runtime: AxialRuntime, schema, messages, *, kind: str, metadata: dict[str, Any]) -> dict[str, Any]:
-    """One structured provider call. A repair is a second acquisition."""
+async def _structured_call(
+    runtime: AxialRuntime,
+    schema,
+    messages,
+    *,
+    kind: str,
+    metadata: dict[str, Any],
+    stage: str,
+) -> dict[str, Any]:
+    """One structured provider call. A repair acquires the same stage again."""
     audits: list[dict[str, Any]] = []
     try:
         (parsed, usage), sent = await ainvoke_structured(
@@ -1290,6 +1351,7 @@ async def _structured_call(runtime: AxialRuntime, schema, messages, *, kind: str
             preserve_failed=True,
             send_repair_overflow=False,
             allowance_kind=kind,
+            allowance_stage=stage,
             call_audits=audits,
         )
     except AllowanceExhausted as exc:
@@ -1305,6 +1367,7 @@ async def _structured_call(runtime: AxialRuntime, schema, messages, *, kind: str
             "audits": audits,
         }
     _sync_allowance(metadata, runtime)
+    _account_responses(metadata, audits)
     unparsed = bool(isinstance(parsed, Mapping) and parsed.get("_agt_unparsed"))
     if unparsed:
         metadata["axial_stop"] = str(parsed.get("reason") or "schema_unparsed")
@@ -1406,6 +1469,8 @@ def _trim_surplus_passages(payload: dict[str, Any], chunk: Sequence[Mapping[str,
 def _excerpt_to_budget(payload: dict[str, Any], schema, request_budget: int) -> tuple[int, bool]:
     """Shorten passage text from the start, keeping a source offset, until the request fits."""
     rows = [dict(item) for item in payload.get("passages") or []]
+    if not rows:
+        return request_input_tokens(_messages("axial_proposal", payload), schema), False
     originals = [str(item.get("text") or "") for item in rows]
 
     def estimate_for(current: list[dict[str, Any]]) -> int:
@@ -1602,13 +1667,39 @@ def _propose_node(runtime: AxialRuntime):
                     "omitted_evidence": omitted,
                     "paradigm_roles": list(PARADIGM_ROLES) if procedure.get("coding_lens") == "paradigm" else ["unspecified"],
                 }
+                if not evidence:
+                    metadata["axial_stop"] = "missing_category_evidence"
+                    missing = list(metadata.get("missing_category_evidence") or [])
+                    for pair in window:
+                        row = _pair_record(pair)
+                        if row not in missing:
+                            missing.append(row)
+                    metadata["missing_category_evidence"] = missing
+                    logs.append(
+                        _prompt_row(
+                            "axial_proposal",
+                            _messages("axial_proposal", payload),
+                            {},
+                            extra={
+                                "status": "deferred",
+                                "reason": "missing_category_evidence",
+                                "estimated_input_tokens": request_input_tokens(_messages("axial_proposal", payload), AxialProposalBatch),
+                                "pairs": [_pair_record(pair) for pair in window],
+                                "needs_review": True,
+                                "flagged": True,
+                            },
+                        )
+                    )
+                    _remember_pairs(accounting["omitted"], window)
+                    window = []
+                    break
                 estimate = _trim_surplus_passages(payload, window, AxialProposalBatch, token_budget)
                 over_request = estimate > token_budget
-                over_total = _allowance_refuses(runtime, estimate, estimated=estimated, max_tokens=max_tokens)
+                over_total = _allowance_refuses(runtime, estimate, estimated=estimated, max_tokens=max_tokens, stage="coding")
                 if over_request and len(window) == 1:
                     estimate, excerpted = _excerpt_to_budget(payload, AxialProposalBatch, token_budget)
                     over_request = estimate > token_budget
-                    over_total = _allowance_refuses(runtime, estimate, estimated=estimated, max_tokens=max_tokens)
+                    over_total = _allowance_refuses(runtime, estimate, estimated=estimated, max_tokens=max_tokens, stage="coding")
                     if excerpted and not over_request and not over_total:
                         sent_chunk = window
                         messages = _messages("axial_proposal", payload)
@@ -1656,6 +1747,7 @@ def _propose_node(runtime: AxialRuntime):
                 messages,
                 kind="axial_proposal",
                 metadata=metadata,
+                stage="coding",
             )
             _log_call_audits(
                 logs,
@@ -1686,7 +1778,6 @@ def _propose_node(runtime: AxialRuntime):
                     pending = []
                 continue
             used += 1
-            _record_usage(metadata, result["usage"])
             _remember_pairs(accounting["attempted"], sent_chunk)
             _remember_pairs(accounting["completed"], sent_chunk)
             parsed = result["parsed"]
@@ -1715,6 +1806,19 @@ def _propose_node(runtime: AxialRuntime):
         _sync_allowance(metadata, runtime)
         if "axial_tokens_estimated" not in metadata:
             metadata["axial_tokens_estimated"] = estimated
+        accounted = metadata.get("pair_accounting") or {}
+        propose_required = int(procedure.get("propose_calls") or 0) > 0 and int(accounted.get("planned_count") or 0) > 0
+        propose_stop = str(metadata.get("axial_stop") or "")
+        attempted_n = int(accounted.get("attempted_count") or 0)
+        completed_n = int(accounted.get("completed_count") or 0)
+        if not propose_required:
+            _note_stage(metadata, "proposals", required=False, status="skipped")
+        elif attempted_n > completed_n or propose_stop == "schema_unparsed":
+            _note_stage(metadata, "proposals", required=True, status="incomplete", reason=propose_stop or "schema_unparsed")
+        elif propose_stop in _BUDGET_STOPS or propose_stop == "missing_category_evidence" or int(accounted.get("remaining_count") or 0) > 0:
+            _note_stage(metadata, "proposals", required=True, status="budget_limited", reason=propose_stop or "budget_limited")
+        else:
+            _note_stage(metadata, "proposals", required=True, status="complete")
         return {
             "relationships": relationships,
             "prompt_log": logs,
@@ -1737,6 +1841,7 @@ def _relation_checkpoint(runtime: AxialRuntime):
         if runtime.decision_mode == "llm":
             if runtime.reviewer is None:
                 metadata["decision_stop"] = "call_allowance"
+                _note_stage(metadata, "decision_review", required=False, status="skipped", reason="call_allowance")
                 return {"relationships": relationships, "metadata": metadata, "prompt_log": logs}
             payload = {
                 "kind": "axial_relation_review",
@@ -1756,10 +1861,14 @@ def _relation_checkpoint(runtime: AxialRuntime):
             parsed, audit = await runtime.reviewer.decide(payload, AxialRelationDecisions, metadata)
             if audit:
                 logs.append(audit)
-                _record_usage(metadata, audit.get("usage") if isinstance(audit, Mapping) else None)
+                if audit.get("status") == "validated":
+                    _record_usage(metadata, audit.get("usage") if isinstance(audit, Mapping) else None)
+            _note_review_outcome(metadata, audit=audit, parsed=parsed)
+            _sync_allowance(metadata, runtime)
             if parsed:
                 relationships = _apply_model_relations(relationships, parsed, audit or {})
             return {"relationships": relationships, "metadata": metadata, "prompt_log": logs}
+        _note_stage(metadata, "decision_review", required=False, status="skipped")
         if not state.get("interrupt_enabled", True):
             return {"relationships": relationships}
         decision = interrupt(
@@ -1842,7 +1951,7 @@ def _counterexample_node(runtime: AxialRuntime):
                 AxialCounterexampleBatch,
                 request_budget=token_budget,
                 fits_total=lambda estimate: not _allowance_refuses(
-                    runtime, estimate, estimated=estimated, max_tokens=max_tokens
+                    runtime, estimate, estimated=estimated, max_tokens=max_tokens, stage="coding"
                 ),
             )
             if reason or not chunk:
@@ -1865,6 +1974,7 @@ def _counterexample_node(runtime: AxialRuntime):
                 messages,
                 kind="axial_counterexample",
                 metadata=metadata,
+                stage="coding",
             )
             estimated = int(metadata.get("axial_tokens_estimated") or estimated)
             _log_call_audits(logs, result["audits"])
@@ -1889,7 +1999,6 @@ def _counterexample_node(runtime: AxialRuntime):
                 break
             used += 1
             made += 1
-            _record_usage(metadata, result["usage"])
             parsed = result["parsed"]
             requested = {(item["relationship_id"], item["passage_id"]) for item in chunk}
             for verdict in parsed.get("counterexamples") or []:
@@ -1931,6 +2040,21 @@ def _counterexample_node(runtime: AxialRuntime):
         metadata["axial_counterexample_relevance"]["judgments"] = len(judged)
         metadata["axial_counterexample_relevance"]["relevant_judgments"] = relevant
         metadata["axial_counterexample_relevance"]["relevance_rate"] = None if not judged else round(relevant / len(judged), 4)
+        counter_required = int(procedure.get("counterexample_calls") or 0) > 0 and bool(queued or relationships)
+        counter_stop = str(metadata.get("axial_stop") or "")
+        proposals_done = (metadata.get("stage_outcomes") or {}).get("proposals") or {}
+        # A stop recorded by proposals is not a counterexample failure.
+        counter_failed = counter_stop if proposals_done.get("status") == "complete" else ""
+        if not counter_required:
+            _note_stage(metadata, "counterexamples", required=False, status="skipped")
+        elif counter_stop == "schema_unparsed" and proposals_done.get("status") == "complete":
+            _note_stage(metadata, "counterexamples", required=True, status="incomplete", reason=counter_stop)
+        elif pending and counter_failed in _BUDGET_STOPS:
+            _note_stage(metadata, "counterexamples", required=True, status="budget_limited", reason=counter_failed)
+        elif pending and proposals_done.get("status") == "complete":
+            _note_stage(metadata, "counterexamples", required=True, status="budget_limited", reason=counter_stop or "call_allowance")
+        else:
+            _note_stage(metadata, "counterexamples", required=counter_required, status="complete" if counter_required else "skipped")
         return {
             "relationships": relationships,
             "passages": [item for item in passages if not item.get("synthetic")],
@@ -1998,6 +2122,7 @@ def _saturation_checkpoint(runtime: AxialRuntime):
             if runtime.reviewer is None:
                 metadata["decision_stop"] = "call_allowance"
                 report["judgment"] = None
+                _note_stage(metadata, "decision_review", required=False, status="skipped", reason="call_allowance")
                 return {"saturation": report, "metadata": metadata, "prompt_log": logs}
             parsed, audit = await runtime.reviewer.decide(
                 {
@@ -2015,7 +2140,10 @@ def _saturation_checkpoint(runtime: AxialRuntime):
             )
             if audit:
                 logs.append(audit)
-                _record_usage(metadata, audit.get("usage") if isinstance(audit, Mapping) else None)
+                if audit.get("status") == "validated":
+                    _record_usage(metadata, audit.get("usage") if isinstance(audit, Mapping) else None)
+            _note_review_outcome(metadata, audit=audit, parsed=parsed)
+            _sync_allowance(metadata, runtime)
             if parsed:
                 metadata["model_saturation"] = {
                     "assessment": parsed.get("assessment"),
@@ -2027,8 +2155,9 @@ def _saturation_checkpoint(runtime: AxialRuntime):
                 report["model_saturation"] = metadata["model_saturation"]
             report["judgment"] = None
             return {"saturation": report, "metadata": metadata, "prompt_log": logs}
+        _note_stage(metadata, "decision_review", required=False, status="skipped")
         if not state.get("interrupt_enabled", True):
-            return {"saturation": report}
+            return {"saturation": report, "metadata": metadata}
         decision = interrupt(
             {
                 "kind": "thematic_saturation",
@@ -2067,29 +2196,48 @@ def _saturation_checkpoint(runtime: AxialRuntime):
 def _apply_run_status(metadata: dict[str, Any]) -> None:
     """Graph completion is not analytical coverage.
 
-    A run that finishes the graph with pairs left unexamined, or that stopped
-    on a token or call ceiling, is ``budget_limited``. A preserved parse failure
-    is ``incomplete``. ``complete`` means every planned pair was examined.
+    ``complete`` means every requested stage did its required work. A stage
+    that stopped on a token or call ceiling is ``budget_limited``. A preserved
+    parse failure is ``incomplete``. Pair accounting still applies when the
+    axial planner left pairs unexamined.
     """
     if metadata.get("stop") == "timeout" or metadata.get("status") == "incomplete" and metadata.get("stop") == "timeout":
         metadata["complete"] = False
         metadata["graph_finished"] = False
         metadata["analytical_coverage"] = "incomplete"
         return
+    metadata["graph_finished"] = True
+    required = [
+        row for row in (metadata.get("stage_outcomes") or {}).values()
+        if isinstance(row, Mapping) and row.get("required")
+    ]
+    failed = [row for row in required if row.get("status") == "incomplete"]
+    limited = [row for row in required if row.get("status") == "budget_limited"]
+    if failed:
+        metadata["status"] = "incomplete"
+        metadata["complete"] = False
+        metadata["analytical_coverage"] = "partial"
+        metadata["stop"] = str(failed[0].get("reason") or metadata.get("axial_stop") or "schema_unparsed")
+        return
+    if limited:
+        metadata["status"] = "budget_limited"
+        metadata["complete"] = False
+        metadata["analytical_coverage"] = "budget_limited"
+        metadata["stop"] = str(limited[0].get("reason") or metadata.get("axial_stop") or "budget_limited")
+        return
     accounting = metadata.get("pair_accounting") or {}
     remaining = int(accounting.get("remaining_count") or 0)
     attempted = int(accounting.get("attempted_count") or 0)
     completed = int(accounting.get("completed_count") or 0)
-    failed = max(0, attempted - completed)
+    unparsed = max(0, attempted - completed)
     analytical_stop = str(metadata.get("axial_stop") or "")
-    metadata["graph_finished"] = True
-    if failed > 0:
+    if unparsed > 0:
         metadata["status"] = "incomplete"
         metadata["complete"] = False
         metadata["analytical_coverage"] = "partial"
         metadata["stop"] = analytical_stop or "schema_unparsed"
         return
-    if remaining > 0 or analytical_stop in {"token_allowance", "call_allowance", "request_budget"}:
+    if remaining > 0 or analytical_stop in _BUDGET_STOPS:
         metadata["status"] = "budget_limited"
         metadata["complete"] = False
         metadata["analytical_coverage"] = "budget_limited"
@@ -2174,6 +2322,8 @@ def _core_checkpoint(runtime: AxialRuntime):
         if runtime.decision_mode == "llm":
             if runtime.reviewer is None:
                 metadata["decision_stop"] = "call_allowance"
+                _note_stage(metadata, "decision_review", required=False, status="skipped", reason="call_allowance")
+                _note_stage(metadata, "selective_core", required=False, status="skipped", reason="call_allowance")
                 return {"core_candidates": candidates, "metadata": metadata, "prompt_log": logs}
             parsed, audit = await runtime.reviewer.decide(
                 {"kind": "axial_core_review", "candidates": candidates},
@@ -2182,7 +2332,18 @@ def _core_checkpoint(runtime: AxialRuntime):
             )
             if audit:
                 logs.append(audit)
-                _record_usage(metadata, audit.get("usage") if isinstance(audit, Mapping) else None)
+                if audit.get("status") == "validated":
+                    _record_usage(metadata, audit.get("usage") if isinstance(audit, Mapping) else None)
+            _note_review_outcome(metadata, audit=audit, parsed=parsed)
+            _sync_allowance(metadata, runtime)
+            review = (metadata.get("stage_outcomes") or {}).get("decision_review") or {}
+            _note_stage(
+                metadata,
+                "selective_core",
+                required=bool(review.get("required")),
+                status=str(review.get("status") or "incomplete"),
+                reason=str(review.get("reason") or ""),
+            )
             if parsed:
                 known = {str(row.get("code_id") or "") for row in candidates}
                 chosen = str(parsed.get("core_id") or "")
@@ -2203,6 +2364,8 @@ def _core_checkpoint(runtime: AxialRuntime):
                     row["model_core"] = row.get("code_id") == chosen
             metadata["researcher_core_id"] = ""
             return {"core_candidates": candidates, "metadata": metadata, "prompt_log": logs}
+        _note_stage(metadata, "decision_review", required=False, status="skipped")
+        _note_stage(metadata, "selective_core", required=False, status="skipped")
         if not state.get("interrupt_enabled", True):
             metadata["researcher_core_id"] = ""
             return {"core_candidates": candidates, "metadata": metadata}
@@ -2261,7 +2424,7 @@ def _memo_node(runtime: AxialRuntime):
                 TheoreticalMemoBatch,
                 request_budget=token_budget,
                 fits_total=lambda estimate: not _allowance_refuses(
-                    runtime, estimate, estimated=estimated, max_tokens=max_tokens
+                    runtime, estimate, estimated=estimated, max_tokens=max_tokens, stage="selective"
                 ),
             )
             if reason or not chunk:
@@ -2289,6 +2452,7 @@ def _memo_node(runtime: AxialRuntime):
                 messages,
                 kind="theoretical_memo",
                 metadata=metadata,
+                stage="selective",
             )
             estimated = int(metadata.get("axial_tokens_estimated") or estimated)
             _log_call_audits(logs, result["audits"])
@@ -2312,7 +2476,6 @@ def _memo_node(runtime: AxialRuntime):
                     pending = list(chunk) + list(pending)
                 break
             used += 1
-            _record_usage(metadata, result["usage"])
             parsed = result["parsed"]
             returned = {str(item.get("relationship_id") or ""): item for item in parsed.get("memos") or []}
             for relationship in chunk:
@@ -2341,6 +2504,13 @@ def _memo_node(runtime: AxialRuntime):
             if note not in warnings:
                 warnings.append(note)
         metadata["axial_tokens_estimated"] = estimated
+        memo_stop = str(metadata.get("axial_stop") or "")
+        if pending and memo_stop == "schema_unparsed":
+            _note_stage(metadata, "memos", required=True, status="incomplete", reason=memo_stop)
+        elif pending:
+            _note_stage(metadata, "memos", required=True, status="budget_limited", reason=memo_stop or "call_allowance")
+        else:
+            _note_stage(metadata, "memos", required=True, status="complete")
         return {"memos": memos, "prompt_log": logs, "selective_calls_used": used, "warnings": warnings, "metadata": metadata}
 
     return draft_memos
@@ -2357,7 +2527,10 @@ def _story_node(runtime: AxialRuntime):
             note = "The storyline was not drafted. The selective call allowance is a ceiling."
             if note not in warnings:
                 warnings.append(note)
-            return {"warnings": warnings}
+            metadata = dict(state.get("metadata") or {})
+            metadata["axial_stop"] = "call_allowance"
+            _note_stage(metadata, "storyline", required=True, status="budget_limited", reason="call_allowance")
+            return {"warnings": warnings, "metadata": metadata}
         metadata = dict(state.get("metadata") or {})
         core_id, provenance = _story_core(state)
         story_passages = [
@@ -2390,13 +2563,13 @@ def _story_node(runtime: AxialRuntime):
         estimated = int(metadata.get("axial_tokens_estimated") or 0)
         estimate = request_input_tokens(messages, StorylineBatch)
         while len(payload["passages"]) > 1 and (
-            estimate > token_budget or _allowance_refuses(runtime, estimate, estimated=estimated, max_tokens=max_tokens)
+            estimate > token_budget or _allowance_refuses(runtime, estimate, estimated=estimated, max_tokens=max_tokens, stage="selective")
         ):
             payload["passages"] = payload["passages"][:-1]
             messages = _messages("storyline", payload)
             estimate = request_input_tokens(messages, StorylineBatch)
         logs = list(state.get("prompt_log") or [])
-        over_total = _allowance_refuses(runtime, estimate, estimated=estimated, max_tokens=max_tokens)
+        over_total = _allowance_refuses(runtime, estimate, estimated=estimated, max_tokens=max_tokens, stage="selective")
         over_request = estimate > token_budget
         if over_total or over_request:
             reason = "token_allowance" if over_total else "request_budget"
@@ -2413,8 +2586,9 @@ def _story_node(runtime: AxialRuntime):
             note = f"The storyline was not drafted ({reason})."
             if note not in warnings:
                 warnings.append(note)
+            _note_stage(metadata, "storyline", required=True, status="budget_limited", reason=reason)
             return {"warnings": warnings, "prompt_log": logs, "metadata": metadata}
-        result = await _structured_call(runtime, StorylineBatch, messages, kind="storyline", metadata=metadata)
+        result = await _structured_call(runtime, StorylineBatch, messages, kind="storyline", metadata=metadata, stage="selective")
         _log_call_audits(logs, result["audits"], extra={"core_id": core_id, "core_provenance": provenance})
         if result["refused"] or result["unparsed"]:
             warnings = list(state.get("warnings") or [])
@@ -2438,8 +2612,14 @@ def _story_node(runtime: AxialRuntime):
                         },
                     )
                 )
+            _note_stage(
+                metadata,
+                "storyline",
+                required=True,
+                status="incomplete" if result["unparsed"] else "budget_limited",
+                reason=str(result["reason"] or metadata.get("axial_stop") or "schema_unparsed"),
+            )
             return {"warnings": warnings, "prompt_log": logs, "metadata": metadata}
-        _record_usage(metadata, result["usage"])
         parsed = result["parsed"]
         passages = _by_passage(state)
         statements = []
@@ -2467,6 +2647,10 @@ def _story_node(runtime: AxialRuntime):
                 }
             )
         used = int(state.get("selective_calls_used") or 0) + 1
+        if statements:
+            _note_stage(metadata, "storyline", required=True, status="complete")
+        else:
+            _note_stage(metadata, "storyline", required=True, status="incomplete", reason="storyline_empty")
         held = {**state, "storyline": statements, "metadata": metadata}
         return {
             "storyline": statements,
@@ -2482,13 +2666,7 @@ def _story_node(runtime: AxialRuntime):
 def _export_selective(output_dir: str | Path | None):
     def export_selective(state: AxialState) -> dict:
         metadata = dict(state.get("metadata") or {})
-        if not metadata.get("pair_accounting"):
-            metadata.setdefault("status", "complete")
-            metadata.setdefault("complete", True)
-            metadata.setdefault("analytical_coverage", "complete")
-            metadata["graph_finished"] = True
-        else:
-            _apply_run_status(metadata)
+        _apply_run_status(metadata)
         metadata["saturation_judgment"] = None
         held = {**state, "metadata": metadata}
         held["coverage"] = state.get("coverage") or _coverage(held)
@@ -2692,7 +2870,18 @@ def _initial(data: Mapping[str, Any], metadata: dict, *, interrupt_enabled: bool
     }
 
 
-async def _invoke(builder, saver, initial: AxialState | None, *, thread_id: str, resume: Any, resuming: bool, output_dir, raise_on_timeout: bool, allow_changes: bool, procedure: Mapping[str, Any]) -> AxialResult:
+def _restore_runtime_budget(runtime: AxialRuntime, metadata: Mapping[str, Any]) -> None:
+    """A resumed run keeps the allowance consumed before the checkpoint."""
+    allowance = getattr(runtime.limiter, "provider_allowance", None)
+    budget = metadata.get("provider_budget") if isinstance(metadata, Mapping) else None
+    if allowance is None or not isinstance(budget, Mapping) or not budget:
+        return
+    allowance.restore(budget)
+    if runtime.reviewer is not None:
+        runtime.reviewer.limiter.provider_allowance = allowance
+
+
+async def _invoke(builder, saver, initial: AxialState | None, *, thread_id: str, resume: Any, resuming: bool, output_dir, raise_on_timeout: bool, allow_changes: bool, procedure: Mapping[str, Any], runtime: AxialRuntime | None = None) -> AxialResult:
     graph = builder.compile(checkpointer=saver)
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 80}
     snapshot = await graph.aget_state(config)
@@ -2705,8 +2894,10 @@ async def _invoke(builder, saver, initial: AxialState | None, *, thread_id: str,
                 raise AxialError(f"Thread {thread_id!r} is not waiting on a checkpoint.")
             if resume == {}:
                 raise AxialError("An empty object is not a resume value.")
-            saved = ((snapshot.values or {}).get("metadata") or {}).get("procedure") or {}
-            _check_resume(saved, procedure, allow_changes=allow_changes)
+            saved_meta = dict((snapshot.values or {}).get("metadata") or {})
+            _check_resume(saved_meta.get("procedure") or {}, procedure, allow_changes=allow_changes)
+            if runtime is not None:
+                _restore_runtime_budget(runtime, saved_meta)
             await graph.ainvoke(Command(resume=resume), config)
         else:
             if has_state:
@@ -2841,8 +3032,8 @@ class AxialDecisionReviewer:
         estimate = request_input_tokens(self.messages(payload), schema)
         shared = getattr(self.limiter, "provider_allowance", None)
         shared_stop = None
-        if shared is not None and shared.would_refuse(estimate):
-            shared_stop = shared.preview(estimate)["reason"]
+        if shared is not None and shared.would_refuse(estimate, stage="review"):
+            shared_stop = shared.preview(estimate, stage="review")["reason"]
         stop = (
             "call_allowance" if calls >= self.max_calls
             else shared_stop if shared_stop
@@ -2875,6 +3066,7 @@ class AxialDecisionReviewer:
                 use_cache=False,
                 allowance_estimate=estimate,
                 allowance_kind="decision_review",
+                allowance_stage="review",
             )
             audit["usage"] = usage_from_result(response)
             raw = response.get("raw") if isinstance(response, dict) else None
@@ -2899,7 +3091,25 @@ class AxialDecisionReviewer:
             return None, audit
 
 
-def _runtime(model, *, decision_mode: str, decision_model, request_timeout: float, include_memos: bool, include_storyline: bool, propose_calls: int, counter_calls: int, selective_calls: int, decision_calls: int, max_review_tokens: int = DEFAULT_MAX_AXIAL_REVIEW_TOKENS, token_budget: int = DEFAULT_AXIAL_TOKEN_BUDGET, max_provider_calls: int = 0, tokens_already: int = 0) -> AxialRuntime:
+def _runtime(
+    model,
+    *,
+    decision_mode: str,
+    decision_model,
+    request_timeout: float,
+    include_memos: bool,
+    include_storyline: bool,
+    propose_calls: int,
+    counter_calls: int,
+    selective_calls: int,
+    decision_calls: int,
+    max_review_tokens: int = DEFAULT_MAX_AXIAL_REVIEW_TOKENS,
+    token_budget: int = DEFAULT_AXIAL_TOKEN_BUDGET,
+    coding_calls: int | None = None,
+    review_calls: int | None = None,
+    selective_call_ceiling: int | None = None,
+    tokens_already: int = 0,
+) -> AxialRuntime:
     reviewer = None
     if decision_mode == "llm" and int(decision_calls) > 0:
         chosen = model if decision_model is None else decision_model
@@ -2923,10 +3133,17 @@ def _runtime(model, *, decision_mode: str, decision_model, request_timeout: floa
         decision_step_timeout=decision_watch,
         selective_step_timeout=_step_watchdog(request_timeout, max(1, selective_calls)),
     )
+    stages: dict[str, int] = {}
+    if coding_calls is not None:
+        stages["coding"] = max(0, int(coding_calls))
+    if review_calls is not None:
+        stages["review"] = max(0, int(review_calls))
+    if selective_call_ceiling is not None:
+        stages["selective"] = max(0, int(selective_call_ceiling))
     allowance = ProviderAllowance(
-        max_calls=max(0, int(max_provider_calls)),
         max_tokens=max(0, int(max_review_tokens)),
         tokens_estimated=max(0, int(tokens_already)),
+        stages=stages or None,
     )
     runtime.limiter.provider_allowance = allowance
     if runtime.reviewer is not None:
@@ -3036,7 +3253,8 @@ async def aaxial_code(
         decision_calls=max_decision_calls,
         max_review_tokens=max_axial_review_tokens,
         token_budget=axial_token_budget,
-        max_provider_calls=int(procedure["max_axial_review_calls"]) + (int(max_decision_calls) if decision_mode == "llm" else 0),
+        coding_calls=int(procedure["max_axial_review_calls"]),
+        review_calls=int(max_decision_calls) if decision_mode == "llm" else 0,
     )
     from langgraph.checkpoint.memory import InMemorySaver
 
@@ -3055,6 +3273,7 @@ async def aaxial_code(
         raise_on_timeout=raise_on_timeout,
         allow_changes=allow_changes,
         procedure=procedure,
+        runtime=runtime,
     )
     if also_selective and not result.interrupted and result.metadata.get("stop") != "timeout":
         return await aselective_code(
@@ -3162,8 +3381,8 @@ async def aselective_code(
         decision_calls=max_decision_calls,
         max_review_tokens=max_axial_review_tokens,
         token_budget=axial_token_budget,
-        max_provider_calls=int(max_selective_review_calls if (include_memos or include_storyline) else 0)
-        + (int(max_decision_calls) if decision_mode == "llm" else 0),
+        selective_call_ceiling=int(max_selective_review_calls if (include_memos or include_storyline) else 0),
+        review_calls=int(max_decision_calls) if decision_mode == "llm" else 0,
         tokens_already=int(metadata.get("axial_tokens_estimated") or 0),
     )
     from langgraph.checkpoint.memory import InMemorySaver
@@ -3181,6 +3400,7 @@ async def aselective_code(
         raise_on_timeout=raise_on_timeout,
         allow_changes=allow_changes,
         procedure=procedure,
+        runtime=runtime,
     )
 
 

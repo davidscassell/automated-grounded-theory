@@ -27,12 +27,15 @@ from typing import Any, Callable, Mapping, Sequence
 logger = logging.getLogger("automated_grounded_theory")
 
 class ProviderAllowance:
-    """One call ceiling and one estimated-token ceiling for provider requests.
+    """Shared estimated-token ceiling and separate per-stage call ceilings.
 
     Coding, counterexample, memo, storyline, decision review, schema repair,
     and a retry all acquire from this object before the provider is called.
-    A request that does not fit is not sent. ``max_calls`` or ``max_tokens``
-    of ``None`` leaves that side open. Zero is a closed ceiling.
+    Repairs and retries use the stage that originated the request. A request
+    that does not fit is not sent. ``max_calls`` or a stage ceiling of ``None``
+    leaves that side open. Zero is a closed ceiling. ``max_tokens`` is one
+    pool across stages. ``snapshot`` and ``restore`` are the checkpoint copy
+    of the counters, so a new runtime can continue the same allowance.
     """
 
     def __init__(
@@ -42,14 +45,25 @@ class ProviderAllowance:
         max_tokens: int | None = None,
         calls_used: int = 0,
         tokens_estimated: int = 0,
+        stages: Mapping[str, int | None] | None = None,
     ) -> None:
         self.max_calls = None if max_calls is None else max(0, int(max_calls))
         self.max_tokens = None if max_tokens is None else max(0, int(max_tokens))
         self.calls_used = max(0, int(calls_used))
         self.tokens_estimated = max(0, int(tokens_estimated))
         self.refusals: list[dict[str, Any]] = []
+        self.stage_ceilings: dict[str, int | None] = {}
+        self.stage_used: dict[str, int] = {}
+        for name, ceiling in (stages or {}).items():
+            self.stage_ceilings[str(name)] = None if ceiling is None else max(0, int(ceiling))
+            self.stage_used[str(name)] = 0
 
-    def remaining_calls(self) -> int | None:
+    def remaining_calls(self, stage: str | None = None) -> int | None:
+        if stage and self.stage_ceilings:
+            ceiling = self.stage_ceilings.get(stage)
+            if ceiling is None:
+                return None
+            return max(0, ceiling - self.stage_used.get(stage, 0))
         if self.max_calls is None:
             return None
         return max(0, self.max_calls - self.calls_used)
@@ -59,26 +73,75 @@ class ProviderAllowance:
             return None
         return max(0, self.max_tokens - self.tokens_estimated)
 
-    def preview(self, estimate: int) -> dict[str, Any]:
-        return self._decide(estimate, commit=False, kind="preview")
+    def snapshot(self) -> dict[str, Any]:
+        """Counters that must survive a human checkpoint and a new runtime."""
+        return {
+            "calls_used": self.calls_used,
+            "tokens_estimated": self.tokens_estimated,
+            "max_calls": self.max_calls,
+            "max_tokens": self.max_tokens,
+            "stages": {
+                name: {
+                    "calls_used": self.stage_used.get(name, 0),
+                    "max_calls": self.stage_ceilings.get(name),
+                }
+                for name in set(self.stage_ceilings) | set(self.stage_used)
+            },
+        }
 
-    def would_refuse(self, estimate: int) -> bool:
-        return self.preview(estimate)["status"] != "acquired"
+    def restore(self, snapshot: Mapping[str, Any] | None) -> None:
+        """Replace consumed counters from a checkpoint. Ceilings stay on this runtime."""
+        if not snapshot:
+            return
+        self.calls_used = max(0, int(snapshot.get("calls_used") or 0))
+        self.tokens_estimated = max(0, int(snapshot.get("tokens_estimated") or 0))
+        for name, row in (snapshot.get("stages") or {}).items():
+            if isinstance(row, Mapping):
+                used = row.get("calls_used")
+            else:
+                used = row
+            self.stage_used[str(name)] = max(0, int(used or 0))
 
-    def try_acquire(self, estimate: int, *, kind: str) -> dict[str, Any]:
-        return self._decide(estimate, commit=True, kind=kind)
+    def preview(self, estimate: int, *, stage: str | None = None, kind: str = "preview") -> dict[str, Any]:
+        return self._decide(estimate, commit=False, kind=kind, stage=stage)
 
-    def _decide(self, estimate: int, *, commit: bool, kind: str) -> dict[str, Any]:
+    def would_refuse(self, estimate: int, *, stage: str | None = None, kind: str = "preview") -> bool:
+        return self.preview(estimate, stage=stage, kind=kind)["status"] != "acquired"
+
+    def try_acquire(self, estimate: int, *, kind: str, stage: str | None = None) -> dict[str, Any]:
+        return self._decide(estimate, commit=True, kind=kind, stage=stage)
+
+    def _bucket(self, kind: str, stage: str | None) -> str:
+        if stage:
+            return stage
+        if kind in {"decision_review"}:
+            return "review"
+        if kind in {"theoretical_memo", "storyline"}:
+            return "selective"
+        if kind in {"focused_recode", "focused_label_retry"}:
+            return "focused"
+        return "coding"
+
+    def _decide(self, estimate: int, *, commit: bool, kind: str, stage: str | None = None) -> dict[str, Any]:
         estimate = max(0, int(estimate))
-        if self.max_calls is not None and self.calls_used >= self.max_calls:
+        bucket = self._bucket(kind, stage)
+        stage_limited = bool(self.stage_ceilings)
+        ceiling = self.stage_ceilings.get(bucket) if stage_limited else None
+        used = self.stage_used.get(bucket, 0) if stage_limited else self.calls_used
+        call_max = ceiling if stage_limited else self.max_calls
+        if stage_limited and bucket not in self.stage_ceilings and self.max_calls is not None:
+            call_max = self.max_calls
+            used = self.calls_used
+        if call_max is not None and used >= call_max:
             row = {
                 "status": "refused",
                 "reason": "call_allowance",
                 "kind": kind,
+                "stage": bucket,
                 "estimated_input_tokens": estimate,
-                "calls_used": self.calls_used,
+                "calls_used": used,
                 "tokens_estimated": self.tokens_estimated,
-                "max_calls": self.max_calls,
+                "max_calls": call_max,
                 "max_tokens": self.max_tokens,
             }
         elif self.max_tokens is not None and self.tokens_estimated + estimate > self.max_tokens:
@@ -86,24 +149,31 @@ class ProviderAllowance:
                 "status": "refused",
                 "reason": "token_allowance",
                 "kind": kind,
+                "stage": bucket,
                 "estimated_input_tokens": estimate,
-                "calls_used": self.calls_used,
+                "calls_used": used,
                 "tokens_estimated": self.tokens_estimated,
-                "max_calls": self.max_calls,
+                "max_calls": call_max,
                 "max_tokens": self.max_tokens,
             }
         else:
             if commit:
                 self.calls_used += 1
                 self.tokens_estimated += estimate
+                if stage_limited:
+                    self.stage_used[bucket] = self.stage_used.get(bucket, 0) + 1
+                    used = self.stage_used[bucket]
+                else:
+                    used = self.calls_used
             row = {
                 "status": "acquired",
                 "reason": "",
                 "kind": kind,
+                "stage": bucket,
                 "estimated_input_tokens": estimate,
-                "calls_used": self.calls_used,
+                "calls_used": used if commit else used,
                 "tokens_estimated": self.tokens_estimated,
-                "max_calls": self.max_calls,
+                "max_calls": call_max,
                 "max_tokens": self.max_tokens,
             }
         if commit and row["status"] != "acquired":
@@ -237,6 +307,7 @@ class CallLimiter:
         use_cache: bool = True,
         allowance_estimate: int | None = None,
         allowance_kind: str = "provider",
+        allowance_stage: str | None = None,
     ):
         """``await runnable.ainvoke(payload)`` under the AIMD cap, with rate-limit retries.
 
@@ -273,6 +344,7 @@ class CallLimiter:
                 deadline=deadline,
                 allowance_estimate=allowance_estimate,
                 allowance_kind=allowance_kind,
+                allowance_stage=allowance_stage,
             )
 
         result = await self._retry(once, deadline=deadline)
@@ -339,6 +411,7 @@ class CallLimiter:
         deadline: float | None = None,
         allowance_estimate: int | None = None,
         allowance_kind: str = "provider",
+        allowance_stage: str | None = None,
     ):
         """One provider attempt: reserve budgets, hold one shared slot, reconcile."""
         record = {"queue_wait": 0.0, "latency": None, "reserved": 0.0, "usage": None}
@@ -348,6 +421,7 @@ class CallLimiter:
             decision = self.provider_allowance.try_acquire(
                 0 if allowance_estimate is None else int(allowance_estimate),
                 kind=allowance_kind,
+                stage=allowance_stage,
             )
             if decision["status"] != "acquired":
                 raise AllowanceExhausted(decision)
@@ -1150,6 +1224,7 @@ async def ainvoke_structured(
     preserve_failed: bool = False,
     send_repair_overflow: bool = True,
     allowance_kind: str = "structured",
+    allowance_stage: str | None = None,
     call_audits: list | None = None,
 ) -> tuple[tuple[dict, dict], list]:
     """Invoke ``schema`` once, then repair a single malformed output.
@@ -1165,8 +1240,12 @@ async def ainvoke_structured(
     the budget is logged, reported to ``on_overflow``, and sent unless
     ``send_repair_overflow`` is false. A shared :class:`ProviderAllowance` on
     the limiter is acquired for the first request and again for the repair.
-    When the repair does not fit and ``preserve_failed`` is true, the failed
-    output is returned with ``_agt_unparsed`` instead of being dropped.
+    Both acquisitions use ``allowance_stage``, so a repair spends the
+    originating stage's call allowance. When the repair does not fit and
+    ``preserve_failed`` is true, the failed output is returned with
+    ``_agt_unparsed`` instead of being dropped. A repair that also fails to
+    parse keeps that second response and its usage, and the returned usage
+    is the sum of both responses.
     """
     from langchain_core.messages import HumanMessage
 
@@ -1224,6 +1303,7 @@ async def ainvoke_structured(
         sent,
         allowance_estimate=first_estimate,
         allowance_kind=allowance_kind,
+        allowance_stage=allowance_stage,
         **extra,
     )
     _record_raw(result, raw_out)
@@ -1279,6 +1359,7 @@ async def ainvoke_structured(
                 repair,
                 allowance_estimate=repair_estimate,
                 allowance_kind="schema_repair",
+                allowance_stage=allowance_stage,
                 **extra,
             )
         except AllowanceExhausted as exc:
@@ -1291,11 +1372,36 @@ async def ainvoke_structured(
                 return held
             raise
         _record_raw(repaired, raw_out)
+        repair_raw = _raw_text(repaired.get("raw")) if isinstance(repaired, dict) else _raw_text(repaired)
+        repair_usage = usage_from_result(repaired)
         try:
             payload, usage = parse_structured(repaired, schema)
-        except ValueError:
+        except ValueError as repair_error:
             if preserve_failed:
-                return _preserved(first, failed_usage, reason="schema_unparsed", sent_messages=repair, raw_text=failed_raw)
+                combined = combine_usage(failed_usage, repair_usage)
+                payload = {
+                    "_agt_unparsed": True,
+                    "needs_review": True,
+                    "flagged": True,
+                    "reason": "schema_unparsed",
+                    "error": str(repair_error),
+                    "raw_response": failed_raw,
+                    "repair_raw_response": repair_raw,
+                    "repair_usage": repair_usage,
+                }
+                _remember(
+                    {
+                        "kind": "schema_repair",
+                        "messages": repair,
+                        "estimated_input_tokens": repair_estimate,
+                        "usage": repair_usage,
+                        "status": "schema_unparsed",
+                        "reason": "schema_unparsed",
+                        "parsed": payload,
+                        "raw_response": repair_raw,
+                    }
+                )
+                return (payload, combined), repair
             raise first from None
         _remember(
             {

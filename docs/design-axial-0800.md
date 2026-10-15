@@ -1,8 +1,18 @@
-# Axial coding, saturation, and later steps (0.8.0, fixes in 0.8.1 and 0.8.2)
+# Axial coding, saturation, and later steps (0.8.0, fixes in 0.8.1, 0.8.2, and 0.8.3)
 
-This note is the design for package 0.8.0, with the 0.8.1 and 0.8.2 corrections below. It sits on the focused-coding graph from 0.7.9. The default run is still initial coding plus a theme report. Focused coding is unchanged. Axial coding, saturation indicators, and selective coding are separate graphs. [design-later-stages.md](design-later-stages.md) is the longer literature note. This file is the slice that is implemented.
+This note is the design for package 0.8.0, with the 0.8.1, 0.8.2, and 0.8.3 corrections below. It sits on the focused-coding graph from 0.7.9. The default run is still initial coding plus a theme report. Focused coding is unchanged. Axial coding, saturation indicators, and selective coding are separate graphs. [design-later-stages.md](design-later-stages.md) is the longer literature note. This file is the slice that is implemented.
 
-`policy_version` is `0.8.2`.
+`policy_version` is `0.8.3`.
+
+## 0.8.3 corrections
+
+**Checkpoints do not reset the budget.** Each provider attempt writes `provider_budget` onto the graph state: shared tokens, and calls used per stage. Resume restores that snapshot into the new runtime before the next node runs. The same snapshot is how focused and selective runs continue, including a resume whose checkpointer was loaded in a new process. A pause and an uninterrupted run of the same procedure keep the same ceiling.
+
+**Separate call ceilings.** `max_axial_review_calls` limits coding (proposals, counterexamples, and their repairs). `max_decision_calls` limits decision review. `max_selective_review_calls` limits memos and the storyline. `max_axial_review_tokens` remains the one shared token ceiling. A repair uses the originating stage, so LLM review does not fund an extra coding call.
+
+**Stage status.** `stage_outcomes` records proposals, counterexamples, decision review, selective core, memos, and storyline. `complete` means every requested stage finished. A ceiling stop is `budget_limited`. A preserved parse failure, including a storyline whose repair also failed, is `incomplete`. A selective failure after successful proposals stays on the later stage. The run JSON and `theory_coverage.json` include the per-stage status.
+
+**Usage and empty evidence.** Each provider response updates `provider_token_usage` once, whether or not it parses. A failed repair keeps `repair_raw_response` and `repair_usage`. A pair whose categories have no segment assignments is deferred with `missing_category_evidence` and recorded in coverage. Packing does not call `max` on an empty passage list.
 
 ## 0.8.2 corrections
 

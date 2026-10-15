@@ -363,7 +363,11 @@ Package 0.8.1 measures code-frequency stabilization as total variation between c
 
 Package 0.8.2 keeps a paraphrased contradiction as a negative case. Missing subject overlap is `claim_subject_uncertain` and still disputes. Only explicit irrelevance language, not a phrase such as "is about", flags `rationale_indicates_irrelevance`, and that row stays as `disputed_pending_review` rather than being dropped. `max_axial_review_tokens` is one shared estimated-token allowance for coding, counterexamples, memos, the storyline, and decision review. Schema repair and retries acquire that allowance and a call from the same provider ceiling; a repair that does not fit keeps the failed output for review. An oversized batch is shrunk before its items are abandoned, and proposal trimming keeps evidence for both categories or defers the pair. A finished graph is not the same as analytical coverage: pairs that were not examined stay in `unexamined_pairs`, and a run that did no analysis is `budget_limited` rather than `complete`. Total variation between consecutive documents describes the difference between those documents. A low figure does not establish theoretical saturation, and it is separate from a human confirmation.
 
-`policy_version` is `0.8.2`.
+`policy_version` was `0.8.2` in that release.
+
+Package 0.8.3 keeps the same budget across a human checkpoint. Consumed calls and estimated tokens are stored on the graph state and restored into a new runtime before any resumed node runs, including a resume in a new process. Coding calls and reviewer calls have separate ceilings. They share one token allowance. A repair spends the stage that originated it, so an LLM reviewer does not give coding a larger call budget. `complete` requires every requested stage to finish its work. A skipped review, an omitted storyline, or a selective failure after successful proposals is `budget_limited` or `incomplete`, with a status for each stage. Provider usage is recorded for every response, including a repair that fails to parse. A pair with no segment evidence is deferred as `missing_category_evidence` instead of raising inside the packer.
+
+`policy_version` is `0.8.3`.
 
 ## 26. Out of scope
 

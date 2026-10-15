@@ -4974,6 +4974,12 @@ def _commit_node(runtime: FocusedRuntime):
                 warnings.append(note)
             if not keep_only:
                 warnings = [item for item in warnings if item != note]
+        allowance = getattr(runtime.limiter, "provider_allowance", None)
+        if allowance is not None:
+            budget = allowance.snapshot()
+            budget["decision_calls_used"] = int(metadata.get("decision_calls_used") or 0)
+            budget["decision_tokens_used"] = int(metadata.get("decision_tokens_used") or 0)
+            metadata["provider_budget"] = budget
         metadata["proposal_consolidation"] = consolidation
         for group in consolidation:
             if not group.get("conflict"):
@@ -6240,6 +6246,10 @@ async def _invoke(
                 metadata.get("checkpoint_manifest") or {},
                 allow_changes=allow_changes,
             )
+            allowance = getattr(runtime.limiter, "provider_allowance", None)
+            budget = saved_meta.get("provider_budget") or {}
+            if allowance is not None and isinstance(budget, Mapping) and budget:
+                allowance.restore(budget)
             if continuation:
                 metadata = dict(metadata)
                 metadata["continuations"] = list(saved_meta.get("continuations") or []) + continuation
