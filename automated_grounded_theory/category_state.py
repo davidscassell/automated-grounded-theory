@@ -7,7 +7,7 @@ Integration must tolerate ``relations`` being null.
 Every proposal keeps three separate fields:
 
 - ``disposition``: ``proposed``, ``accepted``, ``rejected``, or ``superseded``
-- ``evidence_condition``: ``anchored``, ``disputed``, or ``insufficient``
+- ``evidence_condition``: ``anchored``, ``disputed``, ``disputed_pending_review``, or ``insufficient``
 - ``downstream_eligible``: true only when the disposition is ``accepted``,
   the evidence condition is ``anchored``, the row is not marked
   ``needs_review``, human ``claim_support`` is not ``contradicted``, and the
@@ -35,7 +35,7 @@ REREAD_PURPOSES = ("develop", "compete", "outside")
 # an incident purpose and it is not interleaved into the first queue.
 COVERAGE_PURPOSES = ("develop", "compete", "outside", "claim_compete")
 DISPOSITIONS = ("proposed", "accepted", "rejected", "superseded")
-EVIDENCE_CONDITIONS = ("anchored", "disputed", "insufficient")
+EVIDENCE_CONDITIONS = ("anchored", "disputed", "disputed_pending_review", "insufficient")
 CLAIM_SUPPORTS = (
     "supported",
     "partially_supported",

@@ -146,6 +146,29 @@ def test_ops_team_case_is_uncertain_rather_than_a_silent_dispute():
     assert "rationale_indicates_irrelevance" not in ops["flags"]
 
 
+def test_pending_review_condition_survives_a_disposition_resume():
+    from automated_grounded_theory.category_state import apply_claim_review, proposal_record_fields
+
+    fields = proposal_record_fields(
+        disposition="proposed",
+        evidence_condition="disputed_pending_review",
+        needs_review=True,
+    )
+    assert fields["evidence_condition"] == "disputed_pending_review"
+    assert fields["downstream_eligible"] is False
+    props = [_claim("m1", "manager access", "Managers are accessible.")]
+    props[0]["evidence_condition"] = "disputed_pending_review"
+    props[0]["disposition"] = "proposed"
+    props[0]["needs_review"] = True
+    updated = apply_claim_review(
+        props,
+        [],
+        {"claim_dispositions": [{"entry_id": "m1", "disposition": "proposed"}]},
+    )
+    assert updated["properties"][0]["evidence_condition"] == "disputed_pending_review"
+    assert updated["properties"][0]["downstream_eligible"] is False
+
+
 def test_total_variation_note_does_not_claim_saturation():
     report = thematic_saturation_report(
         [
