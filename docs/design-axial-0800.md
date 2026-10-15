@@ -1,8 +1,20 @@
-# Axial coding, saturation, and later steps (0.8.0, fixes in 0.8.1, 0.8.2, 0.8.3, and 0.8.4)
+# Axial coding, saturation, and later steps (0.8.0, fixes in 0.8.1, 0.8.2, 0.8.3, 0.8.4, and 0.8.5)
 
-This note is the design for package 0.8.0, with the 0.8.1, 0.8.2, 0.8.3, and 0.8.4 corrections below. It sits on the focused-coding graph from 0.7.9. The default run is still initial coding plus a theme report. Focused coding is unchanged. Axial coding, saturation indicators, and selective coding are separate graphs. [design-later-stages.md](design-later-stages.md) is the longer literature note. This file is the slice that is implemented.
+This note is the design for package 0.8.0, with the 0.8.1, 0.8.2, 0.8.3, 0.8.4, and 0.8.5 corrections below. It sits on the focused-coding graph from 0.7.9. The default run is still initial coding plus a theme report. Focused coding is unchanged. Axial coding, saturation indicators, and selective coding are separate graphs. [design-later-stages.md](design-later-stages.md) is the longer literature note. This file is the slice that is implemented.
 
-`policy_version` is `0.8.4`.
+`policy_version` is `0.8.5`.
+
+## 0.8.5 corrections
+
+**Both endpoints.** `citation_anchoring_rate` is 1 only when every relationship quote shares a content token with both categories. Otherwise it is null. `endpoint_anchoring_rate` is the share of endpoints that quote names. A passage assignment is not that evidence. The row is flagged `endpoint_evidence_partial` and kept.
+
+**Storyline.** The request carries non-rejected relationships, their endpoint categories, the core when one is set, and the passages those rows cite. It is packed to `axial_token_budget`. Omitted relationship, category, and passage ids are on the request and on `storyline_omitted`. A statement that cites only rejected relationships is flagged `storyline_rejected_relationship`. `storyline.json` includes `core_id` and `core_provenance`. An empty or unknown core is `unset`.
+
+**Selective calls.** `memo_calls` and `storyline_calls` split `max_selective_review_calls`. When both products are requested, one call is reserved for the storyline. Those counts are procedure, not a performance setting. Memo and storyline prompts are not the relationship-proposal prompt, and their prompt-log stage is `selective`. A memo that names a category absent from its quote is flagged `memo_quote_unsupported` and `needs_review`.
+
+**Budget and tests.** `aselective_code` restores the axial `provider_budget`, including the coding stage, and adds selective calls to that counter. `relationships_with_negative_case_search` is judgments over all relationships. An axial supports, contradicts, or qualifies verdict whose rationale says the passage is irrelevant (`not linked`, `does not mention`, and the other irrelevance cues) is `axial_test_invalid` and is not a negative case.
+
+**Saturation and planning.** `code_frequency_shift` is total variation. 0 is the same mix and 1 is maximal change. The reviewer prompt uses that label and does not describe 1 as stabilization. `code_frequency_stabilization` still stores the same number. A model assessment has `model_judgment` and does not set `judgment`. A zero `new_property_rate` or `new_relationship_rate` is `undefined_partial_coverage` while pairs remain. Obvious pairs rotate by `seed`. `pair_coverage` is examined pairs over the unordered pair count. An automated saturation resume (`automated: true` or `actor: "automated"`) is stored as actor `automated`.
 
 ## 0.8.4 corrections
 

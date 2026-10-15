@@ -27,8 +27,8 @@ from tests.test_v070 import _entry, _passages, _source
 
 
 def test_version_is_074():
-    assert __version__ == "0.8.4"
-    assert POLICY_VERSION == "0.8.4"
+    assert __version__ == "0.8.5"
+    assert POLICY_VERSION == "0.8.5"
     assert FocusedAlternativeReading.model_fields["alternative_fit"].is_required()
 
 
@@ -77,8 +77,8 @@ def test_claim_search_pairs_a_claim_with_a_relevant_passage_only():
         _passage("p2", "charlie delta"),
         _passage("p3", "echo foxtrot suitcase"),
         _passage("p4", "golf hotel"),
-        _passage("p5", "india juliet", embedding=[1.0, 0.0]),
-        _passage("p6", "kilo lima", embedding=[0.0, 1.0]),
+        _passage("p5", "india juliet timing suitcase morning", embedding=[1.0, 0.0]),
+        _passage("p6", "kilo lima", embedding=[1.0, 0.0]),
     ]
     claims = [
         {

@@ -322,8 +322,8 @@ def _run(model=None, **kwargs):
 
 
 def test_version_and_graphs():
-    assert __version__ == "0.8.4"
-    assert POLICY_VERSION == "0.8.4"
+    assert __version__ == "0.8.5"
+    assert POLICY_VERSION == "0.8.5"
     from automated_grounded_theory.axial import aaxial_code
 
     assert inspect.signature(aaxial_code).parameters["batch_size"].default == 1
@@ -666,7 +666,8 @@ def test_selective_human_and_llm_stay_separate(tmp_path):
     uncited = [row for row in finished.storyline if "storyline_uncited" in row["flags"]]
     assert cited and uncited
     assert finished.coverage["unsupported_statements"] >= 1
-    assert finished.coverage["citation_anchoring_rate"] is not None
+    assert finished.coverage["citation_anchoring_rate"] is None
+    assert finished.coverage["endpoint_anchoring_rate"] == 0.0
     assert (tmp_path / "storyline.json").exists()
     assert (tmp_path / "theoretical_memos.json").exists()
     assert (tmp_path / "core_candidates.json").exists()
