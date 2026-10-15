@@ -27,8 +27,8 @@ TOO_LONG = (
 
 
 def test_version_is_0_6_3():
-    assert __version__ == "0.8.1"
-    assert POLICY_VERSION == "0.8.1"
+    assert __version__ == "0.8.2"
+    assert POLICY_VERSION == "0.8.2"
 
 
 def test_split_and_bundle_detectors():

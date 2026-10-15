@@ -25,7 +25,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import Literal, TypedDict
 
 from automated_grounded_theory.async_support import (
+    AllowanceExhausted,
     CallLimiter,
+    ProviderAllowance,
     ainvoke_structured,
     parse_structured,
     run_sync,
@@ -627,7 +629,11 @@ def _coverage(state: Mapping[str, Any]) -> dict[str, Any]:
         "disputed_relationships": disputed,
         "unsupported_statements": unsupported,
         "empty_paradigm_slots": len(list(state.get("empty_slots") or [])),
-        "note": "Rates are null when there is nothing to score. They are not claim support.",
+        "pair_accounting": dict((state.get("metadata") or {}).get("pair_accounting") or {}),
+        "note": (
+            "Rates are null when there is nothing to score. They are not claim support. "
+            "Pair counts distinguish pairs that were planned, sent, completed, omitted, and still remaining."
+        ),
     }
 
 
@@ -1072,6 +1078,7 @@ def export_axial_state(state: Mapping[str, Any], directory: str | Path) -> dict[
                 "relationships": relationships,
                 "empty_slots": list(state.get("empty_slots") or []),
                 "unexamined_pairs": list(state.get("unexamined_pairs") or []),
+                "pair_accounting": dict(metadata.get("pair_accounting") or {}),
             },
         )
         write("thematic_saturation.json", dict(state.get("saturation") or _saturation(state)))
@@ -1179,16 +1186,32 @@ def _plan_node(state: AxialState) -> dict:
     warnings = list(state.get("warnings") or [])
     if plan["unexamined_pair_count"]:
         note = (
-            f"{plan['unexamined_pair_count']} category pairs were not examined. "
-            "The call allowance is a ceiling."
+            f"{plan['unexamined_pair_count']} category pairs are outside this round. "
+            "The call allowance is a ceiling. Coverage is reconciled after the requests run."
         )
         if note not in warnings:
             warnings.append(note)
+    planned_rows: list[dict[str, str]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for pair in list(plan["round"]) + list(plan["unexamined_pairs"]):
+        row = _pair_record(pair)
+        key = (row["from_id"], row["to_id"])
+        if not key[0] or not key[1] or key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        planned_rows.append(row)
+    metadata["pair_accounting"] = {
+        "planned": planned_rows,
+        "attempted": [],
+        "completed": [],
+        "omitted": [],
+    }
     return {
         "relation_round": list(plan["round"]),
         "unexamined_pairs": list(plan["unexamined_pairs"]),
         "warnings": warnings,
         "relationships": list(state.get("relationships") or []),
+        "metadata": metadata,
     }
 
 
@@ -1197,6 +1220,271 @@ def _request_token_budget(metadata: Mapping[str, Any]) -> int:
     if "axial_token_budget" not in performance:
         return DEFAULT_AXIAL_TOKEN_BUDGET
     return max(0, int(performance.get("axial_token_budget") or 0))
+
+
+def _pair_record(pair: Mapping[str, Any]) -> dict[str, str]:
+    left = str(pair.get("from_id") or "")
+    right = str(pair.get("to_id") or "")
+    if right < left:
+        left, right = right, left
+    return {"from_id": left, "to_id": right}
+
+
+def _pair_key(pair: Mapping[str, Any]) -> tuple[str, str]:
+    row = _pair_record(pair)
+    return row["from_id"], row["to_id"]
+
+
+def _sync_allowance(metadata: dict[str, Any], runtime: AxialRuntime) -> None:
+    allowance = getattr(runtime.limiter, "provider_allowance", None)
+    if allowance is None:
+        return
+    metadata["axial_tokens_estimated"] = allowance.tokens_estimated
+    metadata["provider_calls_used"] = allowance.calls_used
+
+
+def _allowance_refuses(runtime: AxialRuntime, estimate: int, *, estimated: int, max_tokens: int) -> bool:
+    allowance = getattr(runtime.limiter, "provider_allowance", None)
+    if allowance is not None:
+        return allowance.would_refuse(estimate)
+    return estimated + int(estimate) > int(max_tokens)
+
+
+def _log_call_audits(logs: list, audits: Sequence[Mapping[str, Any]], *, extra: Mapping[str, Any] | None = None) -> None:
+    for audit in audits:
+        status = str(audit.get("status") or "")
+        flagged = status in {"parse_failed", "refused", "schema_unparsed"}
+        row_extra = {
+            "status": status,
+            "reason": audit.get("reason") or "",
+            "estimated_input_tokens": audit.get("estimated_input_tokens"),
+            "needs_review": flagged,
+            "flagged": flagged,
+        }
+        if audit.get("raw_response"):
+            row_extra["raw_response"] = audit.get("raw_response")
+        if extra:
+            row_extra.update(dict(extra))
+        logs.append(
+            _prompt_row(
+                str(audit.get("kind") or "provider"),
+                audit.get("messages") or [],
+                audit.get("parsed") if isinstance(audit.get("parsed"), Mapping) else {},
+                audit.get("usage") if isinstance(audit.get("usage"), Mapping) else None,
+                extra=row_extra,
+            )
+        )
+
+
+async def _structured_call(runtime: AxialRuntime, schema, messages, *, kind: str, metadata: dict[str, Any]) -> dict[str, Any]:
+    """One structured provider call. A repair is a second acquisition."""
+    audits: list[dict[str, Any]] = []
+    try:
+        (parsed, usage), sent = await ainvoke_structured(
+            runtime.coder,
+            schema,
+            messages,
+            runtime.limiter,
+            use_cache=True,
+            token_budget=_request_token_budget(metadata),
+            preserve_failed=True,
+            send_repair_overflow=False,
+            allowance_kind=kind,
+            call_audits=audits,
+        )
+    except AllowanceExhausted as exc:
+        _sync_allowance(metadata, runtime)
+        metadata["axial_stop"] = exc.reason
+        return {
+            "refused": True,
+            "unparsed": False,
+            "reason": exc.reason,
+            "parsed": {},
+            "usage": {},
+            "sent": list(messages),
+            "audits": audits,
+        }
+    _sync_allowance(metadata, runtime)
+    unparsed = bool(isinstance(parsed, Mapping) and parsed.get("_agt_unparsed"))
+    if unparsed:
+        metadata["axial_stop"] = str(parsed.get("reason") or "schema_unparsed")
+    return {
+        "refused": False,
+        "unparsed": unparsed,
+        "reason": str(parsed.get("reason") or "") if unparsed else "",
+        "parsed": parsed if isinstance(parsed, Mapping) else {},
+        "usage": usage,
+        "sent": sent,
+        "audits": audits,
+    }
+
+
+def _pack_window(
+    pending: Sequence[Any],
+    batch: int,
+    render,
+    schema,
+    *,
+    request_budget: int,
+    fits_total,
+) -> tuple[list, list, list, int, str | None]:
+    """Largest prefix that fits the request budget and the shared allowance.
+
+    Items that do not fit in this prefix go back on the pending list. When the
+    first item alone does not fit, it is not returned and ``reason`` says why.
+    """
+    window = list(pending[:batch])
+    rest = list(pending[batch:])
+    while window:
+        messages = render(window)
+        estimate = request_input_tokens(messages, schema)
+        request_ok = estimate <= int(request_budget)
+        total_ok = bool(fits_total(estimate))
+        if request_ok and total_ok:
+            return window, rest, messages, estimate, None
+        if len(window) > 1:
+            rest = [window[-1], *rest]
+            window = window[:-1]
+            continue
+        reason = "token_allowance" if not total_ok else "request_budget"
+        return [], rest, messages, estimate, reason
+    return [], rest, [], 0, None
+
+
+_MIN_EXCERPT = 40
+
+
+def _passage_covers(passage: Mapping[str, Any], code_id: str) -> bool:
+    return code_id in {str(item) for item in (passage.get("code_ids") or [])}
+
+
+def _protected_indexes(chunk: Sequence[Mapping[str, Any]], passages: Sequence[Mapping[str, Any]]) -> set[int]:
+    """Passages that are the only remaining evidence for a pair's category."""
+    needed: list[tuple[tuple[str, str], str]] = []
+    for pair in chunk:
+        key = _pair_key(pair)
+        for code_id in (str(pair.get("from_id") or ""), str(pair.get("to_id") or "")):
+            if code_id:
+                needed.append((key, code_id))
+    protected: set[int] = set()
+    for key, code_id in needed:
+        covers = [index for index, passage in enumerate(passages) if _passage_covers(passage, code_id)]
+        if len(covers) == 1:
+            protected.add(covers[0])
+    return protected
+
+
+def _trim_surplus_passages(payload: dict[str, Any], chunk: Sequence[Mapping[str, Any]], schema, request_budget: int) -> int:
+    """Drop passages that are not the last evidence for a category. Return the estimate."""
+    messages = _messages("axial_proposal", payload)
+    estimate = request_input_tokens(messages, schema)
+    while estimate > request_budget and len(payload.get("passages") or []) > 1:
+        protected = _protected_indexes(chunk, payload["passages"])
+        drop_at = None
+        for index in range(len(payload["passages"]) - 1, -1, -1):
+            if index not in protected:
+                drop_at = index
+                break
+        if drop_at is None:
+            break
+        dropped = payload["passages"].pop(drop_at)
+        omitted = dict(payload.get("omitted_evidence") or {})
+        omitted["omitted_count"] = int(omitted.get("omitted_count") or 0) + 1
+        omitted_ids = list(omitted.get("omitted_passage_ids") or [])
+        passage_id = str(dropped.get("passage_id") or "")
+        if passage_id and passage_id not in omitted_ids:
+            omitted_ids.append(passage_id)
+        omitted["omitted_passage_ids"] = omitted_ids
+        omitted["included"] = len(payload["passages"])
+        omitted["packed_for_request_budget"] = True
+        payload["omitted_evidence"] = omitted
+        messages = _messages("axial_proposal", payload)
+        estimate = request_input_tokens(messages, schema)
+    return estimate
+
+
+def _excerpt_to_budget(payload: dict[str, Any], schema, request_budget: int) -> tuple[int, bool]:
+    """Shorten passage text from the start, keeping a source offset, until the request fits."""
+    rows = [dict(item) for item in payload.get("passages") or []]
+    originals = [str(item.get("text") or "") for item in rows]
+
+    def estimate_for(current: list[dict[str, Any]]) -> int:
+        held = dict(payload)
+        held["passages"] = current
+        return request_input_tokens(_messages("axial_proposal", held), schema)
+
+    estimate = estimate_for(rows)
+    if estimate <= request_budget:
+        return estimate, False
+    guard = 0
+    while estimate > request_budget and guard < 24:
+        guard += 1
+        index = max(range(len(rows)), key=lambda item: len(str(rows[item].get("text") or "")))
+        text = str(rows[index].get("text") or "")
+        if len(text) <= _MIN_EXCERPT:
+            break
+        rows[index]["text"] = text[: max(_MIN_EXCERPT, len(text) // 2)]
+        rows[index]["excerpt"] = True
+        rows[index]["source_offset"] = 0
+        rows[index]["source_length"] = len(originals[index])
+        estimate = estimate_for(rows)
+    if estimate > request_budget:
+        return estimate, False
+    payload["passages"] = rows
+    omitted = dict(payload.get("omitted_evidence") or {})
+    omitted["excerpts"] = True
+    payload["omitted_evidence"] = omitted
+    return estimate, True
+
+
+def _remember_pairs(bucket: list, pairs: Sequence[Mapping[str, Any]]) -> None:
+    seen = {_pair_key(item) for item in bucket}
+    for pair in pairs:
+        key = _pair_key(pair)
+        if not key[0] or not key[1] or key in seen:
+            continue
+        seen.add(key)
+        bucket.append(_pair_record(pair))
+
+
+def _finalize_pair_accounting(metadata: dict[str, Any], pending: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+    """Reconcile planned, attempted, completed, omitted, and remaining pairs."""
+    accounting = dict(metadata.get("pair_accounting") or {})
+    planned = [_pair_record(pair) for pair in accounting.get("planned") or []]
+    planned_keys: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in planned:
+        key = (row["from_id"], row["to_id"])
+        if not key[0] or not key[1] or key in seen:
+            continue
+        seen.add(key)
+        planned_keys.append(key)
+    attempted = {_pair_key(pair) for pair in accounting.get("attempted") or []}
+    completed = {_pair_key(pair) for pair in accounting.get("completed") or []}
+    omitted = {_pair_key(pair) for pair in accounting.get("omitted") or []}
+    for pair in pending:
+        key = _pair_key(pair)
+        if key not in attempted:
+            omitted.add(key)
+    def rows(keys: Sequence[tuple[str, str]]) -> list[dict[str, str]]:
+        return [{"from_id": left, "to_id": right} for left, right in keys if left and right]
+
+    omitted_keys = [key for key in planned_keys if key in omitted and key not in attempted]
+    remaining_keys = [key for key in planned_keys if key not in completed]
+    unexamined_keys = [key for key in planned_keys if key not in attempted]
+    metadata["pair_accounting"] = {
+        "planned_count": len(planned_keys),
+        "attempted_count": len([key for key in planned_keys if key in attempted]),
+        "completed_count": len([key for key in planned_keys if key in completed]),
+        "omitted_count": len(omitted_keys),
+        "remaining_count": len(remaining_keys),
+        "planned": rows(planned_keys),
+        "attempted": rows([key for key in planned_keys if key in attempted]),
+        "completed": rows([key for key in planned_keys if key in completed]),
+        "omitted": rows(omitted_keys),
+        "remaining": rows(remaining_keys),
+    }
+    return rows(unexamined_keys)
 
 
 def _allocate_evidence(
@@ -1293,78 +1581,117 @@ def _propose_node(runtime: AxialRuntime):
         token_budget = _request_token_budget(metadata)
         max_tokens = int(procedure.get("max_axial_review_tokens") or 0)
         estimated = int(metadata.get("axial_tokens_estimated") or 0)
+        accounting = metadata.setdefault("pair_accounting", {"planned": [], "attempted": [], "completed": [], "omitted": []})
         while pending and used < int(procedure.get("propose_calls") or 0):
-            chunk = pending[:batch]
-            pending = pending[batch:]
-            evidence, omitted = _allocate_evidence(chunk, assigned, passages, limit)
-            payload = {
-                "pairs": chunk,
-                "categories": [
-                    {"code_id": code_id, "code": book[code_id].get("code"), "definition": book[code_id].get("definition")}
-                    for code_id in book
-                    if code_id in {pair.get("from_id") for pair in chunk} | {pair.get("to_id") for pair in chunk}
-                ],
-                "passages": evidence,
-                "omitted_evidence": omitted,
-                "paradigm_roles": list(PARADIGM_ROLES) if procedure.get("coding_lens") == "paradigm" else ["unspecified"],
-            }
-            messages = _messages("axial_proposal", payload)
-            estimate = request_input_tokens(messages, AxialProposalBatch)
-            while len(payload["passages"]) > 1 and estimate > token_budget:
-                dropped = payload["passages"].pop()
-                omitted = dict(omitted)
-                omitted["omitted_count"] = int(omitted.get("omitted_count") or 0) + 1
-                omitted_ids = list(omitted.get("omitted_passage_ids") or [])
-                passage_id = str(dropped.get("passage_id") or "")
-                if passage_id and passage_id not in omitted_ids:
-                    omitted_ids.append(passage_id)
-                omitted["omitted_passage_ids"] = omitted_ids
-                omitted["included"] = len(payload["passages"])
-                omitted["packed_for_request_budget"] = True
-                payload["omitted_evidence"] = omitted
-                payload["passages"] = list(payload["passages"])
-                messages = _messages("axial_proposal", payload)
-                estimate = request_input_tokens(messages, AxialProposalBatch)
-            if estimated + estimate > max_tokens:
-                metadata["axial_stop"] = "token_allowance"
-                note = (
-                    f"Axial proposal stopped: the next request is {estimate} estimated tokens "
-                    f"and {estimated} of {max_tokens} are already estimated."
-                )
+            window = list(pending[:batch])
+            pending = list(pending[batch:])
+            sent_chunk: list = []
+            payload: dict[str, Any] = {}
+            messages: list = []
+            estimate = 0
+            while window:
+                evidence, omitted = _allocate_evidence(window, assigned, passages, limit)
+                payload = {
+                    "pairs": window,
+                    "categories": [
+                        {"code_id": code_id, "code": book[code_id].get("code"), "definition": book[code_id].get("definition")}
+                        for code_id in book
+                        if code_id in {pair.get("from_id") for pair in window} | {pair.get("to_id") for pair in window}
+                    ],
+                    "passages": evidence,
+                    "omitted_evidence": omitted,
+                    "paradigm_roles": list(PARADIGM_ROLES) if procedure.get("coding_lens") == "paradigm" else ["unspecified"],
+                }
+                estimate = _trim_surplus_passages(payload, window, AxialProposalBatch, token_budget)
+                over_request = estimate > token_budget
+                over_total = _allowance_refuses(runtime, estimate, estimated=estimated, max_tokens=max_tokens)
+                if over_request and len(window) == 1:
+                    estimate, excerpted = _excerpt_to_budget(payload, AxialProposalBatch, token_budget)
+                    over_request = estimate > token_budget
+                    over_total = _allowance_refuses(runtime, estimate, estimated=estimated, max_tokens=max_tokens)
+                    if excerpted and not over_request and not over_total:
+                        sent_chunk = window
+                        messages = _messages("axial_proposal", payload)
+                        break
+                if not over_request and not over_total:
+                    sent_chunk = window
+                    messages = _messages("axial_proposal", payload)
+                    break
+                if len(window) > 1:
+                    pending = [window[-1], *pending]
+                    window = window[:-1]
+                    continue
+                reason = "evidence_does_not_fit" if over_request else "token_allowance"
+                metadata["axial_stop"] = reason if reason != "evidence_does_not_fit" else "request_budget"
                 logs.append(
                     _prompt_row(
                         "axial_proposal",
-                        messages,
+                        _messages("axial_proposal", payload),
                         {},
-                        extra={"status": "omitted", "reason": "token_allowance", "estimated_input_tokens": estimate, "omitted_evidence": omitted},
+                        extra={
+                            "status": "deferred",
+                            "reason": reason,
+                            "estimated_input_tokens": estimate,
+                            "omitted_evidence": payload.get("omitted_evidence"),
+                            "pairs": [_pair_record(pair) for pair in window],
+                            "needs_review": True,
+                            "flagged": True,
+                        },
                     )
                 )
-                pending = chunk + pending
+                _remember_pairs(accounting["omitted"], window)
+                window = []
+                if reason == "token_allowance":
+                    allowance = getattr(runtime.limiter, "provider_allowance", None)
+                    remaining = None if allowance is None else allowance.remaining_tokens()
+                    if remaining == 0 or (allowance is None and estimated >= max_tokens):
+                        _remember_pairs(accounting["omitted"], pending)
+                        pending = []
                 break
-            if estimate > token_budget:
-                metadata["axial_stop"] = "request_budget"
-                logs.append(
-                    _prompt_row(
-                        "axial_proposal",
-                        messages,
-                        {},
-                        extra={"status": "omitted", "reason": "request_budget", "estimated_input_tokens": estimate, "omitted_evidence": omitted},
-                    )
-                )
+            if not sent_chunk:
                 continue
-            (parsed, usage), sent = await ainvoke_structured(
-                runtime.coder,
+            result = await _structured_call(
+                runtime,
                 AxialProposalBatch,
                 messages,
-                runtime.limiter,
-                use_cache=True,
+                kind="axial_proposal",
+                metadata=metadata,
             )
+            _log_call_audits(
+                logs,
+                result["audits"],
+                extra={"omitted_evidence": payload.get("omitted_evidence"), "pairs": [_pair_record(pair) for pair in sent_chunk]},
+            )
+            estimated = int(metadata.get("axial_tokens_estimated") or estimated)
+            if result["refused"] or result["unparsed"]:
+                if not result["audits"]:
+                    logs.append(
+                        _prompt_row(
+                            "axial_proposal",
+                            messages,
+                            result["parsed"],
+                            extra={
+                                "status": "omitted" if result["refused"] else "schema_unparsed",
+                                "reason": result["reason"],
+                                "estimated_input_tokens": estimate,
+                                "needs_review": True,
+                                "flagged": True,
+                                "raw_response": (result["parsed"] or {}).get("raw_response"),
+                            },
+                        )
+                    )
+                _remember_pairs(accounting["attempted"] if result["unparsed"] else accounting["omitted"], sent_chunk)
+                if result["refused"] and result["reason"] in {"call_allowance", "token_allowance"}:
+                    _remember_pairs(accounting["omitted"], pending)
+                    pending = []
+                continue
             used += 1
-            estimated += estimate
-            _record_usage(metadata, usage)
-            logs.append(_prompt_row("axial_proposal", sent, parsed, usage, extra={"estimated_input_tokens": estimate, "omitted_evidence": omitted}))
-            requested = {(str(pair.get("from_id")), str(pair.get("to_id"))) for pair in chunk}
-            bands = {(str(pair.get("from_id")), str(pair.get("to_id"))): pair.get("band") for pair in chunk}
+            _record_usage(metadata, result["usage"])
+            _remember_pairs(accounting["attempted"], sent_chunk)
+            _remember_pairs(accounting["completed"], sent_chunk)
+            parsed = result["parsed"]
+            requested = {(str(pair.get("from_id")), str(pair.get("to_id"))) for pair in sent_chunk}
+            bands = {(str(pair.get("from_id")), str(pair.get("to_id"))): pair.get("band") for pair in sent_chunk}
             for draft in parsed.get("relationships") or []:
                 key = (str(draft.get("from_id") or ""), str(draft.get("to_id") or ""))
                 if key not in requested and (key[1], key[0]) not in requested:
@@ -1384,12 +1711,16 @@ def _propose_node(runtime: AxialRuntime):
                         lens=str(procedure.get("coding_lens") or "paradigm"),
                     )
                 )
-        metadata["axial_tokens_estimated"] = estimated
+        unexamined = _finalize_pair_accounting(metadata, pending)
+        _sync_allowance(metadata, runtime)
+        if "axial_tokens_estimated" not in metadata:
+            metadata["axial_tokens_estimated"] = estimated
         return {
             "relationships": relationships,
             "prompt_log": logs,
             "axial_calls_used": used,
             "relation_round": pending,
+            "unexamined_pairs": unexamined,
             "metadata": metadata,
         }
 
@@ -1491,55 +1822,75 @@ def _counterexample_node(runtime: AxialRuntime):
         max_tokens = int(procedure.get("max_axial_review_tokens") or 0)
         estimated = int(metadata.get("axial_tokens_estimated") or 0)
         while pending and made < allowance:
-            chunk = pending[:batch]
-            pending = pending[batch:]
-            payload = {
-                "counterexamples": [
-                    {
-                        "relationship": by_id.get(item["relationship_id"]),
-                        "passage": passage_by_id.get(item["passage_id"]),
-                        "source": item["source"],
-                    }
-                    for item in chunk
-                ]
-            }
-            messages = _messages("axial_counterexample", payload)
-            estimate = request_input_tokens(messages, AxialCounterexampleBatch)
-            if estimated + estimate > max_tokens:
-                metadata["axial_stop"] = "token_allowance"
-                pending = chunk + pending
-                logs.append(
-                    _prompt_row(
-                        "axial_counterexample",
-                        messages,
-                        {},
-                        extra={"status": "omitted", "reason": "token_allowance", "estimated_input_tokens": estimate},
+            def _render(window, _by_id=by_id, _passages=passage_by_id):
+                payload = {
+                    "counterexamples": [
+                        {
+                            "relationship": _by_id.get(item["relationship_id"]),
+                            "passage": _passages.get(item["passage_id"]),
+                            "source": item["source"],
+                        }
+                        for item in window
+                    ]
+                }
+                return _messages("axial_counterexample", payload)
+
+            chunk, pending, messages, estimate, reason = _pack_window(
+                pending,
+                batch,
+                _render,
+                AxialCounterexampleBatch,
+                request_budget=token_budget,
+                fits_total=lambda estimate: not _allowance_refuses(
+                    runtime, estimate, estimated=estimated, max_tokens=max_tokens
+                ),
+            )
+            if reason or not chunk:
+                metadata["axial_stop"] = reason or "request_budget"
+                if messages:
+                    logs.append(
+                        _prompt_row(
+                            "axial_counterexample",
+                            messages,
+                            {},
+                            extra={"status": "omitted", "reason": reason or "request_budget", "estimated_input_tokens": estimate},
+                        )
                     )
-                )
-                break
-            if estimate > token_budget:
-                metadata["axial_stop"] = "request_budget"
-                logs.append(
-                    _prompt_row(
-                        "axial_counterexample",
-                        messages,
-                        {},
-                        extra={"status": "omitted", "reason": "request_budget", "estimated_input_tokens": estimate},
-                    )
-                )
+                if reason == "token_allowance":
+                    break
                 continue
-            (parsed, usage), sent = await ainvoke_structured(
-                runtime.coder,
+            result = await _structured_call(
+                runtime,
                 AxialCounterexampleBatch,
                 messages,
-                runtime.limiter,
-                use_cache=True,
+                kind="axial_counterexample",
+                metadata=metadata,
             )
+            estimated = int(metadata.get("axial_tokens_estimated") or estimated)
+            _log_call_audits(logs, result["audits"])
+            if result["refused"] or result["unparsed"]:
+                if not result["audits"]:
+                    logs.append(
+                        _prompt_row(
+                            "axial_counterexample",
+                            messages,
+                            result["parsed"],
+                            extra={
+                                "status": "schema_unparsed" if result["unparsed"] else "omitted",
+                                "reason": result["reason"],
+                                "estimated_input_tokens": estimate,
+                                "needs_review": True,
+                                "flagged": True,
+                            },
+                        )
+                    )
+                if result["refused"]:
+                    pending = []
+                break
             used += 1
             made += 1
-            estimated += estimate
-            _record_usage(metadata, usage)
-            logs.append(_prompt_row("axial_counterexample", sent, parsed, usage, extra={"estimated_input_tokens": estimate}))
+            _record_usage(metadata, result["usage"])
+            parsed = result["parsed"]
             requested = {(item["relationship_id"], item["passage_id"]) for item in chunk}
             for verdict in parsed.get("counterexamples") or []:
                 key = (str(verdict.get("relationship_id") or ""), str(verdict.get("passage_id") or ""))
@@ -1713,13 +2064,47 @@ def _saturation_checkpoint(runtime: AxialRuntime):
     return saturation_checkpoint
 
 
+def _apply_run_status(metadata: dict[str, Any]) -> None:
+    """Graph completion is not analytical coverage.
+
+    A run that finishes the graph with pairs left unexamined, or that stopped
+    on a token or call ceiling, is ``budget_limited``. A preserved parse failure
+    is ``incomplete``. ``complete`` means every planned pair was examined.
+    """
+    if metadata.get("stop") == "timeout" or metadata.get("status") == "incomplete" and metadata.get("stop") == "timeout":
+        metadata["complete"] = False
+        metadata["graph_finished"] = False
+        metadata["analytical_coverage"] = "incomplete"
+        return
+    accounting = metadata.get("pair_accounting") or {}
+    remaining = int(accounting.get("remaining_count") or 0)
+    attempted = int(accounting.get("attempted_count") or 0)
+    completed = int(accounting.get("completed_count") or 0)
+    failed = max(0, attempted - completed)
+    analytical_stop = str(metadata.get("axial_stop") or "")
+    metadata["graph_finished"] = True
+    if failed > 0:
+        metadata["status"] = "incomplete"
+        metadata["complete"] = False
+        metadata["analytical_coverage"] = "partial"
+        metadata["stop"] = analytical_stop or "schema_unparsed"
+        return
+    if remaining > 0 or analytical_stop in {"token_allowance", "call_allowance", "request_budget"}:
+        metadata["status"] = "budget_limited"
+        metadata["complete"] = False
+        metadata["analytical_coverage"] = "budget_limited"
+        metadata["stop"] = analytical_stop or "budget_limited"
+        return
+    metadata["status"] = "complete"
+    metadata["complete"] = True
+    metadata["analytical_coverage"] = "complete"
+    metadata.setdefault("stop", "")
+
+
 def _export_node(runtime_output: dict):
     def export_axial(state: AxialState) -> dict:
         metadata = dict(state.get("metadata") or {})
-        if metadata.get("stop") != "timeout":
-            metadata["status"] = "complete"
-            metadata["complete"] = True
-            metadata.setdefault("stop", "")
+        _apply_run_status(metadata)
         metadata["saturation_judgment"] = None
         held = {**state, "metadata": metadata, "saturation": state.get("saturation") or _saturation(state)}
         held["coverage"] = _coverage(held)
@@ -1869,47 +2254,66 @@ def _memo_node(runtime: AxialRuntime):
         max_tokens = int(((metadata.get("procedure") or {}).get("max_axial_review_tokens") or 0))
         estimated = int(metadata.get("axial_tokens_estimated") or 0)
         while pending and used < allowance:
-            chunk = pending[:batch]
-            pending = pending[batch:]
-            messages = _messages(
-                "theoretical_memo",
-                {"relationships": chunk},
+            chunk, pending, messages, estimate, reason = _pack_window(
+                pending,
+                batch,
+                lambda window: _messages("theoretical_memo", {"relationships": window}),
+                TheoreticalMemoBatch,
+                request_budget=token_budget,
+                fits_total=lambda estimate: not _allowance_refuses(
+                    runtime, estimate, estimated=estimated, max_tokens=max_tokens
+                ),
             )
-            estimate = request_input_tokens(messages, TheoreticalMemoBatch)
-            if estimated + estimate > max_tokens:
-                metadata["axial_stop"] = "token_allowance"
-                pending = chunk + pending
-                logs.append(
-                    _prompt_row(
-                        "theoretical_memo",
-                        messages,
-                        {},
-                        extra={"status": "omitted", "reason": "token_allowance", "estimated_input_tokens": estimate},
+            if reason or not chunk:
+                metadata["axial_stop"] = reason or "request_budget"
+                if messages:
+                    logs.append(
+                        _prompt_row(
+                            "theoretical_memo",
+                            messages,
+                            {},
+                            extra={
+                                "status": "omitted",
+                                "reason": reason or "request_budget",
+                                "estimated_input_tokens": estimate,
+                                "relationship_ids": [str(row.get("relationship_id") or "") for row in []],
+                            },
+                        )
                     )
-                )
-                break
-            if estimate > token_budget:
-                metadata["axial_stop"] = "request_budget"
-                logs.append(
-                    _prompt_row(
-                        "theoretical_memo",
-                        messages,
-                        {},
-                        extra={"status": "omitted", "reason": "request_budget", "estimated_input_tokens": estimate},
-                    )
-                )
+                if reason == "token_allowance":
+                    break
                 continue
-            (parsed, usage), sent = await ainvoke_structured(
-                runtime.coder,
+            result = await _structured_call(
+                runtime,
                 TheoreticalMemoBatch,
                 messages,
-                runtime.limiter,
-                use_cache=True,
+                kind="theoretical_memo",
+                metadata=metadata,
             )
+            estimated = int(metadata.get("axial_tokens_estimated") or estimated)
+            _log_call_audits(logs, result["audits"])
+            if result["refused"] or result["unparsed"]:
+                if not result["audits"]:
+                    logs.append(
+                        _prompt_row(
+                            "theoretical_memo",
+                            messages,
+                            result["parsed"],
+                            extra={
+                                "status": "schema_unparsed" if result["unparsed"] else "omitted",
+                                "reason": result["reason"],
+                                "estimated_input_tokens": estimate,
+                                "needs_review": True,
+                                "flagged": True,
+                            },
+                        )
+                    )
+                if result["refused"]:
+                    pending = list(chunk) + list(pending)
+                break
             used += 1
-            estimated += estimate
-            _record_usage(metadata, usage)
-            logs.append(_prompt_row("theoretical_memo", sent, parsed, usage, extra={"estimated_input_tokens": estimate}))
+            _record_usage(metadata, result["usage"])
+            parsed = result["parsed"]
             returned = {str(item.get("relationship_id") or ""): item for item in parsed.get("memos") or []}
             for relationship in chunk:
                 relationship_id = str(relationship.get("relationship_id") or "")
@@ -1985,12 +2389,14 @@ def _story_node(runtime: AxialRuntime):
         max_tokens = int(((metadata.get("procedure") or {}).get("max_axial_review_tokens") or 0))
         estimated = int(metadata.get("axial_tokens_estimated") or 0)
         estimate = request_input_tokens(messages, StorylineBatch)
-        while len(payload["passages"]) > 1 and estimate > token_budget:
+        while len(payload["passages"]) > 1 and (
+            estimate > token_budget or _allowance_refuses(runtime, estimate, estimated=estimated, max_tokens=max_tokens)
+        ):
             payload["passages"] = payload["passages"][:-1]
             messages = _messages("storyline", payload)
             estimate = request_input_tokens(messages, StorylineBatch)
         logs = list(state.get("prompt_log") or [])
-        over_total = estimated + estimate > max_tokens
+        over_total = _allowance_refuses(runtime, estimate, estimated=estimated, max_tokens=max_tokens)
         over_request = estimate > token_budget
         if over_total or over_request:
             reason = "token_allowance" if over_total else "request_budget"
@@ -2008,24 +2414,33 @@ def _story_node(runtime: AxialRuntime):
             if note not in warnings:
                 warnings.append(note)
             return {"warnings": warnings, "prompt_log": logs, "metadata": metadata}
-        (parsed, usage), sent = await ainvoke_structured(
-            runtime.coder,
-            StorylineBatch,
-            messages,
-            runtime.limiter,
-            use_cache=True,
-        )
-        _record_usage(metadata, usage)
-        metadata["axial_tokens_estimated"] = estimated + estimate
-        logs.append(
-            _prompt_row(
-                "storyline",
-                sent,
-                parsed,
-                usage,
-                extra={"estimated_input_tokens": estimate, "core_id": core_id, "core_provenance": provenance},
-            )
-        )
+        result = await _structured_call(runtime, StorylineBatch, messages, kind="storyline", metadata=metadata)
+        _log_call_audits(logs, result["audits"], extra={"core_id": core_id, "core_provenance": provenance})
+        if result["refused"] or result["unparsed"]:
+            warnings = list(state.get("warnings") or [])
+            note = f"The storyline was not drafted ({result['reason']}). The failed output is kept for review."
+            if note not in warnings:
+                warnings.append(note)
+            if not result["audits"]:
+                logs.append(
+                    _prompt_row(
+                        "storyline",
+                        messages,
+                        result["parsed"],
+                        extra={
+                            "status": "schema_unparsed" if result["unparsed"] else "omitted",
+                            "reason": result["reason"],
+                            "estimated_input_tokens": estimate,
+                            "needs_review": True,
+                            "flagged": True,
+                            "core_id": core_id,
+                            "core_provenance": provenance,
+                        },
+                    )
+                )
+            return {"warnings": warnings, "prompt_log": logs, "metadata": metadata}
+        _record_usage(metadata, result["usage"])
+        parsed = result["parsed"]
         passages = _by_passage(state)
         statements = []
         for index, draft in enumerate(parsed.get("statements") or [], start=1):
@@ -2067,8 +2482,13 @@ def _story_node(runtime: AxialRuntime):
 def _export_selective(output_dir: str | Path | None):
     def export_selective(state: AxialState) -> dict:
         metadata = dict(state.get("metadata") or {})
-        metadata.setdefault("status", "complete")
-        metadata.setdefault("complete", True)
+        if not metadata.get("pair_accounting"):
+            metadata.setdefault("status", "complete")
+            metadata.setdefault("complete", True)
+            metadata.setdefault("analytical_coverage", "complete")
+            metadata["graph_finished"] = True
+        else:
+            _apply_run_status(metadata)
         metadata["saturation_judgment"] = None
         held = {**state, "metadata": metadata}
         held["coverage"] = state.get("coverage") or _coverage(held)
@@ -2417,19 +2837,22 @@ class AxialDecisionReviewer:
 
     async def decide(self, payload, schema, metadata):
         calls = int(metadata.get("decision_calls_used", 0))
-        tokens = int(metadata.get("decision_tokens_used", 0))
+        tokens = int(metadata.get("axial_tokens_estimated") or metadata.get("decision_tokens_used") or 0)
         estimate = request_input_tokens(self.messages(payload), schema)
+        shared = getattr(self.limiter, "provider_allowance", None)
+        shared_stop = None
+        if shared is not None and shared.would_refuse(estimate):
+            shared_stop = shared.preview(estimate)["reason"]
         stop = (
             "call_allowance" if calls >= self.max_calls
+            else shared_stop if shared_stop
+            else None if shared is not None
             else "token_allowance" if tokens + estimate > self.max_tokens
             else "request_budget" if estimate > self.token_budget
             else None
         )
-        if stop:
-            metadata["decision_stop"] = stop
-            return None, None
-        metadata["decision_calls_used"] = calls + 1
-        metadata["decision_tokens_used"] = tokens + estimate
+        if stop is None and estimate > self.token_budget:
+            stop = "request_budget"
         messages = self.messages(payload)
         audit = {
             "kind": "decision_review",
@@ -2440,11 +2863,18 @@ class AxialDecisionReviewer:
             "estimated_input_tokens": estimate,
             "messages": [{"role": message.type, "content": message.content} for message in messages],
         }
+        if stop:
+            metadata["decision_stop"] = stop
+            audit.update(status="omitted", reason=stop, needs_review=True, flagged=True)
+            return None, audit
+        metadata["decision_calls_used"] = calls + 1
         try:
             response = await self.limiter.ainvoke(
                 structured_runnable(self.model, schema),
                 messages,
                 use_cache=False,
+                allowance_estimate=estimate,
+                allowance_kind="decision_review",
             )
             audit["usage"] = usage_from_result(response)
             raw = response.get("raw") if isinstance(response, dict) else None
@@ -2453,14 +2883,23 @@ class AxialDecisionReviewer:
             parsed = schema.model_validate(parsed).model_dump()
             audit["response"] = parsed
             audit["status"] = "validated"
+            if shared is not None:
+                metadata["axial_tokens_estimated"] = shared.tokens_estimated
+                metadata["decision_tokens_used"] = shared.tokens_estimated
+            else:
+                metadata["decision_tokens_used"] = tokens + estimate
             return parsed, audit
+        except AllowanceExhausted as exc:
+            metadata["decision_stop"] = exc.reason
+            audit.update(status="omitted", reason=exc.reason, needs_review=True, flagged=True)
+            return None, audit
         except Exception as exc:
             metadata["decision_stop"] = "review_error"
             audit.update(status="error", error=f"{type(exc).__name__}: {exc}")
             return None, audit
 
 
-def _runtime(model, *, decision_mode: str, decision_model, request_timeout: float, include_memos: bool, include_storyline: bool, propose_calls: int, counter_calls: int, selective_calls: int, decision_calls: int, max_review_tokens: int = DEFAULT_MAX_AXIAL_REVIEW_TOKENS, token_budget: int = DEFAULT_AXIAL_TOKEN_BUDGET) -> AxialRuntime:
+def _runtime(model, *, decision_mode: str, decision_model, request_timeout: float, include_memos: bool, include_storyline: bool, propose_calls: int, counter_calls: int, selective_calls: int, decision_calls: int, max_review_tokens: int = DEFAULT_MAX_AXIAL_REVIEW_TOKENS, token_budget: int = DEFAULT_AXIAL_TOKEN_BUDGET, max_provider_calls: int = 0, tokens_already: int = 0) -> AxialRuntime:
     reviewer = None
     if decision_mode == "llm" and int(decision_calls) > 0:
         chosen = model if decision_model is None else decision_model
@@ -2473,7 +2912,7 @@ def _runtime(model, *, decision_mode: str, decision_model, request_timeout: floa
         )
     calls = max(propose_calls, counter_calls, 1)
     decision_watch = _step_watchdog(request_timeout, int(decision_calls)) if decision_mode == "llm" and int(decision_calls) > 0 else 0.0
-    return AxialRuntime(
+    runtime = AxialRuntime(
         coder=model,
         reviewer=reviewer,
         decision_mode=decision_mode,
@@ -2484,6 +2923,16 @@ def _runtime(model, *, decision_mode: str, decision_model, request_timeout: floa
         decision_step_timeout=decision_watch,
         selective_step_timeout=_step_watchdog(request_timeout, max(1, selective_calls)),
     )
+    allowance = ProviderAllowance(
+        max_calls=max(0, int(max_provider_calls)),
+        max_tokens=max(0, int(max_review_tokens)),
+        tokens_estimated=max(0, int(tokens_already)),
+    )
+    runtime.limiter.provider_allowance = allowance
+    if runtime.reviewer is not None:
+        runtime.reviewer.limiter.provider_allowance = allowance
+        runtime.reviewer.max_tokens = allowance.max_tokens or 0
+    return runtime
 
 
 async def aaxial_code(
@@ -2587,6 +3036,7 @@ async def aaxial_code(
         decision_calls=max_decision_calls,
         max_review_tokens=max_axial_review_tokens,
         token_budget=axial_token_budget,
+        max_provider_calls=int(procedure["max_axial_review_calls"]) + (int(max_decision_calls) if decision_mode == "llm" else 0),
     )
     from langgraph.checkpoint.memory import InMemorySaver
 
@@ -2712,6 +3162,9 @@ async def aselective_code(
         decision_calls=max_decision_calls,
         max_review_tokens=max_axial_review_tokens,
         token_budget=axial_token_budget,
+        max_provider_calls=int(max_selective_review_calls if (include_memos or include_storyline) else 0)
+        + (int(max_decision_calls) if decision_mode == "llm" else 0),
+        tokens_already=int(metadata.get("axial_tokens_estimated") or 0),
     )
     from langgraph.checkpoint.memory import InMemorySaver
 

@@ -313,7 +313,7 @@ def test_pre_call_stall_and_open_connection_hit_the_request_deadline():
     assert holder.opened is True
 
 
-def test_irrelevant_contradiction_does_not_dispute_the_claim():
+def test_ops_team_paraphrase_is_an_uncertain_dispute_not_irrelevance():
     props = [
         {
             "entry_id": "R039_q1",
@@ -341,10 +341,13 @@ def test_irrelevant_contradiction_does_not_dispute_the_claim():
         valid=True,
         passage_text=quote,
     )
-    assert props[0].get("evidence_condition") != "disputed"
-    assert not props[0].get("negative_cases")
-    assert "claim_test_invalid" in props[0]["flags"]
-    assert props[0]["claim_tests"][-1]["reason"] == "rationale_indicates_irrelevance"
+    assert props[0]["evidence_condition"] == "disputed"
+    assert props[0]["negative_cases"]
+    assert props[0]["negative_cases"][-1]["claim_subject_uncertain"] is True
+    assert props[0]["needs_review"] is True
+    assert "claim_subject_uncertain" in props[0]["flags"]
+    assert "claim_test_invalid" not in props[0]["flags"]
+    assert "rationale_indicates_irrelevance" not in props[0]["flags"]
     uncertain = [
         {
             "entry_id": "R039_q1",
