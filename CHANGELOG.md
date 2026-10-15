@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.3
+
+- Pausing for human review does not reset the provider allowance. Consumed calls and tokens are checkpoint state (`provider_budget`) and are restored into the runtime before a resumed node runs, including a new process. Axial, focused, and selective graphs all restore that state. Decision-review counters travel with it.
+- Coding and review have separate call ceilings on one shared token allowance. A schema repair or retry spends the stage that sent the original request. `decision_mode` does not give coding extra calls.
+- A run is `complete` only when every requested stage did its work. Stages are proposals, counterexamples, decision review, selective core, memos, and storyline. A ceiling stop is `budget_limited`. A preserved parse failure is `incomplete`. Per-stage status is on the run JSON.
+- Every provider response is counted once, including a repair that also fails to parse. The failed repair keeps its own response and usage.
+- A proposal with no segment evidence is deferred as `missing_category_evidence`. An empty evidence list does not raise inside packing.
+- `policy_version` is `0.8.3`.
+
 ## 0.8.2
 
 - A paraphrased contradiction stays a negative case. "is about" and "about the" are not irrelevance cues. Missing subject-stem overlap is `claim_subject_uncertain` and still disputes. Only explicit irrelevance language (`irrelevant`, `unrelated`, `does not address`, `does not mention`, `nothing to do with`) flags `rationale_indicates_irrelevance`, and a negation such as "not unrelated" does not. That negative case is kept as `disputed_pending_review` instead of being dropped.
