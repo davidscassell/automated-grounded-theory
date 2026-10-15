@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from automated_grounded_theory.async_support import CallLimiter, run_sync
+from automated_grounded_theory.backends import CrossLoopClientError, ProviderClientFactory
 from automated_grounded_theory.batching import TOKEN_ESTIMATE_ADJUSTMENT_NOTE, adjusted_token_estimate, estimate_tokens
 from automated_grounded_theory.decision_review import DecisionReviewer, claims_payload, next_claim_batch
 from automated_grounded_theory.focused import (
@@ -306,13 +307,18 @@ def test_httpx_client_used_on_one_loop_works_on_the_model_loop():
         loop.run_forever()
 
     threading.Thread(target=spin, daemon=True).start()
-    client = httpx.AsyncClient()
+    factory = ProviderClientFactory(
+        auth=httpx.BasicAuth("alice", "secret"),
+        cookies={"session": "aaa"},
+        trust_env=False,
+    )
+    client = factory.build(timeout=httpx.Timeout(5.0), loop=loop)
 
-    async def prime():
-        response = await client.get(url)
+    async def prime(target):
+        response = await target.get(url)
         return response.text
 
-    assert asyncio.run_coroutine_threadsafe(prime(), loop).result(timeout=3) == "ok"
+    assert asyncio.run_coroutine_threadsafe(prime(client), loop).result(timeout=3) == "ok"
     holder = _HttpHolder(client, url)
     limiter = CallLimiter(1, max_retries=0, request_timeout=2, wall_timeout=2)
     first = run_sync(limiter.ainvoke(holder, {"n": 1}, use_cache=False), timeout=5)
@@ -320,6 +326,15 @@ def test_httpx_client_used_on_one_loop_works_on_the_model_loop():
     assert first == "ok"
     assert second == "ok"
     assert holder.http_async_client is not client
+    replacement = holder.http_async_client
+    assert replacement.cookies["session"] == "aaa"
+    assert replacement.trust_env is False
+    assert replacement.auth._auth_header == client.auth._auth_header
+
+    raw = httpx.AsyncClient(trust_env=False)
+    assert asyncio.run_coroutine_threadsafe(prime(raw), loop).result(timeout=3) == "ok"
+    with pytest.raises(CrossLoopClientError):
+        run_sync(limiter.ainvoke(_HttpHolder(raw, url), {"n": 3}, use_cache=False), timeout=5)
     loop.call_soon_threadsafe(loop.stop)
 
 

@@ -1,4 +1,4 @@
-# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, 0.6.14, 0.6.15, and 0.6.16, focused coding in 0.7.0, fixes in 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, 0.7.6, 0.7.7, 0.7.8, and 0.7.9, axial coding and saturation indicators in 0.8.0)
+# automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, 0.6.14, 0.6.15, and 0.6.16, focused coding in 0.7.0, fixes in 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, 0.7.6, 0.7.7, 0.7.8, and 0.7.9, axial coding and saturation indicators in 0.8.0, fixes in 0.8.1)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
 Status: steps 1 and 2 of the v0.6 plan, plus focused coding in 0.7.0 and the 0.7.1 through 0.7.9 fixes. Axial coding, saturation indicators, and optional selective coding are separate graphs in 0.8.0. See [design-axial-0800.md](design-axial-0800.md). Theoretical sampling is not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
@@ -355,7 +355,11 @@ Package 0.7.9 cuts off a provider that holds a connection open with a monotonic 
 
 Package 0.8.0 adds `get_graph("axial")` and `get_graph("selective")`. They are not nodes on open coding, themes, or focused coding. Relationships use the five paradigm roles, cite a passage, and stay proposals until a researcher resumes `interrupt()`. `decision_mode="llm"` writes model fields and an audit row, and leaves human `claim_support`, `researcher_saturation`, and `researcher_core_id` unset. Saturation indicators are a curve. `judgment` stays null. A timeout returns an incomplete result unless `raise_on_timeout=True`. The design of this slice is [design-axial-0800.md](design-axial-0800.md).
 
-`policy_version` is `0.8.0`.
+`policy_version` was `0.8.0` in that release.
+
+Package 0.8.1 measures code-frequency stabilization as total variation between consecutive documents' normalized assignment counts. Presence-bit reports from 0.8.0 are not comparable. A combined axial-then-selective run keeps the axial audit, and selective export does not rewrite the axial JSON. Call budgets count model calls: proposal calls are `ceil(pairs / batch_size)`, unused calls move, and the counterexample pair capacity is calls times batch size. `max_decision_calls=0` sends no reviewer call. The storyline names the core the decision mode actually selected. Proposal evidence is shared across both categories before the limit is filled. Provider HTTP clients are rebuilt only from `ProviderClientFactory` configuration. Axial and selective calls record provider token usage under `max_axial_review_tokens` and `axial_token_budget`. A stall before the first model call is on the same monotonic deadline as the request. A contradicts verdict that does not engage the claim's subject does not dispute it. Reallocation metadata matches the warning, and reallocation stays inside the token allowance.
+
+`policy_version` is `0.8.1`.
 
 ## 26. Out of scope
 

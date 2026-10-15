@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,6 +41,16 @@ from automated_grounded_theory.validation import anchor_quote
 from automated_grounded_theory.version import __version__
 
 logger = logging.getLogger("automated_grounded_theory")
+
+DEFAULT_MAX_AXIAL_REVIEW_TOKENS = 24000
+DEFAULT_AXIAL_TOKEN_BUDGET = 6000
+_AXIAL_EXPORT_NAMES = (
+    "category_relationships.json",
+    "thematic_saturation.json",
+    "theory_coverage.json",
+    "axial_run.json",
+)
+
 
 PARADIGM_ROLES = (
     "causal_condition",
@@ -99,6 +110,7 @@ _PROCEDURE_KEYS = (
     "axial_synthetic_counterexample",
     "decision_mode",
     "source_hash",
+    "max_axial_review_tokens",
 )
 _LOCKED_KEYS = frozenset({"seed", "source_hash"})
 
@@ -341,6 +353,19 @@ def _source_mapping(source: Any) -> dict[str, Any]:
             "relationships": list(getattr(source, "relationships", []) or []),
             "metadata": dict(getattr(source, "metadata", {}) or {}),
         }
+        for name in (
+            "prompt_log",
+            "warnings",
+            "saturation",
+            "coverage",
+            "storyline",
+            "core_candidates",
+            "empty_slots",
+            "unexamined_pairs",
+        ):
+            value = getattr(source, name, None)
+            if value:
+                data[name] = value
     data["codebook"] = _book(data.get("codebook"))
     return data
 
@@ -508,14 +533,6 @@ def _windows_from_state(state: Mapping[str, Any]) -> list[dict[str, Any]]:
         doc = str(passage.get("doc_id") or passage.get("document_id") or passage.get("passage_id") or "")
         if doc and doc not in order and doc != "synthetic":
             order.append(doc)
-    codes_by_doc: dict[str, set[str]] = {doc: set() for doc in order}
-    for segment in state.get("segments") or []:
-        if not isinstance(segment, Mapping):
-            continue
-        doc = _doc_of(str(segment.get("passage_id") or ""), passages)
-        code_id = str(segment.get("code_id") or "")
-        if doc in codes_by_doc and code_id:
-            codes_by_doc[doc].add(code_id)
     properties_by_doc: dict[str, set[str]] = {doc: set() for doc in order}
     for row in list(state.get("properties") or []) + list(state.get("dimensions") or []):
         if not isinstance(row, Mapping):
@@ -531,6 +548,15 @@ def _windows_from_state(state: Mapping[str, Any]) -> list[dict[str, Any]]:
         doc = _doc_of(str(row.get("passage_id") or ""), passages)
         if doc in relations_by_doc:
             relations_by_doc[doc].add(str(row.get("relationship_id") or ""))
+    counts_by_doc: dict[str, dict[str, int]] = {doc: {} for doc in order}
+    for segment in state.get("segments") or []:
+        if not isinstance(segment, Mapping):
+            continue
+        doc = _doc_of(str(segment.get("passage_id") or ""), passages)
+        code_id = str(segment.get("code_id") or "")
+        if doc in counts_by_doc and code_id:
+            counts_by_doc[doc][code_id] = counts_by_doc[doc].get(code_id, 0) + 1
+    codes_by_doc = {doc: set(counts) for doc, counts in counts_by_doc.items()}
     seen_codes: set[str] = set()
     seen_properties: set[str] = set()
     seen_relations: set[str] = set()
@@ -549,7 +575,7 @@ def _windows_from_state(state: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "new_properties": len(new_properties),
                 "new_relationships": len(new_relations),
                 "cumulative_codes": len(seen_codes),
-                "code_frequencies": {code_id: 1 for code_id in seen_codes},
+                "code_frequencies": dict(counts_by_doc[doc]),
             }
         )
     return windows
@@ -653,8 +679,43 @@ def _messages(kind: str, payload: Mapping[str, Any]) -> list:
     ]
 
 
-def _prompt_row(kind: str, messages: Sequence, parsed: Mapping[str, Any]) -> dict[str, Any]:
+def _empty_provider_usage() -> dict[str, int]:
     return {
+        "input_tokens": 0,
+        "cached_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "reported_calls": 0,
+        "unreported_calls": 0,
+    }
+
+
+def _record_usage(metadata: dict[str, Any], usage: Mapping[str, Any] | None) -> None:
+    """Add one provider report. A response with no counts is unreported, not an estimate."""
+    total = _empty_provider_usage()
+    current = metadata.get("provider_token_usage") or {}
+    total.update({key: int(current.get(key) or 0) for key in total})
+    reported = bool(usage) and any(int((usage or {}).get(key) or 0) for key in ("input_tokens", "output_tokens", "total_tokens"))
+    if not reported:
+        total["unreported_calls"] += 1
+        metadata["provider_token_usage"] = total
+        return
+    for key in ("input_tokens", "cached_tokens", "output_tokens", "total_tokens"):
+        total[key] += int((usage or {}).get(key) or 0)
+    if int((usage or {}).get("total_tokens") or 0) <= 0:
+        total["total_tokens"] += int((usage or {}).get("input_tokens") or 0) + int((usage or {}).get("output_tokens") or 0)
+    total["reported_calls"] += 1
+    metadata["provider_token_usage"] = total
+
+
+def _prompt_row(
+    kind: str,
+    messages: Sequence,
+    parsed: Mapping[str, Any],
+    usage: Mapping[str, Any] | None = None,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    row = {
         "stage": "axial",
         "kind": kind,
         "messages": [
@@ -663,6 +724,11 @@ def _prompt_row(kind: str, messages: Sequence, parsed: Mapping[str, Any]) -> dic
         ],
         "response": parsed,
     }
+    if usage is not None:
+        row["usage"] = dict(usage)
+    if extra:
+        row.update(dict(extra))
+    return row
 
 
 def _new_relationship(
@@ -990,6 +1056,8 @@ def export_axial_state(state: Mapping[str, Any], directory: str | Path) -> dict[
     place = Path(directory)
     place.mkdir(parents=True, exist_ok=True)
     paths = {}
+    metadata = dict(state.get("metadata") or {})
+    stage = str(metadata.get("stage") or "axial")
 
     def write(name: str, payload: Any) -> None:
         path = place / name
@@ -997,16 +1065,26 @@ def export_axial_state(state: Mapping[str, Any], directory: str | Path) -> dict[
         paths[name] = str(path)
 
     relationships = _public_relationships(state.get("relationships") or [])
-    write(
-        "category_relationships.json",
-        {
-            "relationships": relationships,
-            "empty_slots": list(state.get("empty_slots") or []),
-            "unexamined_pairs": list(state.get("unexamined_pairs") or []),
-        },
-    )
-    write("thematic_saturation.json", dict(state.get("saturation") or _saturation(state)))
-    write("theory_coverage.json", dict(state.get("coverage") or _coverage(state)))
+    if stage != "selective":
+        write(
+            "category_relationships.json",
+            {
+                "relationships": relationships,
+                "empty_slots": list(state.get("empty_slots") or []),
+                "unexamined_pairs": list(state.get("unexamined_pairs") or []),
+            },
+        )
+        write("thematic_saturation.json", dict(state.get("saturation") or _saturation(state)))
+        write("theory_coverage.json", dict(state.get("coverage") or _coverage(state)))
+        write(
+            "axial_run.json",
+            {
+                "metadata": metadata,
+                "warnings": list(state.get("warnings") or []),
+                "prompt_log": list(state.get("prompt_log") or []),
+                "relationships": relationships,
+            },
+        )
     if state.get("core_candidates"):
         write(
             "core_candidates.json",
@@ -1025,15 +1103,22 @@ def export_axial_state(state: Mapping[str, Any], directory: str | Path) -> dict[
         write("theoretical_memos.json", {"memos": memos})
     if state.get("storyline"):
         write("storyline.json", {"statements": list(state.get("storyline") or []), "draft": True})
-    write(
-        "axial_run.json",
-        {
-            "metadata": dict(state.get("metadata") or {}),
-            "warnings": list(state.get("warnings") or []),
-            "prompt_log": list(state.get("prompt_log") or []),
-            "relationships": relationships,
-        },
-    )
+    if stage == "selective":
+        write(
+            "selective_run.json",
+            {
+                "metadata": metadata,
+                "warnings": list(state.get("warnings") or []),
+                "prompt_log": list(state.get("prompt_log") or []),
+                "saturation": dict(state.get("saturation") or {}),
+                "coverage": dict(state.get("coverage") or {}),
+                "axial_procedure": metadata.get("axial_procedure") or {},
+            },
+        )
+        for name in _AXIAL_EXPORT_NAMES:
+            existing = place / name
+            if existing.exists():
+                paths.setdefault(name, str(existing))
     return paths
 
 
@@ -1107,6 +1192,85 @@ def _plan_node(state: AxialState) -> dict:
     }
 
 
+def _request_token_budget(metadata: Mapping[str, Any]) -> int:
+    performance = metadata.get("performance") or {}
+    if "axial_token_budget" not in performance:
+        return DEFAULT_AXIAL_TOKEN_BUDGET
+    return max(0, int(performance.get("axial_token_budget") or 0))
+
+
+def _allocate_evidence(
+    chunk: Sequence[Mapping[str, Any]],
+    assigned: Mapping[str, Sequence[str]],
+    passages: Mapping[str, Mapping[str, Any]],
+    limit: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Give every pair and both categories a share before filling the rest.
+
+    Passages are deduped by id. A passage that illustrates two categories
+    keeps both ids. Passages that do not fit are listed, not dropped silently.
+    """
+    buckets: list[tuple[str, list[str]]] = []
+    for pair in chunk:
+        for code_id in (str(pair.get("from_id") or ""), str(pair.get("to_id") or "")):
+            if code_id:
+                buckets.append((code_id, [str(item) for item in assigned.get(code_id) or []]))
+    selected: dict[str, dict[str, Any]] = {}
+    cursors = [0] * len(buckets)
+
+    def take_new(index: int) -> bool:
+        code_id, ids = buckets[index]
+        while cursors[index] < len(ids):
+            passage_id = ids[cursors[index]]
+            cursors[index] += 1
+            passage = passages.get(passage_id)
+            if passage is None:
+                continue
+            row = selected.get(passage_id)
+            if row is not None:
+                if code_id not in row["code_ids"]:
+                    row["code_ids"].append(code_id)
+                continue
+            if len(selected) >= limit:
+                return False
+            selected[passage_id] = {
+                "passage_id": passage_id,
+                "doc_id": passage.get("doc_id"),
+                "text": passage.get("text"),
+                "code_ids": [code_id],
+            }
+            return True
+        return False
+
+    progressed = True
+    while len(selected) < limit and progressed:
+        progressed = False
+        for index in range(len(buckets)):
+            if len(selected) >= limit:
+                break
+            if take_new(index):
+                progressed = True
+    for code_id, ids in buckets:
+        for passage_id in ids:
+            row = selected.get(passage_id)
+            if row is not None and code_id not in row["code_ids"]:
+                row["code_ids"].append(code_id)
+    seen: list[str] = []
+    seen_ids: set[str] = set()
+    for _code_id, ids in buckets:
+        for passage_id in ids:
+            if passage_id not in seen_ids and passages.get(passage_id) is not None:
+                seen_ids.add(passage_id)
+                seen.append(passage_id)
+    omitted = [passage_id for passage_id in seen if passage_id not in selected]
+    return list(selected.values()), {
+        "omitted_count": len(omitted),
+        "omitted_passage_ids": omitted,
+        "limit": limit,
+        "included": len(selected),
+    }
+
+
 def _propose_node(runtime: AxialRuntime):
     async def propose_relations(state: AxialState) -> dict:
         metadata = dict(state.get("metadata") or {})
@@ -1126,23 +1290,13 @@ def _propose_node(runtime: AxialRuntime):
         batch = max(1, int((metadata.get("performance") or {}).get("batch_size") or 1))
         model_name = describe_model(runtime.coder)
         pending = list(state.get("relation_round") or [])
+        token_budget = _request_token_budget(metadata)
+        max_tokens = int(procedure.get("max_axial_review_tokens") or 0)
+        estimated = int(metadata.get("axial_tokens_estimated") or 0)
         while pending and used < int(procedure.get("propose_calls") or 0):
             chunk = pending[:batch]
             pending = pending[batch:]
-            evidence = []
-            for pair in chunk:
-                for code_id in (pair.get("from_id"), pair.get("to_id")):
-                    for passage_id in assigned.get(str(code_id), [])[:limit]:
-                        passage = passages.get(passage_id)
-                        if passage and passage not in evidence:
-                            evidence.append(
-                                {
-                                    "passage_id": passage_id,
-                                    "doc_id": passage.get("doc_id"),
-                                    "text": passage.get("text"),
-                                    "code_id": code_id,
-                                }
-                            )
+            evidence, omitted = _allocate_evidence(chunk, assigned, passages, limit)
             payload = {
                 "pairs": chunk,
                 "categories": [
@@ -1150,11 +1304,55 @@ def _propose_node(runtime: AxialRuntime):
                     for code_id in book
                     if code_id in {pair.get("from_id") for pair in chunk} | {pair.get("to_id") for pair in chunk}
                 ],
-                "passages": evidence[:limit],
+                "passages": evidence,
+                "omitted_evidence": omitted,
                 "paradigm_roles": list(PARADIGM_ROLES) if procedure.get("coding_lens") == "paradigm" else ["unspecified"],
             }
             messages = _messages("axial_proposal", payload)
-            (parsed, _usage), sent = await ainvoke_structured(
+            estimate = request_input_tokens(messages, AxialProposalBatch)
+            while len(payload["passages"]) > 1 and estimate > token_budget:
+                dropped = payload["passages"].pop()
+                omitted = dict(omitted)
+                omitted["omitted_count"] = int(omitted.get("omitted_count") or 0) + 1
+                omitted_ids = list(omitted.get("omitted_passage_ids") or [])
+                passage_id = str(dropped.get("passage_id") or "")
+                if passage_id and passage_id not in omitted_ids:
+                    omitted_ids.append(passage_id)
+                omitted["omitted_passage_ids"] = omitted_ids
+                omitted["included"] = len(payload["passages"])
+                omitted["packed_for_request_budget"] = True
+                payload["omitted_evidence"] = omitted
+                payload["passages"] = list(payload["passages"])
+                messages = _messages("axial_proposal", payload)
+                estimate = request_input_tokens(messages, AxialProposalBatch)
+            if estimated + estimate > max_tokens:
+                metadata["axial_stop"] = "token_allowance"
+                note = (
+                    f"Axial proposal stopped: the next request is {estimate} estimated tokens "
+                    f"and {estimated} of {max_tokens} are already estimated."
+                )
+                logs.append(
+                    _prompt_row(
+                        "axial_proposal",
+                        messages,
+                        {},
+                        extra={"status": "omitted", "reason": "token_allowance", "estimated_input_tokens": estimate, "omitted_evidence": omitted},
+                    )
+                )
+                pending = chunk + pending
+                break
+            if estimate > token_budget:
+                metadata["axial_stop"] = "request_budget"
+                logs.append(
+                    _prompt_row(
+                        "axial_proposal",
+                        messages,
+                        {},
+                        extra={"status": "omitted", "reason": "request_budget", "estimated_input_tokens": estimate, "omitted_evidence": omitted},
+                    )
+                )
+                continue
+            (parsed, usage), sent = await ainvoke_structured(
                 runtime.coder,
                 AxialProposalBatch,
                 messages,
@@ -1162,7 +1360,9 @@ def _propose_node(runtime: AxialRuntime):
                 use_cache=True,
             )
             used += 1
-            logs.append(_prompt_row("axial_proposal", sent, parsed))
+            estimated += estimate
+            _record_usage(metadata, usage)
+            logs.append(_prompt_row("axial_proposal", sent, parsed, usage, extra={"estimated_input_tokens": estimate, "omitted_evidence": omitted}))
             requested = {(str(pair.get("from_id")), str(pair.get("to_id"))) for pair in chunk}
             bands = {(str(pair.get("from_id")), str(pair.get("to_id"))): pair.get("band") for pair in chunk}
             for draft in parsed.get("relationships") or []:
@@ -1184,11 +1384,13 @@ def _propose_node(runtime: AxialRuntime):
                         lens=str(procedure.get("coding_lens") or "paradigm"),
                     )
                 )
+        metadata["axial_tokens_estimated"] = estimated
         return {
             "relationships": relationships,
             "prompt_log": logs,
             "axial_calls_used": used,
             "relation_round": pending,
+            "metadata": metadata,
         }
 
     return propose_relations
@@ -1201,7 +1403,10 @@ def _relation_checkpoint(runtime: AxialRuntime):
             return {"relationships": relationships}
         metadata = dict(state.get("metadata") or {})
         logs = list(state.get("prompt_log") or [])
-        if runtime.decision_mode == "llm" and runtime.reviewer is not None:
+        if runtime.decision_mode == "llm":
+            if runtime.reviewer is None:
+                metadata["decision_stop"] = "call_allowance"
+                return {"relationships": relationships, "metadata": metadata, "prompt_log": logs}
             payload = {
                 "kind": "axial_relation_review",
                 "relationships": [
@@ -1220,6 +1425,7 @@ def _relation_checkpoint(runtime: AxialRuntime):
             parsed, audit = await runtime.reviewer.decide(payload, AxialRelationDecisions, metadata)
             if audit:
                 logs.append(audit)
+                _record_usage(metadata, audit.get("usage") if isinstance(audit, Mapping) else None)
             if parsed:
                 relationships = _apply_model_relations(relationships, parsed, audit or {})
             return {"relationships": relationships, "metadata": metadata, "prompt_log": logs}
@@ -1257,7 +1463,9 @@ def _counterexample_node(runtime: AxialRuntime):
         if procedure.get("axial_synthetic_counterexample") and relationships:
             if not any(str(item.get("passage_id") or "") == SYNTHETIC_PASSAGE_ID for item in passages):
                 passages.append(_synthetic_passage(relationships[0]))
-        slots = int(procedure.get("counterexample_calls") or 0)
+        allowance = int(procedure.get("counterexample_calls") or 0)
+        batch = max(1, int((metadata.get("performance") or {}).get("batch_size") or 1))
+        slots = allowance * batch
         queued, stats = _select_counterexamples(
             relationships,
             passages,
@@ -1277,9 +1485,12 @@ def _counterexample_node(runtime: AxialRuntime):
         logs = list(state.get("prompt_log") or [])
         used = int(state.get("axial_calls_used") or 0)
         passage_by_id = {str(item.get("passage_id") or ""): item for item in passages}
-        batch = max(1, int((metadata.get("performance") or {}).get("batch_size") or 1))
         pending = list(queued)
-        while pending:
+        made = 0
+        token_budget = _request_token_budget(metadata)
+        max_tokens = int(procedure.get("max_axial_review_tokens") or 0)
+        estimated = int(metadata.get("axial_tokens_estimated") or 0)
+        while pending and made < allowance:
             chunk = pending[:batch]
             pending = pending[batch:]
             payload = {
@@ -1293,7 +1504,31 @@ def _counterexample_node(runtime: AxialRuntime):
                 ]
             }
             messages = _messages("axial_counterexample", payload)
-            (parsed, _usage), sent = await ainvoke_structured(
+            estimate = request_input_tokens(messages, AxialCounterexampleBatch)
+            if estimated + estimate > max_tokens:
+                metadata["axial_stop"] = "token_allowance"
+                pending = chunk + pending
+                logs.append(
+                    _prompt_row(
+                        "axial_counterexample",
+                        messages,
+                        {},
+                        extra={"status": "omitted", "reason": "token_allowance", "estimated_input_tokens": estimate},
+                    )
+                )
+                break
+            if estimate > token_budget:
+                metadata["axial_stop"] = "request_budget"
+                logs.append(
+                    _prompt_row(
+                        "axial_counterexample",
+                        messages,
+                        {},
+                        extra={"status": "omitted", "reason": "request_budget", "estimated_input_tokens": estimate},
+                    )
+                )
+                continue
+            (parsed, usage), sent = await ainvoke_structured(
                 runtime.coder,
                 AxialCounterexampleBatch,
                 messages,
@@ -1301,7 +1536,10 @@ def _counterexample_node(runtime: AxialRuntime):
                 use_cache=True,
             )
             used += 1
-            logs.append(_prompt_row("axial_counterexample", sent, parsed))
+            made += 1
+            estimated += estimate
+            _record_usage(metadata, usage)
+            logs.append(_prompt_row("axial_counterexample", sent, parsed, usage, extra={"estimated_input_tokens": estimate}))
             requested = {(item["relationship_id"], item["passage_id"]) for item in chunk}
             for verdict in parsed.get("counterexamples") or []:
                 key = (str(verdict.get("relationship_id") or ""), str(verdict.get("passage_id") or ""))
@@ -1322,6 +1560,14 @@ def _counterexample_node(runtime: AxialRuntime):
                         "judgment": judgment,
                         "detected": judgment in {"contradicts", "qualifies"},
                     }
+        if pending:
+            note = (
+                f"{len(pending)} counterexample pairs were not sent. "
+                "The call allowance is a ceiling."
+            )
+            if note not in warnings:
+                warnings.append(note)
+        metadata["axial_tokens_estimated"] = estimated
         judgments = []
         for row in relationships:
             judgments.extend(row.get("counterexamples") or [])
@@ -1397,7 +1643,11 @@ def _saturation_checkpoint(runtime: AxialRuntime):
         metadata = dict(state.get("metadata") or {})
         logs = list(state.get("prompt_log") or [])
         report["judgment"] = None
-        if runtime.decision_mode == "llm" and runtime.reviewer is not None:
+        if runtime.decision_mode == "llm":
+            if runtime.reviewer is None:
+                metadata["decision_stop"] = "call_allowance"
+                report["judgment"] = None
+                return {"saturation": report, "metadata": metadata, "prompt_log": logs}
             parsed, audit = await runtime.reviewer.decide(
                 {
                     "kind": "axial_saturation_review",
@@ -1414,6 +1664,7 @@ def _saturation_checkpoint(runtime: AxialRuntime):
             )
             if audit:
                 logs.append(audit)
+                _record_usage(metadata, audit.get("usage") if isinstance(audit, Mapping) else None)
             if parsed:
                 metadata["model_saturation"] = {
                     "assessment": parsed.get("assessment"),
@@ -1507,6 +1758,23 @@ def build_axial_graph(runtime: AxialRuntime | None = None, *, output_dir: str | 
     return builder
 
 
+def _story_core(state: Mapping[str, Any]) -> tuple[str, str]:
+    """The core the storyline should name, plus whether a person or the model chose it."""
+    metadata = state.get("metadata") or {}
+    procedure = metadata.get("procedure") or {}
+    mode = str(metadata.get("decision_mode") or procedure.get("decision_mode") or "human")
+    candidates = {str(row.get("code_id") or "") for row in (state.get("core_candidates") or []) if isinstance(row, Mapping)}
+    if mode == "llm":
+        core_id = str(metadata.get("model_core_id") or "")
+        provenance = "model"
+    else:
+        core_id = str(metadata.get("researcher_core_id") or "")
+        provenance = "human"
+    if core_id and candidates and core_id not in candidates:
+        return "", provenance
+    return core_id, provenance
+
+
 def _load_category(state: AxialState) -> dict:
     return {"core_candidates": _score_candidates(state)}
 
@@ -1518,7 +1786,10 @@ def _core_checkpoint(runtime: AxialRuntime):
         logs = list(state.get("prompt_log") or [])
         if not candidates:
             return {"core_candidates": candidates}
-        if runtime.decision_mode == "llm" and runtime.reviewer is not None:
+        if runtime.decision_mode == "llm":
+            if runtime.reviewer is None:
+                metadata["decision_stop"] = "call_allowance"
+                return {"core_candidates": candidates, "metadata": metadata, "prompt_log": logs}
             parsed, audit = await runtime.reviewer.decide(
                 {"kind": "axial_core_review", "candidates": candidates},
                 ModelCoreDecision,
@@ -1526,6 +1797,7 @@ def _core_checkpoint(runtime: AxialRuntime):
             )
             if audit:
                 logs.append(audit)
+                _record_usage(metadata, audit.get("usage") if isinstance(audit, Mapping) else None)
             if parsed:
                 known = {str(row.get("code_id") or "") for row in candidates}
                 chosen = str(parsed.get("core_id") or "")
@@ -1592,6 +1864,10 @@ def _memo_node(runtime: AxialRuntime):
         allowance = int(((state.get("metadata") or {}).get("procedure") or {}).get("max_selective_review_calls") or 0)
         batch = max(1, int(((state.get("metadata") or {}).get("performance") or {}).get("batch_size") or 1))
         pending = list(relationships)
+        metadata = dict(state.get("metadata") or {})
+        token_budget = _request_token_budget(metadata)
+        max_tokens = int(((metadata.get("procedure") or {}).get("max_axial_review_tokens") or 0))
+        estimated = int(metadata.get("axial_tokens_estimated") or 0)
         while pending and used < allowance:
             chunk = pending[:batch]
             pending = pending[batch:]
@@ -1599,7 +1875,31 @@ def _memo_node(runtime: AxialRuntime):
                 "theoretical_memo",
                 {"relationships": chunk},
             )
-            (parsed, _usage), sent = await ainvoke_structured(
+            estimate = request_input_tokens(messages, TheoreticalMemoBatch)
+            if estimated + estimate > max_tokens:
+                metadata["axial_stop"] = "token_allowance"
+                pending = chunk + pending
+                logs.append(
+                    _prompt_row(
+                        "theoretical_memo",
+                        messages,
+                        {},
+                        extra={"status": "omitted", "reason": "token_allowance", "estimated_input_tokens": estimate},
+                    )
+                )
+                break
+            if estimate > token_budget:
+                metadata["axial_stop"] = "request_budget"
+                logs.append(
+                    _prompt_row(
+                        "theoretical_memo",
+                        messages,
+                        {},
+                        extra={"status": "omitted", "reason": "request_budget", "estimated_input_tokens": estimate},
+                    )
+                )
+                continue
+            (parsed, usage), sent = await ainvoke_structured(
                 runtime.coder,
                 TheoreticalMemoBatch,
                 messages,
@@ -1607,7 +1907,9 @@ def _memo_node(runtime: AxialRuntime):
                 use_cache=True,
             )
             used += 1
-            logs.append(_prompt_row("theoretical_memo", sent, parsed))
+            estimated += estimate
+            _record_usage(metadata, usage)
+            logs.append(_prompt_row("theoretical_memo", sent, parsed, usage, extra={"estimated_input_tokens": estimate}))
             returned = {str(item.get("relationship_id") or ""): item for item in parsed.get("memos") or []}
             for relationship in chunk:
                 relationship_id = str(relationship.get("relationship_id") or "")
@@ -1634,7 +1936,8 @@ def _memo_node(runtime: AxialRuntime):
             )
             if note not in warnings:
                 warnings.append(note)
-        return {"memos": memos, "prompt_log": logs, "selective_calls_used": used, "warnings": warnings}
+        metadata["axial_tokens_estimated"] = estimated
+        return {"memos": memos, "prompt_log": logs, "selective_calls_used": used, "warnings": warnings, "metadata": metadata}
 
     return draft_memos
 
@@ -1651,31 +1954,78 @@ def _story_node(runtime: AxialRuntime):
             if note not in warnings:
                 warnings.append(note)
             return {"warnings": warnings}
-        messages = _messages(
-            "storyline",
-            {
-                "categories": [
-                    {"code_id": code_id, "code": entry.get("code"), "definition": entry.get("definition")}
-                    for code_id, entry in (state.get("codebook") or {}).items()
-                ],
-                "relationships": _public_relationships(state.get("relationships") or []),
-                "core_id": (state.get("metadata") or {}).get("researcher_core_id") or "",
-                "passages": [
-                    {"passage_id": item.get("passage_id"), "text": item.get("text")}
-                    for item in (state.get("passages") or [])
-                    if isinstance(item, Mapping) and not item.get("synthetic")
-                ][:8],
-            },
-        )
-        (parsed, _usage), sent = await ainvoke_structured(
+        metadata = dict(state.get("metadata") or {})
+        core_id, provenance = _story_core(state)
+        story_passages = [
+            {"passage_id": item.get("passage_id"), "text": item.get("text")}
+            for item in (state.get("passages") or [])
+            if isinstance(item, Mapping) and not item.get("synthetic")
+        ]
+        payload = {
+            "categories": [
+                {"code_id": code_id, "code": entry.get("code"), "definition": entry.get("definition")}
+                for code_id, entry in (state.get("codebook") or {}).items()
+            ],
+            "relationships": _public_relationships(state.get("relationships") or []),
+            "core_id": core_id,
+            "core_provenance": provenance,
+            "researcher_core_id": str(metadata.get("researcher_core_id") or ""),
+            "model_core_id": str(metadata.get("model_core_id") or ""),
+            "passages": story_passages[:8],
+        }
+        omitted_passages = [str(item.get("passage_id") or "") for item in story_passages[8:]]
+        if omitted_passages:
+            payload["omitted_evidence"] = {
+                "omitted_count": len(omitted_passages),
+                "omitted_passage_ids": omitted_passages,
+                "limit": 8,
+            }
+        messages = _messages("storyline", payload)
+        token_budget = _request_token_budget(metadata)
+        max_tokens = int(((metadata.get("procedure") or {}).get("max_axial_review_tokens") or 0))
+        estimated = int(metadata.get("axial_tokens_estimated") or 0)
+        estimate = request_input_tokens(messages, StorylineBatch)
+        while len(payload["passages"]) > 1 and estimate > token_budget:
+            payload["passages"] = payload["passages"][:-1]
+            messages = _messages("storyline", payload)
+            estimate = request_input_tokens(messages, StorylineBatch)
+        logs = list(state.get("prompt_log") or [])
+        over_total = estimated + estimate > max_tokens
+        over_request = estimate > token_budget
+        if over_total or over_request:
+            reason = "token_allowance" if over_total else "request_budget"
+            metadata["axial_stop"] = reason
+            logs.append(
+                _prompt_row(
+                    "storyline",
+                    messages,
+                    {},
+                    extra={"status": "omitted", "reason": reason, "estimated_input_tokens": estimate, "core_id": core_id, "core_provenance": provenance},
+                )
+            )
+            warnings = list(state.get("warnings") or [])
+            note = f"The storyline was not drafted ({reason})."
+            if note not in warnings:
+                warnings.append(note)
+            return {"warnings": warnings, "prompt_log": logs, "metadata": metadata}
+        (parsed, usage), sent = await ainvoke_structured(
             runtime.coder,
             StorylineBatch,
             messages,
             runtime.limiter,
             use_cache=True,
         )
-        logs = list(state.get("prompt_log") or [])
-        logs.append(_prompt_row("storyline", sent, parsed))
+        _record_usage(metadata, usage)
+        metadata["axial_tokens_estimated"] = estimated + estimate
+        logs.append(
+            _prompt_row(
+                "storyline",
+                sent,
+                parsed,
+                usage,
+                extra={"estimated_input_tokens": estimate, "core_id": core_id, "core_provenance": provenance},
+            )
+        )
         passages = _by_passage(state)
         statements = []
         for index, draft in enumerate(parsed.get("statements") or [], start=1):
@@ -1702,12 +2052,13 @@ def _story_node(runtime: AxialRuntime):
                 }
             )
         used = int(state.get("selective_calls_used") or 0) + 1
-        held = {**state, "storyline": statements}
+        held = {**state, "storyline": statements, "metadata": metadata}
         return {
             "storyline": statements,
             "prompt_log": logs,
             "selective_calls_used": used,
             "coverage": _coverage(held),
+            "metadata": metadata,
         }
 
     return draft_storyline
@@ -1893,7 +2244,7 @@ def _check_resume(saved: Mapping[str, Any], current: Mapping[str, Any], *, allow
         raise AxialCheckpointMismatch(differences)
 
 
-def _initial(data: Mapping[str, Any], metadata: dict, *, interrupt_enabled: bool) -> AxialState:
+def _initial(data: Mapping[str, Any], metadata: dict, *, interrupt_enabled: bool, keep_audit: bool = False) -> AxialState:
     return {
         "passages": [dict(item) for item in data.get("passages") or [] if isinstance(item, Mapping)],
         "segments": [dict(item) for item in data.get("segments") or [] if isinstance(item, Mapping)],
@@ -1907,12 +2258,12 @@ def _initial(data: Mapping[str, Any], metadata: dict, *, interrupt_enabled: bool
         "unexamined_pairs": [],
         "counterexample_queue": [],
         "storyline": list(data.get("storyline") or []),
-        "core_candidates": [],
-        "saturation": {},
-        "coverage": {},
+        "core_candidates": [dict(item) for item in data.get("core_candidates") or [] if isinstance(item, Mapping)] if keep_audit else [],
+        "saturation": dict(data.get("saturation") or {}) if keep_audit else {},
+        "coverage": dict(data.get("coverage") or {}) if keep_audit else {},
         "metadata": metadata,
-        "warnings": [],
-        "prompt_log": [],
+        "warnings": [str(item) for item in (data.get("warnings") or [])] if keep_audit else [],
+        "prompt_log": [dict(item) if isinstance(item, Mapping) else item for item in (data.get("prompt_log") or [])] if keep_audit else [],
         "export_paths": {},
         "interrupt_enabled": interrupt_enabled,
         "finished": False,
@@ -1979,21 +2330,31 @@ async def _invoke(builder, saver, initial: AxialState | None, *, thread_id: str,
 
 def _procedure_from_kwargs(data: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
     max_calls = int(kwargs["max_axial_review_calls"])
+    if max_calls < 0:
+        raise AxialError("max_axial_review_calls must be zero or more.")
+    max_tokens = int(kwargs.get("max_axial_review_tokens", DEFAULT_MAX_AXIAL_REVIEW_TOKENS))
+    if max_tokens < 0:
+        raise AxialError("max_axial_review_tokens must be zero or more.")
     share = float(kwargs["axial_share_propose"])
     if not 0 <= share <= 1:
         raise AxialError("axial_share_propose must be between 0 and 1.")
-    propose = int(round(max_calls * share))
-    counter = max_calls - propose
-    # A round with nothing to propose gives those calls to the counterexample search.
+    allocated_propose = int(round(max_calls * share))
+    allocated_counter = max_calls - allocated_propose
     book = data.get("codebook") or {}
     pair_count = max(0, len(book) * (len(book) - 1) // 2)
     batch = max(1, int(kwargs["batch_size"]))
-    if kwargs["axial_relations"] and pair_count < propose * batch:
-        counter += propose - pair_count
-        propose = pair_count
-        transferred = True
+    if kwargs["axial_relations"]:
+        required = 0 if pair_count <= 0 else math.ceil(pair_count / batch)
+        propose = min(allocated_propose, required)
+        unused = allocated_propose - propose
+        counter = allocated_counter + unused
+        transferred = unused > 0
     else:
+        propose = allocated_propose
+        counter = allocated_counter
         transferred = False
+    if propose < 0 or counter < 0:
+        raise AxialError("Axial call split produced a negative allowance.")
     procedure = {
         "seed": int(kwargs["seed"]),
         "coding_lens": kwargs["coding_lens"],
@@ -2010,6 +2371,7 @@ def _procedure_from_kwargs(data: Mapping[str, Any], **kwargs: Any) -> dict[str, 
         "axial_synthetic_counterexample": bool(kwargs["axial_synthetic_counterexample"]),
         "decision_mode": kwargs["decision_mode"],
         "source_hash": _source_hash(data),
+        "max_axial_review_tokens": max_tokens,
         "propose_calls": propose,
         "counterexample_calls": counter,
         "reallocated_propose_calls": transferred,
@@ -2035,11 +2397,11 @@ class AxialDecisionReviewer:
     as ``model_saturation`` with ``model_judgment`` true.
     """
 
-    def __init__(self, model, *, max_calls=4, timeout=120):
+    def __init__(self, model, *, max_calls=4, timeout=120, max_tokens=DEFAULT_MAX_AXIAL_REVIEW_TOKENS, token_budget=DEFAULT_AXIAL_TOKEN_BUDGET):
         self.model = model
-        self.max_calls = max_calls
-        self.max_tokens = 10**9
-        self.token_budget = 10**9
+        self.max_calls = max(0, int(max_calls))
+        self.max_tokens = max(0, int(max_tokens))
+        self.token_budget = max(0, int(token_budget))
         self.limiter = CallLimiter(
             1,
             max_retries=0,
@@ -2098,16 +2460,19 @@ class AxialDecisionReviewer:
             return None, audit
 
 
-def _runtime(model, *, decision_mode: str, decision_model, request_timeout: float, include_memos: bool, include_storyline: bool, propose_calls: int, counter_calls: int, selective_calls: int, decision_calls: int) -> AxialRuntime:
+def _runtime(model, *, decision_mode: str, decision_model, request_timeout: float, include_memos: bool, include_storyline: bool, propose_calls: int, counter_calls: int, selective_calls: int, decision_calls: int, max_review_tokens: int = DEFAULT_MAX_AXIAL_REVIEW_TOKENS, token_budget: int = DEFAULT_AXIAL_TOKEN_BUDGET) -> AxialRuntime:
     reviewer = None
-    if decision_mode == "llm":
+    if decision_mode == "llm" and int(decision_calls) > 0:
         chosen = model if decision_model is None else decision_model
         reviewer = AxialDecisionReviewer(
             chosen,
-            max_calls=max(1, decision_calls),
+            max_calls=int(decision_calls),
             timeout=request_timeout if request_timeout > 0 else 120,
+            max_tokens=max_review_tokens,
+            token_budget=token_budget,
         )
     calls = max(propose_calls, counter_calls, 1)
+    decision_watch = _step_watchdog(request_timeout, int(decision_calls)) if decision_mode == "llm" and int(decision_calls) > 0 else 0.0
     return AxialRuntime(
         coder=model,
         reviewer=reviewer,
@@ -2116,7 +2481,7 @@ def _runtime(model, *, decision_mode: str, decision_model, request_timeout: floa
         include_memos=include_memos,
         include_storyline=include_storyline,
         step_timeout=_step_watchdog(request_timeout, calls),
-        decision_step_timeout=_step_watchdog(request_timeout, max(1, decision_calls)) if decision_mode == "llm" else 0.0,
+        decision_step_timeout=decision_watch,
         selective_step_timeout=_step_watchdog(request_timeout, max(1, selective_calls)),
     )
 
@@ -2144,6 +2509,8 @@ async def aaxial_code(
     decision_mode: str = "human",
     decision_model: BaseChatModel | None = None,
     max_decision_calls: int = 4,
+    max_axial_review_tokens: int = DEFAULT_MAX_AXIAL_REVIEW_TOKENS,
+    axial_token_budget: int = DEFAULT_AXIAL_TOKEN_BUDGET,
     batch_size: int = 1,
     axial_request_timeout: float = 120.0,
     interrupt: bool = True,
@@ -2168,6 +2535,10 @@ async def aaxial_code(
         raise AxialError("decision_mode must be 'human' or 'llm'.")
     if decision_mode == "human" and decision_model is not None:
         raise AxialError("decision_model requires decision_mode='llm'.")
+    if int(max_decision_calls) < 0:
+        raise AxialError("max_decision_calls must be zero or more. Zero disables reviewer calls.")
+    if int(axial_token_budget) < 0:
+        raise AxialError("axial_token_budget must be zero or more.")
     if abs((axial_share_propose + axial_share_counterexample) - 1) > 1e-9:
         raise AxialError("axial shares must sum to 1.")
     data = _source_mapping(source)
@@ -2187,13 +2558,16 @@ async def aaxial_code(
         decision_mode=decision_mode,
         max_selective_review_calls=max_selective_review_calls,
         batch_size=batch_size,
+        max_axial_review_tokens=max_axial_review_tokens,
     )
     metadata = {
         "procedure": procedure,
+        "stage": "axial",
         "performance": {
             "batch_size": batch_size,
             "axial_request_timeout": axial_request_timeout,
             "axial_evidence_limit": axial_evidence_limit,
+            "axial_token_budget": int(axial_token_budget),
         },
         "comparison_runs": list(comparison_runs or []),
         "output_dir": str(output_dir) if output_dir else "",
@@ -2211,6 +2585,8 @@ async def aaxial_code(
         counter_calls=int(procedure["counterexample_calls"]),
         selective_calls=max_selective_review_calls,
         decision_calls=max_decision_calls,
+        max_review_tokens=max_axial_review_tokens,
+        token_budget=axial_token_budget,
     )
     from langgraph.checkpoint.memory import InMemorySaver
 
@@ -2241,6 +2617,8 @@ async def aaxial_code(
             decision_mode=decision_mode,
             decision_model=decision_model,
             max_decision_calls=max_decision_calls,
+            max_axial_review_tokens=max_axial_review_tokens,
+            axial_token_budget=axial_token_budget,
             batch_size=batch_size,
             axial_request_timeout=axial_request_timeout,
             interrupt=interrupt,
@@ -2263,6 +2641,8 @@ async def aselective_code(
     decision_mode: str = "human",
     decision_model: BaseChatModel | None = None,
     max_decision_calls: int = 4,
+    max_axial_review_tokens: int = DEFAULT_MAX_AXIAL_REVIEW_TOKENS,
+    axial_token_budget: int = DEFAULT_AXIAL_TOKEN_BUDGET,
     batch_size: int = 1,
     axial_request_timeout: float = 120.0,
     interrupt: bool = True,
@@ -2277,7 +2657,13 @@ async def aselective_code(
     """Score core candidates. Memos and the storyline run only when asked."""
     if decision_mode not in {"human", "llm"}:
         raise AxialError("decision_mode must be 'human' or 'llm'.")
+    if int(max_decision_calls) < 0:
+        raise AxialError("max_decision_calls must be zero or more. Zero disables reviewer calls.")
+    if int(max_axial_review_tokens) < 0 or int(axial_token_budget) < 0:
+        raise AxialError("Token allowances must be zero or more.")
     data = _source_mapping(source)
+    upstream = dict(data.get("metadata") or {})
+    axial_procedure = dict(upstream.get("procedure") or {})
     procedure = {
         "seed": int(seed),
         "coding_lens": "selective",
@@ -2294,15 +2680,25 @@ async def aselective_code(
         "axial_synthetic_counterexample": False,
         "decision_mode": decision_mode,
         "source_hash": _source_hash(data),
+        "max_axial_review_tokens": int(max_axial_review_tokens),
     }
-    metadata = {
-        "procedure": procedure,
-        "performance": {"batch_size": batch_size, "axial_request_timeout": axial_request_timeout},
-        "output_dir": str(output_dir) if output_dir else "",
-        "decision_mode": decision_mode,
-        "saturation_judgment": None,
-        "researcher_core_id": "",
+    metadata = dict(upstream)
+    if upstream.get("stage") == "axial" or data.get("saturation") or upstream.get("model_saturation"):
+        if axial_procedure:
+            metadata["axial_procedure"] = axial_procedure
+    if metadata.get("performance") and "axial_performance" not in metadata:
+        metadata["axial_performance"] = dict(metadata["performance"])
+    metadata["procedure"] = procedure
+    metadata["stage"] = "selective"
+    metadata["performance"] = {
+        "batch_size": batch_size,
+        "axial_request_timeout": axial_request_timeout,
+        "axial_token_budget": int(axial_token_budget),
     }
+    metadata["output_dir"] = str(output_dir) if output_dir else str(metadata.get("output_dir") or "")
+    metadata["decision_mode"] = decision_mode
+    metadata["saturation_judgment"] = None
+    metadata.setdefault("researcher_core_id", "")
     runtime = _runtime(
         model,
         decision_mode=decision_mode,
@@ -2314,6 +2710,8 @@ async def aselective_code(
         counter_calls=1,
         selective_calls=max_selective_review_calls if (include_memos or include_storyline) else 1,
         decision_calls=max_decision_calls,
+        max_review_tokens=max_axial_review_tokens,
+        token_budget=axial_token_budget,
     )
     from langgraph.checkpoint.memory import InMemorySaver
 
@@ -2322,7 +2720,7 @@ async def aselective_code(
     return await _invoke(
         build_selective_graph(runtime, output_dir=output_dir),
         saver,
-        None if resuming else _initial(data, metadata, interrupt_enabled=interrupt),
+        None if resuming else _initial(data, metadata, interrupt_enabled=interrupt, keep_audit=True),
         thread_id=thread,
         resume=resume if decision_mode == "human" else {"automated_review": True},
         resuming=resuming,

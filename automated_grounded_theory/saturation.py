@@ -50,6 +50,20 @@ def saturation_point(
     }
 
 
+def _normalized_code_distribution(frequencies: Mapping[str, int]) -> dict[str, float] | None:
+    """Shares of this document's assignment counts. An empty document is undefined."""
+    total = sum(max(0, int(value)) for value in frequencies.values())
+    if total <= 0:
+        return None
+    return {str(key): max(0, int(value)) / total for key, value in frequencies.items()}
+
+
+def _total_variation(left: Mapping[str, float], right: Mapping[str, float]) -> float:
+    """Half the L1 distance between two distributions on the same code ids."""
+    keys = set(left) | set(right)
+    return 0.5 * sum(abs(float(left.get(key, 0.0)) - float(right.get(key, 0.0))) for key in keys)
+
+
 def thematic_saturation_report(
     windows: Sequence[Mapping],
     *,
@@ -60,25 +74,29 @@ def thematic_saturation_report(
 
     Each window is one document. Batch size stays 1, so a rate is the count of
     new codes, properties, or relationships first evidenced in that document.
-    Frequency stabilization needs two windows. Cross-run stability needs the
-    caller to pass a report from more than one run. Missing figures stay null.
+    ``code_frequency_stabilization`` is the total variation between the last
+    two documents' normalized assignment distributions. It is undefined with
+    fewer than two documents, or when either of those documents has no
+    assignments. A 0.8.0 report stored presence bits and is not comparable.
+    Cross-run stability needs the caller to pass a report from more than one
+    run. Missing figures stay null.
     """
     rows = []
-    previous_frequency: Mapping[str, int] | None = None
-    shifts: list[float] = []
+    previous: dict[str, float] | None = None
+    have_previous = False
     for index, window in enumerate(windows):
         item = dict(window)
         frequencies = {
             str(key): int(value)
             for key, value in dict(item.get("code_frequencies") or {}).items()
         }
+        distribution = _normalized_code_distribution(frequencies)
         shift = None
-        if previous_frequency is not None:
-            keys = set(previous_frequency) | set(frequencies)
-            if keys:
-                shift = sum(abs(int(frequencies.get(key, 0)) - int(previous_frequency.get(key, 0))) for key in keys) / len(keys)
-                shifts.append(shift)
-        previous_frequency = frequencies
+        if have_previous:
+            if previous is not None and distribution is not None:
+                shift = _total_variation(previous, distribution)
+        previous = distribution
+        have_previous = True
         new_codes = int(item.get("new_codes") or 0)
         new_properties = int(item.get("new_properties") or 0)
         new_relationships = int(item.get("new_relationships") or 0)
@@ -98,16 +116,22 @@ def thematic_saturation_report(
             }
         )
     too_few = len(rows) < 2
+    empty_comparison = (not too_few) and rows[-1]["code_frequency_shift"] is None
     property_level = None if not property_stability_report else property_stability_report.get("name_level")
     relationship_level = None if not relationship_stability_report else relationship_stability_report.get("role_level")
     notes = [
         "These figures are a saturation curve, not a verdict. judgment stays null. "
-        "A researcher may record a decision separately. A model assessment is not that decision."
+        "A researcher may record a decision separately. A model assessment is not that decision.",
+        "code_frequency_stabilization is the total variation between consecutive documents' "
+        "normalized code-assignment distributions. A 0.8.0 report stored presence bits "
+        "(1 once a code had been seen) and is not comparable.",
     ]
     if not rows:
         notes.append("Saturation rates are undefined: there are no documents.")
     elif too_few:
         notes.append("Code-frequency stabilization is undefined: fewer than two documents.")
+    elif empty_comparison:
+        notes.append("Code-frequency stabilization is undefined: a document has no code assignments.")
     if property_stability_report is None or property_stability_report.get("name_level") is None:
         notes.append("Property stability across passes is undefined until two runs name properties.")
     if relationship_stability_report is None or relationship_stability_report.get("role_level") is None:
@@ -119,7 +143,8 @@ def thematic_saturation_report(
         "new_code_rate": None if not rows else rows[-1]["new_code_rate"],
         "new_property_rate": None if not rows else rows[-1]["new_property_rate"],
         "new_relationship_rate": None if not rows else rows[-1]["new_relationship_rate"],
-        "code_frequency_stabilization": None if too_few or not shifts else shifts[-1],
+        "code_frequency_comparison": "total_variation",
+        "code_frequency_stabilization": None if too_few or empty_comparison else rows[-1]["code_frequency_shift"],
         "property_stability": None if property_stability_report is None else dict(property_stability_report),
         "relationship_stability": None if relationship_stability_report is None else dict(relationship_stability_report),
         "property_name_level": property_level,

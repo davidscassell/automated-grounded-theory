@@ -1,8 +1,20 @@
-# Axial coding, saturation, and later steps (0.8.0)
+# Axial coding, saturation, and later steps (0.8.0, fixes in 0.8.1)
 
-This note is the design for package 0.8.0. It sits on the focused-coding graph from 0.7.9. The default run is still initial coding plus a theme report. Focused coding is unchanged. Axial coding, saturation indicators, and selective coding are separate graphs. [design-later-stages.md](design-later-stages.md) is the longer literature note. This file is the slice that is implemented.
+This note is the design for package 0.8.0, with the 0.8.1 corrections below. It sits on the focused-coding graph from 0.7.9. The default run is still initial coding plus a theme report. Focused coding is unchanged. Axial coding, saturation indicators, and selective coding are separate graphs. [design-later-stages.md](design-later-stages.md) is the longer literature note. This file is the slice that is implemented.
 
-`policy_version` is `0.8.0`.
+`policy_version` is `0.8.1`.
+
+## 0.8.1 corrections
+
+**Frequency.** `code_frequency_stabilization` is total variation between consecutive documents' normalized per-document assignment counts (`code_frequency_comparison` is `total_variation`). It is undefined with fewer than two documents or when a compared document has no assignments. 0.8.0 stored a presence bit for every code seen so far. Those reports are not comparable. New-code rate is still discovery, separate from this shift.
+
+**Combined run.** `also_selective=True` copies the axial prompt log, warnings, saturation, coverage, and procedure onto the selective state (`axial_procedure`, `stage` `selective`). Selective counters start at zero. `export` of the selective stage writes `selective_run.json`, core, memos, and storyline. It does not overwrite `category_relationships.json`, `thematic_saturation.json`, `theory_coverage.json`, or `axial_run.json`.
+
+**Calls, not pairs.** `propose_calls` is `min(allocated_calls, ceil(pair_count / batch_size))`. Unused allocated calls are added to `counterexample_calls`. Pair capacity for that round is `counterexample_calls * batch_size`. Neither allowance is negative. `max_decision_calls=0` does not build a reviewer and does not interrupt; `decision_stop` is `call_allowance`.
+
+**Core and evidence.** The storyline payload carries the effective `core_id` and `core_provenance` (`human` or `model`). An unknown model id is not treated as the core. Evidence for a proposal request is round-robin across each pair's two categories, then filled to `axial_evidence_limit`. Omitted passages are `omitted_evidence`.
+
+**Tokens and clients.** `max_axial_review_tokens` (default 24000) is the estimated-input ceiling. `axial_token_budget` (default 6000) is the per-request ceiling. Both are public. Provider usage is stored on each prompt-log row and as `provider_token_usage`. `ProviderClientFactory` owns HTTP client configuration. A foreign client bound to another loop raises `CrossLoopClientError`.
 
 ## Decisions
 

@@ -40,8 +40,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_version_and_batch_size_stay_split_from_procedure():
-    assert __version__ == "0.8.0"
-    assert POLICY_VERSION == "0.8.0"
+    assert __version__ == "0.8.1"
+    assert POLICY_VERSION == "0.8.1"
     assert inspect.signature(focused_code).parameters["batch_size"].default == 1
     assert inspect.signature(afocused_code).parameters["batch_size"].default == 1
     assert DEFAULT_FOCUSED_BATCH_SIZE == 1
@@ -759,6 +759,7 @@ def test_researcher_incident_can_enter_any_purpose(tmp_path):
     # is reallocated onto compete and p1 is queued after the incident.
     assert compete == ["p4", "p1"]
     assert resumed.metadata["claim_test_relevance"]["reallocated_calls"] == 1
+    assert resumed.metadata["reread_reallocation"]["reallocated"] is True
 
 
 def test_negative_cases_include_the_supporting_category():

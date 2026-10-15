@@ -401,86 +401,142 @@ def install_provider_http_timeout(model, seconds: float | None):
 
 
 _OWNER_ATTR = "_agt_owner_loop"
-_CLIENTS_BY_LOOP: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_FACTORY_ATTR = "_agt_client_factory"
 
 
-def _client_signature(client: Any) -> tuple:
-    try:
-        base = str(client.base_url)
-    except Exception:
-        base = ""
-    try:
-        headers = tuple(sorted((str(key), str(value)) for key, value in client.headers.items()))
-    except Exception:
-        headers = ()
-    return (base, headers)
+class CrossLoopClientError(RuntimeError):
+    """A client bound to another loop was not built by :class:`ProviderClientFactory`."""
 
 
-def _fresh_async_client(template: Any, timeout: Any) -> Any:
-    """Build a new client on the running loop. Do not copy a transport."""
-    import httpx
+class ProviderClientFactory:
+    """Configuration for one provider HTTP client identity.
 
-    kwargs: dict[str, Any] = {"timeout": timeout}
-    redirects = getattr(template, "follow_redirects", None)
-    if isinstance(redirects, bool):
-        kwargs["follow_redirects"] = redirects
-    limits = getattr(template, "limits", None)
-    if limits is not None:
-        kwargs["limits"] = limits
-    try:
-        headers = dict(template.headers)
-    except Exception:
-        headers = None
-    if headers:
-        kwargs["headers"] = headers
-    try:
-        base = str(template.base_url or "")
-    except Exception:
-        base = ""
-    if base:
-        kwargs["base_url"] = template.base_url
-    try:
-        return httpx.AsyncClient(**kwargs)
-    except Exception:
-        return httpx.AsyncClient(timeout=timeout)
+    A cross-loop replacement is built from this configuration, not from a few
+    attributes copied off a live client. Two factories stay two clients even
+    when they share a base URL. Auth, cookies, params, proxies, TLS, and
+    ``trust_env`` are part of the identity.
+    """
+
+    def __init__(self, **config: Any) -> None:
+        self.config = dict(config)
+        self._clients: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+    def build(self, *, timeout: Any, loop: Any) -> Any:
+        import httpx
+
+        kwargs = dict(self.config)
+        kwargs["timeout"] = timeout
+        client = httpx.AsyncClient(**kwargs)
+        try:
+            setattr(client, _OWNER_ATTR, loop)
+            setattr(client, _FACTORY_ATTR, self)
+        except Exception:
+            pass
+        return client
+
+    def for_loop(self, loop: Any, timeout: Any) -> Any:
+        cached = self._clients.get(loop)
+        if cached is not None:
+            try:
+                if not cached.is_closed:
+                    cached.timeout = timeout
+                    return cached
+            except Exception:
+                pass
+        client = self.build(timeout=timeout, loop=loop)
+        self._clients[loop] = client
+        return client
+
+
+def _holds_foreign_asyncio_primitive(root: Any, loop: Any) -> bool:
+    """True when a pooled connection still holds an asyncio primitive from another loop.
+
+    httpx 0.28 does not store the loop on the connection pool. A keepalive
+    stream does: its protocol events are created on the loop that opened the
+    connection. Reading that binding is how a foreign client is refused. The
+    client is not rebuilt from its URL and headers.
+    """
+    pool = getattr(getattr(root, "_transport", None), "_pool", None)
+    if pool is None:
+        return False
+    seen: set[int] = set()
+    stack: list[tuple[Any, int]] = [(pool, 0)]
+    while stack:
+        obj, depth = stack.pop()
+        if obj is None or depth > 8:
+            continue
+        ident = id(obj)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        if len(seen) > 200:
+            break
+        module = type(obj).__module__
+        if module.startswith("asyncio"):
+            bound = getattr(obj, "_loop", None)
+            if bound is not None and bound is not loop:
+                return True
+            continue
+        if not (module.startswith(("httpx", "httpcore", "anyio")) or isinstance(obj, (list, tuple))):
+            continue
+        children: list[Any] = []
+        if isinstance(obj, (list, tuple)):
+            children.extend(obj)
+        else:
+            try:
+                children.extend(vars(obj).values())
+            except Exception:
+                pass
+            slots = getattr(type(obj), "__slots__", ())
+            if isinstance(slots, str):
+                slots = (slots,)
+            for slot in slots:
+                if not isinstance(slot, str) or slot.startswith("__"):
+                    continue
+                try:
+                    children.append(getattr(obj, slot))
+                except Exception:
+                    continue
+        for child in children:
+            if child is None or isinstance(child, (str, bytes, int, float, bool)):
+                continue
+            stack.append((child, depth + 1))
+    return False
 
 
 def client_for_running_loop(template: Any, timeout: Any) -> Any:
-    """Return an async client constructed on the running loop.
+    """Return a client for the running loop without inventing a new configuration.
 
-    httpx 0.28.1 does not store the loop on ``transport._pool``. A client that
-    has already completed a request keeps its locks on that loop, and the next
-    loop raises ``Event is bound to a different event loop``. Ownership is
-    recorded on the client this function builds. A later call on the same loop
-    reuses that client. A different loop gets its own. Private pool attributes
-    are not consulted.
+    A client this factory built can be rebuilt on the running loop with the
+    same auth, cookies, and transport settings. A client that was not built
+    here and is already bound to another loop raises :class:`CrossLoopClientError`.
+    Binding is an owner stamp or a keepalive connection whose asyncio primitives
+    belong to another loop. The client is not replaced by one reconstructed
+    from the base URL and headers. A client with no recorded owner and no
+    foreign connection is left in place and only has its timeout set.
     """
     loop = asyncio.get_running_loop()
+    factory = getattr(template, _FACTORY_ATTR, None)
+    if factory is not None:
+        return factory.for_loop(loop, timeout)
     owned = getattr(template, _OWNER_ATTR, None)
-    if owned is loop:
-        try:
-            if not template.is_closed:
-                template.timeout = timeout
-                return template
-        except Exception:
-            pass
-    bucket = _CLIENTS_BY_LOOP.setdefault(loop, {})
-    key = _client_signature(template)
-    cached = bucket.get(key)
-    if cached is not None:
-        try:
-            if not cached.is_closed:
-                cached.timeout = timeout
-                return cached
-        except Exception:
-            pass
-    client = _fresh_async_client(template, timeout)
+    if (owned is not None and owned is not loop) or _holds_foreign_asyncio_primitive(template, loop):
+        raise CrossLoopClientError(
+            "This HTTP client is bound to another event loop and was not created by "
+            "ProviderClientFactory. The package will not substitute a client rebuilt "
+            "from a few attributes. Build it with ProviderClientFactory so auth, "
+            "cookies, params, proxies, TLS, and trust_env stay with that identity."
+        )
     try:
-        setattr(client, _OWNER_ATTR, loop)
+        if not template.is_closed:
+            template.timeout = timeout
+            return template
     except Exception:
         pass
-    bucket[key] = client
-    return client
+    raise CrossLoopClientError(
+        "This HTTP client cannot be moved onto the running loop because it was not "
+        "created by ProviderClientFactory."
+    )
 
 
 def _httpx_client_slots(root: Any):
@@ -548,6 +604,8 @@ async def arm_provider_clients(root: Any, seconds: float) -> None:
             pass
         try:
             replacement = client_for_running_loop(client, timeout)
+        except CrossLoopClientError:
+            raise
         except Exception:
             continue
         if replacement is client:

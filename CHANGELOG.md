@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.8.1
+
+- Code-frequency stabilization is the total variation between consecutive documents' normalized assignment counts. A document that assigns a code 99 times and another once is not the same distribution as the reverse. The figure is undefined with fewer than two documents, or when a compared document has no assignments. A 0.8.0 report stored presence bits and is not comparable.
+- `axial_code(..., also_selective=True)` keeps the axial prompt log, warnings, saturation assessment, and procedure. Selective export writes `selective_run.json` and does not rewrite `category_relationships.json`, `thematic_saturation.json`, `theory_coverage.json`, or `axial_run.json`.
+- Propose and counterexample allowances are model calls. Required proposal calls are `ceil(pair_count / batch_size)`. Only unused calls move to the counterexample share, and that share's pair capacity is calls times batch size. The split is never negative. `max_decision_calls=0` disables reviewer calls instead of clamping to one.
+- The storyline prompt uses the core selected for the decision mode. An LLM choice is `model_core_id` with provenance `model`. An id that is not a candidate is not passed as the core.
+- Proposal evidence is shared across the pairs in the request and both categories before any category fills the rest of `axial_evidence_limit`. A passage keeps every category id it illustrates. Passages that do not fit are `omitted_evidence`.
+- An httpx client built with `ProviderClientFactory` keeps its auth, cookies, params, proxies, TLS, and `trust_env` when another loop needs a client. Two factories stay two clients. A client that was not built by the factory and is bound to another loop raises `CrossLoopClientError` instead of being replaced by a stripped client.
+- Axial and selective calls use `max_axial_review_tokens` (default 24000) and `axial_token_budget` (default 6000). Every proposal, counterexample, memo, storyline, and decision-review call records provider input, output, and cached tokens. A request that does not fit is omitted and the reason is on the prompt log.
+- A stall before the first model call, including a slot wait, a budget wait, or an embedding call, is under the same monotonic deadline as the request timeout. The deadline thread is not armed only after `ainvoke` starts.
+- A `contradicts` or `qualifies` verdict is `claim_test_invalid` with reason `rationale_indicates_irrelevance` when the quote and rationale do not share the claim's subject and the rationale says the passage is about something else. That row does not dispute the claim. Missing overlap without that cue stays a dispute and is flagged `claim_subject_uncertain`. A claim with no subject stems stays uncertain.
+- v25 claim-round relevance was about 0.03 (30 of 31 judgments irrelevant after the filter had already skipped 11). The bar is unchanged: two content tokens, a stored embedding at or above 0.55, or counterevidence. The rate is reported. Pairs below the bar are still not sent.
+- `reread_reallocation.reallocated` is true when claim calls are actually moved, matching the reallocation warning. Reallocation does not queue a prompt that would pass the token allowance; calls left behind are `token_reallocation` with reason `token_allowance`.
+- v25 revise and drop proposals stayed rare and unstable (one drop and two different revisions of R023_q2). `cross_seed_conflicts` already records that. No procedure change. Property-name stability on that pass was about 0.04. The score stays as measured. LLM decision mode was not in the live run. No change.
+- `policy_version` is `0.8.1`.
+
 ## 0.8.0
 
 - Axial coding is a separate graph: `load_focused`, `plan_relations`, `propose_relations`, `relation_checkpoint`, `counterexample_worker`, `commit_relations`, `saturation_indicators`, `saturation_checkpoint`, `export_axial`. It is not a node on open coding, themes, or focused coding.
