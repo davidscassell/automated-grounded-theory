@@ -31,7 +31,7 @@ from tests.fake_llm import FakeCoder
 
 
 def test_version_is_0_6_12():
-    assert __version__ == "0.7.9"
+    assert __version__ == "0.8.0"
 
 
 class ConfigCoder(FakeCoder):

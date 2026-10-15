@@ -50,6 +50,18 @@ FOCUSED_RE = re.compile(
     re.escape(FOCUSED_BEGIN) + r"\n```mermaid\n(.*?)```\n" + re.escape(FOCUSED_END),
     re.DOTALL,
 )
+AXIAL_BEGIN = "<!-- graph:axial:begin -->"
+AXIAL_END = "<!-- graph:axial:end -->"
+AXIAL_RE = re.compile(
+    re.escape(AXIAL_BEGIN) + r"\n```mermaid\n(.*?)```\n" + re.escape(AXIAL_END),
+    re.DOTALL,
+)
+SELECTIVE_BEGIN = "<!-- graph:selective:begin -->"
+SELECTIVE_END = "<!-- graph:selective:end -->"
+SELECTIVE_RE = re.compile(
+    re.escape(SELECTIVE_BEGIN) + r"\n```mermaid\n(.*?)```\n" + re.escape(SELECTIVE_END),
+    re.DOTALL,
+)
 
 
 def _runtime(**overrides) -> RunConfig:
@@ -112,6 +124,16 @@ def focused_mermaid() -> str:
     return get_graph("focused").compile().get_graph().draw_mermaid()
 
 
+def axial_mermaid() -> str:
+    """Mermaid for ``get_graph("axial")``."""
+    return get_graph("axial").compile().get_graph().draw_mermaid()
+
+
+def selective_mermaid() -> str:
+    """Mermaid for ``get_graph("selective")``."""
+    return get_graph("selective").compile().get_graph().draw_mermaid()
+
+
 def readme_mermaid(readme: str) -> str:
     match = BLOCK_RE.search(readme)
     if match is None:
@@ -155,6 +177,13 @@ def replace_readme_mermaid(readme: str, mermaid: str) -> str:
 
 def replace_focused_mermaid(readme: str, mermaid: str) -> str:
     return _replace_block(readme, FOCUSED_RE, FOCUSED_BEGIN, FOCUSED_END, mermaid)
+
+
+def readme_named_mermaid(readme: str, pattern: re.Pattern[str], begin: str, end: str) -> str:
+    match = pattern.search(readme)
+    if match is None:
+        raise ValueError(f"README.md is missing the generated mermaid block between {begin} and {end}.")
+    return match.group(1)
 
 
 def _edge_tuples(compiled) -> set[tuple[str, str, bool]]:
@@ -230,10 +259,14 @@ def main(argv: list[str] | None = None) -> int:
     mermaid = diagram_mermaid()
     check_variants(mermaid)
     focused = focused_mermaid()
+    axial = axial_mermaid()
+    selective = selective_mermaid()
     readme = README_PATH.read_text(encoding="utf-8")
     try:
         current = readme_mermaid(readme)
         current_focused = readme_focused_mermaid(readme)
+        current_axial = readme_named_mermaid(readme, AXIAL_RE, AXIAL_BEGIN, AXIAL_END)
+        current_selective = readme_named_mermaid(readme, SELECTIVE_RE, SELECTIVE_BEGIN, SELECTIVE_END)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     if args.check:
@@ -241,9 +274,16 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("README mermaid block does not match graph.get_graph().draw_mermaid().")
         if current_focused != focused:
             raise SystemExit("README focused mermaid block does not match get_graph('focused').draw_mermaid().")
-        print("README open_code and focused diagrams match the compiled graphs.")
+        if current_axial != axial:
+            raise SystemExit("README axial mermaid block does not match get_graph('axial').draw_mermaid().")
+        if current_selective != selective:
+            raise SystemExit("README selective mermaid block does not match get_graph('selective').draw_mermaid().")
+        print("README open_code, focused, axial, and selective diagrams match the compiled graphs.")
         return 0
-    updated = replace_focused_mermaid(replace_readme_mermaid(readme, mermaid), focused)
+    updated = replace_readme_mermaid(readme, mermaid)
+    updated = replace_focused_mermaid(updated, focused)
+    updated = _replace_block(updated, AXIAL_RE, AXIAL_BEGIN, AXIAL_END, axial)
+    updated = _replace_block(updated, SELECTIVE_RE, SELECTIVE_BEGIN, SELECTIVE_END, selective)
     if updated != readme:
         README_PATH.write_text(updated, encoding="utf-8")
         print(f"Updated {README_PATH.relative_to(ROOT)}")

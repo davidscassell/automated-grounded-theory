@@ -50,6 +50,87 @@ def saturation_point(
     }
 
 
+def thematic_saturation_report(
+    windows: Sequence[Mapping],
+    *,
+    property_stability_report: Mapping | None = None,
+    relationship_stability_report: Mapping | None = None,
+) -> dict:
+    """Indicators a researcher can read. This function does not set ``judgment``.
+
+    Each window is one document. Batch size stays 1, so a rate is the count of
+    new codes, properties, or relationships first evidenced in that document.
+    Frequency stabilization needs two windows. Cross-run stability needs the
+    caller to pass a report from more than one run. Missing figures stay null.
+    """
+    rows = []
+    previous_frequency: Mapping[str, int] | None = None
+    shifts: list[float] = []
+    for index, window in enumerate(windows):
+        item = dict(window)
+        frequencies = {
+            str(key): int(value)
+            for key, value in dict(item.get("code_frequencies") or {}).items()
+        }
+        shift = None
+        if previous_frequency is not None:
+            keys = set(previous_frequency) | set(frequencies)
+            if keys:
+                shift = sum(abs(int(frequencies.get(key, 0)) - int(previous_frequency.get(key, 0))) for key in keys) / len(keys)
+                shifts.append(shift)
+        previous_frequency = frequencies
+        new_codes = int(item.get("new_codes") or 0)
+        new_properties = int(item.get("new_properties") or 0)
+        new_relationships = int(item.get("new_relationships") or 0)
+        rows.append(
+            {
+                "batch": index + 1,
+                "document_id": str(item.get("document_id") or ""),
+                "passages_in_batch": 1,
+                "new_codes": new_codes,
+                "new_properties": new_properties,
+                "new_relationships": new_relationships,
+                "new_code_rate": new_codes,
+                "new_property_rate": new_properties,
+                "new_relationship_rate": new_relationships,
+                "code_frequency_shift": shift,
+                "cumulative_codes": int(item.get("cumulative_codes") or 0),
+            }
+        )
+    too_few = len(rows) < 2
+    property_level = None if not property_stability_report else property_stability_report.get("name_level")
+    relationship_level = None if not relationship_stability_report else relationship_stability_report.get("role_level")
+    notes = [
+        "These figures are a saturation curve, not a verdict. judgment stays null. "
+        "A researcher may record a decision separately. A model assessment is not that decision."
+    ]
+    if not rows:
+        notes.append("Saturation rates are undefined: there are no documents.")
+    elif too_few:
+        notes.append("Code-frequency stabilization is undefined: fewer than two documents.")
+    if property_stability_report is None or property_stability_report.get("name_level") is None:
+        notes.append("Property stability across passes is undefined until two runs name properties.")
+    if relationship_stability_report is None or relationship_stability_report.get("role_level") is None:
+        notes.append("Relationship stability across passes is undefined until two runs share relationships.")
+    return {
+        "model": "theoretical_saturation_indicators",
+        "batch_size": 1,
+        "points": rows,
+        "new_code_rate": None if not rows else rows[-1]["new_code_rate"],
+        "new_property_rate": None if not rows else rows[-1]["new_property_rate"],
+        "new_relationship_rate": None if not rows else rows[-1]["new_relationship_rate"],
+        "code_frequency_stabilization": None if too_few or not shifts else shifts[-1],
+        "property_stability": None if property_stability_report is None else dict(property_stability_report),
+        "relationship_stability": None if relationship_stability_report is None else dict(relationship_stability_report),
+        "property_name_level": property_level,
+        "relationship_role_level": relationship_level,
+        "judgment": None,
+        "researcher_saturation": None,
+        "model_saturation": None,
+        "note": " ".join(notes),
+    }
+
+
 def saturation_report(points: Sequence[Mapping]) -> dict:
     rows = [dict(point) for point in points]
     latest = rows[-1] if rows else None
