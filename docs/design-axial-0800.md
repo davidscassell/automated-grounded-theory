@@ -1,8 +1,18 @@
-# Axial coding, saturation, and later steps (0.8.0, fixes in 0.8.1, 0.8.2, and 0.8.3)
+# Axial coding, saturation, and later steps (0.8.0, fixes in 0.8.1, 0.8.2, 0.8.3, and 0.8.4)
 
-This note is the design for package 0.8.0, with the 0.8.1, 0.8.2, and 0.8.3 corrections below. It sits on the focused-coding graph from 0.7.9. The default run is still initial coding plus a theme report. Focused coding is unchanged. Axial coding, saturation indicators, and selective coding are separate graphs. [design-later-stages.md](design-later-stages.md) is the longer literature note. This file is the slice that is implemented.
+This note is the design for package 0.8.0, with the 0.8.1, 0.8.2, 0.8.3, and 0.8.4 corrections below. It sits on the focused-coding graph from 0.7.9. The default run is still initial coding plus a theme report. Focused coding is unchanged. Axial coding, saturation indicators, and selective coding are separate graphs. [design-later-stages.md](design-later-stages.md) is the longer literature note. This file is the slice that is implemented.
 
-`policy_version` is `0.8.3`.
+`policy_version` is `0.8.4`.
+
+## 0.8.4 corrections
+
+**One proposal request, then a checkpoint.** `propose_relations` sends one provider request and returns. While pairs remain and the proposal allowance has calls left, the graph runs that node again. A timeout therefore keeps the responses already written. The attempt that timed out is written onto `provider_budget` and the prompt log before resume. Resume restores that allowance, so a ceiling of three calls cannot become five attempts.
+
+**Memos.** `memo_accounting` counts requested, produced, omitted, failed, and empty memos. A chunk that fails to parse stays unresolved. A memo with empty or missing text is stored and flagged `memo_empty`, and the stage is `incomplete`. An empty pending list is not treated as completion.
+
+**Usage.** A received response is counted once, including a response that fails to parse. A repair that cannot fit the request budget is `not_sent`. It does not copy the original response's usage, and the warning says the request was not sent. Decision review counts a response whose status is not `validated`.
+
+**Evidence for both categories.** A pair is deferred when either endpoint has no passage in the request, even if the other category has evidence. The deferred row records `unsupported_code_ids`.
 
 ## 0.8.3 corrections
 
@@ -60,7 +70,7 @@ This note is the design for package 0.8.0, with the 0.8.1, 0.8.2, and 0.8.3 corr
 
 ## Graphs
 
-Axial: `load_focused` → `plan_relations` → `propose_relations` → `relation_checkpoint` → `counterexample_worker` → `commit_relations` → `saturation_indicators` → `saturation_checkpoint` → `export_axial`.
+Axial: `load_focused` → `plan_relations` → `propose_relations` → `relation_checkpoint` → `counterexample_worker` → `commit_relations` → `saturation_indicators` → `saturation_checkpoint` → `export_axial`. `propose_relations` also returns to itself after each request while pairs remain.
 
 Selective: `load_category_development` → `score_candidates` → `core_checkpoint` → `draft_memos` → `draft_storyline` → `export_selective`.
 

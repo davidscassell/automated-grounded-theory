@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.4
+
+- A proposal request is one graph step. The response and the allowance it consumed are checkpointed before the next request. A timeout keeps those responses and counts the timed-out attempt, so a resume cannot spend the ceiling again.
+- Memo completion counts requested, produced, omitted, failed, and empty memos. A failed chunk stays unresolved. Empty or missing memo text is `incomplete`, including a schema-valid empty memo.
+- Provider usage is counted once per received response. A repair that was not sent does not carry the original response's usage, and its warning says the repair was not sent. A decision-review response counts whether or not it parses.
+- A proposal is deferred when either category has no passage in the request. The deferred row names the unsupported category ids.
+- The fresh-process checkpoint test derives the checkout path from the test file.
+- `policy_version` is `0.8.4`.
+
 ## 0.8.3
 
 - Pausing for human review does not reset the provider allowance. Consumed calls and tokens are checkpoint state (`provider_budget`) and are restored into the runtime before a resumed node runs, including a new process. Axial, focused, and selective graphs all restore that state. Decision-review counters travel with it.

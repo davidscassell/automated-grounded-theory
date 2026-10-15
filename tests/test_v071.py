@@ -18,8 +18,8 @@ from tests.test_v070 import _book, _entry, _passages, _source
 
 
 def test_version_is_071():
-    assert __version__ == "0.8.3"
-    assert POLICY_VERSION == "0.8.3"
+    assert __version__ == "0.8.4"
+    assert POLICY_VERSION == "0.8.4"
 
 
 def _tied_codes(n=6):

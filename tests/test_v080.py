@@ -322,8 +322,8 @@ def _run(model=None, **kwargs):
 
 
 def test_version_and_graphs():
-    assert __version__ == "0.8.3"
-    assert POLICY_VERSION == "0.8.3"
+    assert __version__ == "0.8.4"
+    assert POLICY_VERSION == "0.8.4"
     from automated_grounded_theory.axial import aaxial_code
 
     assert inspect.signature(aaxial_code).parameters["batch_size"].default == 1
@@ -472,6 +472,7 @@ def test_reject_revise_and_merge_keep_both_rows():
     saver = InMemorySaver()
     source = _corpus()
     source["codebook"]["c-other"] = _code("c-other", "other work")
+    source["segments"].append({"segment_id": "s3", "code_id": "c-other", "passage_id": "p1"})
     common = dict(model=FakeAxialCoder(), seed=3, max_axial_review_calls=4, checkpointer=saver, thread_id="axial-merge")
     paused = axial_code(source, interrupt=True, **common)
     assert len(paused.relationships) == 2
