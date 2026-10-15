@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.2
+
+- A paraphrased contradiction stays a negative case. "is about" and "about the" are not irrelevance cues. Missing subject-stem overlap is `claim_subject_uncertain` and still disputes. Only explicit irrelevance language (`irrelevant`, `unrelated`, `does not address`, `does not mention`, `nothing to do with`) flags `rationale_indicates_irrelevance`, and a negation such as "not unrelated" does not. That negative case is kept as `disputed_pending_review` instead of being dropped.
+- `max_axial_review_tokens` is one shared estimated-token allowance for axial coding, counterexamples, memos, the storyline, and decision review. A later selective run continues from the tokens already estimated. `max_selective_review_calls` remains a separate call ceiling. Focused coding keeps `max_focused_review_tokens` separate from `max_decision_tokens`.
+- Schema repair and retries acquire that same call and token allowance and are their own audit rows. When no allowance remains, the failed output is kept and flagged for review.
+- An oversized batch is shrunk until it fits. A proposal no longer drops the last passage for a category. If both sides of a pair cannot fit, the pair is deferred and the reason is recorded, or the passages are excerpts with a source offset and length.
+- A finished graph is not analytical coverage. Pairs are reconciled into planned, attempted, completed, omitted, and remaining. `unexamined_pairs` lists pairs that were not sent. A run that stops on a token or call ceiling is `budget_limited`. A preserved parse failure is `incomplete`.
+- Total variation between consecutive documents describes the difference between those documents. A low figure does not establish theoretical saturation and is not a human confirmation.
+- `policy_version` is `0.8.2`.
+
 ## 0.8.1
 
 - Code-frequency stabilization is the total variation between consecutive documents' normalized assignment counts. A document that assigns a code 99 times and another once is not the same distribution as the reverse. The figure is undefined with fewer than two documents, or when a compared document has no assignments. A 0.8.0 report stored presence bits and is not comparable.

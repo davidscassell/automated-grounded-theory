@@ -26,6 +26,100 @@ from typing import Any, Callable, Mapping, Sequence
 
 logger = logging.getLogger("automated_grounded_theory")
 
+class ProviderAllowance:
+    """One call ceiling and one estimated-token ceiling for provider requests.
+
+    Coding, counterexample, memo, storyline, decision review, schema repair,
+    and a retry all acquire from this object before the provider is called.
+    A request that does not fit is not sent. ``max_calls`` or ``max_tokens``
+    of ``None`` leaves that side open. Zero is a closed ceiling.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_calls: int | None = None,
+        max_tokens: int | None = None,
+        calls_used: int = 0,
+        tokens_estimated: int = 0,
+    ) -> None:
+        self.max_calls = None if max_calls is None else max(0, int(max_calls))
+        self.max_tokens = None if max_tokens is None else max(0, int(max_tokens))
+        self.calls_used = max(0, int(calls_used))
+        self.tokens_estimated = max(0, int(tokens_estimated))
+        self.refusals: list[dict[str, Any]] = []
+
+    def remaining_calls(self) -> int | None:
+        if self.max_calls is None:
+            return None
+        return max(0, self.max_calls - self.calls_used)
+
+    def remaining_tokens(self) -> int | None:
+        if self.max_tokens is None:
+            return None
+        return max(0, self.max_tokens - self.tokens_estimated)
+
+    def preview(self, estimate: int) -> dict[str, Any]:
+        return self._decide(estimate, commit=False, kind="preview")
+
+    def would_refuse(self, estimate: int) -> bool:
+        return self.preview(estimate)["status"] != "acquired"
+
+    def try_acquire(self, estimate: int, *, kind: str) -> dict[str, Any]:
+        return self._decide(estimate, commit=True, kind=kind)
+
+    def _decide(self, estimate: int, *, commit: bool, kind: str) -> dict[str, Any]:
+        estimate = max(0, int(estimate))
+        if self.max_calls is not None and self.calls_used >= self.max_calls:
+            row = {
+                "status": "refused",
+                "reason": "call_allowance",
+                "kind": kind,
+                "estimated_input_tokens": estimate,
+                "calls_used": self.calls_used,
+                "tokens_estimated": self.tokens_estimated,
+                "max_calls": self.max_calls,
+                "max_tokens": self.max_tokens,
+            }
+        elif self.max_tokens is not None and self.tokens_estimated + estimate > self.max_tokens:
+            row = {
+                "status": "refused",
+                "reason": "token_allowance",
+                "kind": kind,
+                "estimated_input_tokens": estimate,
+                "calls_used": self.calls_used,
+                "tokens_estimated": self.tokens_estimated,
+                "max_calls": self.max_calls,
+                "max_tokens": self.max_tokens,
+            }
+        else:
+            if commit:
+                self.calls_used += 1
+                self.tokens_estimated += estimate
+            row = {
+                "status": "acquired",
+                "reason": "",
+                "kind": kind,
+                "estimated_input_tokens": estimate,
+                "calls_used": self.calls_used,
+                "tokens_estimated": self.tokens_estimated,
+                "max_calls": self.max_calls,
+                "max_tokens": self.max_tokens,
+            }
+        if commit and row["status"] != "acquired":
+            self.refusals.append(dict(row))
+        return row
+
+
+class AllowanceExhausted(RuntimeError):
+    """A provider request did not fit the shared call or token allowance."""
+
+    def __init__(self, decision: Mapping[str, Any]):
+        self.decision = dict(decision)
+        self.reason = str(decision.get("reason") or "call_allowance")
+        super().__init__(f"Provider allowance refused this request ({self.reason}).")
+
+
 class CallLimiter:
     """Cap in-flight work, adapt on 429, and retry transient failures with full-jitter backoff.
 
@@ -82,6 +176,7 @@ class CallLimiter:
         request_timeout: float = 120.0,
         wall_timeout: float | None = None,
         process_isolation: bool = False,
+        provider_allowance: ProviderAllowance | None = None,
     ) -> None:
         self.concurrency = max(1, int(concurrency))
         self.max_concurrency = self.concurrency
@@ -96,6 +191,7 @@ class CallLimiter:
         self.request_timeout = float(request_timeout)
         self.wall_timeout = None if wall_timeout is None else float(wall_timeout)
         self.process_isolation = bool(process_isolation)
+        self.provider_allowance = provider_allowance
         self._tokens = self.tokens_per_minute
         self._token_stamp: float | None = None
         self._requests = self.requests_per_minute
@@ -139,6 +235,8 @@ class CallLimiter:
         timeout: float | None = None,
         reserved_output: int | None = None,
         use_cache: bool = True,
+        allowance_estimate: int | None = None,
+        allowance_kind: str = "provider",
     ):
         """``await runnable.ainvoke(payload)`` under the AIMD cap, with rate-limit retries.
 
@@ -173,6 +271,8 @@ class CallLimiter:
                 timeout=attempt_timeout,
                 estimate=estimate,
                 deadline=deadline,
+                allowance_estimate=allowance_estimate,
+                allowance_kind=allowance_kind,
             )
 
         result = await self._retry(once, deadline=deadline)
@@ -237,11 +337,20 @@ class CallLimiter:
         timeout: float | None,
         estimate: int,
         deadline: float | None = None,
+        allowance_estimate: int | None = None,
+        allowance_kind: str = "provider",
     ):
         """One provider attempt: reserve budgets, hold one shared slot, reconcile."""
         record = {"queue_wait": 0.0, "latency": None, "reserved": 0.0, "usage": None}
         held = False
         limit = float(timeout or 0)
+        if self.provider_allowance is not None:
+            decision = self.provider_allowance.try_acquire(
+                0 if allowance_estimate is None else int(allowance_estimate),
+                kind=allowance_kind,
+            )
+            if decision["status"] != "acquired":
+                raise AllowanceExhausted(decision)
 
         async def _before_call() -> None:
             await self._reserve_budgets(record, estimate, deadline=deadline)
@@ -1038,6 +1147,10 @@ async def ainvoke_structured(
     on_overflow: Callable[[OversizedRequest], None] | None = None,
     use_cache: bool = True,
     raw_out: list | None = None,
+    preserve_failed: bool = False,
+    send_repair_overflow: bool = True,
+    allowance_kind: str = "structured",
+    call_audits: list | None = None,
 ) -> tuple[tuple[dict, dict], list]:
     """Invoke ``schema`` once, then repair a single malformed output.
 
@@ -1049,11 +1162,43 @@ async def ainvoke_structured(
     When ``token_budget`` is set, the repair request is measured again,
     including the schema, and the repair note is shortened until the input
     plus ``reserved_output`` fits that budget. A repair that is still over
-    the budget is logged, reported to ``on_overflow``, and sent.
+    the budget is logged, reported to ``on_overflow``, and sent unless
+    ``send_repair_overflow`` is false. A shared :class:`ProviderAllowance` on
+    the limiter is acquired for the first request and again for the repair.
+    When the repair does not fit and ``preserve_failed`` is true, the failed
+    output is returned with ``_agt_unparsed`` instead of being dropped.
     """
     from langchain_core.messages import HumanMessage
 
     from automated_grounded_theory.batching import request_input_tokens, shrink_repair_messages
+
+    def _remember(audit: dict) -> None:
+        if call_audits is not None:
+            call_audits.append(audit)
+
+    def _preserved(error: BaseException, usage: dict, *, reason: str, sent_messages: list, raw_text: str = "") -> tuple[tuple[dict, dict], list]:
+        if not raw_text and raw_out:
+            raw_text = str(raw_out[-1] or "")
+        payload = {
+            "_agt_unparsed": True,
+            "needs_review": True,
+            "flagged": True,
+            "reason": reason,
+            "error": str(error),
+            "raw_response": raw_text,
+        }
+        _remember(
+            {
+                "kind": "schema_repair",
+                "messages": sent_messages,
+                "estimated_input_tokens": 0,
+                "usage": usage,
+                "status": "schema_unparsed",
+                "reason": reason,
+                "parsed": payload,
+            }
+        )
+        return (payload, usage), sent_messages
 
     runnable = structured_runnable(model, schema)
     extra: dict[str, Any] = {}
@@ -1064,16 +1209,41 @@ async def ainvoke_structured(
     if not use_cache:
         extra["use_cache"] = False
     reserved = 0 if reserved_output is None else max(0, int(reserved_output))
-    budget = None if token_budget is None else max(1, int(token_budget))
+    if token_budget is None:
+        budget = None
+    elif preserve_failed:
+        budget = max(0, int(token_budget))
+    else:
+        budget = max(1, int(token_budget))
     sent = list(messages)
+    first_estimate = request_input_tokens(sent, schema, tokenizer) + reserved
     # The coding caller measures this payload and flags it when it is still over.
-    # The repair below is a second invocation and is checked on its own.
-    result = await limiter.ainvoke(runnable, sent, **extra)
+    # The repair below is a second invocation and acquires its own allowance.
+    result = await limiter.ainvoke(
+        runnable,
+        sent,
+        allowance_estimate=first_estimate,
+        allowance_kind=allowance_kind,
+        **extra,
+    )
     _record_raw(result, raw_out)
+    failed_raw = _raw_text(result.get("raw")) if isinstance(result, dict) else _raw_text(result)
     try:
-        return parse_structured(result, schema), sent
+        parsed = parse_structured(result, schema)
     except ValueError as first:
         failed_usage = usage_from_result(result)
+        _remember(
+            {
+                "kind": allowance_kind,
+                "messages": sent,
+                "estimated_input_tokens": first_estimate,
+                "usage": failed_usage,
+                "status": "parse_failed",
+                "reason": str(first),
+                "parsed": {},
+                "raw_response": failed_raw,
+            }
+        )
         repair = list(messages) + [
             HumanMessage(
                 content=(
@@ -1083,9 +1253,10 @@ async def ainvoke_structured(
                 )
             )
         ]
-        if budget is not None:
+        if budget is not None and budget > 0:
             ceiling = max(1, budget - reserved)
             repair = shrink_repair_messages(repair, schema, ceiling, tokenizer)
+        repair_estimate = request_input_tokens(repair, schema, tokenizer) + reserved
         overflow = _request_overflow(
             repair,
             schema,
@@ -1099,14 +1270,59 @@ async def ainvoke_structured(
             logger.warning("%s", overflow)
             if on_overflow is not None:
                 on_overflow(overflow)
+            if not send_repair_overflow:
+                return _preserved(first, failed_usage, reason="request_budget", sent_messages=sent, raw_text=failed_raw)
         try:
             limiter.schema_repairs = int(getattr(limiter, "schema_repairs", 0) or 0) + 1
-            repaired = await limiter.ainvoke(runnable, repair, **extra)
-            _record_raw(repaired, raw_out)
+            repaired = await limiter.ainvoke(
+                runnable,
+                repair,
+                allowance_estimate=repair_estimate,
+                allowance_kind="schema_repair",
+                **extra,
+            )
+        except AllowanceExhausted as exc:
+            if preserve_failed:
+                held = _preserved(first, failed_usage, reason=exc.reason, sent_messages=sent, raw_text=failed_raw)
+                if call_audits:
+                    call_audits[-1]["estimated_input_tokens"] = repair_estimate
+                    call_audits[-1]["reason"] = exc.reason
+                    call_audits[-1]["status"] = "refused"
+                return held
+            raise
+        _record_raw(repaired, raw_out)
+        try:
             payload, usage = parse_structured(repaired, schema)
-            return (payload, combine_usage(failed_usage, usage)), repair
         except ValueError:
+            if preserve_failed:
+                return _preserved(first, failed_usage, reason="schema_unparsed", sent_messages=repair, raw_text=failed_raw)
             raise first from None
+        _remember(
+            {
+                "kind": "schema_repair",
+                "messages": repair,
+                "estimated_input_tokens": repair_estimate,
+                "usage": usage,
+                "status": "validated",
+                "reason": "",
+                "parsed": payload,
+            }
+        )
+        return (payload, combine_usage(failed_usage, usage)), repair
+    else:
+        payload, usage = parsed
+        _remember(
+            {
+                "kind": allowance_kind,
+                "messages": sent,
+                "estimated_input_tokens": first_estimate,
+                "usage": usage,
+                "status": "validated",
+                "reason": "",
+                "parsed": payload,
+            }
+        )
+        return parsed, sent
 
 
 async def _close_async_http_clients() -> None:

@@ -95,7 +95,14 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, RetryPolicy, Send, interrupt
 from typing_extensions import TypedDict
 
-from automated_grounded_theory.async_support import CallLimiter, ainvoke_structured, combine_usage, run_sync
+from automated_grounded_theory.async_support import (
+    AllowanceExhausted,
+    CallLimiter,
+    ProviderAllowance,
+    ainvoke_structured,
+    combine_usage,
+    run_sync,
+)
 from automated_grounded_theory.batching import calibrated_token_estimate, request_input_tokens, resolve_tokenizer
 from automated_grounded_theory.backends import chat_model_settings, describe_model
 from automated_grounded_theory.category_state import (
@@ -3497,33 +3504,57 @@ def _claim_subject_tokens(claim: Mapping[str, Any]) -> set[str]:
 
 
 _IRRELEVANCE_CUES = (
-    "irrelevant",
-    "unrelated",
-    "not about",
-    "isn't about",
-    "is about",
-    "about the",
-    "different subject",
+    "nothing to do with",
     "does not address",
     "doesn't address",
-    "off topic",
-    "off-topic",
+    "does not mention",
+    "doesn't mention",
+    "irrelevant",
+    "unrelated",
+)
+_IRRELEVANCE_NEGATIONS = frozenset(
+    {"not", "no", "never", "isn't", "isnt", "aren't", "arent", "wasn't", "wasnt", "without"}
 )
 
 
 def _rationale_indicates_irrelevance(rationale: str) -> bool:
-    """True when the rationale says the passage is about a different subject."""
-    folded = " ".join(str(rationale or "").casefold().split())
-    return any(cue in folded for cue in _IRRELEVANCE_CUES)
+    """True only for explicit irrelevance language that is not negated.
+
+    ``is about`` and ``about the`` are not cues: a paraphrase can use them.
+    ``not unrelated`` does not count. Missing lexical overlap is not itself
+    irrelevance.
+    """
+    raw = str(rationale or "").casefold().replace("\u2019", "'")
+    folded = " ".join(
+        "".join(character for character in token if character.isalnum() or character == "'")
+        for token in raw.split()
+    )
+    folded = " ".join(folded.split())
+    padded = f" {folded} "
+    for cue in _IRRELEVANCE_CUES:
+        needle = f" {cue} "
+        start = 0
+        while True:
+            index = padded.find(needle, start)
+            if index < 0:
+                break
+            prefix = folded[:index].split()
+            window = prefix[-3:]
+            negations = sum(1 for token in window if token in _IRRELEVANCE_NEGATIONS or token.endswith("n't"))
+            if negations % 2 == 0:
+                return True
+            start = index + len(needle)
+    return False
 
 
 def _subject_engagement(claim: Mapping[str, Any], quote: str, rationale: str) -> str:
     """``engaged``, ``irrelevant``, or ``uncertain``.
 
     A quote or rationale that shares a subject stem with the claim engages it.
-    A rationale that says the passage is about something else, and does not
-    share a subject stem, is not a dispute. Missing overlap without that cue
-    stays a diagnostic. A claim with no subject stems left stays a diagnostic.
+    Missing overlap without an explicit irrelevance cue is ``uncertain`` and
+    still a dispute. Only explicit irrelevance language, not a neutral
+    paraphrase, is ``irrelevant``. A claim with no subject stems stays
+    ``uncertain``.
     """
     subject = _claim_subject_tokens(claim)
     if not subject:
@@ -4261,16 +4292,64 @@ def _worker(runtime: FocusedRuntime):
             claims=claims,
         )
         raw_parts: list[str] = []
-        (parsed, usage), sent = await ainvoke_structured(
-            runtime.coder,
-            schema,
-            messages,
-            runtime.limiter,
-            use_cache=False,
-            raw_out=raw_parts,
-        )
-        calls = 1
+        audits: list[dict] = []
+        try:
+            (parsed, usage), sent = await ainvoke_structured(
+                runtime.coder,
+                schema,
+                messages,
+                runtime.limiter,
+                use_cache=False,
+                raw_out=raw_parts,
+                token_budget=runtime.token_budget,
+                preserve_failed=True,
+                send_repair_overflow=False,
+                allowance_kind="focused_recode",
+                call_audits=audits,
+            )
+        except AllowanceExhausted as exc:
+            parsed = {
+                "_agt_unparsed": True,
+                "needs_review": True,
+                "flagged": True,
+                "reason": exc.reason,
+                "error": str(exc),
+            }
+            usage = {}
+            sent = messages
+        calls = 1 + sum(1 for row in audits if row.get("kind") == "schema_repair" and row.get("status") == "validated")
         interpreted_retry = False
+        if parsed.get("_agt_unparsed"):
+            return {
+                "proposal_buffer": {
+                    "items": [
+                        {
+                            "proposal_id": job.get("proposal_id"),
+                            "snapshot_id": job.get("snapshot_id"),
+                            "passage_index": 0,
+                            "coding": parsed,
+                            "passage_ids": list(job.get("passage_ids") or []),
+                            "purposes": purposes,
+                            "claim_pairs": list(job.get("claim_pairs") or _claim_pairs(claims)),
+                            "claim_sources": dict(job.get("claim_sources") or {}),
+                            "calls": calls,
+                            "usage": usage,
+                            "label_retry": False,
+                            "schema_unparsed": True,
+                            "schema_reason": parsed.get("reason"),
+                            "needs_review": True,
+                            "flagged": True,
+                            "response": parsed,
+                            "raw_response": "\n".join(part for part in raw_parts if part),
+                            "provider_audits": audits,
+                            "messages": [
+                                {"role": getattr(message, "type", "unknown"), "content": getattr(message, "content", "")}
+                                for message in sent
+                            ],
+                        }
+                    ]
+                }
+            }
         if job.get("allow_label_retry"):
             probe = _probe_labels(parsed, passages, book, runtime)
             if probe:
@@ -4284,17 +4363,38 @@ def _worker(runtime: FocusedRuntime):
                     claims=claims,
                     feedback=feedback,
                 )
-                (parsed, retry_usage), sent = await ainvoke_structured(
-                    runtime.coder,
-                    retry_schema,
-                    retry_messages,
-                    runtime.limiter,
-                    use_cache=False,
-                    raw_out=raw_parts,
-                )
+                kept = parsed
+                kept_sent = sent
+                try:
+                    (retried, retry_usage), retry_sent = await ainvoke_structured(
+                        runtime.coder,
+                        retry_schema,
+                        retry_messages,
+                        runtime.limiter,
+                        use_cache=False,
+                        raw_out=raw_parts,
+                        token_budget=runtime.token_budget,
+                        preserve_failed=True,
+                        send_repair_overflow=False,
+                        allowance_kind="focused_label_retry",
+                        call_audits=audits,
+                    )
+                except AllowanceExhausted:
+                    retried = kept
+                    retry_usage = {}
+                    retry_sent = kept_sent
+                    interpreted_retry = False
+                else:
+                    if retried.get("_agt_unparsed"):
+                        retried = kept
+                        retry_sent = kept_sent
+                        interpreted_retry = False
+                    else:
+                        interpreted_retry = True
+                        calls = 2
                 usage = combine_usage(usage, retry_usage)
-                calls = 2
-                interpreted_retry = True
+                parsed = retried
+                sent = retry_sent
         proposal = {
             "proposal_id": job.get("proposal_id"),
             "snapshot_id": job.get("snapshot_id"),
@@ -4308,6 +4408,7 @@ def _worker(runtime: FocusedRuntime):
             "usage": usage,
             "label_retry": interpreted_retry,
             "response": parsed,
+            "provider_audits": audits,
             "raw_response": "\n".join(part for part in raw_parts if part),
             "messages": [
                 {"role": getattr(message, "type", "unknown"), "content": getattr(message, "content", "")}
@@ -4523,13 +4624,25 @@ def _apply_claim_test(
     if judgment in {"contradicts", "qualifies"} and valid and not reason:
         engagement = _subject_engagement(target, record["quote"], record["rationale"])
         if engagement == "irrelevant":
-            reason = "rationale_indicates_irrelevance"
-            valid = False
-            record["reason"] = reason
-            record["valid_test"] = False
-        elif engagement == "uncertain":
+            record["reason"] = "rationale_indicates_irrelevance"
+            record["flagged"] = True
+            record["needs_review"] = True
+            cases = [dict(item) for item in (target.get("negative_cases") or []) if isinstance(item, Mapping)]
+            cases.append(record)
+            target["negative_cases"] = cases
+            target["evidence_condition"] = "disputed_pending_review"
+            target["downstream_eligible"] = False
+            target["needs_review"] = True
+            flags = [str(item) for item in (target.get("flags") or [])]
+            for flag in ("claim_test_negative", "rationale_indicates_irrelevance"):
+                if flag not in flags:
+                    flags.append(flag)
+            target["flags"] = flags
+            return record
+        if engagement == "uncertain":
             record["claim_subject_uncertain"] = True
             record["flagged"] = True
+            record["needs_review"] = True
     if judgment in {"contradicts", "qualifies"} and valid and not reason:
         cases = [dict(item) for item in (target.get("negative_cases") or []) if isinstance(item, Mapping)]
         cases.append(record)
@@ -4540,6 +4653,8 @@ def _apply_claim_test(
         flags = [str(item) for item in (target.get("flags") or [])]
         if "claim_test_negative" not in flags:
             flags.append("claim_test_negative")
+        if record.get("claim_subject_uncertain") and "claim_subject_uncertain" not in flags:
+            flags.append("claim_subject_uncertain")
         target["flags"] = flags
         return record
     if reason or (not valid and judgment in {"contradicts", "qualifies"}):
@@ -4658,18 +4773,29 @@ def _commit_node(runtime: FocusedRuntime):
                 addressed = True
             extra_calls += max(0, int(proposal.get("calls") or 1) - 1)
             usage = proposal.get("usage") or {}
-            prompt_log.append(
-                {
-                    "stage": "focused",
-                    "proposal_id": proposal.get("proposal_id"),
-                    "passage_ids": sent_ids,
-                    "usage": usage,
-                    "label_retry": bool(proposal.get("label_retry")),
-                    "response": proposal.get("response"),
-                    "raw_response": proposal.get("raw_response") or "",
-                    "messages": list(proposal.get("messages") or []),
-                }
-            )
+            prompt_row = {
+                "stage": "focused",
+                "proposal_id": proposal.get("proposal_id"),
+                "passage_ids": sent_ids,
+                "usage": usage,
+                "label_retry": bool(proposal.get("label_retry")),
+                "response": proposal.get("response"),
+                "raw_response": proposal.get("raw_response") or "",
+                "messages": list(proposal.get("messages") or []),
+                "provider_audits": list(proposal.get("provider_audits") or []),
+            }
+            if proposal.get("schema_unparsed"):
+                prompt_row.update(
+                    status="schema_unparsed",
+                    needs_review=True,
+                    flagged=True,
+                    reason=proposal.get("schema_reason") or "",
+                )
+                warnings.append(
+                    "A focused recode response could not be parsed and the repair was not sent. "
+                    "The failed output is kept for review and was not applied."
+                )
+            prompt_log.append(prompt_row)
             provider_usage = _add_provider_usage(provider_usage, usage)
             purposes = proposal.get("purposes") or {}
             if any(int((usage or {}).get(key) or 0) for key in ("input_tokens", "output_tokens", "total_tokens")):
@@ -5842,6 +5968,10 @@ async def afocused_code(
             max_retries=int(procedure["focused_request_retries"]),
             request_timeout=float(procedure["focused_request_timeout"]),
             wall_timeout=float(procedure["focused_request_timeout"]),
+            provider_allowance=ProviderAllowance(
+                max_calls=int(procedure["max_focused_review_calls"]),
+                max_tokens=int(procedure["max_focused_review_tokens"]),
+            ),
         ),
         validation_retries=validation_retries,
         duplicate_similarity=float(procedure["focused_duplicate_similarity"]),

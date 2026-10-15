@@ -1,8 +1,20 @@
-# Axial coding, saturation, and later steps (0.8.0, fixes in 0.8.1)
+# Axial coding, saturation, and later steps (0.8.0, fixes in 0.8.1 and 0.8.2)
 
-This note is the design for package 0.8.0, with the 0.8.1 corrections below. It sits on the focused-coding graph from 0.7.9. The default run is still initial coding plus a theme report. Focused coding is unchanged. Axial coding, saturation indicators, and selective coding are separate graphs. [design-later-stages.md](design-later-stages.md) is the longer literature note. This file is the slice that is implemented.
+This note is the design for package 0.8.0, with the 0.8.1 and 0.8.2 corrections below. It sits on the focused-coding graph from 0.7.9. The default run is still initial coding plus a theme report. Focused coding is unchanged. Axial coding, saturation indicators, and selective coding are separate graphs. [design-later-stages.md](design-later-stages.md) is the longer literature note. This file is the slice that is implemented.
 
-`policy_version` is `0.8.1`.
+`policy_version` is `0.8.2`.
+
+## 0.8.2 corrections
+
+**Irrelevance.** A contradicts or qualifies verdict stays a negative case when the rationale is a paraphrase. "is about" and "about the" are not irrelevance cues. Missing subject-stem overlap is `claim_subject_uncertain` and still disputes. Only explicit language (`irrelevant`, `unrelated`, `does not address`, `does not mention`, `nothing to do with`) flags `rationale_indicates_irrelevance`, and a negation such as "not unrelated" cancels that cue. The flagged row is `disputed_pending_review`. It is not dropped and it is not `claim_test_invalid`.
+
+**One token allowance.** `max_axial_review_tokens` is one estimated-input ceiling for coding, counterexamples, memos, the storyline, and decision review. A selective run continues from `axial_tokens_estimated`. `max_selective_review_calls` stays its own call ceiling. Focused coding still uses `max_focused_review_tokens` and does not share it with `max_decision_tokens`. Every provider request, including a schema repair and a retry, acquires the call ceiling and the token ceiling before it is sent. A repair that does not fit is its own audit row. The failed output stays, flagged, for review.
+
+**Packing.** A batch that does not fit is shrunk to the longest prefix that fits the request budget and the shared allowance. Items left out stay queued. Proposal trimming does not remove the last passage for either category of a pair. If both sides still do not fit, the pair is deferred with a recorded reason, or the passages are bounded excerpts with `source_offset` and `source_length`. Batch size does not silently drop one side of the evidence.
+
+**Coverage.** Graph completion is not analytical coverage. After the requests run, pairs are `planned`, `attempted`, `completed`, `omitted`, or `remaining`. `unexamined_pairs` lists pairs that were not sent. A token or call ceiling yields `budget_limited`. A preserved parse failure yields `incomplete`. `complete` means every planned pair was examined. Those counts are on `theory_coverage.json`, `axial_run.json`, and `category_relationships.json`.
+
+**Saturation figure.** Total variation between consecutive documents describes the difference between those documents. A low figure does not establish theoretical saturation and is not a human confirmation. `judgment` stays null.
 
 ## 0.8.1 corrections
 

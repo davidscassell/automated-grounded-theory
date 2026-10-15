@@ -75,8 +75,10 @@ def thematic_saturation_report(
     Each window is one document. Batch size stays 1, so a rate is the count of
     new codes, properties, or relationships first evidenced in that document.
     ``code_frequency_stabilization`` is the total variation between the last
-    two documents' normalized assignment distributions. It is undefined with
-    fewer than two documents, or when either of those documents has no
+    two documents' normalized assignment distributions. The figure describes
+    the difference between those documents. It does not establish theoretical
+    saturation, and it is separate from a human confirmation. It is undefined
+    with fewer than two documents, or when either of those documents has no
     assignments. A 0.8.0 report stored presence bits and is not comparable.
     Cross-run stability needs the caller to pass a report from more than one
     run. Missing figures stay null.
@@ -123,8 +125,9 @@ def thematic_saturation_report(
         "These figures are a saturation curve, not a verdict. judgment stays null. "
         "A researcher may record a decision separately. A model assessment is not that decision.",
         "code_frequency_stabilization is the total variation between consecutive documents' "
-        "normalized code-assignment distributions. A 0.8.0 report stored presence bits "
-        "(1 once a code had been seen) and is not comparable.",
+        "normalized code-assignment distributions. It describes how those documents differ. "
+        "A low figure does not establish theoretical saturation and is not a human confirmation. "
+        "A 0.8.0 report stored presence bits (1 once a code had been seen) and is not comparable.",
     ]
     if not rows:
         notes.append("Saturation rates are undefined: there are no documents.")

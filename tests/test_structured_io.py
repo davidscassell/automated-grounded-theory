@@ -21,7 +21,7 @@ from automated_grounded_theory.validation import label_restates_context
 
 
 class _Limiter:
-    async def ainvoke(self, runnable, messages):
+    async def ainvoke(self, runnable, messages, **kwargs):
         return runnable.invoke(messages)
 
 
