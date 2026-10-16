@@ -148,3 +148,7 @@ A reread is one direction and one passage. The researcher's `sampled_passage_ids
 ## Checkpointed rereads and explicit selections (0.9.5)
 
 Each `(direction_id, passage_id)` reread returns before the next request, so a later timeout keeps the note and the prompt row. The partial result separates completed, failed, and unattempted pairs. Resume continues at `pursuit_reread`, skips a pair that already has a note, and keeps the calls already consumed. A selection that does not parse is stored before the repair call. When `selections` is present, those pairs are the rereads. They are checked against the directions and the corpus. The flat lists are derived from the pairs that pass. A disagreement, or a pair that names an unknown id, leaves the stage incomplete. The note is [design-review-fixes-095.md](design-review-fixes-095.md).
+
+## Reread repairs and the active pair (0.9.6)
+
+A reread repair is its own visit. The malformed response and its usage are stored before the repair is sent. Resume sends the repair and does not repeat the initial request. Before each provider call the visit records `reread_active_pair`. A timeout uses that pair as `reread_failed_pairs`. Pairs already in `reread_unsent_pairs` stay there. An empty flat list is omitted and derived from the selections. Each nonempty list is compared on its own. The note is [design-review-fixes-096.md](design-review-fixes-096.md).

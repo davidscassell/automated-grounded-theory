@@ -24,8 +24,8 @@ from tests.fake_llm import FakeCoder
 
 
 def test_version_is_0_6_16():
-    assert __version__ == "0.9.5"
-    assert POLICY_VERSION == "0.9.5"
+    assert __version__ == "0.9.6"
+    assert POLICY_VERSION == "0.9.6"
     assert "not a probability" in CONFIDENCE_HELP
 
 

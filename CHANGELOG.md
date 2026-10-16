@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.6
+
+- A malformed sampling reread is checkpointed, with its usage, before the repair is sent. A repair timeout keeps that response. Resume sends the repair and does not repeat the initial request. The consumed allowance stays consumed.
+- `reread_active_pair` is recorded before each provider call. A timeout uses it as the failed pair. Pairs already withheld, including a request that did not fit the per-request budget, stay on `reread_unsent_pairs` and are not labeled as the failure.
+- Each nonempty flat id list is compared on its own. An omitted list is derived from the explicit selections. One matching list plus one omitted list is not `model_flat_list_mismatch`.
+- The design is [docs/design-review-fixes-096.md](docs/design-review-fixes-096.md). `policy_version` is `0.9.6`.
+
 ## 0.9.5
 
 - Each sampling reread is one graph step. A later timeout keeps the notes, usage, and prompt rows already stored. The partial result lists completed, failed, and unattempted pairs. Resume skips completed rereads and keeps the consumed allowance. A selection that does not parse is checkpointed before its repair, so a repair timeout keeps that first response.
