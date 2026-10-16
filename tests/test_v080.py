@@ -170,9 +170,10 @@ class FakeAxialCoder(BaseChatModel):
             passage = item.get("passage") or {}
             text = str(passage.get("text") or "")
             folded = text.casefold()
-            if "synthetic counterexample" in folded or "however" in folded:
+            synthetic = bool(passage.get("synthetic")) or str(passage.get("passage_id") or "") == "synthetic-counterexample"
+            if synthetic or "synthetic counterexample" in folded or "however" in folded:
                 quote = "not in the passage" if self.mode == "bad_quote" else (
-                    "the reported pattern does not hold" if "synthetic counterexample" in folded else "had no issues however"
+                    "the reported pattern does not hold" if synthetic or "does not hold" in folded else "had no issues however"
                 )
                 judgment = "contradicts"
             elif "monday" in folded:
@@ -322,8 +323,8 @@ def _run(model=None, **kwargs):
 
 
 def test_version_and_graphs():
-    assert __version__ == "0.8.5"
-    assert POLICY_VERSION == "0.8.5"
+    assert __version__ == "0.8.6"
+    assert POLICY_VERSION == "0.8.6"
     from automated_grounded_theory.axial import aaxial_code
 
     assert inspect.signature(aaxial_code).parameters["batch_size"].default == 1
@@ -424,15 +425,16 @@ def test_human_checkpoints_accept_and_record_saturation(tmp_path):
     )
     assert reviewed.interrupt_payload["kind"] == "thematic_saturation"
     row = reviewed.relationships[0]
-    assert row["human_disposition"] == "accepted"
+    assert row["human_disposition"] == "provisional"
+    assert row["disposition"] == "provisional"
+    assert "acceptance_withheld" in row["flags"]
     assert row["human_paradigm_role"] == "context"
     assert row["claim_support"] == "undefined"
     assert row["evidence_condition"] == "disputed"
     assert row["negative_case_search"] is True
     assert row["negative_cases"]
     assert row["negative_cases"][0]["quote"] == "had no issues however"
-    irrelevant = [item for item in row["counterexamples"] if item["judgment"] == "irrelevant"]
-    assert irrelevant and irrelevant[0]["quote"] == "" and irrelevant[0]["valid_test"] is True
+    assert all(item["judgment"] != "irrelevant" for item in row["counterexamples"])
     assert "relationship_negative" in row["flags"]
     relevance = reviewed.metadata["axial_counterexample_relevance"]
     assert relevance["skipped_low_relevance"] >= 1
@@ -532,8 +534,9 @@ def test_reject_revise_and_merge_keep_both_rows():
     )
     row = updated.relationships[0]
     assert row["human_disposition"] == "revised"
-    assert row["evidence_condition"] == "unanchored"
+    assert row["evidence_condition"] == "disputed"
     assert "unanchored_quote" in row["flags"]
+    assert row["negative_cases"]
     assert row["statement"] == "A revised condition."
     assert paused2.relationships[0]["relationship_id"] == row["relationship_id"]
     reject_saver = InMemorySaver()
@@ -566,7 +569,9 @@ def test_llm_review_keeps_human_fields_undefined():
     coder, result = _run(decision_mode="llm", interrupt=True)
     assert result.interrupted is False
     row = result.relationships[0]
-    assert row["model_disposition"] == "accepted"
+    assert row["model_disposition"] == "provisional"
+    assert row["acceptance_requested"] == "accepted"
+    assert "acceptance_withheld" in row["flags"]
     assert row["model_paradigm_role"] == "context"
     assert row["human_disposition"] is None
     assert row["human_paradigm_role"] is None

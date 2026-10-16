@@ -29,8 +29,8 @@ from tests.fake_llm import FakeCoder
 
 
 def test_version_is_0_6_13():
-    assert __version__ == "0.8.5"
-    assert POLICY_VERSION == "0.8.5"
+    assert __version__ == "0.8.6"
+    assert POLICY_VERSION == "0.8.6"
 
 
 RAND_LIKE = """ Interviewer: What did you read before you left?

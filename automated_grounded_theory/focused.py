@@ -103,8 +103,13 @@ from automated_grounded_theory.async_support import (
     combine_usage,
     run_sync,
 )
-from automated_grounded_theory.batching import calibrated_token_estimate, request_input_tokens, resolve_tokenizer
-from automated_grounded_theory.backends import chat_model_settings, describe_model
+from automated_grounded_theory.batching import (
+    calibrated_token_estimate,
+    guarded_allowance_estimate,
+    request_input_tokens,
+    resolve_tokenizer,
+)
+from automated_grounded_theory.backends import chat_model_settings, describe_model, record_model_determinism
 from automated_grounded_theory.category_state import (
     ANALYTIC_FEATURES,
     COVERAGE_PURPOSES,
@@ -151,6 +156,7 @@ from automated_grounded_theory.schemas import FocusedClaimTest, FocusedCompeteBa
 from automated_grounded_theory.validation import (
     anchor_quote,
     code_key,
+    meaningful_tokens,
 )
 from automated_grounded_theory.version import __version__
 
@@ -2838,7 +2844,12 @@ def _allowance_block(state: Mapping[str, Any]) -> tuple[str, list[str]] | None:
     }
     messages, schema = _recode_request(batch, raised, other=other, purposes=purposes, initial_codes=initial)
     estimate = request_input_tokens(messages, schema, resolve_tokenizer(None))
-    if tokens + estimate > max_tokens:
+    observation = (meta.get("token_estimate_observation") or {})
+    raw_total = int(observation.get("raw") or 0)
+    provider_input = int(observation.get("input") or 0)
+    compared = guarded_allowance_estimate(tokens, raw_total=raw_total, provider_input=provider_input)
+    compared += guarded_allowance_estimate(estimate, raw_total=raw_total, provider_input=provider_input)
+    if compared > max_tokens:
         return "token_allowance", _queue_passage_ids(remaining)
     return None
 
@@ -2909,9 +2920,9 @@ def _focused_stage_outcomes(status: str, stop: str) -> dict[str, Any]:
     )
     if budget:
         outcome = "budget_limited"
-    elif status == "complete":
+    elif status in {"complete", "complete_for_queue"}:
         outcome = "complete"
-        reason = ""
+        reason = "" if status == "complete" else "queue_complete"
     else:
         outcome = "incomplete"
     return {"focused": {"required": True, "status": outcome, "reason": reason}}
@@ -3628,7 +3639,6 @@ def _synthetic_counterexample_passage(claims: Sequence[Mapping[str, Any]]) -> di
         "passage_id": SYNTHETIC_PASSAGE_ID,
         "doc_id": "synthetic",
         "text": (
-            f"{SYNTHETIC_MARKER} Injected for evaluation. Not research data. "
             f"This account contradicts ({pole}): the reported pattern does not hold, "
             "however there is an exception, and the opposite was observed."
         ),
@@ -3659,8 +3669,8 @@ def _claim_pair_relevant(
     passage_text = str(passage.get("text") or "")
     subject = _claim_subject_tokens(claim)
     passage_stems = {_stem_token(token) for token in _content_tokens(passage_text)}
-    quoted = _content_tokens(" ".join(str(claim.get(key) or "") for key in ("pole", "quote")))
-    quote_overlap = len(quoted & _content_tokens(passage_text))
+    quoted = meaningful_tokens(" ".join(str(claim.get(key) or "") for key in ("pole", "quote")))
+    quote_overlap = len(quoted & meaningful_tokens(passage_text))
     subject_hit = bool(subject and (passage_stems & subject))
     if subject and not subject_hit and quote_overlap < _MIN_EVIDENCE_TOKENS:
         return False
@@ -3669,7 +3679,11 @@ def _claim_pair_relevant(
         return True
     if subject and not subject_hit:
         return quote_overlap >= _MIN_EVIDENCE_TOKENS
-    return shared >= _MIN_EVIDENCE_TOKENS
+    meaningful_shared = len(
+        meaningful_tokens(" ".join(str(claim.get(key) or "") for key in ("pole", "text", "quote")))
+        & meaningful_tokens(passage_text)
+    )
+    return meaningful_shared >= _MIN_EVIDENCE_TOKENS
 
 
 def _claim_similarity_score(passage: Mapping[str, Any], claim: Mapping[str, Any]) -> float:
@@ -3984,17 +3998,22 @@ def _fit_unspent_claim_calls(
     procedure = (state.get("metadata") or {}).get("procedure") or {}
     max_tokens = int(procedure.get("max_focused_review_tokens") or 0)
     used = int(state.get("focused_tokens_estimated") or 0)
-    remaining = max_tokens - used
+    observation = ((state.get("metadata") or {}).get("token_estimate_observation") or {})
+    raw_total = int(observation.get("raw") or 0)
+    provider_input = int(observation.get("input") or 0)
+    guarded_used = guarded_allowance_estimate(used, raw_total=raw_total, provider_input=provider_input)
+    remaining = max_tokens - guarded_used
     probe = _reallocate_unspent_claim_calls(state, calls=1, batch_size=batch_size) if calls > 0 else []
     estimate = _queue_batch_estimate(state, probe) if probe else 0
+    compared = guarded_allowance_estimate(estimate, raw_total=raw_total, provider_input=provider_input)
     if calls <= 0 or not probe:
         fit = 0
-    elif estimate <= 0:
+    elif compared <= 0:
         fit = calls
-    elif remaining < estimate:
+    elif remaining < compared:
         fit = 0
     else:
-        fit = min(calls, remaining // estimate)
+        fit = min(calls, remaining // compared)
     blocked = max(0, calls - fit)
     moved = _reallocate_unspent_claim_calls(state, calls=fit, batch_size=batch_size) if fit else []
     return {
@@ -4511,9 +4530,19 @@ def _claim_test_relevance(
                 ):
                     relevant += 1
     merged = {key: value for key, value in dict(prior or {}).items() if key != "notes"}
+    if judgments == 0:
+        relevance_rate = None
+        relevance_label = "undefined_no_judgment"
+    elif relevant == 0:
+        relevance_rate = None
+        relevance_label = "undefined_no_relevant_judgment"
+    else:
+        relevance_rate = round(relevant / judgments, 4)
+        relevance_label = "relevant_judgments"
     merged["judgments"] = judgments
     merged["relevant_judgments"] = relevant
-    merged["relevance_rate"] = None if judgments == 0 else round(relevant / judgments, 4)
+    merged["relevance_rate"] = relevance_rate
+    merged["relevance"] = relevance_label
     return merged
 
 
@@ -4881,6 +4910,11 @@ def _commit_node(runtime: FocusedRuntime):
                             "judgment": recorded.get("judgment"),
                             "entry_id": recorded.get("entry_id"),
                             "detected": recorded.get("judgment") in {"contradicts", "qualifies"},
+                            "limitation": (
+                                "The synthetic counterexample only checks that a contradicting passage can be recorded. "
+                                "It is not a test of analytic judgment. The passage text sent to the model does not "
+                                "announce itself; the label stays in the audit. Research exports omit the passage."
+                            ),
                         }
                     if passage_id == SYNTHETIC_PASSAGE_ID:
                         continue
@@ -5011,6 +5045,12 @@ def _commit_node(runtime: FocusedRuntime):
             budget["decision_calls_used"] = int(metadata.get("decision_calls_used") or 0)
             budget["decision_tokens_used"] = int(metadata.get("decision_tokens_used") or 0)
             metadata["provider_budget"] = budget
+            metadata["token_estimate_ratio"] = allowance.estimate_ratio()
+            metadata["token_estimate_observation"] = {
+                "raw": allowance.observed_raw,
+                "input": allowance.observed_input,
+                "ratio": allowance.estimate_ratio(),
+            }
         metadata["proposal_consolidation"] = consolidation
         for group in consolidation:
             if not group.get("conflict"):
@@ -6025,6 +6065,7 @@ async def afocused_code(
             else 0.0
         ),
     )
+    metadata.update(record_model_determinism(runtime.coder))
     if isinstance(model, str):
         metadata["model"] = {
             "model": describe_model(runtime.coder),

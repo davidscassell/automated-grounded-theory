@@ -1373,6 +1373,7 @@ def plan_relation_pairs(
         "pair_count": len(pairs),
         "examined_count": examined_count,
         "pair_coverage": None if not pairs else round(examined_count / len(pairs), 4),
+        "pair_coverage_statement": f"{examined_count} of {len(pairs)} unordered pairs examined",
         "round": [
             {"from_id": left, "to_id": right, "band": band}
             for band, (left, right) in chosen

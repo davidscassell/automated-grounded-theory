@@ -54,6 +54,8 @@ class ProviderAllowance:
         self.refusals: list[dict[str, Any]] = []
         self.stage_ceilings: dict[str, int | None] = {}
         self.stage_used: dict[str, int] = {}
+        self.observed_raw = 0
+        self.observed_input = 0
         for name, ceiling in (stages or {}).items():
             self.stage_ceilings[str(name)] = None if ceiling is None else max(0, int(ceiling))
             self.stage_used[str(name)] = 0
@@ -87,6 +89,9 @@ class ProviderAllowance:
                 }
                 for name in set(self.stage_ceilings) | set(self.stage_used)
             },
+            "observed_raw": self.observed_raw,
+            "observed_input": self.observed_input,
+            "token_estimate_ratio": self.estimate_ratio(),
         }
 
     def restore(self, snapshot: Mapping[str, Any] | None) -> None:
@@ -95,6 +100,8 @@ class ProviderAllowance:
             return
         self.calls_used = max(0, int(snapshot.get("calls_used") or 0))
         self.tokens_estimated = max(0, int(snapshot.get("tokens_estimated") or 0))
+        self.observed_raw = max(0, int(snapshot.get("observed_raw") or 0))
+        self.observed_input = max(0, int(snapshot.get("observed_input") or 0))
         for name, row in (snapshot.get("stages") or {}).items():
             if isinstance(row, Mapping):
                 used = row.get("calls_used")
@@ -111,6 +118,28 @@ class ProviderAllowance:
     def try_acquire(self, estimate: int, *, kind: str, stage: str | None = None) -> dict[str, Any]:
         return self._decide(estimate, commit=True, kind=kind, stage=stage)
 
+    def note_estimate_observation(self, raw: int, usage: Mapping[str, Any] | None) -> None:
+        """Record one call whose raw estimate and provider input tokens are both known."""
+        reported = int((usage or {}).get("input_tokens") or 0)
+        raw = max(0, int(raw or 0))
+        if reported <= 0 or raw <= 0:
+            return
+        self.observed_raw += raw
+        self.observed_input += reported
+
+    def estimate_ratio(self) -> float | None:
+        """Raw heuristic divided by provider input tokens. Null until both are known."""
+        if self.observed_input <= 0 or self.observed_raw <= 0:
+            return None
+        return round(self.observed_raw / self.observed_input, 4)
+
+    def _guarded(self, raw: int) -> int:
+        from automated_grounded_theory.batching import guarded_allowance_estimate
+
+        return guarded_allowance_estimate(
+            raw, raw_total=self.observed_raw, provider_input=self.observed_input
+        )
+
     def _bucket(self, kind: str, stage: str | None) -> str:
         if stage:
             return stage
@@ -123,7 +152,9 @@ class ProviderAllowance:
         return "coding"
 
     def _decide(self, estimate: int, *, commit: bool, kind: str, stage: str | None = None) -> dict[str, Any]:
-        estimate = max(0, int(estimate))
+        raw_estimate = max(0, int(estimate))
+        estimate = self._guarded(raw_estimate)
+        spent = self._guarded(self.tokens_estimated)
         bucket = self._bucket(kind, stage)
         stage_limited = bool(self.stage_ceilings)
         ceiling = self.stage_ceilings.get(bucket) if stage_limited else None
@@ -138,19 +169,21 @@ class ProviderAllowance:
                 "reason": "call_allowance",
                 "kind": kind,
                 "stage": bucket,
-                "estimated_input_tokens": estimate,
+                "estimated_input_tokens": raw_estimate,
+                "guarded_estimate": estimate,
                 "calls_used": used,
                 "tokens_estimated": self.tokens_estimated,
                 "max_calls": call_max,
                 "max_tokens": self.max_tokens,
             }
-        elif self.max_tokens is not None and self.tokens_estimated + estimate > self.max_tokens:
+        elif self.max_tokens is not None and spent + estimate > self.max_tokens:
             row = {
                 "status": "refused",
                 "reason": "token_allowance",
                 "kind": kind,
                 "stage": bucket,
-                "estimated_input_tokens": estimate,
+                "estimated_input_tokens": raw_estimate,
+                "guarded_estimate": estimate,
                 "calls_used": used,
                 "tokens_estimated": self.tokens_estimated,
                 "max_calls": call_max,
@@ -159,7 +192,7 @@ class ProviderAllowance:
         else:
             if commit:
                 self.calls_used += 1
-                self.tokens_estimated += estimate
+                self.tokens_estimated += raw_estimate
                 if stage_limited:
                     self.stage_used[bucket] = self.stage_used.get(bucket, 0) + 1
                     used = self.stage_used[bucket]
@@ -170,7 +203,8 @@ class ProviderAllowance:
                 "reason": "",
                 "kind": kind,
                 "stage": bucket,
-                "estimated_input_tokens": estimate,
+                "estimated_input_tokens": raw_estimate,
+                "guarded_estimate": estimate,
                 "calls_used": used if commit else used,
                 "tokens_estimated": self.tokens_estimated,
                 "max_calls": call_max,
@@ -438,6 +472,8 @@ class CallLimiter:
             held = True
             result = await self._invoke(runnable, payload, timeout=timeout, record=record)
             record["usage"] = usage_from_result(result)
+            if self.provider_allowance is not None and allowance_estimate is not None:
+                self.provider_allowance.note_estimate_observation(int(allowance_estimate), record["usage"])
             self._on_success()
             return result
         finally:

@@ -31,9 +31,17 @@ _BROKEN_TOKENIZERS: set[int] = set()
 # That ratio mixes output length into the denominator. v24 (first live run of
 # 0.7.7+0.7.8): heuristic / provider input tokens was about 1.38, and dividing
 # by 1.28 left an adjusted reading reported within 0.3% of those input tokens.
-# Neither figure is a general calibration. Allowances still use the unadjusted
-# heuristic.
+# Neither figure is a general calibration. The 1.28 divisor is a reported
+# reading. The allowance comparison uses the raw heuristic until a call
+# reports provider input tokens, then a padded observed ratio. See
+# :func:`guarded_allowance_estimate`.
 TOKEN_ESTIMATE_ADJUSTMENT = 1.28
+# After at least one call reports provider input tokens, an over-prediction
+# is compared as raw * pad / ratio. The pad stays above the observed actual.
+# A ratio above the cap is reported and is not used to open the ceiling: a
+# usage figure that is a small fraction of the heuristic must not erase the guard.
+ESTIMATE_RATIO_PAD = 1.10
+ESTIMATE_RATIO_CAP = 3.0
 TOKEN_ESTIMATE_CALIBRATION = TOKEN_ESTIMATE_ADJUSTMENT
 TOKEN_ESTIMATE_ADJUSTMENT_NOTE = (
     "Empirical adjustment, not a general calibration. v23 focused-coding live "
@@ -50,9 +58,11 @@ def estimate_tokens(text: str) -> int:
     """Heuristic of about three characters per token. Not a guaranteed ceiling.
 
     That is higher than a four-characters-per-token English count, so the
-    estimate often runs above provider input usage. It is what stops a reread
-    when no provider tokenizer is available. Empty text is zero. Any other
-    text is at least one token. Report it beside provider input, output, and
+    estimate often runs above provider input usage. Until a provider reports
+    input tokens, this heuristic is what the allowance compares. After that,
+    :func:`guarded_allowance_estimate` compares a padded observed ratio and
+    does not shrink an under-prediction. Empty text is zero. Any other text
+    is at least one token. Report it beside provider input, output, and
     cached counts. Do not treat it as those counts. An adjusted reading divides
     the heuristic by :data:`TOKEN_ESTIMATE_ADJUSTMENT` under the conditions in
     :data:`TOKEN_ESTIMATE_ADJUSTMENT_NOTE` and is not what stops the run.
@@ -77,6 +87,24 @@ def adjusted_token_estimate(estimated: int) -> int:
 def calibrated_token_estimate(estimated: int) -> int:
     """Alias of :func:`adjusted_token_estimate`. Not a general calibration."""
     return adjusted_token_estimate(estimated)
+
+
+def guarded_allowance_estimate(raw: int, *, raw_total: int, provider_input: int) -> int:
+    """Estimate used for the allowance comparison.
+
+    The first call, an under-prediction (ratio at or below 1), and a ratio
+    above :data:`ESTIMATE_RATIO_CAP` stay at the raw heuristic. Otherwise the
+    figure is the raw estimate times :data:`ESTIMATE_RATIO_PAD` divided by the
+    observed raw/provider-input ratio, and it is never above the raw estimate.
+    """
+    raw = max(0, int(raw))
+    if raw <= 0 or int(provider_input) <= 0 or int(raw_total) <= 0:
+        return raw
+    ratio = int(raw_total) / int(provider_input)
+    if ratio <= 1 or ratio > ESTIMATE_RATIO_CAP:
+        return raw
+    guarded = int(round(raw * ESTIMATE_RATIO_PAD / ratio))
+    return max(1, min(raw, guarded))
 
 
 def resolve_tokenizer(model):
