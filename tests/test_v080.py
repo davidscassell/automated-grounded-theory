@@ -170,10 +170,15 @@ class FakeAxialCoder(BaseChatModel):
             passage = item.get("passage") or {}
             text = str(passage.get("text") or "")
             folded = text.casefold()
-            synthetic = bool(passage.get("synthetic")) or str(passage.get("passage_id") or "") == "synthetic-counterexample"
-            if synthetic or "synthetic counterexample" in folded or "however" in folded:
+            passage_id = str(passage.get("passage_id") or "")
+            synthetic = (
+                bool(passage.get("synthetic"))
+                or passage_id in {"synthetic-counterexample", "p-contrast"}
+                or "synthetic counterexample" in folded
+            )
+            if synthetic or "however" in folded:
                 quote = "not in the passage" if self.mode == "bad_quote" else (
-                    "the reported pattern does not hold" if synthetic or "does not hold" in folded else "had no issues however"
+                    "the expected outcome did not occur" if synthetic else "had no issues however"
                 )
                 judgment = "contradicts"
             elif "monday" in folded:
@@ -323,8 +328,8 @@ def _run(model=None, **kwargs):
 
 
 def test_version_and_graphs():
-    assert __version__ == "0.8.6"
-    assert POLICY_VERSION == "0.8.6"
+    assert __version__ == "0.8.7"
+    assert POLICY_VERSION == "0.8.7"
     from automated_grounded_theory.axial import aaxial_code
 
     assert inspect.signature(aaxial_code).parameters["batch_size"].default == 1

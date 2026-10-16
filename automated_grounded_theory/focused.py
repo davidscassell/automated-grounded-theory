@@ -2585,11 +2585,14 @@ def _claim_test_messages(
         passage_id = str(item.get("passage_id") or "")
         claim = dict(claims.get(passage_id) or {})
         category = by_code.get(str(claim.get("category_id") or ""), {})
+        model_passage_id = MODEL_CONTRAST_PASSAGE_ID if _is_synthetic_passage(item) else passage_id
+        model_doc = "d-review" if _is_synthetic_passage(item) else item.get("doc_id")
+        model_text = NEUTRAL_CONTRAST_TEXT if _is_synthetic_passage(item) else item.get("text")
         rendered.append(
             {
-                "passage_id": passage_id,
-                "doc_id": item.get("doc_id"),
-                "text": item.get("text"),
+                "passage_id": model_passage_id,
+                "doc_id": model_doc,
+                "text": model_text,
                 "claim": {
                     "entry_id": claim.get("entry_id"),
                     "kind": claim.get("kind"),
@@ -2854,10 +2857,19 @@ def _allowance_block(state: Mapping[str, Any]) -> tuple[str, list[str]] | None:
     return None
 
 
+def _canonical_passage_id(passage_id: str) -> str:
+    if passage_id == MODEL_CONTRAST_PASSAGE_ID:
+        return SYNTHETIC_PASSAGE_ID
+    return passage_id
+
+
 def _is_synthetic_passage(item: Mapping[str, Any] | str) -> bool:
     if isinstance(item, str):
-        return item == SYNTHETIC_PASSAGE_ID
-    return bool(item.get("synthetic")) or str(item.get("passage_id") or "") == SYNTHETIC_PASSAGE_ID
+        return item in {SYNTHETIC_PASSAGE_ID, MODEL_CONTRAST_PASSAGE_ID}
+    return bool(item.get("synthetic")) or str(item.get("passage_id") or "") in {
+        SYNTHETIC_PASSAGE_ID,
+        MODEL_CONTRAST_PASSAGE_ID,
+    }
 
 
 def _corpus_passage_ids(state: Mapping[str, Any]) -> list[str]:
@@ -2928,6 +2940,24 @@ def _focused_stage_outcomes(status: str, stop: str) -> dict[str, Any]:
     return {"focused": {"required": True, "status": outcome, "reason": reason}}
 
 
+def _claim_round_stage(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The claim round is not plain complete when it never searched.
+
+    No calls, or judgments that are all irrelevant, is complete_no_negative_search.
+    """
+    claim = metadata.get("claim_round") or {}
+    if not claim.get("requested"):
+        return None
+    relevance = metadata.get("claim_test_relevance") or {}
+    judgments = int(relevance.get("judgments") or 0)
+    relevant = int(relevance.get("relevant_judgments") or 0)
+    if judgments == 0:
+        return {"required": True, "status": "complete_no_negative_search", "reason": "no_calls"}
+    if relevant == 0:
+        return {"required": True, "status": "complete_no_negative_search", "reason": "no_relevant_judgment"}
+    return {"required": True, "status": "complete", "reason": ""}
+
+
 def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
     procedure = (state.get("metadata") or {}).get("procedure") or {}
     stop = str(state.get("recode_stop") or "")
@@ -2970,7 +3000,10 @@ def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
             dict(state.get("provider_token_usage") or {}),
         ),
         "token_accounting_note": (
-            "focused_tokens_estimated is a pre-call heuristic, not a bill and not provider usage. "
+            "focused_tokens_estimated is the raw pre-call heuristic, not a bill and not provider usage. "
+            "provider_budget.tokens_estimated_raw is that same accumulator. "
+            "provider_budget.tokens_estimated_compared is the guarded reading, and that is the figure "
+            "compared with the token ceiling. A raw total above the ceiling can still pass. "
             "Without a provider tokenizer the heuristic is about three characters per token, plus schema and "
             "message framing. It often runs higher than provider input usage. It is what stops the reread. "
             "focused_tokens_adjusted (also stored as focused_tokens_calibrated) divides that heuristic by 1.28. "
@@ -2982,7 +3015,14 @@ def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
             "token_estimate_ratio is the heuristic divided by provider input_tokens when the provider reported "
             "input tokens, and null otherwise. Output length is not in that ratio."
         ),
-        "stage_outcomes": _focused_stage_outcomes(status, stop),
+        "stage_outcomes": {
+            **_focused_stage_outcomes(status, stop),
+            **(
+                {"claim_round": _claim_round_stage(state.get("metadata") or {})}
+                if _claim_round_stage(state.get("metadata") or {})
+                else {}
+            ),
+        },
         "max_focused_review_calls": int(procedure.get("max_focused_review_calls") or 0),
         "max_focused_review_tokens": int(procedure.get("max_focused_review_tokens") or 0),
         "focused_not_reread": not_reread,
@@ -3331,7 +3371,11 @@ _COUNTER_MARKERS = (
     " but ",
 )
 SYNTHETIC_PASSAGE_ID = "synthetic-counterexample"
+MODEL_CONTRAST_PASSAGE_ID = "p-contrast"
 SYNTHETIC_MARKER = "[synthetic counterexample]"
+NEUTRAL_CONTRAST_TEXT = (
+    "On this occasion the usual sequence ran differently, and the expected outcome did not occur."
+)
 
 
 def _absence_pole(value: Any) -> bool:
@@ -3625,23 +3669,18 @@ def _passage_counterevidence(text: Any, claim: Mapping[str, Any]) -> bool:
 
 
 def _synthetic_counterexample_passage(claims: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
-    """One labeled passage that contradicts a claim. It is not research data.
+    """One audit passage used to check that a contrast can be recorded.
 
-    The text names itself as synthetic. Research exports omit it. A live eval
-    turns this on with ``focused_synthetic_counterexample`` so a run can show
-    whether a contradicting passage is detected.
+    The object sent to the model does not carry the synthetic flag, the audit
+    label, or text that announces the injection. Research exports omit it.
     """
     claim = next((dict(item) for item in claims if item.get("entry_id")), None)
     if claim is None:
         return None
-    pole = str(claim.get("pole") or claim.get("text") or "the claim")
     return {
         "passage_id": SYNTHETIC_PASSAGE_ID,
-        "doc_id": "synthetic",
-        "text": (
-            f"This account contradicts ({pole}): the reported pattern does not hold, "
-            "however there is an exception, and the opposite was observed."
-        ),
+        "doc_id": "d-review",
+        "text": NEUTRAL_CONTRAST_TEXT,
         "synthetic": True,
         "synthetic_label": "counterexample",
     }
@@ -4111,6 +4150,13 @@ def _prepare_node(state: FocusedState) -> dict:
                     warnings.append(note)
             filled_calls = 0 if not extra else min(claim_calls, (len(extra) + batch_size - 1) // batch_size)
             unspent_calls = claim_calls - filled_calls
+            claim_meta = dict(updates.get("metadata") or state.get("metadata") or {})
+            claim_meta["claim_round"] = {
+                "requested": True,
+                "calls_scheduled": int(claim_calls),
+                "items_queued": len(extra),
+            }
+            updates["metadata"] = claim_meta
             if unspent_calls > 0:
                 fitted = _fit_unspent_claim_calls(
                     state,
@@ -4870,7 +4916,7 @@ def _commit_node(runtime: FocusedRuntime):
                     seen_purposes.append(purpose)
                     purpose_provider[purpose] = purpose_provider.get(purpose, 0) + added
             for row in returned:
-                passage_id = str(row.get("passage_id") or "")
+                passage_id = _canonical_passage_id(str(row.get("passage_id") or ""))
                 passage = by_id.get(passage_id)
                 if passage is None or passage_id not in sent_ids:
                     warnings.append(
@@ -6010,9 +6056,19 @@ async def afocused_code(
         {"model": describe_model(reviewer_model), "model_settings": chat_model_settings(reviewer_model)}
         if reviewer_model is not None else None), max_decision_calls=max_decision_calls,
         max_decision_tokens=max_decision_tokens, decision_token_budget=decision_token_budget)
+    coder = (
+        _resolve_model(model, timeout=focused_request_timeout)
+        if isinstance(model, str)
+        else _bind_model_timeout(model, focused_request_timeout)
+    )
+    sampling_seed = procedure.get("focused_sampling_seed")
+    determinism = record_model_determinism(
+        coder,
+        seed=int(sampling_seed) if isinstance(sampling_seed, int) and not isinstance(sampling_seed, bool) else None,
+    )
     manifest = focused_manifest(
         source,
-        model=model,
+        model=coder,
         context=context,
         procedure=procedure,
         performance=performance,
@@ -6033,11 +6089,7 @@ async def afocused_code(
     }
     limit = recursion_limit if recursion_limit is not None else max(250, 8 * max(1, len(source.passages)) + 40)
     runtime = FocusedRuntime(
-        coder=(
-            _resolve_model(model, timeout=focused_request_timeout)
-            if isinstance(model, str)
-            else _bind_model_timeout(model, focused_request_timeout)
-        ),
+        coder=coder,
         decision_mode=decision_mode,
         reviewer=DecisionReviewer(reviewer_model, max_calls=max_decision_calls,
             max_tokens=max_decision_tokens, token_budget=decision_token_budget,
@@ -6065,15 +6117,7 @@ async def afocused_code(
             else 0.0
         ),
     )
-    metadata.update(record_model_determinism(runtime.coder))
-    if isinstance(model, str):
-        metadata["model"] = {
-            "model": describe_model(runtime.coder),
-            "model_settings": chat_model_settings(runtime.coder),
-        }
-        manifest = dict(manifest)
-        manifest["model"] = metadata["model"]
-        metadata["checkpoint_manifest"] = manifest
+    metadata.update(determinism)
 
     own_saver = checkpointer is None and checkpoint_path is None
     if checkpoint_path is not None:

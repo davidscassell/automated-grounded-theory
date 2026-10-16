@@ -143,12 +143,24 @@ def thematic_saturation_report(
     ]
     n_documents = len(rows)
     window = "not_interpretable" if n_documents < SATURATION_MIN_DOCUMENTS else "interpretable"
+    window_new_codes = sum(int(row["new_codes"]) for row in rows)
+    window_new_relationships = sum(int(row["new_relationships"]) for row in rows)
+    window_definition = (
+        f"Window-wide rates divide the sum of new codes or relationships across {n_documents} document(s) "
+        "by that document count. The last-document rate is only the newest document and is not the window rate."
+    )
     if not rows:
         notes.append("Saturation rates are undefined: there are no documents.")
     elif too_few:
         notes.append("Code-frequency shift is undefined: fewer than two documents.")
     elif empty_comparison:
         notes.append("Code-frequency shift is undefined: a document has no code assignments.")
+    if rows:
+        notes.append(
+            "last_document_new_code_rate and last_document_new_relationship_rate are the newest document only. "
+            "window_new_code_rate and window_new_relationship_rate are the sums divided by n_documents. "
+            "Do not read the last-document rate as the window rate."
+        )
     if n_documents < SATURATION_MIN_DOCUMENTS:
         notes.append(
             f"The saturation window is {n_documents} document(s), below {SATURATION_MIN_DOCUMENTS}. "
@@ -165,6 +177,12 @@ def thematic_saturation_report(
         "new_code_rate": None if not rows else rows[-1]["new_code_rate"],
         "new_property_rate": None if not rows else rows[-1]["new_property_rate"],
         "new_relationship_rate": None if not rows else rows[-1]["new_relationship_rate"],
+        "last_document_new_code_rate": None if not rows else rows[-1]["new_code_rate"],
+        "last_document_new_property_rate": None if not rows else rows[-1]["new_property_rate"],
+        "last_document_new_relationship_rate": None if not rows else rows[-1]["new_relationship_rate"],
+        "window_new_code_rate": None if n_documents == 0 else round(window_new_codes / n_documents, 4),
+        "window_new_relationship_rate": None if n_documents == 0 else round(window_new_relationships / n_documents, 4),
+        "window_definition": window_definition,
         "code_frequency_comparison": "total_variation",
         "code_frequency_shift": None if too_few or empty_comparison else rows[-1]["code_frequency_shift"],
         "code_frequency_shift_label": CODE_FREQUENCY_SHIFT_LABEL,

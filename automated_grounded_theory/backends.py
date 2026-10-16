@@ -145,12 +145,19 @@ def _clean_setting(name: str, value: Any) -> Any:
     return _MISSING
 
 
-def record_model_determinism(model: BaseChatModel | str | None) -> dict[str, Any]:
+def record_model_determinism(
+    model: BaseChatModel | str | None,
+    *,
+    seed: int | None = None,
+) -> dict[str, Any]:
     """Record temperature and seed. Set temperature 0 only when the instance allows it.
 
     An already-set temperature is left alone. When the instance has no
     temperature and assignment fails, ``model_determinism`` is ``unset``.
+    A seed is written only when the instance already exposes ``seed`` and it
+    is empty. Temperature 0 does not guarantee identical completions.
     """
+    seed_status = "unsupported"
     if model is not None and not isinstance(model, str):
         current = _declared_setting(model, "temperature")
         if current is _MISSING or current is None:
@@ -158,13 +165,30 @@ def record_model_determinism(model: BaseChatModel | str | None) -> dict[str, Any
                 setattr(model, "temperature", 0.0)
             except Exception:
                 pass
+        current_seed = _declared_setting(model, "seed")
+        if current_seed is _MISSING:
+            seed_status = "unsupported"
+        elif current_seed is None and seed is not None:
+            try:
+                setattr(model, "seed", int(seed))
+                seed_status = "set"
+            except Exception:
+                seed_status = "unset"
+        else:
+            seed_status = "recorded" if current_seed is not None else "unset"
     settings = chat_model_settings(model)
     temperature = settings.get("temperature")
     return {
         "chat_model_settings": settings,
         "model_temperature": temperature if temperature is not None else None,
         "model_seed": settings.get("seed"),
+        "model_seed_status": seed_status,
         "model_determinism": "recorded" if temperature is not None else "unset",
+        "model_determinism_note": (
+            "temperature 0 does not guarantee identical completions. "
+            "A seed is passed only when the instance already exposes one and it was unset. "
+            "model_seed stays null when the provider has no seed field."
+        ),
     }
 
 

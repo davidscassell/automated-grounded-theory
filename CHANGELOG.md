@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.8.7
+
+- A relationship records where each quote sits. `citation_anchoring_rate` is 1 only when both endpoints are anchored and both quotes are in the cited passage. Otherwise it is null. `citation_anchoring_same_passage` is the both-anchored share of same-passage rows. `citation_anchoring_cross_passage` stays null, because quotes from different passages do not evidence the link. A causal or consequence link is not accepted on cross-respondent quotes; the row stays as `cross_respondent_pattern`. The reviewer sees a per-quote passage check. A rationale or memo that says "same passage" when the quotes do not share one is flagged.
+- The focused checkpoint manifest is built after temperature 0 is applied, so resuming with the same model object does not see a changed manifest. Temperature 0 does not guarantee identical completions. A seed is passed when the instance already exposes one.
+- A generic stem such as work, job, or team does not anchor a category by itself. The quote has to share a distinctive stem, or an embedding at or above 0.55. Disagreements between those signals are reported.
+- A blank proposal row or an empty statement is rejected, counted in `proposal_diagnostics`, and not stored as a relationship.
+- A core that is not an endpoint of a relationship in the run is `core_unsupported_by_graph`. `core_stability` stays undefined and reports `n`.
+- A counterexample or claim stage that made no calls, or whose judgments were all irrelevant, is `complete_no_negative_search` rather than `complete`. Counterexample retrieval prefers another respondent's passage that mentions both endpoints' distinctive terms.
+- When a storyline is requested, one quarter of the token ceiling is reserved for it. That reserve is procedure, not a performance setting. If the storyline still does not fit, the stage is `budget_limited` with reason `token_allowance`.
+- The synthetic passage sent to the model has no synthetic flag, no audit label, and neutral text. The audit keeps the label and the limitation.
+- `provider_budget.tokens_estimated` remains the raw heuristic. `tokens_estimated_compared` is the guarded figure that is compared with the ceiling.
+- The saturation reviewer receives last-document rates and window-wide rates, with the window definition. A last-document rate is not the window rate. `judgment` stays null.
+- `metadata.seed` is the same value as `pair_coverage.seed`.
+- `policy_version` is `0.8.7`.
+
 ## 0.8.6
 
 - A relationship is accepted only when each endpoint has its own evidence: `quote_from` and `quote_to`, or one quote that matches both. A match is a content stem shared with the category label, its definition, or a segment quote, or an embedding at or above 0.55. Stopwords, including `from`, do not count. `matched_tokens` records the stems. A one-sided row stays in the run as `provisional` with `acceptance_withheld`, and the reviewer and the storyline see that status.
