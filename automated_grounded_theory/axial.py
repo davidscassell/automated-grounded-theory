@@ -66,7 +66,7 @@ from automated_grounded_theory.relationship_tiers import (
     promote_verified,
     wording_overreach,
 )
-from automated_grounded_theory.validation import GENERIC_CONTENT_STEMS, anchor_quote, meaningful_tokens
+from automated_grounded_theory.validation import GENERIC_CONTENT_STEMS, anchor_quote, locate_quote, meaningful_tokens
 from automated_grounded_theory.version import __version__
 
 logger = logging.getLogger("automated_grounded_theory")
@@ -579,6 +579,10 @@ def _model_facing_source(source: str) -> str:
 
 def _strip_model_values(value: Any) -> Any:
     """Drop audit-only synthetic fields from a value the model will see."""
+    if isinstance(value, str):
+        if value == SYNTHETIC_PASSAGE_ID:
+            return MODEL_CONTRAST_PASSAGE_ID
+        return value
     if isinstance(value, Mapping):
         cleaned = {
             key: _strip_model_values(item)
@@ -591,6 +595,8 @@ def _strip_model_values(value: Any) -> Any:
             cleaned["doc_id"] = "d-review"
         elif cleaned.get("passage_id") == SYNTHETIC_PASSAGE_ID:
             cleaned["passage_id"] = MODEL_CONTRAST_PASSAGE_ID
+        if cleaned.get("quote_passage_id") == SYNTHETIC_PASSAGE_ID:
+            cleaned["quote_passage_id"] = MODEL_CONTRAST_PASSAGE_ID
         return cleaned
     if isinstance(value, list):
         return [_strip_model_values(item) for item in value]
@@ -1016,6 +1022,7 @@ def _endpoint_anchoring(
             disagreement = ""
         else:
             anchored, reason, matched = False, "quote_misses_category", []
+        located: dict[str, Any] = {}
         if passages is not None and quote.strip():
             located = _locate_quote(quote, passages, str(relationship.get("passage_id") or ""))
             if not located.get("passage_id"):
@@ -1044,12 +1051,16 @@ def _endpoint_anchoring(
                     second_signal = "unavailable"
                 else:
                     second_signal = "passage_embedding_unanchored"
+        found_id = str(located.get("passage_id") or "") if located else ""
         row = {
             "endpoint": endpoint,
             "code_id": code_id,
             "anchored": anchored,
             "quote": quote,
             "passage_id": str(relationship.get("passage_id") or ""),
+            "quote_passage_id": found_id or None,
+            "quote_start": located.get("quote_start") if found_id else None,
+            "quote_end": located.get("quote_end") if found_id else None,
             "reason": reason,
             "matched_tokens": matched,
             "anchoring_disagreement": disagreement,
@@ -1079,9 +1090,18 @@ def _locate_quote(quote: str, passages: Mapping[str, Mapping[str, Any]], cited: 
                 found = passage_id
                 break
     row = passages.get(found) or {}
+    start = None
+    end = None
+    if found:
+        span = locate_quote(quote, str(row.get("text") or ""))
+        if span is not None:
+            start, end = span
     return {
         "quote": quote,
         "passage_id": found,
+        "quote_passage_id": found or None,
+        "quote_start": start,
+        "quote_end": end,
         "doc_id": str(row.get("doc_id") or row.get("document_id") or ""),
         "in_cited_passage": in_cited,
     }
@@ -1691,6 +1711,28 @@ def _new_relationship(
     return row
 
 
+def _quote_provenance(quote: str, passages: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Primary passage first, then complementary passages.
+
+    Offsets are character spans in the passage that contains the quotation.
+    An unanchored quotation leaves the id and both offsets null.
+    """
+    for item in passages:
+        if not isinstance(item, Mapping):
+            continue
+        text = str(item.get("text") or "")
+        if not _anchored(quote, text):
+            continue
+        span = locate_quote(quote, text)
+        passage_id = str(item.get("passage_id") or "") or None
+        return {
+            "quote_passage_id": passage_id,
+            "quote_start": None if span is None else span[0],
+            "quote_end": None if span is None else span[1],
+        }
+    return {"quote_passage_id": None, "quote_start": None, "quote_end": None}
+
+
 def _apply_counterexample(
     relationship: dict,
     verdict: Mapping[str, Any],
@@ -1698,13 +1740,23 @@ def _apply_counterexample(
     *,
     also_texts: Sequence[str] = (),
     complementary_passage_ids: Sequence[str] = (),
+    complementary_passages: Sequence[Mapping[str, Any]] = (),
 ) -> None:
     judgment = str(verdict.get("judgment") or "").strip().casefold()
     if judgment not in {"supports", "contradicts", "qualifies", "irrelevant"}:
         return
     quote = str(verdict.get("quote") or "")
-    text = str(passage.get("text") or "")
-    texts = [text, *[str(item) for item in also_texts if str(item or "").strip()]]
+    ordered: list[Mapping[str, Any]] = [passage]
+    seen = {str(passage.get("passage_id") or "")}
+    for item in complementary_passages:
+        if not isinstance(item, Mapping):
+            continue
+        passage_id = str(item.get("passage_id") or "")
+        if passage_id and passage_id not in seen:
+            ordered.append(item)
+            seen.add(passage_id)
+    texts = [str(item.get("text") or "") for item in ordered]
+    texts.extend(str(item) for item in also_texts if str(item or "").strip())
     synthetic = bool(passage.get("synthetic")) or str(passage.get("passage_id") or "") == SYNTHETIC_PASSAGE_ID
     reason = ""
     valid = True
@@ -1717,9 +1769,17 @@ def _apply_counterexample(
     if judgment in {"supports", "contradicts", "qualifies"} and _rationale_indicates_irrelevance(rationale):
         valid = False
         reason = "rationale_indicates_irrelevance"
+    provenance = (
+        {"quote_passage_id": None, "quote_start": None, "quote_end": None}
+        if judgment == "irrelevant" or not valid
+        else _quote_provenance(quote, ordered)
+    )
     record = {
         "relationship_id": relationship.get("relationship_id"),
         "passage_id": str(passage.get("passage_id") or ""),
+        "quote_passage_id": provenance["quote_passage_id"],
+        "quote_start": provenance["quote_start"],
+        "quote_end": provenance["quote_end"],
         "judgment": judgment,
         "quote": quote,
         "rationale": rationale,
@@ -1765,13 +1825,25 @@ def _apply_counterexample(
         relationship["flags"] = flags
 
 
+def _stored_quote_passage(case: Mapping[str, Any]) -> str:
+    """Passage that holds the quotation.
+
+    ``passage_id`` on a counterexample is the candidate that was selected.
+    ``quote_passage_id`` is where the quotation was found. A record written
+    before that field existed is read as the selected passage.
+    """
+    if case.get("quote_passage_id"):
+        return str(case.get("quote_passage_id"))
+    return str(case.get("passage_id") or "")
+
+
 def _document_count(relationship: Mapping[str, Any], passages: Mapping[str, Mapping[str, Any]]) -> int:
     docs = set()
     if str(relationship.get("evidence_condition") or "") in {"anchored", "disputed"}:
         docs.add(_doc_of(str(relationship.get("passage_id") or ""), passages))
     for case in relationship.get("negative_cases") or []:
         if isinstance(case, Mapping) and case.get("valid_test") and not case.get("synthetic"):
-            docs.add(_doc_of(str(case.get("passage_id") or ""), passages))
+            docs.add(_doc_of(_stored_quote_passage(case), passages))
     docs.discard("")
     docs.discard("synthetic")
     return len(docs)
@@ -2862,6 +2934,25 @@ def _allocate_evidence(
     }
 
 
+def _pairs_without_assigned_evidence(
+    window: Sequence[Mapping[str, Any]],
+    assigned: Mapping[str, Sequence[str]],
+) -> tuple[list[Mapping[str, Any]], list[dict[str, Any]]]:
+    """Pairs whose from or to category has no assigned passage in the corpus."""
+    supported: list[Mapping[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    for pair in window:
+        ends = [str(pair.get("from_id") or ""), str(pair.get("to_id") or "")]
+        gap = [code_id for code_id in ends if code_id and not assigned.get(code_id)]
+        if gap:
+            record = _pair_record(pair)
+            record["unsupported_code_ids"] = gap
+            missing.append(record)
+        else:
+            supported.append(pair)
+    return supported, missing
+
+
 def _pairs_missing_evidence(
     window: Sequence[Mapping[str, Any]],
     evidence: Sequence[Mapping[str, Any]],
@@ -2929,6 +3020,35 @@ def _propose_node(runtime: AxialRuntime):
         max_tokens = int(procedure.get("max_axial_review_tokens") or 0)
         estimated = int(metadata.get("axial_tokens_estimated") or 0)
         accounting = metadata.setdefault("pair_accounting", {"planned": [], "attempted": [], "completed": [], "omitted": []})
+        if not metadata.get("unsupported_pairs_reconciled"):
+            supported_pending, unsupported = _pairs_without_assigned_evidence(pending, assigned)
+            if unsupported:
+                metadata["axial_stop"] = "missing_category_evidence"
+                missing = list(metadata.get("missing_category_evidence") or [])
+                for row in unsupported:
+                    if row not in missing:
+                        missing.append(row)
+                metadata["missing_category_evidence"] = missing
+                logs.append(
+                    _prompt_row(
+                        "axial_proposal",
+                        _messages("axial_proposal", {"pairs": unsupported, "reason": "missing_category_evidence"}),
+                        {},
+                        extra={
+                            "status": "deferred",
+                            "reason": "missing_category_evidence",
+                            "pairs": unsupported,
+                            "unsupported_code_ids": sorted(
+                                {code_id for row in unsupported for code_id in row.get("unsupported_code_ids") or []}
+                            ),
+                            "needs_review": True,
+                            "flagged": True,
+                        },
+                    )
+                )
+                _remember_pairs(accounting["omitted"], unsupported)
+                pending = list(supported_pending)
+            metadata["unsupported_pairs_reconciled"] = True
         while pending and used < int(procedure.get("propose_calls") or 0):
             window = list(pending[:batch])
             pending = list(pending[batch:])
@@ -3446,16 +3566,18 @@ def _counterexample_node(runtime: AxialRuntime):
                     continue
                 queued_item = chunk_by_key.get(key) or {}
                 complementary_ids = [str(item) for item in (queued_item.get("complementary_passage_ids") or [])]
-                also_texts = [
-                    str((passage_by_id.get(passage_id) or {}).get("text") or "")
+                complementary_passages = [
+                    passage_by_id[passage_id]
                     for passage_id in complementary_ids
+                    if passage_id in passage_by_id
                 ]
                 _apply_counterexample(
                     relationship,
                     verdict,
                     passage,
-                    also_texts=also_texts,
+                    also_texts=[str(item.get("text") or "") for item in complementary_passages],
                     complementary_passage_ids=complementary_ids,
+                    complementary_passages=complementary_passages,
                 )
                 if passage.get("synthetic") or key[1] == SYNTHETIC_PASSAGE_ID:
                     judgment = str(verdict.get("judgment") or "")
@@ -4350,9 +4472,13 @@ def _cited_story_passages(
 
     for row in relationships:
         add(row.get("passage_id"))
+        for location in row.get("quote_locations") or []:
+            if isinstance(location, Mapping):
+                add(location.get("quote_passage_id") or location.get("passage_id"))
         for case in list(row.get("negative_cases") or []) + list(row.get("counterexamples") or []):
             if isinstance(case, Mapping):
                 add(case.get("passage_id"))
+                add(case.get("quote_passage_id"))
     wanted = {str(code_id) for code_id in category_ids}
     for segment in state.get("segments") or []:
         if isinstance(segment, Mapping) and str(segment.get("code_id") or "") in wanted:
@@ -4973,15 +5099,19 @@ _GRAPH_NODE_OVERHEAD = 24
 
 
 def _derived_recursion_limit(procedure: Mapping[str, Any], *, override: int | None = None) -> int:
-    """Steps for this graph, from the planned proposal requests plus overhead.
+    """Steps for this graph.
 
-    Each axial proposal request is its own graph step. Counterexample, memo,
-    and storyline calls stay inside one node. A caller may pass ``override``.
+    Each proposal request returns from the node, and so does a window that is
+    deferred or split back onto the round. The allowance is the planned
+    proposal requests, plus one such return for every planned pair, plus the
+    fixed overhead. Unsupported pairs are also reconciled once before that
+    loop. A caller may pass ``override``.
     """
     if override is not None:
         return max(1, int(override))
     propose = int(procedure.get("propose_calls") or 0)
-    return propose + _GRAPH_NODE_OVERHEAD
+    pairs = int(procedure.get("planned_pair_count") or 0)
+    return propose + pairs + _GRAPH_NODE_OVERHEAD
 
 
 def _mark_recursion_limit(state: dict, *, limit: int, exc: BaseException) -> dict:
@@ -5141,6 +5271,7 @@ def _procedure_from_kwargs(data: Mapping[str, Any], **kwargs: Any) -> dict[str, 
         "max_axial_review_tokens": max_tokens,
         "storyline_token_reserve": _storyline_token_reserve(max_tokens, include_storyline=bool(kwargs["include_storyline"])),
         "propose_calls": propose,
+        "planned_pair_count": pair_count,
         "counterexample_calls": counter,
         "reallocated_propose_calls": transferred,
         "pattern_min_cases": max(1, int(kwargs.get("pattern_min_cases", 2) or 2)),

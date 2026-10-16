@@ -45,3 +45,7 @@ Core selection, memos, and the storyline each store a `graph_snapshot` of the re
 ## Respondent classification and a real budget (0.9.3)
 
 0.9.2 counted the 2x2 at respondent level and then still labeled each passage. A respondent with one question about packing and another about returning was counted under both endpoints and queued as `a_without_b` and `b_without_a`. 0.9.3 classifies the respondent after the passages are combined, queues one representative passage, and adds the complementary passage when the selected passage would hide the other endpoint. The first slot goes to each relationship before any relationship gets a second. `plausible`, `queued`, `attempted`, and `remaining` are separate. Remaining candidates make the stage `budget_limited` even if another relationship was judged. The detail is [design-review-fixes-093.md](design-review-fixes-093.md).
+
+## Where the quotation was found (0.9.4)
+
+A quote may still be anchored in the selected passage or in a complementary passage. The stored candidate keeps `passage_id`. `quote_passage_id`, `quote_start`, and `quote_end` name the passage that contains the quotation. Offsets are null when it is not anchored. A record from before this field is read as the selected passage. The detail is [design-review-fixes-094.md](design-review-fixes-094.md).

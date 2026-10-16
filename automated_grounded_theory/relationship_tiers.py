@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from typing import Any, Mapping, Sequence
 
-from automated_grounded_theory.validation import GENERIC_CONTENT_STEMS, meaningful_tokens
+from automated_grounded_theory.validation import GENERIC_CONTENT_STEMS, locate_quote, meaningful_tokens
 
 PATTERN_MIN_CASES = 2
 PATTERN_MIN_CASES_NOTE = (
@@ -146,11 +146,21 @@ def _is_label(quote: str, labels: set[str]) -> bool:
     return _norm(quote) in labels
 
 
-def _quote_row(endpoint: str, quote: str, passage_id: str) -> dict[str, Any]:
+def _quote_row(
+    endpoint: str,
+    quote: str,
+    passage_id: str,
+    *,
+    start: int | None = None,
+    end: int | None = None,
+) -> dict[str, Any]:
     return {
         "endpoint": endpoint,
         "quote": quote,
         "passage_id": passage_id,
+        "quote_passage_id": passage_id or None,
+        "quote_start": start,
+        "quote_end": end,
         "anchored": True,
         "verbatim": True,
     }
@@ -178,7 +188,14 @@ def _add_quote(
     case_id = case_id_of(passage)
     if not case_id:
         return
-    row = _quote_row(endpoint, text, found)
+    span = locate_quote(text, str(passage.get("text") or ""))
+    row = _quote_row(
+        endpoint,
+        text,
+        found,
+        start=None if span is None else span[0],
+        end=None if span is None else span[1],
+    )
     existing = bucket.setdefault(case_id, [])
     key = (endpoint, _norm(text), found)
     if key not in {(item["endpoint"], _norm(item["quote"]), item["passage_id"]) for item in existing}:

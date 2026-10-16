@@ -397,7 +397,11 @@ Package 0.9.2 makes negative-case search able to return a respondent who has one
 
 Package 0.9.3 classifies a negative case for the respondent after that respondent's passages are combined, and it keeps a split interview from being queued as endpoint absence. A budget that leaves plausible candidates unqueued or unattempted is `budget_limited`. Sampling measures each initial request and does not send one that exceeds the per-request budget or the total allowance. A malformed sampling response is an incomplete result. Axial, focused, sampling, and selective graphs derive a step allowance from the planned requests and, if that limit is still hit, return the partial result. The design is [design-review-fixes-093.md](design-review-fixes-093.md).
 
-`policy_version` is `0.9.3`.
+`policy_version` was `0.9.3`.
+
+Package 0.9.4 keeps a sampling reread on the direction the researcher or the model paired with that passage. A passage selected for two directions is two rereads, and each one spends a coding call. A quotation found in a complementary passage is stored with `quote_passage_id` and offsets, while `passage_id` stays the selected candidate. Older records that omit `quote_passage_id` are still read. Axial coding reconciles pairs that have no category passage before the proposal loop, and the derived step allowance includes a defer or split return for each planned pair. A step limit that is still hit returns the partial result. The design is [design-review-fixes-094.md](design-review-fixes-094.md).
+
+`policy_version` is `0.9.4`.
 
 ## 26. Out of scope
 
