@@ -46,6 +46,8 @@ from automated_grounded_theory.retrieval import cosine
 from automated_grounded_theory.saturation import (
     SATURATION_MIN_DOCUMENTS,
     STOPPING_QUIET_ROUNDS,
+    gate_model_saturation,
+    pair_coverage_reading,
     stopping_criteria_report,
 )
 from automated_grounded_theory.validation import GENERIC_CONTENT_STEMS, anchor_quote, meaningful_tokens
@@ -1387,11 +1389,17 @@ def _saturation_decision(runtime: SamplingRuntime):
                                 "window_new_relationship_rate": indicators.get("window_new_relationship_rate"),
                                 "window_definition": indicators.get("window_definition"),
                                 "code_frequency_shift": indicators.get("code_frequency_shift"),
+                                "pairs_planned": indicators.get("pairs_planned"),
+                                "pairs_completed": indicators.get("pairs_completed"),
+                                "pair_coverage": indicators.get("pair_coverage"),
+                                "relationships_found": indicators.get("relationships_found"),
                             },
                             "sampling_ledger": ledger,
                             "stopping_criteria": criteria,
                             "instruction": (
-                                "Use the window-wide rates and the sampling ledger. "
+                                "Use the window-wide rates, the pair coverage, the number of relationships found, and the sampling ledger. "
+                                "When 10 or more pairs were planned, coverage below 0.05 or fewer than 2 relationships "
+                                "is not interpretable. Do not assess sufficient_for_this_question in that case. "
                                 "Your assessment is a model judgment. It does not set judgment and it is not a researcher decision."
                             ),
                         },
@@ -1419,17 +1427,25 @@ def _saturation_decision(runtime: SamplingRuntime):
                             "does_not_set_judgment": True,
                         }
                     else:
-                        metadata["model_saturation_judgment"] = {
-                            "status": "recorded",
-                            "assessment": parsed.get("assessment"),
-                            "rationale": parsed.get("rationale"),
-                            "actor": "llm",
-                            "model_judgment": True,
-                            "does_not_set_judgment": True,
-                            "n_documents": indicators.get("n_documents"),
-                            "sampling_rounds": len(ledger),
-                            "note": "This is a model judgment. It does not set judgment and it is not written into a researcher field.",
-                        }
+                        reading = pair_coverage_reading(
+                            indicators.get("pairs_planned") if "pairs_planned" in indicators else None,
+                            indicators.get("pairs_completed") if "pairs_planned" in indicators else None,
+                            indicators.get("relationships_found") if "relationships_found" in indicators else None,
+                        )
+                        metadata["model_saturation_judgment"] = gate_model_saturation(
+                            {
+                                "status": "recorded",
+                                "assessment": parsed.get("assessment"),
+                                "rationale": parsed.get("rationale"),
+                                "actor": "llm",
+                                "model_judgment": True,
+                                "does_not_set_judgment": True,
+                                "n_documents": indicators.get("n_documents"),
+                                "sampling_rounds": len(ledger),
+                                "note": "This is a model judgment. It does not set judgment and it is not written into a researcher field.",
+                            },
+                            reading,
+                        )
             metadata["saturation_decision"] = None
             metadata["saturation_judgment"] = None
             indicators["judgment"] = None

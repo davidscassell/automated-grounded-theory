@@ -186,6 +186,9 @@ def record_model_determinism(
         "model_determinism": "recorded" if temperature is not None else "unset",
         "model_determinism_note": (
             "temperature 0 does not guarantee identical completions. "
+            "A paused run and an uninterrupted run given the same prompt are not a reproducibility check. "
+            "model_determinism records the requested temperature and seed. "
+            "It does not claim the provider returned the same text. "
             "A seed is passed only when the instance already exposes one and it was unset. "
             "model_seed stays null when the provider has no seed field."
         ),
