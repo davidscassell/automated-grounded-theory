@@ -41,3 +41,7 @@ A storyline statement cites relationship ids and their tiers, or it is `statemen
 Core selection, memos, and the storyline each store a `graph_snapshot` of the relationship ids and tiers they read. Later edits do not rewrite that snapshot.
 
 `judgment` stays null. Human and model fields stay separate. An empty resume is still an error. `provider_budget` still survives a pause.
+
+## Respondent classification and a real budget (0.9.3)
+
+0.9.2 counted the 2x2 at respondent level and then still labeled each passage. A respondent with one question about packing and another about returning was counted under both endpoints and queued as `a_without_b` and `b_without_a`. 0.9.3 classifies the respondent after the passages are combined, queues one representative passage, and adds the complementary passage when the selected passage would hide the other endpoint. The first slot goes to each relationship before any relationship gets a second. `plausible`, `queued`, `attempted`, and `remaining` are separate. Remaining candidates make the stage `budget_limited` even if another relationship was judged. The detail is [design-review-fixes-093.md](design-review-fixes-093.md).

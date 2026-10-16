@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.3
+
+- Negative-case classification is per respondent. Passages from one respondent are combined before a type is assigned. A split interview is not queued as both `a_without_b` and `b_without_a`. The request includes a complementary passage when that passage changes the reading. One representative candidate is queued per respondent.
+- Plausible, queued, attempted, and remaining counts stay separate. The stage is `budget_limited` whenever a plausible candidate was not queued or not attempted, including when another relationship was judged. The first slot is offered to each relationship before any relationship receives another.
+- Sampling measures each initial request. `sampling_token_budget` and `max_sampling_review_tokens` are enforced separately. A request that does not fit is not sent, and the stage is `incomplete` with a reason. Failed sampling output is preserved. A parse failure after repair is `incomplete`, with each attempt and its usage. A reread includes the selected direction, the sampling query, and the target evidence, and the note is stored on that direction.
+- Axial proposal steps no longer use a fixed graph limit of 80. The step allowance is the planned proposal requests plus graph overhead, or `recursion_limit` when the caller sets it. Focused coding already derived its limit. Sampling and selective coding do too. If a limit is still hit, the run returns the partial result and marks the stage `incomplete` with reason `recursion_limit`.
+- The design is [docs/design-review-fixes-093.md](docs/design-review-fixes-093.md). `policy_version` is `0.9.3`.
+
 ## 0.9.2
 
 - Negative-case search is respondent-level. For a relationship at tier 1 or above, and for a claim, candidates are respondents with one endpoint and not the other, an opposite pole or a different outcome, both endpoints, or an embedding at or above 0.55. A cheap pre-filter holds the rest back. Tier 0 is not searched. The search record stores candidates considered, how many were filtered, why no call was made, and a descriptive 2x2. Those counts do not validate a link.
