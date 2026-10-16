@@ -536,9 +536,9 @@ class _SyntheticCoder(FakeFocusedCoder):
                 FocusedClaimJudgment(
                     passage_id=str(passage.get("passage_id") or ""),
                     entry_id=str(claim.get("entry_id") or ""),
-                    judgment="contradicts" if str(passage.get("passage_id") or "") == SYNTHETIC_PASSAGE_ID or SYNTHETIC_MARKER in text else "irrelevant",
-                    rationale="Synthetic detection check." if str(passage.get("passage_id") or "") == SYNTHETIC_PASSAGE_ID or SYNTHETIC_MARKER in text else "Not the claim.",
-                    quote=text if str(passage.get("passage_id") or "") == SYNTHETIC_PASSAGE_ID or SYNTHETIC_MARKER in text else "",
+                    judgment="contradicts" if str(passage.get("passage_id") or "") in {SYNTHETIC_PASSAGE_ID, "p-contrast"} or SYNTHETIC_MARKER in text else "irrelevant",
+                    rationale="Synthetic detection check." if str(passage.get("passage_id") or "") in {SYNTHETIC_PASSAGE_ID, "p-contrast"} or SYNTHETIC_MARKER in text else "Not the claim.",
+                    quote=text if str(passage.get("passage_id") or "") in {SYNTHETIC_PASSAGE_ID, "p-contrast"} or SYNTHETIC_MARKER in text else "",
                 )
             )
         return FocusedClaimTest(passages=rows)

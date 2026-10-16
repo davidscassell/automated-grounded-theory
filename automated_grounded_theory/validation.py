@@ -219,6 +219,25 @@ CONTENT_STOPWORDS = frozenset(
         "they",
     }
 )
+# Content stems that are too generic to anchor a category by themselves.
+# A distinctive stem from the category must also match, or an embedding must.
+GENERIC_CONTENT_STEMS = frozenset(
+    {
+        "work",
+        "job",
+        "team",
+        "staff",
+        "employee",
+        "worker",
+        "company",
+        "place",
+        "group",
+        "member",
+        "office",
+        "role",
+        "task",
+    }
+)
 _FALSE_GERUNDS = frozenset(
     {
         "something",

@@ -46,11 +46,13 @@ class ProviderAllowance:
         calls_used: int = 0,
         tokens_estimated: int = 0,
         stages: Mapping[str, int | None] | None = None,
+        token_reserve: int = 0,
     ) -> None:
         self.max_calls = None if max_calls is None else max(0, int(max_calls))
         self.max_tokens = None if max_tokens is None else max(0, int(max_tokens))
         self.calls_used = max(0, int(calls_used))
         self.tokens_estimated = max(0, int(tokens_estimated))
+        self.token_reserve = max(0, int(token_reserve))
         self.refusals: list[dict[str, Any]] = []
         self.stage_ceilings: dict[str, int | None] = {}
         self.stage_used: dict[str, int] = {}
@@ -92,6 +94,15 @@ class ProviderAllowance:
             "observed_raw": self.observed_raw,
             "observed_input": self.observed_input,
             "token_estimate_ratio": self.estimate_ratio(),
+            "tokens_estimated_raw": self.tokens_estimated,
+            "tokens_estimated_compared": self._guarded(self.tokens_estimated),
+            "token_reserve": self.token_reserve,
+            "ceiling_comparison": "guarded",
+            "ceiling_note": (
+                "tokens_estimated is the raw heuristic accumulator. "
+                "The ceiling comparison uses tokens_estimated_compared, the guarded reading of that raw total. "
+                "A raw total can sit above the ceiling while the guarded reading still fits."
+            ),
         }
 
     def restore(self, snapshot: Mapping[str, Any] | None) -> None:
@@ -109,14 +120,28 @@ class ProviderAllowance:
                 used = row
             self.stage_used[str(name)] = max(0, int(used or 0))
 
-    def preview(self, estimate: int, *, stage: str | None = None, kind: str = "preview") -> dict[str, Any]:
-        return self._decide(estimate, commit=False, kind=kind, stage=stage)
+    def preview(
+        self,
+        estimate: int,
+        *,
+        stage: str | None = None,
+        kind: str = "preview",
+        apply_reserve: bool = True,
+    ) -> dict[str, Any]:
+        return self._decide(estimate, commit=False, kind=kind, stage=stage, apply_reserve=apply_reserve)
 
-    def would_refuse(self, estimate: int, *, stage: str | None = None, kind: str = "preview") -> bool:
-        return self.preview(estimate, stage=stage, kind=kind)["status"] != "acquired"
+    def would_refuse(
+        self,
+        estimate: int,
+        *,
+        stage: str | None = None,
+        kind: str = "preview",
+        apply_reserve: bool = True,
+    ) -> bool:
+        return self.preview(estimate, stage=stage, kind=kind, apply_reserve=apply_reserve)["status"] != "acquired"
 
     def try_acquire(self, estimate: int, *, kind: str, stage: str | None = None) -> dict[str, Any]:
-        return self._decide(estimate, commit=True, kind=kind, stage=stage)
+        return self._decide(estimate, commit=True, kind=kind, stage=stage, apply_reserve=kind != "storyline")
 
     def note_estimate_observation(self, raw: int, usage: Mapping[str, Any] | None) -> None:
         """Record one call whose raw estimate and provider input tokens are both known."""
@@ -151,10 +176,26 @@ class ProviderAllowance:
             return "focused"
         return "coding"
 
-    def _decide(self, estimate: int, *, commit: bool, kind: str, stage: str | None = None) -> dict[str, Any]:
+    def _compared_ceiling(self, kind: str, *, apply_reserve: bool) -> int | None:
+        if self.max_tokens is None:
+            return None
+        if not apply_reserve or kind == "storyline" or self.token_reserve <= 0:
+            return self.max_tokens
+        return max(0, self.max_tokens - self.token_reserve)
+
+    def _decide(
+        self,
+        estimate: int,
+        *,
+        commit: bool,
+        kind: str,
+        stage: str | None = None,
+        apply_reserve: bool = True,
+    ) -> dict[str, Any]:
         raw_estimate = max(0, int(estimate))
         estimate = self._guarded(raw_estimate)
         spent = self._guarded(self.tokens_estimated)
+        compared_ceiling = self._compared_ceiling(kind, apply_reserve=apply_reserve)
         bucket = self._bucket(kind, stage)
         stage_limited = bool(self.stage_ceilings)
         ceiling = self.stage_ceilings.get(bucket) if stage_limited else None
@@ -176,7 +217,7 @@ class ProviderAllowance:
                 "max_calls": call_max,
                 "max_tokens": self.max_tokens,
             }
-        elif self.max_tokens is not None and spent + estimate > self.max_tokens:
+        elif compared_ceiling is not None and spent + estimate > compared_ceiling:
             row = {
                 "status": "refused",
                 "reason": "token_allowance",
