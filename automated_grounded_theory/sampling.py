@@ -141,10 +141,12 @@ class SamplingSelectionPair(BaseModel):
 class ModelSamplingSelection(BaseModel):
     """Model sampling choice.
 
-    ``selections`` is authoritative when it is not empty. Empty
-    ``direction_ids`` and ``passage_ids`` mean those lists were not sent.
-    A non-empty flat list that names a different set is a mismatch: the
-    selections are still the rereads, and the stage is incomplete.
+    ``selections`` is authoritative when it is not empty. An empty
+    ``direction_ids`` or ``passage_ids`` list means that list was not sent
+    and is derived from the pairs. A nonempty list is compared on its own.
+    One nonempty list that matches, with the other list omitted, is not a
+    mismatch. A nonempty list that names a different set is a mismatch:
+    the selections are still the rereads, and the stage is incomplete.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1630,10 +1632,11 @@ def _read_model_selection(
 ) -> dict[str, Any]:
     """Explicit pairs are the rereads. Flat lists are derived, or a mismatch.
 
-    Empty flat lists were not sent. A non-empty flat list that is not the
-    derived set does not replace the pairs. Unknown ids are rejected. Any
-    dropped request leaves ``status`` incomplete, so a warning is not paired
-    with a completed stage.
+    An empty flat list was not sent and is derived from the pairs. Each
+    nonempty list is compared on its own. One matching list plus one omitted
+    list is not a mismatch. A nonempty list that differs does not replace
+    the pairs. Unknown ids are rejected. Any dropped request leaves
+    ``status`` incomplete, so a warning is not paired with a completed stage.
     """
     explicit = _explicit_selection_rows(parsed)
     if any(item["direction_id"] or item["passage_id"] for item in explicit):
@@ -1656,16 +1659,27 @@ def _read_model_selection(
         passage_ids = _unique_ids([row["passage_id"] for row in pairs])
         flat_directions = [str(item) for item in (parsed.get("direction_ids") or [])]
         flat_passages = [str(item) for item in (parsed.get("passage_ids") or [])]
+        compared: list[str] = []
+        disagreed: list[str] = []
+        if flat_directions:
+            compared.append("direction_ids")
+            if set(flat_directions) != set(direction_ids):
+                disagreed.append("direction_ids")
+        if flat_passages:
+            compared.append("passage_ids")
+            if set(flat_passages) != set(passage_ids):
+                disagreed.append("passage_ids")
         mismatch = None
-        if flat_directions or flat_passages:
-            if set(flat_directions) != set(direction_ids) or set(flat_passages) != set(passage_ids):
-                mismatch = {
-                    "direction_ids": flat_directions,
-                    "passage_ids": flat_passages,
-                    "derived_direction_ids": direction_ids,
-                    "derived_passage_ids": passage_ids,
-                    "wins": "selections",
-                }
+        if disagreed:
+            mismatch = {
+                "direction_ids": flat_directions,
+                "passage_ids": flat_passages,
+                "derived_direction_ids": direction_ids,
+                "derived_passage_ids": passage_ids,
+                "compared": compared,
+                "disagreed": disagreed,
+                "wins": "selections",
+            }
         warnings = []
         if rejected:
             warnings.append(
@@ -1800,14 +1814,48 @@ def _pending_reread_pairs(state: Mapping[str, Any]) -> list[dict[str, str]]:
     return [pair for pair in wanted if _reread_pair_key(pair) not in done]
 
 
+def _active_reread_pair(metadata: Mapping[str, Any]) -> dict[str, str] | None:
+    row = metadata.get("reread_active_pair")
+    if not isinstance(row, Mapping):
+        return None
+    pair = {"direction_id": str(row.get("direction_id") or ""), "passage_id": str(row.get("passage_id") or "")}
+    if not pair["direction_id"] or not pair["passage_id"]:
+        return None
+    return pair
+
+
 def _reread_partition(state: Mapping[str, Any], *, failed: int) -> tuple[list[dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
-    """Completed notes, the in-flight pair, and pairs not yet sent."""
+    """Completed notes, the in-flight pair, and pairs not yet sent.
+
+    Pairs already withheld (an oversized request, a missing passage, a spent
+    call allowance) stay in ``reread_unsent_pairs``. They are not the failed
+    pair and they are not unattempted. The failed pair is ``reread_active_pair``
+    when that was recorded before the provider call. Older checkpoints that
+    have no active pair still use the first pair that is neither stored nor
+    withheld.
+    """
     wanted = _selected_pairs(state)
-    done = {_reread_pair_key(row) for row in (state.get("reread_notes") or []) if isinstance(row, Mapping)}
-    completed = [pair for pair in wanted if _reread_pair_key(pair) in done]
-    rest = [pair for pair in wanted if _reread_pair_key(pair) not in done]
-    failed_rows = rest[: max(0, failed)]
-    return completed, failed_rows, rest[len(failed_rows) :]
+    metadata = state.get("metadata") or {}
+    noted = {_reread_pair_key(row) for row in (state.get("reread_notes") or []) if isinstance(row, Mapping)}
+    withheld = {_reread_pair_key(row) for row in (metadata.get("reread_unsent_pairs") or []) if isinstance(row, Mapping)}
+    completed = [pair for pair in wanted if _reread_pair_key(pair) in noted]
+    failed_rows: list[dict[str, str]] = []
+    if failed:
+        active = _active_reread_pair(metadata)
+        if active is not None:
+            key = _reread_pair_key(active)
+            if key not in noted and key not in withheld:
+                failed_rows = [active]
+        if not failed_rows:
+            rest = [pair for pair in wanted if _reread_pair_key(pair) not in noted and _reread_pair_key(pair) not in withheld]
+            failed_rows = rest[:1]
+    failed_keys = {_reread_pair_key(row) for row in failed_rows}
+    unattempted = [
+        pair
+        for pair in wanted
+        if _reread_pair_key(pair) not in noted and _reread_pair_key(pair) not in withheld and _reread_pair_key(pair) not in failed_keys
+    ]
+    return completed, failed_rows, unattempted
 
 
 def _finish_reread(
@@ -1850,78 +1898,14 @@ def _reread_return(notes: list, metadata: dict[str, Any], logs: list, warnings: 
     return {"reread_notes": notes, "metadata": metadata, "prompt_log": logs, "warnings": warnings}
 
 
-async def _reread(runtime: SamplingRuntime, state: SamplingState) -> dict:
-    """One direction-passage request, then return so the checkpoint keeps it.
-
-    The next visit skips pairs that already have a note. A timeout on a later
-    visit therefore leaves the earlier note and its prompt row in the checkpoint.
-    """
-    metadata = dict(state.get("metadata") or {})
-    procedure = metadata.get("procedure") or {}
-    notes = list(state.get("reread_notes") or [])
-    logs = list(state.get("prompt_log") or [])
-    warnings = list(state.get("warnings") or [])
-    if procedure.get("pursuit") != "reread":
-        return {"reread_notes": notes, "metadata": metadata}
-    wanted = _selected_pairs(state)
-    unsent = [dict(row) for row in (metadata.get("reread_unsent_pairs") or []) if isinstance(row, Mapping)]
-    pending = _pending_reread_pairs({"reread_notes": notes, "metadata": {**metadata, "reread_unsent_pairs": unsent}, "directions": state.get("directions"), "passage_proposals": state.get("passage_proposals")})
-    if not pending:
-        _finish_reread(metadata, notes, wanted, unsent)
-        _sync_allowance(metadata, runtime)
-        return _reread_return(notes, metadata, logs, warnings)
-    pair = pending[0]
-    passages = {
-        str(row.get("passage_id") or ""): row
-        for row in (state.get("passages") or [])
-        if isinstance(row, Mapping)
-    }
-    passage = passages.get(pair["passage_id"])
-    allowance = runtime.limiter.provider_allowance
-    if passage is None or (allowance is not None and allowance.remaining_calls("coding") == 0):
-        if passage is None:
-            unsent.append(dict(pair))
-        else:
-            unsent.extend(dict(item) for item in pending)
-            metadata["reread_unattempted_pairs"] = [dict(item) for item in pending]
-            if metadata.get("stop") != "timeout":
-                metadata["reread_stop"] = "call_allowance"
-        metadata["reread_unsent_pairs"] = unsent
-        metadata["reread_unsent_passage_ids"] = [item["passage_id"] for item in unsent]
-        if passage is None and len(pending) > 1:
-            metadata.pop("reread_status", None)
-        else:
-            _finish_reread(metadata, notes, wanted, unsent)
-        metadata["reread_notes_do_not_change_saturation_indicators"] = True
-        _sync_allowance(metadata, runtime)
-        return _reread_return(notes, metadata, logs, warnings)
-    direction = _direction_row(state, pair["direction_id"])
-    messages = _messages("sampling_reread", _reread_payload(state, pair["passage_id"], passage, direction))
-    result = await _sampling_call(
-        runtime,
-        runtime.coder,
-        SamplingRereadNote,
-        messages,
-        kind="sampling_reread",
-        stage="coding",
-        metadata=metadata,
-        logs=logs,
-        reserved_output=300,
-    )
-    if result["refused"] or result["unparsed"]:
-        unsent.append(dict(pair))
-        metadata["reread_unsent_pairs"] = unsent
-        metadata["reread_unsent_passage_ids"] = [item["passage_id"] for item in unsent]
-        metadata["reread_stop"] = str(result["reason"] or metadata.get("reread_stop") or "incomplete")
-        if result["reason"] in {"request_budget", "token_allowance"} or result["unparsed"]:
-            metadata["reread_incomplete"] = True
-        if len(pending) == 1:
-            _finish_reread(metadata, notes, wanted, unsent)
-        else:
-            metadata.pop("reread_status", None)
-        _sync_allowance(metadata, runtime)
-        return _reread_return(notes, metadata, logs, warnings)
-    parsed = dict(result["parsed"] or {})
+def _append_reread_note(
+    notes: list,
+    *,
+    pair: Mapping[str, Any],
+    passage: Mapping[str, Any],
+    direction: Mapping[str, Any],
+    parsed: Mapping[str, Any],
+) -> None:
     quote = str(parsed.get("quote") or "")
     flags = []
     stored_quote = ""
@@ -1945,6 +1929,212 @@ async def _reread(runtime: SamplingRuntime, state: SamplingState) -> dict:
             "actor": "llm",
         }
     )
+
+
+def _withhold_reread(metadata: dict[str, Any], unsent: list, pair: Mapping[str, Any], *, reason: str) -> None:
+    row = {"direction_id": pair["direction_id"], "passage_id": pair["passage_id"], "reason": reason}
+    unsent.append(row)
+    metadata["reread_unsent_pairs"] = unsent
+    metadata["reread_unsent_passage_ids"] = [item["passage_id"] for item in unsent]
+    metadata["reread_stop"] = reason or metadata.get("reread_stop") or "incomplete"
+    if reason in {"request_budget", "token_allowance", "schema_unparsed"}:
+        metadata["reread_incomplete"] = True
+
+
+async def _reread(runtime: SamplingRuntime, state: SamplingState) -> dict:
+    """One provider request, then return so the checkpoint keeps it.
+
+    The visit before a request records ``reread_active_pair`` and returns
+    without calling the model. The next visit sends that pair. A parse
+    failure returns again, with the response and its usage, before the
+    repair is sent. A timeout therefore names the active pair and does not
+    drop the original response or relabel a pair that was already withheld.
+    """
+    metadata = dict(state.get("metadata") or {})
+    procedure = metadata.get("procedure") or {}
+    notes = list(state.get("reread_notes") or [])
+    logs = list(state.get("prompt_log") or [])
+    warnings = list(state.get("warnings") or [])
+    if procedure.get("pursuit") != "reread":
+        return {"reread_notes": notes, "metadata": metadata}
+    wanted = _selected_pairs(state)
+    unsent = [dict(row) for row in (metadata.get("reread_unsent_pairs") or []) if isinstance(row, Mapping)]
+    pending = _pending_reread_pairs({"reread_notes": notes, "metadata": {**metadata, "reread_unsent_pairs": unsent}, "directions": state.get("directions"), "passage_proposals": state.get("passage_proposals")})
+    active = _active_reread_pair(metadata)
+    if not pending and not metadata.get("reread_repair_pending"):
+        metadata["reread_active_pair"] = None
+        _finish_reread(metadata, notes, wanted, unsent)
+        _sync_allowance(metadata, runtime)
+        return _reread_return(notes, metadata, logs, warnings)
+    pair = active if metadata.get("reread_repair_pending") and active is not None else pending[0]
+    passages = {
+        str(row.get("passage_id") or ""): row
+        for row in (state.get("passages") or [])
+        if isinstance(row, Mapping)
+    }
+    passage = passages.get(pair["passage_id"])
+    direction = _direction_row(state, pair["direction_id"])
+    allowance = runtime.limiter.provider_allowance
+    calls_left = None if allowance is None else allowance.remaining_calls("coding")
+
+    if metadata.get("reread_repair_pending"):
+        if calls_left == 0 or passage is None:
+            metadata["reread_repair_pending"] = False
+            metadata["reread_failed_pairs"] = [dict(pair)]
+            metadata["reread_incomplete"] = True
+            if metadata.get("stop") == "timeout":
+                metadata["reread_stop"] = "timeout"
+            else:
+                metadata["reread_stop"] = "call_allowance"
+            _finish_reread(metadata, notes, wanted, unsent)
+            metadata["reread_notes_do_not_change_saturation_indicators"] = True
+            _sync_allowance(metadata, runtime)
+            return _reread_return(notes, metadata, logs, warnings)
+        error = str(metadata.get("reread_repair_error") or "the output did not match the schema")
+        messages = _messages("sampling_reread", _reread_payload(state, pair["passage_id"], passage, direction))
+        messages.append(
+            HumanMessage(
+                content=(
+                    "REPAIR THIS OUTPUT\n"
+                    f"The previous output was not valid SamplingRereadNote: {error}\n"
+                    "Return only the structured object."
+                )
+            )
+        )
+        result = await _sampling_call(
+            runtime,
+            runtime.coder,
+            SamplingRereadNote,
+            messages,
+            kind="schema_repair",
+            stage="coding",
+            metadata=metadata,
+            logs=logs,
+            reserved_output=300,
+            attempt_repair=False,
+        )
+        metadata["reread_repair_pending"] = False
+        if result.get("repair_pending") or result["refused"] or result["unparsed"]:
+            metadata["reread_active_pair"] = None
+            metadata["reread_incomplete"] = True
+            metadata["reread_failed_pairs"] = [dict(pair)]
+            metadata["reread_stop"] = "schema_unparsed" if result.get("repair_pending") or result["unparsed"] else str(result["reason"] or "incomplete")
+            if metadata.get("stop") == "timeout":
+                metadata["reread_stop"] = "timeout"
+            _finish_reread(metadata, notes, wanted, unsent)
+            if metadata.get("stop") == "timeout":
+                metadata["sampling_stop"] = "timeout"
+                metadata["reread_status"] = "incomplete"
+            metadata["reread_notes_do_not_change_saturation_indicators"] = True
+            _sync_allowance(metadata, runtime)
+            return _reread_return(notes, metadata, logs, warnings)
+        if metadata.get("stop") == "timeout":
+            metadata["stop"] = ""
+            metadata["timeout_recovered"] = True
+            if metadata.get("sampling_stop") == "timeout":
+                metadata["sampling_stop"] = ""
+        _append_reread_note(notes, pair=pair, passage=passage, direction=direction, parsed=dict(result["parsed"] or {}))
+        metadata["reread_active_pair"] = None
+        done = {_reread_pair_key(row) for row in notes}
+        metadata["reread_completed_pairs"] = [dict(item) for item in wanted if _reread_pair_key(item) in done]
+        if len(pending) == 1:
+            _finish_reread(metadata, notes, wanted, unsent)
+        else:
+            metadata.pop("reread_status", None)
+        metadata["reread_notes_do_not_change_saturation_indicators"] = True
+        _sync_allowance(metadata, runtime)
+        return _reread_return(notes, metadata, logs, warnings)
+
+    armed = active is not None and _reread_pair_key(active) == _reread_pair_key(pair)
+    if passage is None or calls_left == 0:
+        metadata["reread_active_pair"] = None
+        if passage is None:
+            _withhold_reread(metadata, unsent, pair, reason="missing_passage")
+            if len(pending) > 1:
+                metadata.pop("reread_status", None)
+            else:
+                _finish_reread(metadata, notes, wanted, unsent)
+        else:
+            for item in pending:
+                _withhold_reread(metadata, unsent, item, reason="call_allowance")
+            metadata["reread_unattempted_pairs"] = [dict(item) for item in pending]
+            if metadata.get("stop") != "timeout":
+                metadata["reread_stop"] = "call_allowance"
+            _finish_reread(metadata, notes, wanted, unsent)
+        metadata["reread_notes_do_not_change_saturation_indicators"] = True
+        _sync_allowance(metadata, runtime)
+        return _reread_return(notes, metadata, logs, warnings)
+    messages = _messages("sampling_reread", _reread_payload(state, pair["passage_id"], passage, direction))
+    if not armed:
+        estimate, reason = _sampling_fit(metadata, messages, SamplingRereadNote, runtime)
+        if reason:
+            logs.append(_prompt_row("sampling_reread", messages, {}, extra_status=reason))
+            logs[-1]["status"] = "omitted"
+            logs[-1]["reason"] = reason
+            logs[-1]["estimated_input_tokens"] = estimate
+            logs[-1]["received"] = False
+            logs[-1]["needs_review"] = True
+            logs[-1]["flagged"] = True
+            _remember_attempt(
+                metadata,
+                {
+                    "kind": "sampling_reread",
+                    "status": "omitted",
+                    "reason": reason,
+                    "usage": {},
+                    "estimated_input_tokens": estimate,
+                    "received": False,
+                },
+            )
+            metadata["sampling_stop"] = reason
+            metadata["reread_active_pair"] = None
+            _withhold_reread(metadata, unsent, pair, reason=reason)
+            if len(pending) > 1:
+                metadata.pop("reread_status", None)
+            else:
+                _finish_reread(metadata, notes, wanted, unsent)
+            metadata["reread_notes_do_not_change_saturation_indicators"] = True
+            _sync_allowance(metadata, runtime)
+            return _reread_return(notes, metadata, logs, warnings)
+        metadata["reread_active_pair"] = {"direction_id": pair["direction_id"], "passage_id": pair["passage_id"]}
+        metadata.pop("reread_status", None)
+        metadata["reread_notes_do_not_change_saturation_indicators"] = True
+        _sync_allowance(metadata, runtime)
+        return _reread_return(notes, metadata, logs, warnings)
+    result = await _sampling_call(
+        runtime,
+        runtime.coder,
+        SamplingRereadNote,
+        messages,
+        kind="sampling_reread",
+        stage="coding",
+        metadata=metadata,
+        logs=logs,
+        reserved_output=300,
+        attempt_repair=False,
+    )
+    if result.get("repair_pending"):
+        metadata["reread_repair_pending"] = True
+        metadata["reread_repair_error"] = str((result.get("parsed") or {}).get("error") or "")
+        metadata["reread_active_pair"] = {"direction_id": pair["direction_id"], "passage_id": pair["passage_id"]}
+        metadata.pop("reread_status", None)
+        metadata.pop("sampling_stop", None)
+        metadata["reread_notes_do_not_change_saturation_indicators"] = True
+        _sync_allowance(metadata, runtime)
+        return _reread_return(notes, metadata, logs, warnings)
+    if result["refused"] or result["unparsed"]:
+        metadata["reread_active_pair"] = None
+        _withhold_reread(metadata, unsent, pair, reason=str(result["reason"] or "incomplete"))
+        if len(pending) == 1:
+            _finish_reread(metadata, notes, wanted, unsent)
+        else:
+            metadata.pop("reread_status", None)
+        metadata["reread_notes_do_not_change_saturation_indicators"] = True
+        _sync_allowance(metadata, runtime)
+        return _reread_return(notes, metadata, logs, warnings)
+    _append_reread_note(notes, pair=pair, passage=passage, direction=direction, parsed=dict(result["parsed"] or {}))
+    metadata["reread_active_pair"] = None
+    metadata["reread_repair_pending"] = False
     done = {_reread_pair_key(row) for row in notes}
     metadata["reread_completed_pairs"] = [dict(item) for item in wanted if _reread_pair_key(item) in done]
     if len(pending) == 1:
@@ -2284,6 +2474,8 @@ def export_sampling_state(state: Mapping[str, Any], directory: str | Path) -> di
         "reread_completed_pairs": metadata.get("reread_completed_pairs"),
         "reread_failed_pairs": metadata.get("reread_failed_pairs"),
         "reread_unattempted_pairs": metadata.get("reread_unattempted_pairs"),
+        "reread_active_pair": metadata.get("reread_active_pair"),
+        "reread_repair_pending": metadata.get("reread_repair_pending"),
         "researcher_sampling": metadata.get("researcher_sampling"),
         "corpus_status": metadata.get("corpus_status"),
         "new_data_collection": metadata.get("new_data_collection"),
@@ -2354,13 +2546,20 @@ def _route_after_checkpoint(state: SamplingState) -> str:
 
 
 def _route_after_reread(state: SamplingState) -> str:
-    """One more reread step while a pair has not been stored or withheld."""
+    """One more reread step while a pair has not been stored or withheld.
+
+    A pending repair is sent on the next visit even when the stage is already
+    marked incomplete by an earlier withheld pair. A recorded active pair is
+    the request that has not returned yet.
+    """
     metadata = state.get("metadata") or {}
     if str((metadata.get("procedure") or {}).get("pursuit") or "") != "reread":
         return "update_ledger"
+    if metadata.get("reread_repair_pending"):
+        return "pursuit_reread"
     if metadata.get("reread_status") in {"complete", "skipped", "budget_limited", "incomplete"}:
         return "update_ledger"
-    if _pending_reread_pairs(state):
+    if _pending_reread_pairs(state) or _active_reread_pair(metadata):
         return "pursuit_reread"
     return "update_ledger"
 
@@ -2498,6 +2697,7 @@ async def _record_timeout(graph, config, exc: BaseException, output_dir, runtime
                 needs_review=True,
                 flagged=True,
                 calls=after_calls - before_calls,
+                pair=metadata.get("reread_active_pair"),
             )
         )
     if step == "pursuit_reread":
@@ -2581,8 +2781,9 @@ def _restore(runtime: SamplingRuntime, metadata: Mapping[str, Any]) -> None:
 def _sampling_recursion_limit(procedure: Mapping[str, Any], *, override: int | None = None) -> int:
     """Steps for the sampling graph, plus the planned calls as headroom.
 
-    Each reread is one step, and a selection repair is one extra visit. Both
-    sit inside the call ceilings. The overhead is not a new analytic setting.
+    Each reread records its pair, then sends it, and a reread repair is one
+    extra visit. Those visits sit inside the call ceilings plus the overhead.
+    The overhead is not a new analytic setting.
     """
     if override is not None:
         return max(1, int(override))

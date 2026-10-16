@@ -405,7 +405,11 @@ Package 0.9.4 keeps a sampling reread on the direction the researcher or the mod
 
 Package 0.9.5 stores each sampling reread before the next request. A later timeout keeps the completed note, its usage, and its prompt row, and lists the failed and unattempted pairs. Resume does not send a reread that already has a note, and it does not reset the allowance. An explicit model selection is the set of rereads. A flat id list that disagrees is reported, and the stage is incomplete when any requested pair was dropped. The design is [design-review-fixes-095.md](design-review-fixes-095.md).
 
-`policy_version` is `0.9.5`.
+`policy_version` was `0.9.5`.
+
+Package 0.9.6 checkpoints a malformed sampling reread before its repair, so a repair timeout keeps the original response and its usage. Resume sends the repair and does not repeat the initial request. The pair that is about to be sent is recorded first. A timeout names that pair, and a pair already withheld stays unsent. An omitted flat id list is derived from the selections. Only a nonempty list is compared. The design is [design-review-fixes-096.md](design-review-fixes-096.md).
+
+`policy_version` is `0.9.6`.
 
 ## 26. Out of scope
 

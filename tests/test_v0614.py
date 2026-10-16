@@ -47,8 +47,8 @@ from tests.test_v0613 import _AlwaysDrop, _DropSecond, _runtime, _two_passages
 
 
 def test_version_is_0_6_14():
-    assert __version__ == "0.9.5"
-    assert POLICY_VERSION == "0.9.5"
+    assert __version__ == "0.9.6"
+    assert POLICY_VERSION == "0.9.6"
     assert SHORT_TURN_CHARS == 0
     assert PROMPT_EXAMPLE_LIMIT == 2
 
