@@ -385,7 +385,11 @@ Package 0.8.7 keeps a relationship whose quotes come from different respondents,
 
 Package 0.9.0 adds a theoretical-sampling graph over the corpus already in hand, and an explicit saturation decision that still leaves `judgment` null. Directions are ranked from categories, relationships, indicators, coverage, and memos. Passage proposals are retrieved from passages that are not already evidence. A missing passage is a researcher action: the package does not collect new data. `decision_mode='llm'` writes `model_direction_ids`, `model_passage_ids`, and `model_saturation_judgment`, and does not write the researcher fields. A model assessment is withheld below 3 documents or below 2 sampling rounds, and also when pair coverage is too thin to read: 10 or more planned pairs, with coverage below 0.05 or fewer than 2 relationships. The stopping-criteria report names met, unmet, and undefined without declaring saturation, including a `pair_coverage` row. Axial and selective coding were not rebuilt. The same release records the v29 citation, memo, counterexample, and saturation-review fixes on those graphs. A limited Glaser family list can sensitize a sampling query. It is not an axial role. Constant comparison across sampling rounds is the indicator delta on the ledger. The design is [design-sampling-0900.md](design-sampling-0900.md).
 
-`policy_version` is `0.9.0`.
+`policy_version` was `0.9.0`.
+
+Package 0.9.1 replaces the rule that a relationship is accepted only when both quotes sit in one cited passage. Each relationship now carries `evidence_tier`. Tier 1 is a hypothesis and is not accepted as supported. Tier 2, `pattern_supported`, needs the configured case floor (default 2), with a verbatim quote for both endpoints in each case. Accepting it does not verify it and does not license "leads to". Tier 3 is an attribution plus a rival check. Tier 4, `verified`, is a researcher promotion with a named scope. A model cannot set it. `citation_anchoring_rate` is null unless a tier of 2 or higher qualifies, and the per-tier rates are null when that tier is empty. The design is [design-relationship-tiers.md](design-relationship-tiers.md).
+
+`policy_version` is `0.9.1`.
 
 ## 26. Out of scope
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.1
+
+- A relationship carries `evidence_tier`, `evidence_label`, and `allowed_wording`. Tier 0 is category evidence: one verbatim quote for an endpoint, not a relationship. Tier 1 (`hypothesis`) anchors each endpoint somewhere, possibly in different respondents, and is flagged `cross_case` when those quotes do not share a case. Its wording is "may be related". It is never accepted as a supported relationship.
+- Tier 2 (`pattern_supported`) needs `pattern_min_cases` distinct cases (default 2). Each case has a verbatim quote for both endpoints. The same passage is the strongest within-case evidence. The same respondent across question segments is weaker and still one case. Wording is "co-occurs in N respondents", not "leads to". Accepting tier 2 records `pattern_supported`. It does not record `verified`.
+- Tier 3 (`attribution`) is tier 2 plus a participant quote that links the two, or an analyst memo that says why, and a rival check that actually returned a relevant judgment. Wording is "participants attribute X to Y". Only tier 3 or 4 may use causal wording. A stronger sentence is kept and flagged `wording_exceeds_tier`, `storyline_wording_exceeds_tier`, or `memo_wording_exceeds_tier`.
+- Tier 4 (`verified`) is a researcher action, `verify`, with a non-empty `scope`. The row has to already be tier 3. Otherwise `verification_withheld` and the computed tier stays. `decision_mode='llm'` cannot set `verified` (`model_cannot_verify`). `judgment` stays null.
+- Supporting cases record the case id, passage ids, and per-endpoint quotes. A category label is not a quote. Respondent-level co-occurrence is a 2x2 count (`both`, `a_only`, `b_only`, `neither`) and is descriptive only. A missing corpus leaves those counts null. Variation search and the rival check stay `undefined` when they were not run.
+- Proposal requests include `candidate_cross_case`: other respondents' passages that contain both endpoints' distinctive terms, inside `axial_evidence_limit`. The same-passage list is still preferred and is not displaced to make room.
+- `citation_anchoring_rate` is the share of tier 2 or higher rows whose cases quote both endpoints. It is null when none qualify. `citation_anchoring_by_tier` reports `n` and `citation_rate` per tier. Tiers below 2, and empty tiers, leave `citation_rate` null. `citation_anchoring_same_passage` is that share among tier 2 or higher rows whose strongest within-case evidence is the same passage, and is null when there are none. `citation_anchoring_cross_passage` stays null.
+- `pattern_min_cases` is recorded on the procedure and on the row, with a note that the floor is a design choice for this package and not a quotation from the method literature. The design is [docs/design-relationship-tiers.md](docs/design-relationship-tiers.md).
+- `policy_version` is `0.9.1`.
+
 ## 0.9.0
 
 - Theoretical sampling is its own graph, `get_graph("sampling")`. It ranks directions from the categories, relationships, saturation indicators, coverage, and open memos already on the run. Each direction names the target, why, a sampling query, and selection criteria. Retrieval proposes passages in the existing corpus that are not already evidence for that target. When none qualify, the direction is `no_suitable_unsampled_passages` and new data collection is recorded as a researcher action. The package does not collect that data.
