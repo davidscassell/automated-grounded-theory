@@ -23,8 +23,8 @@ from tests.test_v082 import _RepairCoder, _install_estimates
 
 
 def test_version_is_083():
-    assert __version__ == "0.9.2"
-    assert POLICY_VERSION == "0.9.2"
+    assert __version__ == "0.9.3"
+    assert POLICY_VERSION == "0.9.3"
 
 
 def _plain(value):
@@ -189,9 +189,9 @@ def test_pause_matches_when_the_allowance_covers_both_stages(monkeypatch, tmp_pa
     axial_code(_corpus(), FakeAxialCoder(), interrupt=True, checkpointer=saver, thread_id="wide", **common)
     resumed = _finish_axial(_load_saver(_dump_saver(saver)), "wide", **common)
     assert _view(straight) == _view(resumed)
-    assert _view(resumed)["tokens"] == 1600
-    assert _view(resumed)["stages"]["coding"] == 3
-    assert _view(resumed)["status"] == "budget_limited"
+    assert _view(resumed)["tokens"] == 1100
+    assert _view(resumed)["stages"]["coding"] == 2
+    assert _view(resumed)["status"] == "complete"
 
 
 def test_review_mode_does_not_change_the_coding_ceiling():

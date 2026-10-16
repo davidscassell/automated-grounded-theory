@@ -393,7 +393,11 @@ Package 0.9.1 replaces the rule that a relationship is accepted only when both q
 
 Package 0.9.2 makes negative-case search able to return a respondent who has one side of a link, an opposite pole, or a different outcome. The 2x2 counts stay descriptive. A contradicting judgment flags the relationship and a qualifying judgment adds a condition. Neither is dropped. The rate stays null when no relevant judgment was made. A core has to be an endpoint of a tier-2 relationship or it is `core_unsupported_by_graph` and is not the center of the storyline. Coverage of that core is null when the graph is empty. The design is [design-negative-cases-092.md](design-negative-cases-092.md).
 
-`policy_version` is `0.9.2`.
+`policy_version` was `0.9.2`.
+
+Package 0.9.3 classifies a negative case for the respondent after that respondent's passages are combined, and it keeps a split interview from being queued as endpoint absence. A budget that leaves plausible candidates unqueued or unattempted is `budget_limited`. Sampling measures each initial request and does not send one that exceeds the per-request budget or the total allowance. A malformed sampling response is an incomplete result. Axial, focused, sampling, and selective graphs derive a step allowance from the planned requests and, if that limit is still hit, return the partial result. The design is [design-review-fixes-093.md](design-review-fixes-093.md).
+
+`policy_version` is `0.9.3`.
 
 ## 26. Out of scope
 

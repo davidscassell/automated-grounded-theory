@@ -90,7 +90,7 @@ from typing import Annotated, Any, Mapping, Sequence
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
-from langgraph.errors import NodeTimeoutError
+from langgraph.errors import GraphRecursionError, NodeTimeoutError
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, RetryPolicy, Send, interrupt
 from typing_extensions import TypedDict
@@ -2965,7 +2965,7 @@ def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
     not_reread = [str(item) for item in (state.get("focused_not_reread") or [])]
     coverage = _coverage_statement(state, not_reread)
     not_queued = list(coverage["not_queued"])
-    if stop in {"call_allowance", "token_allowance", "no_progress", "timeout"}:
+    if stop in {"call_allowance", "token_allowance", "no_progress", "timeout", "recursion_limit"}:
         status = "incomplete"
         complete = False
     elif not not_reread and not not_queued:
@@ -6421,6 +6421,37 @@ async def _invoke(
                 config,
             )
     except Exception as exc:
+        if isinstance(exc, GraphRecursionError):
+            snapshot = await graph.aget_state(config)
+            state = dict(getattr(snapshot, "values", None) or {})
+            state["recode_stop"] = "recursion_limit"
+            metadata = dict(state.get("metadata") or {})
+            metadata["recursion_limit"] = recursion_limit
+            metadata["recursion_error"] = str(exc)
+            warnings = list(state.get("warnings") or [])
+            note = (
+                "The focused-coding graph step limit was reached. "
+                "Usage and records so far are kept. The stage is incomplete."
+            )
+            if note not in warnings:
+                warnings.append(note)
+            state["metadata"] = metadata
+            state["warnings"] = warnings
+            try:
+                await graph.aupdate_state(
+                    config,
+                    {"metadata": metadata, "warnings": warnings, "recode_stop": "recursion_limit"},
+                )
+            except Exception:
+                logger.warning("Could not store the partial focused state after the step limit", exc_info=True)
+            return _result_from_state(
+                state,
+                interrupted=False,
+                payload=None,
+                thread_id=thread_id,
+                resumable=False,
+                checkpointer=saver,
+            )
         if not _is_timeout(exc):
             raise
         await _record_timeout(graph, config, exc, output_dir)

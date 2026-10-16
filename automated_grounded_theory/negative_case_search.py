@@ -1,12 +1,14 @@
 """Respondent-level negative-case retrieval.
 
 A negative case is a respondent who shows one side of a link, an opposite
-pole, or a different outcome. Passage overlap with both endpoints is one
-signal. It is not the only one. The 2x2 counts describe the corpus. They do
-not validate or invalidate a link. Model calls are spent only on candidates
-that pass a lexical or embedding pre-filter. When the budget is exhausted and
-candidates remain, the search records ``budget`` and does not invent a
-fallback call.
+pole, or a different outcome. Passages from one respondent are combined
+before that respondent is classified. Splitting an interview across questions
+does not count as endpoint absence. The 2x2 counts describe the corpus. They
+do not validate or invalidate a link. Model calls are spent only on candidates
+that pass a lexical or embedding pre-filter. The first slot for each
+relationship is offered before any relationship receives a second. When
+plausible candidates stay unqueued, the search records ``budget`` and does
+not invent a fallback call.
 """
 
 from __future__ import annotations
@@ -154,37 +156,106 @@ def _matrix(both: int, a_only: int, b_only: int, neither: int) -> dict[str, Any]
     }
 
 
-def _passage_kind(
-    text: str,
-    *,
-    hits_a: bool,
-    hits_b: bool,
-    semantic: float,
-    coded_a: bool,
-    coded_b: bool,
-) -> str:
-    """The strongest reason this passage is a negative-case candidate."""
-    present_a = hits_a or coded_a
-    present_b = hits_b or coded_b
-    counter = _has_counter(text)
-    if present_a and present_b and counter and hits_a and hits_b:
+def _best_record(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+    usable = [dict(item) for item in rows if isinstance(item, Mapping)]
+    if not usable:
+        return None
+    return min(usable, key=lambda item: (-int(item.get("score") or 0), str(item.get("passage_id") or "")))
+
+
+def _classify_respondent(slot: Mapping[str, Any]) -> str:
+    """Classify the respondent after every passage has been read.
+
+    A passage that shows only one endpoint does not make the respondent
+    one-sided when another passage from the same respondent shows the other.
+    """
+    present_a = bool(slot.get("a"))
+    present_b = bool(slot.get("b"))
+    rows = [item for item in (slot.get("records") or []) if isinstance(item, Mapping) and not item.get("cited")]
+    counter_rows = [
+        item for item in rows if item.get("counter") and (item.get("present_a") or item.get("present_b"))
+    ]
+    if present_a and present_b and counter_rows:
         return "contrasting_outcome"
-    if counter and ((hits_a and not hits_b) or (hits_b and not hits_a)):
+    if counter_rows and present_a != present_b:
         return "opposite_pole"
     if present_a and not present_b:
         return "a_without_b"
     if present_b and not present_a:
         return "b_without_a"
-    if hits_a and hits_b:
+    if present_a and present_b:
         return "both_endpoints"
-    if semantic >= COSINE_THRESHOLD:
+    if any(float(item.get("semantic") or 0) >= COSINE_THRESHOLD for item in rows):
         return "embedding"
     return ""
 
 
-def _respondent_rank(passages: Sequence[dict[str, Any]]) -> tuple:
-    best = min(passages, key=lambda item: (item["rank"], item["passage_id"]))
-    return (best["rank"], -int(best["score"]), str(best["respondent_id"]))
+def _representative(
+    kind: str,
+    records: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any] | None, list[str], str]:
+    """Pick the passage that represents the respondent classification.
+
+    Complementary passages are included only when the selected passage would
+    otherwise hide an endpoint the respondent does show.
+    """
+    rows = [dict(item) for item in records if isinstance(item, Mapping)]
+    candidates = [item for item in rows if not item.get("cited")]
+    complementary: list[str] = []
+    note = ""
+    if kind == "a_without_b":
+        return _best_record([item for item in candidates if item.get("present_a")]), complementary, note
+    if kind == "b_without_a":
+        return _best_record([item for item in candidates if item.get("present_b")]), complementary, note
+    if kind == "opposite_pole":
+        return (
+            _best_record(
+                [item for item in candidates if item.get("counter") and (item.get("present_a") or item.get("present_b"))]
+            ),
+            complementary,
+            note,
+        )
+    if kind == "embedding":
+        return (
+            _best_record([item for item in candidates if float(item.get("semantic") or 0) >= COSINE_THRESHOLD]),
+            complementary,
+            note,
+        )
+    both = [item for item in candidates if item.get("present_a") and item.get("present_b")]
+    if kind == "contrasting_outcome":
+        contrast = [item for item in both if item.get("counter")] or [
+            item for item in candidates if item.get("counter") and (item.get("present_a") or item.get("present_b"))
+        ]
+        primary = _best_record(contrast) or _best_record(both) or _best_record(candidates)
+    else:
+        primary = _best_record(both) or _best_record(candidates)
+    if primary is not None and not (primary.get("present_a") and primary.get("present_b")):
+        if not primary.get("present_a"):
+            other = _best_record(
+                [item for item in rows if item.get("present_a") and item.get("passage_id") != primary.get("passage_id")]
+            )
+            if other is not None:
+                complementary.append(str(other["passage_id"]))
+        if not primary.get("present_b"):
+            other = _best_record(
+                [
+                    item
+                    for item in rows
+                    if item.get("present_b")
+                    and item.get("passage_id") != primary.get("passage_id")
+                    and str(item.get("passage_id") or "") not in complementary
+                ]
+            )
+            if other is not None:
+                complementary.append(str(other["passage_id"]))
+        if complementary:
+            note = (
+                "This respondent's passages are split across questions. "
+                "Read the complementary passages with the selected passage. "
+                "Do not treat one question as endpoint absence when another passage "
+                "from the same respondent shows the other endpoint."
+            )
+    return primary, complementary, note
 
 
 def search_relationships(
@@ -195,12 +266,14 @@ def search_relationships(
     codebook: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None = None,
     segments: Sequence[Mapping[str, Any]] | None = None,
     dimensions: Sequence[Mapping[str, Any]] | None = None,
-) -> tuple[list[dict[str, str]], dict[str, Any]]:
-    """Queue plausible negative-case passages and record the search.
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Queue one representative candidate per plausible respondent.
 
     Tier 0 rows are category evidence and are not searched. A missing tier is
-    still searched. One passage is taken from each plausible respondent before
-    a second passage from the same respondent.
+    still searched. Evidence is combined by respondent before a type is
+    assigned. The first slot is offered to each relationship before any
+    relationship receives another. Plausible, queued, attempted, and remaining
+    counts stay separate. Attempted starts at zero; the worker fills it in.
     """
     del dimensions  # reserved for a later pole table; lexical poles are read from the text
     by_id = {
@@ -216,7 +289,7 @@ def search_relationships(
         code_id = str(segment.get("code_id") or "")
         if passage_id and code_id:
             coded.setdefault(passage_id, set()).add(code_id)
-    queued: list[dict[str, str]] = []
+    queued: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     per_row: dict[str, Any] = {}
     skipped_none = 0
@@ -226,23 +299,17 @@ def search_relationships(
     filter_reasons: dict[str, int] = {}
     opposite_found = 0
     searched: set[str] = set()
-    plausible_total = 0
 
-    def add(relationship_id: str, passage_id: str, source: str, respondent_id: str) -> None:
+    def add(item: Mapping[str, Any]) -> None:
+        relationship_id = str(item.get("relationship_id") or "")
+        passage_id = str(item.get("passage_id") or "")
         if len(queued) >= slots or not relationship_id or not passage_id:
             return
         key = (relationship_id, passage_id)
         if key in seen or passage_id not in by_id:
             return
         seen.add(key)
-        queued.append(
-            {
-                "relationship_id": relationship_id,
-                "passage_id": passage_id,
-                "source": source,
-                "respondent_id": respondent_id,
-            }
-        )
+        queued.append(dict(item))
 
     for relationship in relationships:
         if not isinstance(relationship, Mapping):
@@ -271,31 +338,17 @@ def search_relationships(
         row_filtered = 0
         row_reasons: dict[str, int] = {}
 
-        def touch(passage_id: str, passage: Mapping[str, Any]) -> dict[str, Any]:
+        def touch(passage: Mapping[str, Any]) -> dict[str, Any]:
+            passage_id = str(passage.get("passage_id") or "")
             respondent_id = case_id_of(passage) or str(passage.get("doc_id") or passage_id)
             return by_respondent.setdefault(
                 respondent_id,
-                {"respondent_id": respondent_id, "passages": [], "a": False, "b": False, "plausible": []},
+                {"respondent_id": respondent_id, "examined": False, "a": False, "b": False, "records": []},
             )
 
-        if cited and cited in by_id:
-            cited_passage = by_id[cited]
-            slot = touch(cited, cited_passage)
-            cited_tokens = meaningful_tokens(str(cited_passage.get("text") or ""))
-            cited_codes = coded.get(cited, set())
-            if from_id in cited_codes or bool(topics_left and cited_tokens & topics_left):
-                slot["a"] = True
-            if to_id in cited_codes or bool(topics_right and cited_tokens & topics_right):
-                slot["b"] = True
-        for passage_id, passage in by_id.items():
-            if passage_id == cited:
-                continue
-            slot = touch(passage_id, passage)
-            respondent_id = str(slot["respondent_id"])
-            slot = by_respondent.setdefault(
-                respondent_id,
-                {"respondent_id": respondent_id, "passages": [], "a": False, "b": False, "plausible": []},
-            )
+        def absorb(passage_id: str, passage: Mapping[str, Any], *, cited_row: bool) -> None:
+            nonlocal row_filtered, skipped_low, skipped_none
+            slot = touch(passage)
             text = str(passage.get("text") or "")
             tokens = meaningful_tokens(text)
             hits_a = bool(topics_left) and bool(tokens & topics_left)
@@ -303,21 +356,22 @@ def search_relationships(
             codes = coded.get(passage_id, set())
             coded_a = from_id in codes
             coded_b = to_id in codes
-            if hits_a or coded_a:
+            present_a = hits_a or coded_a
+            present_b = hits_b or coded_b
+            if present_a:
                 slot["a"] = True
-            if hits_b or coded_b:
+            if present_b:
                 slot["b"] = True
             semantic = _cosine(passage, claim_vector)
-            kind = _passage_kind(
-                text,
-                hits_a=hits_a,
-                hits_b=hits_b,
-                semantic=semantic,
-                coded_a=coded_a,
-                coded_b=coded_b,
-            )
-            generic_only = bool(tokens & ((left | right) - (topics_left | topics_right))) and not (hits_a or hits_b)
-            if not kind:
+            counter = _has_counter(text)
+            lexical = present_a or present_b
+            embedded = semantic >= COSINE_THRESHOLD
+            if not cited_row:
+                slot["examined"] = True
+            if not lexical and not embedded:
+                if cited_row:
+                    return
+                generic_only = bool(tokens & ((left | right) - (topics_left | topics_right))) and not (hits_a or hits_b)
                 reason = "low_relevance" if generic_only or (0 < semantic < COSINE_THRESHOLD) else "no_endpoint_signal"
                 row_filtered += 1
                 row_reasons[reason] = row_reasons.get(reason, 0) + 1
@@ -325,25 +379,34 @@ def search_relationships(
                     skipped_low += 1
                 else:
                     skipped_none += 1
-                slot["passages"].append({"passage_id": passage_id, "kind": "", "filtered": True, "reason": reason})
-                continue
+                return
             score = len(tokens & topics_left) + len(tokens & topics_right)
-            if _has_counter(text):
+            if counter:
                 score += 2
-            slot["plausible"].append(
+            if embedded:
+                score += 1
+            slot["records"].append(
                 {
                     "passage_id": passage_id,
-                    "kind": kind,
-                    "rank": _KIND_RANK[kind],
-                    "score": score,
-                    "respondent_id": respondent_id,
+                    "respondent_id": slot["respondent_id"],
+                    "present_a": present_a,
+                    "present_b": present_b,
+                    "counter": counter,
                     "semantic": round(semantic, 4),
+                    "score": score,
+                    "cited": cited_row,
                 }
             )
-            slot["passages"].append({"passage_id": passage_id, "kind": kind, "filtered": False})
+
+        if cited and cited in by_id:
+            absorb(cited, by_id[cited], cited_row=True)
+        for passage_id, passage in by_id.items():
+            if passage_id == cited:
+                continue
+            absorb(passage_id, passage, cited_row=False)
         both = a_only = b_only = neither = 0
-        plausible_respondents = []
-        for respondent_id, slot in by_respondent.items():
+        ordered: list[dict[str, Any]] = []
+        for slot in by_respondent.values():
             if slot["a"] and slot["b"]:
                 both += 1
             elif slot["a"]:
@@ -352,67 +415,85 @@ def search_relationships(
                 b_only += 1
             else:
                 neither += 1
-            if not slot["passages"] and not slot["plausible"]:
+            if not slot["examined"]:
                 continue
             considered += 1
-            if slot["plausible"]:
-                plausible_respondents.append(slot)
-            else:
+            kind = _classify_respondent(slot)
+            primary, complementary, comparison = _representative(kind, slot["records"])
+            if not kind or primary is None:
                 filtered += 1
+                continue
+            if kind == "opposite_pole":
+                opposite_found += 1
+            ordered.append(
+                {
+                    "relationship_id": relationship_id,
+                    "passage_id": str(primary["passage_id"]),
+                    "source": kind,
+                    "respondent_id": str(slot["respondent_id"]),
+                    "complementary_passage_ids": list(complementary),
+                    "comparison": comparison,
+                    "rank": _KIND_RANK[kind],
+                    "score": int(primary.get("score") or 0),
+                }
+            )
         for reason, count in row_reasons.items():
             filter_reasons[reason] = filter_reasons.get(reason, 0) + count
-        opposite_found += sum(
-            1
-            for slot in plausible_respondents
-            for item in slot["plausible"]
-            if item["kind"] == "opposite_pole"
-        )
-        ordered: list[dict[str, Any]] = []
-        ranked_respondents = sorted(
-            plausible_respondents,
-            key=lambda slot: _respondent_rank(slot["plausible"]),
-        )
-        rounds = max((len(slot["plausible"]) for slot in ranked_respondents), default=0)
-        for index in range(rounds):
-            for slot in ranked_respondents:
-                chosen = sorted(slot["plausible"], key=lambda item: (item["rank"], -int(item["score"]), item["passage_id"]))
-                if index < len(chosen):
-                    ordered.append(chosen[index])
-        row_queued = []
+        ordered.sort(key=lambda item: (int(item["rank"]), -int(item["score"]), str(item["respondent_id"]), str(item["passage_id"])))
         if relationship_id:
             searched.add(relationship_id)
-        for item in ordered:
-            before = len(queued)
-            add(relationship_id, str(item["passage_id"]), str(item["kind"]), str(item["respondent_id"]))
-            if len(queued) > before:
-                row_queued.append(queued[-1])
-        plausible_total += len(ordered)
-        if not ordered:
-            reason = "no_plausible_candidates"
-        elif slots <= 0:
-            reason = "budget"
-        elif not row_queued:
-            reason = "budget"
-        else:
-            reason = None
         per_row[relationship_id] = {
             "relationship_id": relationship_id,
             "skipped": False,
-            "candidates_considered": len(by_respondent),
-            "filtered_count": sum(1 for slot in by_respondent.values() if not slot["plausible"]),
+            "candidates_considered": sum(1 for slot in by_respondent.values() if slot["examined"]),
+            "filtered_count": sum(1 for slot in by_respondent.values() if slot["examined"] and not _classify_respondent(slot)),
             "passages_filtered": row_filtered,
             "filter_reasons": row_reasons,
             "plausible": len(ordered),
-            "queued": len(row_queued),
-            "queued_passages": list(row_queued),
-            "no_call_reason": reason,
+            "queued": 0,
+            "attempted": 0,
+            "remaining": len(ordered),
+            "queued_passages": [],
+            "no_call_reason": None,
             "cooccurrence_2x2": _matrix(both, a_only, b_only, neither) if by_id else _empty_matrix(),
-            "sources": sorted({item["source"] for item in row_queued}),
+            "sources": [],
+            "_ordered": ordered,
         }
+    active = [
+        (relationship_id, row)
+        for relationship_id, row in per_row.items()
+        if isinstance(row, dict) and isinstance(row.get("_ordered"), list)
+    ]
+    rounds = max((len(row["_ordered"]) for _, row in active), default=0)
+    for index in range(rounds):
+        for _, row in active:
+            ordered = row["_ordered"]
+            if index >= len(ordered):
+                continue
+            before = len(queued)
+            add(ordered[index])
+            if len(queued) > before:
+                row["queued_passages"].append(queued[-1])
+    plausible_total = 0
+    for _, row in active:
+        ordered = row.pop("_ordered")
+        queued_n = len(row["queued_passages"])
+        plausible_n = len(ordered)
+        plausible_total += plausible_n
+        row["plausible"] = plausible_n
+        row["queued"] = queued_n
+        row["attempted"] = 0
+        row["remaining"] = plausible_n - queued_n
+        if not ordered:
+            row["no_call_reason"] = "no_plausible_candidates"
+        elif queued_n < plausible_n:
+            row["no_call_reason"] = "budget"
+        else:
+            row["no_call_reason"] = None
+        row["sources"] = sorted({str(item.get("source") or "") for item in row["queued_passages"]})
     research = [item for item in queued if item.get("source") != "synthetic_counterexample"]
-    if not research and slots <= 0 and plausible_total:
-        no_call = "budget"
-    elif not research and plausible_total:
+    remaining = max(0, plausible_total - len(research))
+    if plausible_total and remaining:
         no_call = "budget"
     elif not research:
         no_call = "no_plausible_candidates"
@@ -427,10 +508,15 @@ def search_relationships(
         notes.append(
             f"Negative-case search filtered {skipped_low} passages with only weak overlap."
         )
-    if no_call == "budget":
+    if no_call == "budget" and not research:
         notes.append(
             "Negative-case search made no research calls because the call budget was exhausted. "
             f"{plausible_total} plausible candidates were not sent."
+        )
+    elif no_call == "budget":
+        notes.append(
+            "Negative-case search left plausible candidates unqueued because the call budget was exhausted. "
+            f"{remaining} of {plausible_total} plausible candidates were not sent."
         )
     elif no_call == "no_plausible_candidates":
         notes.append(
@@ -439,7 +525,7 @@ def search_relationships(
     elif research:
         notes.append(
             "Negative-case search queued "
-            f"{len(research)} passages from respondents with one-sided evidence, an opposite pole, "
+            f"{len(research)} respondents with one-sided evidence, an opposite pole, "
             "a different outcome, both endpoints, or an embedding match."
         )
     stats = {
@@ -458,6 +544,8 @@ def search_relationships(
         "filtered_count": filtered,
         "filter_reasons": filter_reasons,
         "plausible_candidates": plausible_total,
+        "attempted": 0,
+        "remaining_candidates": remaining,
         "by_relationship": per_row,
         "cooccurrence_2x2": _empty_matrix() if not per_row else next(
             (

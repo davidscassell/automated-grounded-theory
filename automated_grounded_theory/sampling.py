@@ -19,7 +19,7 @@ from typing import Any, Mapping, Sequence
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.errors import NodeTimeoutError
+from langgraph.errors import GraphRecursionError, NodeTimeoutError
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, RetryPolicy, interrupt
 from pydantic import BaseModel, ConfigDict, Field
@@ -800,8 +800,188 @@ def _prompt_row(kind: str, messages: Sequence, parsed: Mapping[str, Any], usage:
 
 
 def _budget(metadata: Mapping[str, Any]) -> int:
+    """Per-request token allowance. Zero is a real ceiling, not the default."""
     performance = metadata.get("performance") or {}
-    return max(0, int(performance.get("sampling_token_budget") or DEFAULT_SAMPLING_TOKEN_BUDGET))
+    if isinstance(performance, Mapping) and "sampling_token_budget" in performance and performance.get("sampling_token_budget") is not None:
+        return max(0, int(performance.get("sampling_token_budget") or 0))
+    return DEFAULT_SAMPLING_TOKEN_BUDGET
+
+
+def _sampling_fit(metadata: Mapping[str, Any], messages: Sequence, schema, runtime: SamplingRuntime) -> tuple[int, str | None]:
+    """Measure one initial request against the per-request budget and the total allowance."""
+    from automated_grounded_theory.batching import request_input_tokens
+
+    estimate = request_input_tokens(messages, schema)
+    if estimate > _budget(metadata):
+        return estimate, "request_budget"
+    allowance = getattr(runtime.limiter, "provider_allowance", None)
+    if allowance is not None and int(getattr(allowance, "max_tokens", 0) or 0) > 0:
+        remaining = allowance.remaining_tokens()
+        if remaining is not None and estimate > remaining:
+            return estimate, "token_allowance"
+    return estimate, None
+
+
+def _remember_attempt(metadata: dict[str, Any], row: Mapping[str, Any]) -> None:
+    attempts = [dict(item) for item in (metadata.get("sampling_attempts") or []) if isinstance(item, Mapping)]
+    attempts.append(dict(row))
+    metadata["sampling_attempts"] = attempts
+
+
+def _log_sampling_audits(logs: list, audits: Sequence[Mapping[str, Any]]) -> None:
+    for audit in audits:
+        if not isinstance(audit, Mapping):
+            continue
+        status = str(audit.get("status") or "")
+        logs.append(
+            _prompt_row(
+                str(audit.get("kind") or "provider"),
+                audit.get("messages") or [],
+                audit.get("parsed") if isinstance(audit.get("parsed"), Mapping) else {},
+                audit.get("usage") if isinstance(audit.get("usage"), Mapping) else None,
+                status=status,
+                reason=audit.get("reason") or "",
+                estimated_input_tokens=audit.get("estimated_input_tokens"),
+                received=bool(audit.get("received", True)),
+                needs_review=status in {"parse_failed", "schema_unparsed", "not_sent", "omitted"},
+                flagged=status in {"parse_failed", "schema_unparsed", "not_sent", "omitted"},
+                raw_response=audit.get("raw_response") or "",
+            )
+        )
+
+
+async def _sampling_call(
+    runtime: SamplingRuntime,
+    model,
+    schema,
+    messages,
+    *,
+    kind: str,
+    stage: str,
+    metadata: dict[str, Any],
+    logs: list,
+    reserved_output: int,
+) -> dict[str, Any]:
+    """Send one sampling request only when it fits. A parse failure stays incomplete."""
+    estimate, reason = _sampling_fit(metadata, messages, schema, runtime)
+    if reason:
+        logs.append(
+            _prompt_row(
+                kind,
+                messages,
+                {},
+                extra_status=reason,
+            )
+        )
+        # _prompt_row puts unknown kwargs on the row. Rebuild so status is explicit.
+        logs[-1]["status"] = "omitted"
+        logs[-1]["reason"] = reason
+        logs[-1]["estimated_input_tokens"] = estimate
+        logs[-1]["received"] = False
+        logs[-1]["needs_review"] = True
+        logs[-1]["flagged"] = True
+        _remember_attempt(
+            metadata,
+            {
+                "kind": kind,
+                "status": "omitted",
+                "reason": reason,
+                "usage": {},
+                "estimated_input_tokens": estimate,
+                "received": False,
+            },
+        )
+        metadata["sampling_stop"] = reason
+        return {"sent": False, "unparsed": False, "refused": True, "reason": reason, "parsed": {}, "usage": {}}
+    audits: list[dict[str, Any]] = []
+    try:
+        (parsed, usage), _sent = await ainvoke_structured(
+            model,
+            schema,
+            messages,
+            runtime.limiter,
+            timeout=runtime.request_timeout or None,
+            token_budget=_budget(metadata),
+            preserve_failed=True,
+            send_repair_overflow=False,
+            allowance_kind=kind,
+            allowance_stage=stage,
+            reserved_output=reserved_output,
+            call_audits=audits,
+        )
+    except AllowanceExhausted as exc:
+        _sync_allowance(metadata, runtime)
+        _log_sampling_audits(logs, audits)
+        _remember_attempt(
+            metadata,
+            {"kind": kind, "status": "omitted", "reason": exc.reason, "usage": {}, "estimated_input_tokens": estimate, "received": False},
+        )
+        metadata["sampling_stop"] = exc.reason
+        return {"sent": False, "unparsed": False, "refused": True, "reason": exc.reason, "parsed": {}, "usage": {}}
+    except ValueError as exc:
+        _sync_allowance(metadata, runtime)
+        _log_sampling_audits(logs, audits)
+        _remember_attempt(
+            metadata,
+            {
+                "kind": kind,
+                "status": "schema_unparsed",
+                "reason": "schema_unparsed",
+                "usage": {},
+                "estimated_input_tokens": estimate,
+                "received": True,
+                "error": str(exc),
+            },
+        )
+        metadata["sampling_stop"] = "schema_unparsed"
+        return {
+            "sent": True,
+            "unparsed": True,
+            "refused": False,
+            "reason": "schema_unparsed",
+            "parsed": {"_agt_unparsed": True, "reason": "schema_unparsed", "error": str(exc)},
+            "usage": {},
+        }
+    _sync_allowance(metadata, runtime)
+    _log_sampling_audits(logs, audits)
+    parsed = dict(parsed or {})
+    usage = dict(usage or {})
+    unparsed = bool(parsed.get("_agt_unparsed"))
+    status = "schema_unparsed" if unparsed else "validated"
+    if unparsed:
+        metadata["sampling_stop"] = str(parsed.get("reason") or "schema_unparsed")
+    _remember_attempt(
+        metadata,
+        {
+            "kind": kind,
+            "status": status,
+            "reason": str(parsed.get("reason") or ""),
+            "usage": usage,
+            "estimated_input_tokens": estimate,
+            "received": True,
+        },
+    )
+    if not audits:
+        logs.append(
+            _prompt_row(
+                kind,
+                messages,
+                parsed,
+                usage,
+                status=status,
+                reason=str(parsed.get("reason") or ""),
+                estimated_input_tokens=estimate,
+                received=True,
+            )
+        )
+    return {
+        "sent": True,
+        "unparsed": unparsed,
+        "refused": False,
+        "reason": str(parsed.get("reason") or ""),
+        "parsed": parsed,
+        "usage": usage,
+    }
 
 
 def _indicators(state: Mapping[str, Any]) -> dict:
@@ -1028,25 +1208,30 @@ async def _select_with_model(runtime: SamplingRuntime, state: SamplingState) -> 
         "instruction": "Return direction_ids and passage_ids from this payload only.",
     }
     messages = _messages("sampling_selection", payload)
-    try:
-        (parsed, usage), sent = await ainvoke_structured(
-            runtime.reviewer,
-            ModelSamplingSelection,
-            messages,
-            runtime.limiter,
-            timeout=runtime.request_timeout or None,
-            token_budget=_budget(metadata),
-            allowance_kind="sampling_selection",
-            allowance_stage="review",
-            reserved_output=400,
-        )
-    except AllowanceExhausted as exc:
-        metadata["model_sampling_status"] = "budget_limited"
-        metadata["sampling_stop"] = exc.reason
+    result = await _sampling_call(
+        runtime,
+        runtime.reviewer,
+        ModelSamplingSelection,
+        messages,
+        kind="sampling_selection",
+        stage="review",
+        metadata=metadata,
+        logs=logs,
+        reserved_output=400,
+    )
+    if result["refused"] or result["unparsed"]:
+        reason = str(result["reason"] or "")
+        if result["unparsed"] or reason in {"request_budget", "token_allowance", "schema_unparsed"}:
+            metadata["model_sampling_status"] = "incomplete"
+        else:
+            metadata["model_sampling_status"] = "budget_limited"
+        metadata["model_direction_ids"] = []
+        metadata["model_passage_ids"] = []
+        metadata["model_sampling_rationale"] = ""
+        metadata["sampling_stop"] = reason or metadata.get("sampling_stop") or "incomplete"
         _sync_allowance(metadata, runtime)
         return {"directions": directions, "metadata": metadata, "prompt_log": logs}
-    parsed = dict(parsed or {})
-    logs.append(_prompt_row("sampling_selection", sent, parsed, usage, status="validated" if not parsed.get("_agt_unparsed") else "schema_unparsed"))
+    parsed = dict(result["parsed"] or {})
     known_directions = {str(row.get("direction_id") or "") for row in directions}
     known_passages = _known_passages(state)
     proposed_passages = set()
@@ -1176,6 +1361,107 @@ def _record_ledger(state: SamplingState) -> dict:
     return {"sampling_ledger": ledger, "metadata": metadata}
 
 
+def _target_evidence(state: Mapping[str, Any], direction: Mapping[str, Any]) -> dict[str, Any]:
+    target_id = str(direction.get("target_id") or "")
+    target_type = str(direction.get("target_type") or "")
+    for row in state.get("relationships") or []:
+        if isinstance(row, Mapping) and str(row.get("relationship_id") or "") == target_id:
+            return {
+                "target_type": "relationship",
+                "target_id": target_id,
+                "statement": row.get("statement"),
+                "from_id": row.get("from_id"),
+                "to_id": row.get("to_id"),
+                "quote": row.get("quote"),
+                "evidence_tier": row.get("evidence_tier"),
+            }
+    book = state.get("codebook") or {}
+    entry = book.get(target_id) if isinstance(book, Mapping) else None
+    if isinstance(entry, Mapping):
+        return {
+            "target_type": target_type or "category",
+            "target_id": target_id,
+            "label": entry.get("code") or entry.get("label") or direction.get("label"),
+            "definition": entry.get("definition"),
+        }
+    return {
+        "target_type": target_type,
+        "target_id": target_id,
+        "label": direction.get("label"),
+        "why": direction.get("why"),
+    }
+
+
+def _direction_for_passage(state: Mapping[str, Any], passage_id: str) -> dict[str, Any]:
+    directions = [row for row in (state.get("directions") or []) if isinstance(row, Mapping)]
+    by_id = {str(row.get("direction_id") or ""): row for row in directions}
+    matched: list[str] = []
+    for group in state.get("passage_proposals") or []:
+        if not isinstance(group, Mapping):
+            continue
+        ids = {
+            str(item.get("passage_id") or "")
+            for item in (group.get("proposals") or [])
+            if isinstance(item, Mapping)
+        }
+        if passage_id in ids:
+            matched.append(str(group.get("direction_id") or ""))
+    for row in directions:
+        if passage_id in {str(item) for item in (row.get("sampled_passage_ids") or [])}:
+            matched.append(str(row.get("direction_id") or ""))
+    metadata = state.get("metadata") or {}
+    if str(metadata.get("decision_mode") or "") == "llm":
+        selected = [str(item) for item in (metadata.get("model_direction_ids") or [])]
+    else:
+        selected = [
+            str(row.get("direction_id") or "")
+            for row in directions
+            if row.get("action") in {"accept", "edit"}
+        ]
+    chosen = ""
+    for direction_id in matched:
+        if not selected or direction_id in selected:
+            chosen = direction_id
+            break
+    if not chosen and len(selected) == 1:
+        chosen = selected[0]
+    if not chosen and matched:
+        chosen = matched[0]
+    return dict(by_id.get(chosen) or {})
+
+
+def _reread_payload(state: Mapping[str, Any], passage_id: str, passage: Mapping[str, Any]) -> dict[str, Any]:
+    direction = _direction_for_passage(state, passage_id)
+    target = _target_evidence(state, direction) if direction else {}
+    query = str(direction.get("sampling_query") or "")
+    comparison = ""
+    if direction:
+        comparison = (
+            f"Resolve whether passage {passage_id} bears on direction {direction.get('direction_id')} "
+            f"({direction.get('kind')}) for target {direction.get('target_id')}. "
+            f"The sampling question is: {query}"
+        )
+    return {
+        "passage_id": passage_id,
+        "text": passage.get("text") or "",
+        "direction": {
+            "direction_id": direction.get("direction_id"),
+            "kind": direction.get("kind"),
+            "target_id": direction.get("target_id"),
+            "target_type": direction.get("target_type"),
+            "why": direction.get("why"),
+            "sampling_query": query,
+            "label": direction.get("label"),
+        },
+        "target": target,
+        "comparison": comparison,
+        "instruction": (
+            "quote must be copied from text. "
+            "If the passage does not bear on this direction and this comparison, leave quote empty."
+        ),
+    }
+
+
 def _selected_passages(state: Mapping[str, Any]) -> list[str]:
     metadata = state.get("metadata") or {}
     if str(metadata.get("decision_mode") or "") == "llm":
@@ -1210,32 +1496,28 @@ async def _reread(runtime: SamplingRuntime, state: SamplingState) -> dict:
             continue
         if allowance is not None and allowance.remaining_calls("coding") == 0:
             unsent.append(passage_id)
+            metadata["reread_stop"] = "call_allowance"
             continue
-        messages = _messages(
-            "sampling_reread",
-            {
-                "passage_id": passage_id,
-                "text": passage.get("text") or "",
-                "instruction": "quote must be copied from text. If the passage does not bear on the direction, leave quote empty.",
-            },
+        direction = _direction_for_passage(state, passage_id)
+        messages = _messages("sampling_reread", _reread_payload(state, passage_id, passage))
+        result = await _sampling_call(
+            runtime,
+            runtime.coder,
+            SamplingRereadNote,
+            messages,
+            kind="sampling_reread",
+            stage="coding",
+            metadata=metadata,
+            logs=logs,
+            reserved_output=300,
         )
-        try:
-            (parsed, usage), sent = await ainvoke_structured(
-                runtime.coder,
-                SamplingRereadNote,
-                messages,
-                runtime.limiter,
-                timeout=runtime.request_timeout or None,
-                token_budget=_budget(metadata),
-                allowance_kind="sampling_reread",
-                allowance_stage="coding",
-                reserved_output=300,
-            )
-        except AllowanceExhausted:
+        if result["refused"] or result["unparsed"]:
             unsent.append(passage_id)
+            metadata["reread_stop"] = str(result["reason"] or metadata.get("reread_stop") or "incomplete")
+            if result["reason"] in {"request_budget", "token_allowance"} or result["unparsed"]:
+                metadata["reread_status"] = "incomplete"
             continue
-        parsed = dict(parsed or {})
-        logs.append(_prompt_row("sampling_reread", sent, parsed, usage))
+        parsed = dict(result["parsed"] or {})
         quote = str(parsed.get("quote") or "")
         flags = []
         stored_quote = ""
@@ -1248,6 +1530,10 @@ async def _reread(runtime: SamplingRuntime, state: SamplingState) -> dict:
         notes.append(
             {
                 "passage_id": passage_id,
+                "direction_id": str(direction.get("direction_id") or ""),
+                "target_id": str(direction.get("target_id") or ""),
+                "kind": str(direction.get("kind") or ""),
+                "sampling_query": str(direction.get("sampling_query") or ""),
                 "note": str(parsed.get("note") or ""),
                 "quote": stored_quote,
                 "flags": flags,
@@ -1255,8 +1541,11 @@ async def _reread(runtime: SamplingRuntime, state: SamplingState) -> dict:
                 "actor": "llm",
             }
         )
-    if unsent:
-        metadata["reread_status"] = "budget_limited" if notes else "budget_limited"
+    if metadata.get("reread_status") == "incomplete":
+        metadata["reread_unsent_passage_ids"] = unsent
+        metadata["sampling_stop"] = str(metadata.get("reread_stop") or metadata.get("sampling_stop") or "incomplete")
+    elif unsent:
+        metadata["reread_status"] = "budget_limited"
         metadata["reread_unsent_passage_ids"] = unsent
         if not notes and wanted:
             metadata["sampling_stop"] = metadata.get("sampling_stop") or "call_allowance"
@@ -1404,20 +1693,31 @@ def _saturation_decision(runtime: SamplingRuntime):
                             ),
                         },
                     )
-                    (parsed, usage), sent = await ainvoke_structured(
+                    result = await _sampling_call(
+                        runtime,
                         reviewer,
                         ModelSaturationJudgment,
                         messages,
-                        runtime.limiter,
-                        timeout=runtime.request_timeout or None,
-                        token_budget=_budget(metadata),
-                        allowance_kind="saturation_decision",
-                        allowance_stage="review",
+                        kind="saturation_decision",
+                        stage="review",
+                        metadata=metadata,
+                        logs=logs,
                         reserved_output=300,
                     )
-                    parsed = dict(parsed or {})
-                    logs.append(_prompt_row("saturation_decision", sent, parsed, usage))
-                    if parsed.get("_agt_unparsed"):
+                    parsed = dict(result["parsed"] or {})
+                    if result["refused"] and not result["unparsed"]:
+                        reason = str(result["reason"] or "")
+                        metadata["model_saturation_judgment"] = {
+                            "status": "incomplete" if reason in {"request_budget", "token_allowance"} else "budget_limited",
+                            "assessment": None,
+                            "rationale": "The saturation request was not sent.",
+                            "reason": reason,
+                            "actor": "llm",
+                            "model_judgment": True,
+                            "does_not_set_judgment": True,
+                            "note": "No model assessment was produced. judgment stays null.",
+                        }
+                    elif result["unparsed"] or parsed.get("_agt_unparsed"):
                         metadata["model_saturation_judgment"] = {
                             "status": "incomplete",
                             "assessment": None,
@@ -1596,10 +1896,20 @@ def export_sampling_state(state: Mapping[str, Any], directory: str | Path) -> di
 def _apply_status(metadata: dict[str, Any]) -> None:
     metadata["graph_finished"] = True
     metadata["saturation_judgment"] = None
-    if metadata.get("stop") == "timeout":
+    if metadata.get("stop") in {"timeout", "recursion_limit"}:
         metadata["status"] = "incomplete"
         metadata["complete"] = False
         metadata["graph_finished"] = False
+        return
+    sampling_stop = str(metadata.get("sampling_stop") or "")
+    if (
+        metadata.get("model_sampling_status") == "incomplete"
+        or metadata.get("reread_status") == "incomplete"
+        or sampling_stop in {"request_budget", "schema_unparsed", "token_allowance"}
+    ):
+        metadata["status"] = "incomplete"
+        metadata["complete"] = False
+        metadata["stop"] = sampling_stop or str(metadata.get("reread_stop") or "incomplete")
         return
     if metadata.get("sampling_stop") in {"call_allowance", "token_allowance"} or metadata.get("reread_status") == "budget_limited":
         if metadata.get("decision_mode") == "llm" and not metadata.get("model_direction_ids") and metadata.get("model_sampling_status") == "budget_limited":
@@ -1808,9 +2118,21 @@ def _restore(runtime: SamplingRuntime, metadata: Mapping[str, Any]) -> None:
     allowance.restore(budget)
 
 
-async def _invoke(builder, saver, initial, *, thread_id: str, resume, resuming: bool, output_dir, raise_on_timeout: bool, allow_changes: bool, procedure: Mapping[str, Any], runtime: SamplingRuntime) -> SamplingResult:
+def _sampling_recursion_limit(procedure: Mapping[str, Any], *, override: int | None = None) -> int:
+    """Steps for the linear sampling graph, plus the planned calls as headroom."""
+    if override is not None:
+        return max(1, int(override))
+    calls = int(procedure.get("max_sampling_review_calls") or 0) + int(procedure.get("max_decision_calls") or 0)
+    return calls + _GRAPH_NODE_OVERHEAD
+
+
+_GRAPH_NODE_OVERHEAD = 24
+
+
+async def _invoke(builder, saver, initial, *, thread_id: str, resume, resuming: bool, output_dir, raise_on_timeout: bool, allow_changes: bool, procedure: Mapping[str, Any], runtime: SamplingRuntime, recursion_limit: int | None = None) -> SamplingResult:
     graph = builder.compile(checkpointer=saver)
-    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 40}
+    limit = _sampling_recursion_limit(procedure, override=recursion_limit)
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": limit}
     snapshot = await graph.aget_state(config)
     has_state = bool(getattr(snapshot, "values", None))
     try:
@@ -1832,6 +2154,27 @@ async def _invoke(builder, saver, initial, *, thread_id: str, resume, resuming: 
     except Exception as exc:
         if isinstance(exc, SamplingError):
             raise
+        if isinstance(exc, GraphRecursionError):
+            snapshot = await graph.aget_state(config)
+            state = dict(getattr(snapshot, "values", None) or {})
+            metadata = dict(state.get("metadata") or {})
+            metadata["status"] = "incomplete"
+            metadata["complete"] = False
+            metadata["stop"] = "recursion_limit"
+            metadata["recursion_limit"] = limit
+            metadata["recursion_error"] = str(exc)
+            metadata["graph_finished"] = False
+            warnings = list(state.get("warnings") or [])
+            note = "The sampling graph step limit was reached. Usage and records so far are kept. The stage is incomplete."
+            if note not in warnings:
+                warnings.append(note)
+            state["metadata"] = metadata
+            state["warnings"] = warnings
+            try:
+                await graph.aupdate_state(config, {"metadata": metadata, "warnings": warnings})
+            except Exception:
+                logger.warning("Could not store the partial sampling state after the step limit", exc_info=True)
+            return _result_from_state(state, interrupted=False, payload=None, thread_id=thread_id, resumable=False)
         if not _is_timeout(exc):
             raise
         await _record_timeout(graph, config, exc, output_dir, runtime)
@@ -1904,6 +2247,7 @@ async def atheoretical_sample(
     allow_changes: bool = False,
     output_dir: str | Path | None = None,
     raise_on_timeout: bool = False,
+    recursion_limit: int | None = None,
 ) -> SamplingResult:
     """Rank sampling directions and record a saturation decision.
 
@@ -1947,6 +2291,7 @@ async def atheoretical_sample(
             "sampling_request_timeout": float(sampling_request_timeout),
             "evidence_limit": int(evidence_limit),
             "sampling_token_budget": int(sampling_token_budget),
+            "recursion_limit": _sampling_recursion_limit(procedure, override=recursion_limit),
         },
         "decision_mode": decision_mode,
         "output_dir": str(output_dir) if output_dir else str(upstream.get("output_dir") or ""),
@@ -1999,6 +2344,7 @@ async def atheoretical_sample(
         allow_changes=allow_changes,
         procedure=procedure,
         runtime=runtime,
+        recursion_limit=recursion_limit,
     )
 
 
