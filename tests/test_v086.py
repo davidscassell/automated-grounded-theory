@@ -20,8 +20,8 @@ from tests.test_v080 import QUOTE, STATEMENT, FakeAxialCoder, _corpus
 
 
 def test_version_is_086():
-    assert __version__ == "0.8.7"
-    assert POLICY_VERSION == "0.8.7"
+    assert __version__ == "0.9.0"
+    assert POLICY_VERSION == "0.9.0"
 
 
 def test_from_does_not_anchor_both_endpoints_and_matched_tokens_are_reported():

@@ -376,8 +376,8 @@ def get_graph(kind: str = "open_code"):
     """Return the LangGraph for one stage.
 
     ``open_code`` and ``themes`` are the default run. ``focused``, ``axial``,
-    and ``selective`` are separate graphs. They are not inserted into
-    ``open_code``. ``draw_mermaid_png`` posts the diagram to ``mermaid.ink``.
+    ``selective``, and ``sampling`` are separate graphs. They are not inserted
+    into ``open_code``. ``draw_mermaid_png`` posts the diagram to ``mermaid.ink``.
     ``draw_ascii`` needs the ``viz`` extra (``grandalf``). ``draw_png`` needs
     optional ``pygraphviz`` and a Graphviz install.
     """
@@ -394,6 +394,10 @@ def get_graph(kind: str = "open_code"):
         from automated_grounded_theory.axial import build_selective_graph
 
         return build_selective_graph()
+    if name == "sampling":
+        from automated_grounded_theory.sampling import build_sampling_graph
+
+        return build_sampling_graph()
     if name == "open_code":
         from automated_grounded_theory.context import ResearchContext
         from automated_grounded_theory.retrieval import LexicalCodeRetriever
@@ -411,7 +415,7 @@ def get_graph(kind: str = "open_code"):
         from automated_grounded_theory.themes import build_theme_graph
 
         return build_theme_graph()
-    raise ValueError("kind must be 'open_code', 'themes', 'focused', 'axial', or 'selective'.")
+    raise ValueError("kind must be 'open_code', 'themes', 'focused', 'axial', 'selective', or 'sampling'.")
 
 
 def compile_graph(runtime: RunConfig, checkpointer, *, interrupt_before_sweep: bool = False):

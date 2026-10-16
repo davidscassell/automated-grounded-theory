@@ -1,6 +1,6 @@
 # automated_grounded_theory
 
-**Automated initial (open) coding**, plus a **theme report**, informed by the grounded theory tradition (Glaser and Strauss 1967; Glaser 1978, 1992; Strauss and Corbin 1990/1998; Charmaz 2006/2014). By default the model reads every document in a seeded order, and every passage of that document in reading order, comparing each incident with the codebook earned so far. The package does not do theoretical sampling, axial coding, selective coding, or a saturation decision. How each step maps onto those sources is in [docs/methodology.md](docs/methodology.md). The 0.6 design, including the 0.6.1 corrections, is in [docs/design.md](docs/design.md). A literature-grounded design for the stages after initial coding is in [docs/design-later-stages.md](docs/design-later-stages.md). Focused coding, the first of those stages, is implemented as its own graph. Axial relations, a core category, and a saturation decision from that note are not. A short notebook with the same citations and the Taguette import steps is [docs/open_coding.ipynb](docs/open_coding.ipynb). A full walkthrough on a fictional employee survey, including an offline mode that needs no API key, is [examples/demo.ipynb](examples/demo.ipynb). The notebook writes its outputs to a temporary directory.
+**Automated initial (open) coding**, plus a **theme report**, informed by the grounded theory tradition (Glaser and Strauss 1967; Glaser 1978, 1992; Strauss and Corbin 1990/1998; Charmaz 2006/2014). By default the model reads every document in a seeded order, and every passage of that document in reading order, comparing each incident with the codebook earned so far. Experimental axial coding, selective coding, indicator-based saturation, and theoretical sampling over the existing corpus are separate later graphs. The package does not collect new fieldwork data, and it does not automatically decide that a theory is saturated. A researcher records a saturation decision, or `decision_mode='llm'` stores a model judgment on `model_saturation_judgment`. That judgment does not set `judgment`. How each step maps onto those sources is in [docs/methodology.md](docs/methodology.md). The 0.6 design, including the 0.6.1 corrections, is in [docs/design.md](docs/design.md). A literature-grounded design for the stages after initial coding is in [docs/design-later-stages.md](docs/design-later-stages.md). The 0.9.0 sampling design is [docs/design-sampling-0900.md](docs/design-sampling-0900.md). Focused coding, axial coding, selective coding, and within-corpus theoretical sampling are implemented as their own graphs. The conditional matrix, the full Glaser 1978 coding-family catalog, and collecting new data are not. A short notebook with the same citations and the Taguette import steps is [docs/open_coding.ipynb](docs/open_coding.ipynb). A full walkthrough on a fictional employee survey, including an offline mode that needs no API key, is [examples/demo.ipynb](examples/demo.ipynb). The notebook writes its outputs to a temporary directory.
 
 `build_themes` is a descriptive grouping of the open codes for reporting. It does not reread the passages and it does not mint codes. Focused coding is not that report.
 
@@ -55,7 +55,7 @@ graph TD;
 
 `segment_and_shuffle` orders the corpus, or goes straight to `export` when there is nothing to code. Each round freezes a snapshot in `prepare_round`, fans out `code_worker` with `Send`, and `commit` is the only writer. Dotted arrows are conditional: a round returns to `prepare_round` until a sweep is due, a sweep returns to `prepare_round` while passages remain, and when the queue is empty `consolidate` reads the codebook once more if at least two codes are still unconsolidated, or the run goes into `review_evidence`, which loops while a code still needs review and the final-review call and token allowances remain, and `export` runs when that review is done, the allowance is spent, or nothing needed review. Document mode (the default) keeps reading order inside a document so later passages see codes committed earlier; wave mode may mix documents in one snapshot; `parallel_documents=True` keeps a codebook per document until a sweep; `pipeline=True` (the default) overlaps the next round with that sweep when more than one request can be in flight, and `strict_sequential_settings()` is this same graph with one passage in flight and the pipeline off.
 
-A PNG of this drawing is [docs/open_code_graph.png](docs/open_code_graph.png). `python scripts/render_graph.py` rewrites this block and the focused, axial, and selective blocks from the compiled graphs.
+A PNG of this drawing is [docs/open_code_graph.png](docs/open_code_graph.png). `python scripts/render_graph.py` rewrites this block and the focused, axial, selective, and sampling blocks from the compiled graphs.
 
 ## Focused coding
 
@@ -235,6 +235,55 @@ graph TD;
 <!-- graph:selective:end -->
 
 `score_candidates` counts centrality twice, once for proposed relationships and once for relationships a researcher has accepted. It does not pick a winner. `core_checkpoint` resumes with `{"core_id": "...", "rationale": "..."}` or `{"leave_core": true}`. Alternatives stay in the list. `decision_mode="llm"` writes `model_core_id` and leaves `researcher_core_id` empty. An empty core has provenance `unset`. `include_memos` and `include_storyline` are off unless requested. When both are on, one call from `max_selective_review_calls` is reserved for the storyline. A memo with no text is kept and flagged `memo_empty`. `memo_quote_unsupported` means the memo shares no distinctive token with a quote that has one, and the memo is not only naming partial evidence. A memo that says the quotes are in the same passage when they are not is `memo_same_passage_mismatch`. A memo that claims support for a one-sided relationship is `memo_overclaims_support`. `memo_accounting.produced` counts memos written in this run, and `preexisting` is separate. The storyline sends cited passages and records omitted categories, relationships, and passages. A statement without an anchored quote is kept and flagged `storyline_uncited`. A statement that cites a passage the request did not send is `storyline_unsent_passage`. A statement with no relationship is `storyline_no_relationship`. A statement that cites only a rejected relationship is flagged. A one-sided relationship is `provisional`, not accepted. `storyline.json` includes the core and its provenance. `theory_coverage.json` reports rates that are null when there is nothing to score. `citation_anchoring_rate` is 1 only when both endpoints are anchored and both quotes sit in the cited passage. Cross-respondent quotes leave that rate null and are not an accepted causal link. A core that is not an endpoint of a relationship is `core_unsupported_by_graph`. When a storyline is requested, a share of the token ceiling is reserved for it. `provider_budget.tokens_estimated` is the raw heuristic; `tokens_estimated_compared` is the figure checked against the ceiling. Temperature 0 does not guarantee identical completions. `max_selective_review_calls` is a separate ceiling. A combined run keeps the coding stage on `provider_budget`.
+
+## Theoretical sampling
+
+Theoretical sampling is `get_graph("sampling")`. It reads categories, relationships, saturation indicators, the coverage report, and open memos. It does not insert nodes into axial or selective coding, and it does not collect new data. The design, including the axial and selective gaps that 0.9.0 left in place, is [docs/design-sampling-0900.md](docs/design-sampling-0900.md).
+
+<!-- graph:sampling:begin -->
+```mermaid
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	load_sampling_state(load_sampling_state)
+	rank_directions(rank_directions)
+	retrieve_passages(retrieve_passages)
+	sampling_checkpoint(sampling_checkpoint)
+	record_ledger(record_ledger)
+	pursuit_reread(pursuit_reread)
+	update_ledger(update_ledger)
+	saturation_decision(saturation_decision)
+	export_sampling(export_sampling)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> load_sampling_state;
+	load_sampling_state --> rank_directions;
+	pursuit_reread --> update_ledger;
+	rank_directions --> retrieve_passages;
+	record_ledger --> pursuit_reread;
+	retrieve_passages --> sampling_checkpoint;
+	sampling_checkpoint --> record_ledger;
+	saturation_decision --> export_sampling;
+	update_ledger --> saturation_decision;
+	export_sampling --> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
+```
+<!-- graph:sampling:end -->
+
+`rank_directions` is deterministic. A thin or one-sided category, a category with no negative-case evidence, an unexplored property or dimension, a partial or cross-respondent relationship, an empty paradigm slot, an unsupported core, and an open memo each become a direction. The direction names the target, why (from those records), a sampling query, and selection criteria. `retrieve_passages` ranks passages in the existing corpus that are not already evidence for that target, preferring a document that has not been coded, and only when a distinctive term or an embedding at or above 0.55 overlaps. A generic stem such as work or team is not enough. When nothing qualifies, the direction is `no_suitable_unsampled_passages` and `new_data_collection` is `researcher_action`.
+
+`sampling_checkpoint` calls `interrupt()` when `decision_mode` is `human`. Resume with `{"accept": true}`, `{"leave_sampling": true}`, or `{"directions": [{"direction_id": "dir-1-0001", "action": "accept|edit|reject", "sampling_query": "...", "sampled_passage_ids": ["p1"]}]}`. An empty object is not a resume value. Passage ids must already be in the corpus unless `outside_corpus` is true, which only records data you collected yourself. `decision_mode="llm"` writes `model_direction_ids` and `model_passage_ids`. An id the model invents is flagged and is not used as evidence. Human sampling fields stay empty. `pursuit` defaults to `brief_only`: the run writes `theoretical_sampling.json` and a `next_round` plan for a later focused or open coding call. `pursuit="reread"` spends `max_sampling_review_calls` on notes for the selected passages. A quote that does not sit in the passage is dropped and flagged `quote_unanchored`. The note does not change the saturation curve.
+
+The sampling ledger appends one round per run, including directions, new direction keys, what was sampled, and the indicator snapshot. Constant comparison across rounds is the delta of window-wide rates. A first round leaves those deltas undefined. `provider_budget` is checkpointed, so a human pause does not reset the allowance, and a timeout keeps the rounds already written.
+
+`saturation_decision` is the explicit decision step. It shows the indicators, the ledger, and a stopping-criteria report. That report marks each criterion met, unmet, or undefined: new codes, new properties, new relationships, code-frequency shift, sampling rounds without new directions, and core-category coverage, with the threshold on the row. It does not declare the theory saturated. Resume with `{"decision": "not_claimed|sufficient_for_this_question|not_saturated", "rationale": "..."}` or `{"leave_saturation": true}`. The stored decision has `actor` and a UTC timestamp. `judgment` stays null. `decision_mode="llm"` writes `model_saturation_judgment` only. Below 3 documents, or below 2 sampling rounds, the assessment is withheld as `not_interpretable` and is not filled in as `not_saturated`. A model judgment is never copied into `saturation_decision` or `researcher_saturation`.
+
+`batch_size` and `sampling_request_timeout` are performance settings. `pursuit`, `coding_family`, `quiet_rounds`, and the document minimum are procedure. `coding_family` may be `glaser` (a limited sensitizing list: the Six Cs, strategy, and means-goal), `paradigm`, `charmaz`, or one family name. Axial coding still accepts only `paradigm` and `charmaz`. Applying the 1978 catalog as axial roles is not implemented.
 
 ## Human-guided or LLM-driven review
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.0
+
+- Theoretical sampling is its own graph, `get_graph("sampling")`. It ranks directions from the categories, relationships, saturation indicators, coverage, and open memos already on the run. Each direction names the target, why, a sampling query, and selection criteria. Retrieval proposes passages in the existing corpus that are not already evidence for that target. When none qualify, the direction is `no_suitable_unsampled_passages` and new data collection is recorded as a researcher action. The package does not collect that data.
+- A human checkpoint accepts, edits, or rejects directions and can record the passages actually sampled, including an explicit `outside_corpus` note. `decision_mode='llm'` writes `model_direction_ids` and `model_passage_ids`. Invented ids are flagged and are not used as evidence. Those model fields are not copied into the researcher record.
+- `pursuit` defaults to `brief_only`. `theoretical_sampling.json` includes the ledger and a `next_round` plan for a later focused or open coding run. `pursuit='reread'` spends the sampling call ceiling on notes for the selected passages. A quote that does not sit in the passage is dropped and flagged `quote_unanchored`. The note does not change the saturation curve.
+- The ledger appends one round at a time. Constant comparison across rounds is the delta of the window-wide rates. A rate that was undefined stays undefined. `provider_budget` survives a human pause and a timeout. A timeout keeps the rounds already written.
+- Saturation still has no automatic boolean. `saturation_decision` stores a researcher decision (`not_claimed`, `sufficient_for_this_question`, or `not_saturated`) with a rationale, an actor, and a UTC timestamp. The checkpoint shows the indicators, the ledger, and a stopping-criteria report. That report marks new codes, new properties, new relationships, code-frequency shift, quiet sampling rounds, and core-category coverage as met, unmet, or undefined, with the threshold on the row. It does not declare the theory saturated. `judgment` stays null.
+- `decision_mode='llm'` writes `model_saturation_judgment` only. Below 3 documents, or below 2 sampling rounds, the assessment is withheld as `not_interpretable` and is not filled in as `not_saturated`. It is never written into `saturation_decision` or `researcher_saturation`.
+- Axial and selective coding were not rebuilt. A sampling query may name a limited Glaser family (the Six Cs, strategy, or means-goal) as a sensitizing label. Axial `coding_lens` is still `paradigm` or `charmaz`. The conditional matrix, the full 1978 family catalog, and collecting new data remain unimplemented.
+- `policy_version` is `0.9.0`.
+
 ## 0.8.7
 
 - A relationship records where each quote sits. `citation_anchoring_rate` is 1 only when both endpoints are anchored and both quotes are in the cited passage. Otherwise it is null. `citation_anchoring_same_passage` is the both-anchored share of same-passage rows. `citation_anchoring_cross_passage` stays null, because quotes from different passages do not evidence the link. A causal or consequence link is not accepted on cross-respondent quotes; the row stays as `cross_respondent_pattern`. The reviewer sees a per-quote passage check. A rationale or memo that says "same passage" when the quotes do not share one is flagged.

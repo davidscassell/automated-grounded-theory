@@ -3,8 +3,11 @@
 Codes are produced passage by passage from the corpus. The research context
 sensitizes attention and is not a codebook. The theme report groups those
 codes afterwards for presentation. It does not reread the passages. Focused
-coding, axial coding, and selective coding are separate graphs. They are not
-the theme report. Saturation indicators do not set ``judgment``.
+coding, axial coding, selective coding, and within-corpus theoretical sampling
+are separate graphs. They are not the theme report. Saturation indicators do
+not set ``judgment``. A saturation decision is a researcher record, or a
+model judgment stored apart from that record. The package does not collect
+new fieldwork data.
 """
 
 from automated_grounded_theory.axial import (
@@ -51,7 +54,14 @@ from automated_grounded_theory.retrieval import (
     EmbeddingCodeRetriever,
     LexicalCodeRetriever,
 )
-from automated_grounded_theory.saturation import thematic_saturation_report
+from automated_grounded_theory.sampling import (
+    SamplingError,
+    SamplingResult,
+    atheoretical_sample,
+    read_sampling_interrupt,
+    theoretical_sample,
+)
+from automated_grounded_theory.saturation import stopping_criteria_report, thematic_saturation_report
 from automated_grounded_theory.segment import plan_coding
 from automated_grounded_theory.stability import StabilityReport
 from automated_grounded_theory.themes import ThemeError, ThemeResult, abuild_themes, build_themes
@@ -72,6 +82,8 @@ __all__ = [
     "OpenCodeResult",
     "PresetCodesError",
     "ResearchContext",
+    "SamplingError",
+    "SamplingResult",
     "SelectionDecision",
     "StabilityReport",
     "ThemeError",
@@ -96,6 +108,7 @@ __all__ = [
     "load_run",
     "read_axial_interrupt",
     "read_focused_interrupt",
+    "read_sampling_interrupt",
     "relation_stability",
     "multi_seed_stability",
     "open_code",
@@ -104,6 +117,9 @@ __all__ = [
     "proposal_stability",
     "selective_code",
     "selection_payload",
+    "stopping_criteria_report",
     "strict_sequential_settings",
     "thematic_saturation_report",
+    "atheoretical_sample",
+    "theoretical_sample",
 ]
