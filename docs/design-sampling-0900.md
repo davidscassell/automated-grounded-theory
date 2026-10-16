@@ -134,3 +134,5 @@ What was already true, and what changed:
 ## Relationship evidence tiers (0.9.1)
 
 0.9.1 does not add a sampling node. It changes how an axial relationship is accepted. The both-quotes-in-one-passage rule accepted nothing in live runs. A cross-respondent stitch is now a hypothesis, not citation support and not a dropped row. The case floor, the wording each tier may use, and the decision to keep negative-case search are in [design-relationship-tiers.md](design-relationship-tiers.md). `pattern_min_cases` (default 2) is a package design choice. It is not a quotation from the method literature.
+
+0.9.2 does not add a sampling node either. Negative-case search now queues one-sided and opposite-pole respondents, and a core is graph-supported only at tier 2 or higher. The rule is [design-negative-cases-092.md](design-negative-cases-092.md).

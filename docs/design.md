@@ -389,7 +389,11 @@ Package 0.9.0 adds a theoretical-sampling graph over the corpus already in hand,
 
 Package 0.9.1 replaces the rule that a relationship is accepted only when both quotes sit in one cited passage. Each relationship now carries `evidence_tier`. Tier 1 is a hypothesis and is not accepted as supported. Tier 2, `pattern_supported`, needs the configured case floor (default 2), with a verbatim quote for both endpoints in each case. Accepting it does not verify it and does not license "leads to". Tier 3 is an attribution plus a rival check. Tier 4, `verified`, is a researcher promotion with a named scope. A model cannot set it. `citation_anchoring_rate` is null unless a tier of 2 or higher qualifies, and the per-tier rates are null when that tier is empty. The design is [design-relationship-tiers.md](design-relationship-tiers.md).
 
-`policy_version` is `0.9.1`.
+`policy_version` was `0.9.1`.
+
+Package 0.9.2 makes negative-case search able to return a respondent who has one side of a link, an opposite pole, or a different outcome. The 2x2 counts stay descriptive. A contradicting judgment flags the relationship and a qualifying judgment adds a condition. Neither is dropped. The rate stays null when no relevant judgment was made. A core has to be an endpoint of a tier-2 relationship or it is `core_unsupported_by_graph` and is not the center of the storyline. Coverage of that core is null when the graph is empty. The design is [design-negative-cases-092.md](design-negative-cases-092.md).
+
+`policy_version` is `0.9.2`.
 
 ## 26. Out of scope
 

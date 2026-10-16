@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.2
+
+- Negative-case search is respondent-level. For a relationship at tier 1 or above, and for a claim, candidates are respondents with one endpoint and not the other, an opposite pole or a different outcome, both endpoints, or an embedding at or above 0.55. A cheap pre-filter holds the rest back. Tier 0 is not searched. The search record stores candidates considered, how many were filtered, why no call was made, and a descriptive 2x2. Those counts do not validate a link.
+- There is no opposite-pole fallback call. No plausible candidate is `no_plausible_candidates` and the stage is `complete_no_negative_search`. An exhausted budget with candidates still waiting is `budget_limited`. An all-irrelevant round leaves the negative-case rate and the relevance rate null.
+- A valid `contradicts` flags `relationship_contradicted` and stores `contradiction_note`. The row stays. A valid `qualifies` stores a variation note and reports the variation search. It remains a relevant rival judgment. Storyline and memo text that ignore a contradiction or a variation are flagged. `negative_case_search` is a procedure switch, default on. It is not a performance setting.
+- A core is graph-supported only as an endpoint of a tier-2 or higher relationship. Candidates show the counts. A model core without that support is kept as `model_core_id`, flagged `core_unsupported_by_graph`, and not promoted. The storyline does not center it. Integration reports direct links, path links, orphans, and contradicted relationships. `core_category_coverage` and `core_respondent_coverage` are null when no relationships exist.
+- A storyline statement cites relationship ids and tiers, or it is `description`. Wording stays inside the tier. A contradicted relationship keeps its qualifier. `core_stability` is pairwise agreement and is null below `core_stability_min_n` (default 2, a design choice). Disagreeing cores score 0. Core selection, memos, and the storyline store the graph snapshot they were built from.
+- The design is [docs/design-negative-cases-092.md](docs/design-negative-cases-092.md). `policy_version` is `0.9.2`.
+
 ## 0.9.1
 
 - A relationship carries `evidence_tier`, `evidence_label`, and `allowed_wording`. Tier 0 is category evidence: one verbatim quote for an endpoint, not a relationship. Tier 1 (`hypothesis`) anchors each endpoint somewhere, possibly in different respondents, and is flagged `cross_case` when those quotes do not share a case. Its wording is "may be related". It is never accepted as a supported relationship.

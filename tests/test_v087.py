@@ -25,8 +25,8 @@ from tests.test_v080 import QUOTE, FakeAxialCoder, _corpus
 
 
 def test_version_is_087():
-    assert __version__ == "0.9.1"
-    assert POLICY_VERSION == "0.9.1"
+    assert __version__ == "0.9.2"
+    assert POLICY_VERSION == "0.9.2"
 
 
 def test_generic_stem_does_not_anchor_and_disagreement_is_reported():
@@ -239,9 +239,10 @@ def test_core_without_a_relationship_is_unsupported_and_stability_stays_undefine
     assert coded.metadata["core_unsupported_by_graph"] is True
     assert coded.metadata["core_graph_support"] == "core_unsupported_by_graph"
     stability = core_stability([{"metadata": {"model_core_id": "a"}}, {"metadata": {"model_core_id": "b"}}])
-    assert stability["score"] is None
+    assert stability["score"] == 0
     assert stability["n"] == 2
     assert core_stability([{"metadata": {}}])["n"] == 1
+    assert core_stability([{"metadata": {}}])["score"] is None
 
 
 def test_counterexample_stage_without_a_relevant_judgment_is_not_plain_complete():

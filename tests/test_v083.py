@@ -23,8 +23,8 @@ from tests.test_v082 import _RepairCoder, _install_estimates
 
 
 def test_version_is_083():
-    assert __version__ == "0.9.1"
-    assert POLICY_VERSION == "0.9.1"
+    assert __version__ == "0.9.2"
+    assert POLICY_VERSION == "0.9.2"
 
 
 def _plain(value):
@@ -191,7 +191,7 @@ def test_pause_matches_when_the_allowance_covers_both_stages(monkeypatch, tmp_pa
     assert _view(straight) == _view(resumed)
     assert _view(resumed)["tokens"] == 1600
     assert _view(resumed)["stages"]["coding"] == 3
-    assert _view(resumed)["status"] == "complete"
+    assert _view(resumed)["status"] == "budget_limited"
 
 
 def test_review_mode_does_not_change_the_coding_ceiling():
