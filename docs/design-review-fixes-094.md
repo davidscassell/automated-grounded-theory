@@ -26,6 +26,8 @@ The same fields are written on endpoint anchoring and on the quote locations use
 
 A record that has no `quote_passage_id` is still readable. Readers treat the missing field as the selected `passage_id`. Focused coding already attributes a quote found in another request passage through `located_passage_id` and `evidence_outside_passage`. That path is unchanged.
 
+The model-facing copy still hides the audit id `synthetic-counterexample`. That rewrite now covers `quote_passage_id` and any other exact copy of the id. The model still sees `p-contrast`.
+
 ## Graph steps
 
 Pairs whose category has no assigned passage are recorded once, before the proposal loop, as `missing_category_evidence` and omitted. They are not one graph return per batch. A window that still has to be deferred or split can return to the node. The derived step allowance is `propose_calls` plus `planned_pair_count` plus 24 steps of overhead, unless the caller passes `recursion_limit`. `planned_pair_count` is the unordered pair count. It is a planning figure stored beside `propose_calls`. It is not a new analytic setting, and `batch_size` stays a performance setting at its default of 1.

@@ -579,6 +579,10 @@ def _model_facing_source(source: str) -> str:
 
 def _strip_model_values(value: Any) -> Any:
     """Drop audit-only synthetic fields from a value the model will see."""
+    if isinstance(value, str):
+        if value == SYNTHETIC_PASSAGE_ID:
+            return MODEL_CONTRAST_PASSAGE_ID
+        return value
     if isinstance(value, Mapping):
         cleaned = {
             key: _strip_model_values(item)
@@ -591,6 +595,8 @@ def _strip_model_values(value: Any) -> Any:
             cleaned["doc_id"] = "d-review"
         elif cleaned.get("passage_id") == SYNTHETIC_PASSAGE_ID:
             cleaned["passage_id"] = MODEL_CONTRAST_PASSAGE_ID
+        if cleaned.get("quote_passage_id") == SYNTHETIC_PASSAGE_ID:
+            cleaned["quote_passage_id"] = MODEL_CONTRAST_PASSAGE_ID
         return cleaned
     if isinstance(value, list):
         return [_strip_model_values(item) for item in value]
