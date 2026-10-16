@@ -144,3 +144,7 @@ What was already true, and what changed:
 ## Direction and passage pairs (0.9.4)
 
 A reread is one direction and one passage. The researcher's `sampled_passage_ids` on a direction are not reassigned because retrieval proposed that passage for another direction. A passage selected for two directions is two prompts, two notes, and two coding calls. The unsent pair names the direction. `decision_mode="llm"` can return `selections`. When it does not, a passage proposed for two selected directions becomes two pairs, and a passage that no selected proposal contains is flagged instead of being given to the first proposal. The note is [design-review-fixes-094.md](design-review-fixes-094.md).
+
+## Checkpointed rereads and explicit selections (0.9.5)
+
+Each `(direction_id, passage_id)` reread returns before the next request, so a later timeout keeps the note and the prompt row. The partial result separates completed, failed, and unattempted pairs. Resume continues at `pursuit_reread`, skips a pair that already has a note, and keeps the calls already consumed. A selection that does not parse is stored before the repair call. When `selections` is present, those pairs are the rereads. They are checked against the directions and the corpus. The flat lists are derived from the pairs that pass. A disagreement, or a pair that names an unknown id, leaves the stage incomplete. The note is [design-review-fixes-095.md](design-review-fixes-095.md).

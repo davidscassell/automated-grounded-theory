@@ -23,8 +23,8 @@ from tests.test_v090 import FakeSamplingCoder, _kwargs
 
 
 def test_version_is_094():
-    assert __version__ == "0.9.4"
-    assert POLICY_VERSION == "0.9.4"
+    assert __version__ == "0.9.5"
+    assert POLICY_VERSION == "0.9.5"
 
 
 def _assigned_passage(paused):
@@ -175,26 +175,32 @@ def test_flat_model_lists_do_not_collapse_two_proposal_directions():
     async def _both():
         runtime = SamplingRuntime(coder=FakeSamplingCoder(), pursuit="reread", decision_mode="llm")
         runtime.limiter.provider_allowance = ProviderAllowance(max_tokens=100_000, stages={"coding": 4})
-        return await _reread(
-            runtime,
-            {
-                "passages": [{"passage_id": "p", "text": "A single suitcase sat by the door."}],
-                "directions": [
-                    {"direction_id": "d1", "kind": "thin_category", "target_id": "t1", "sampling_query": "question one"},
-                    {"direction_id": "d2", "kind": "no_negative_case", "target_id": "t2", "sampling_query": "question two"},
-                ],
-                "passage_proposals": [
-                    {"direction_id": "d1", "proposals": [{"passage_id": "p"}]},
-                    {"direction_id": "d2", "proposals": [{"passage_id": "p"}]},
-                ],
-                "metadata": {
-                    "decision_mode": "llm",
-                    "model_direction_ids": ["d1", "d2"],
-                    "model_passage_ids": ["p"],
-                    "procedure": {"pursuit": "reread"},
-                },
+        state = {
+            "passages": [{"passage_id": "p", "text": "A single suitcase sat by the door."}],
+            "directions": [
+                {"direction_id": "d1", "kind": "thin_category", "target_id": "t1", "sampling_query": "question one"},
+                {"direction_id": "d2", "kind": "no_negative_case", "target_id": "t2", "sampling_query": "question two"},
+            ],
+            "passage_proposals": [
+                {"direction_id": "d1", "proposals": [{"passage_id": "p"}]},
+                {"direction_id": "d2", "proposals": [{"passage_id": "p"}]},
+            ],
+            "metadata": {
+                "decision_mode": "llm",
+                "model_direction_ids": ["d1", "d2"],
+                "model_passage_ids": ["p"],
+                "procedure": {"pursuit": "reread"},
             },
-        )
+            "reread_notes": [],
+            "prompt_log": [],
+        }
+        result = {}
+        for _ in range(4):
+            result = await _reread(runtime, state)
+            state = {**state, **result}
+            if result["metadata"].get("reread_status") in {"complete", "budget_limited", "incomplete", "skipped"}:
+                break
+        return result
 
     result = asyncio.run(_both())
     assert {row["direction_id"] for row in result["reread_notes"]} == {"d1", "d2"}

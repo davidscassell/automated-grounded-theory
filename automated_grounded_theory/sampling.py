@@ -127,8 +127,10 @@ class SamplingCheckpointMismatch(SamplingError):
 class SamplingSelectionPair(BaseModel):
     """One reread: this direction, this passage.
 
-    The two flat lists stay so an older response still parses. ``selections``
-    is the pairing. An empty list means the response did not name pairs.
+    The two flat lists stay so an older response still parses. When
+    ``selections`` names any pair, those pairs are the rereads. The flat
+    lists are then derived from the pairs that name a known direction and a
+    corpus passage.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -137,6 +139,14 @@ class SamplingSelectionPair(BaseModel):
 
 
 class ModelSamplingSelection(BaseModel):
+    """Model sampling choice.
+
+    ``selections`` is authoritative when it is not empty. Empty
+    ``direction_ids`` and ``passage_ids`` mean those lists were not sent.
+    A non-empty flat list that names a different set is a mismatch: the
+    selections are still the rereads, and the stage is incomplete.
+    """
+
     model_config = ConfigDict(extra="forbid")
     direction_ids: list[str] = Field(default_factory=list)
     passage_ids: list[str] = Field(default_factory=list)
@@ -874,6 +884,7 @@ async def _sampling_call(
     metadata: dict[str, Any],
     logs: list,
     reserved_output: int,
+    attempt_repair: bool = True,
 ) -> dict[str, Any]:
     """Send one sampling request only when it fits. A parse failure stays incomplete."""
     estimate, reason = _sampling_fit(metadata, messages, schema, runtime)
@@ -917,6 +928,7 @@ async def _sampling_call(
             token_budget=_budget(metadata),
             preserve_failed=True,
             send_repair_overflow=False,
+            attempt_repair=attempt_repair,
             allowance_kind=kind,
             allowance_stage=stage,
             reserved_output=reserved_output,
@@ -960,8 +972,9 @@ async def _sampling_call(
     parsed = dict(parsed or {})
     usage = dict(usage or {})
     unparsed = bool(parsed.get("_agt_unparsed"))
-    status = "schema_unparsed" if unparsed else "validated"
-    if unparsed:
+    repair_pending = bool(parsed.get("needs_repair"))
+    status = "parse_failed" if repair_pending else ("schema_unparsed" if unparsed else "validated")
+    if unparsed and not repair_pending:
         metadata["sampling_stop"] = str(parsed.get("reason") or "schema_unparsed")
     _remember_attempt(
         metadata,
@@ -994,6 +1007,7 @@ async def _sampling_call(
         "reason": str(parsed.get("reason") or ""),
         "parsed": parsed,
         "usage": usage,
+        "repair_pending": repair_pending,
     }
 
 
@@ -1195,22 +1209,8 @@ def _apply_human_sampling(state: SamplingState, decision: Mapping[str, Any]) -> 
     return {"directions": directions, "metadata": metadata}
 
 
-async def _select_with_model(runtime: SamplingRuntime, state: SamplingState) -> dict:
-    metadata = dict(state.get("metadata") or {})
-    logs = list(state.get("prompt_log") or [])
-    directions = [dict(row) for row in (state.get("directions") or [])]
-    proposals = list(state.get("passage_proposals") or [])
-    allowance = runtime.limiter.provider_allowance
-    if runtime.reviewer is None or allowance is None or allowance.remaining_calls("review") == 0:
-        metadata["model_direction_ids"] = []
-        metadata["model_passage_ids"] = []
-        metadata["model_sampling_pairs"] = []
-        metadata["model_sampling_rationale"] = ""
-        metadata["model_sampling_status"] = "budget_limited"
-        metadata["sampling_stop"] = "call_allowance"
-        _sync_allowance(metadata, runtime)
-        return {"directions": directions, "metadata": metadata, "prompt_log": logs}
-    payload = {
+def _selection_payload(directions: Sequence[Mapping[str, Any]], proposals: Sequence[Any]) -> dict[str, Any]:
+    return {
         "directions": [
             {
                 "direction_id": row.get("direction_id"),
@@ -1221,14 +1221,96 @@ async def _select_with_model(runtime: SamplingRuntime, state: SamplingState) -> 
             }
             for row in directions
         ],
-        "passage_proposals": proposals,
+        "passage_proposals": list(proposals),
         "instruction": (
             "Return direction_ids, passage_ids, and selections from this payload only. "
             "Each selection is one direction_id with one passage_id. "
-            "A passage chosen for two directions is two selections."
+            "A passage chosen for two directions is two selections. "
+            "When you send selections, those pairs are the rereads."
         ),
     }
-    messages = _messages("sampling_selection", payload)
+
+
+def _selection_stopped(metadata: dict[str, Any], directions: list, logs: list, *, status: str, reason: str) -> dict:
+    metadata["model_sampling_status"] = status
+    metadata["model_direction_ids"] = []
+    metadata["model_passage_ids"] = []
+    metadata["model_sampling_pairs"] = []
+    metadata["model_sampling_rationale"] = ""
+    metadata["sampling_stop"] = reason or metadata.get("sampling_stop") or "incomplete"
+    metadata["selection_repair_pending"] = False
+    return {"directions": directions, "metadata": metadata, "prompt_log": logs}
+
+
+def _store_model_selection(
+    runtime: SamplingRuntime,
+    state: Mapping[str, Any],
+    metadata: dict[str, Any],
+    directions: list,
+    parsed: Mapping[str, Any],
+    logs: list,
+) -> dict:
+    """Apply a parsed selection. Explicit pairs win. Dropped work is incomplete."""
+    proposals = list(state.get("passage_proposals") or [])
+    known_directions = {str(row.get("direction_id") or "") for row in directions}
+    known_passages = _known_passages(state)
+    proposed_passages: set[str] = set()
+    for group in proposals:
+        if not isinstance(group, Mapping):
+            continue
+        for row in group.get("proposals") or []:
+            if isinstance(row, Mapping):
+                proposed_passages.add(str(row.get("passage_id") or ""))
+    reading = _read_model_selection(parsed, known_directions, known_passages, proposals)
+    kept_directions = list(reading["direction_ids"])
+    kept_passages = list(reading["passage_ids"])
+    metadata["model_direction_ids"] = kept_directions
+    metadata["model_passage_ids"] = kept_passages
+    metadata["model_sampling_pairs"] = list(reading["pairs"])
+    metadata["model_passages_without_direction"] = list(reading["unpaired"])
+    metadata["model_unknown_direction_ids"] = list(reading["unknown_directions"])
+    metadata["model_unknown_passage_ids"] = list(reading["unknown_passages"])
+    metadata["model_rejected_selections"] = list(reading["rejected"])
+    metadata["model_flat_list_mismatch"] = reading["mismatch"]
+    off_proposal = [item for item in kept_passages if proposed_passages and item not in proposed_passages]
+    metadata["model_passages_outside_proposal"] = off_proposal
+    metadata["model_sampling_rationale"] = str(parsed.get("rationale") or "")
+    metadata["model_sampling_judgment"] = True
+    metadata["model_sampling_status"] = reading["status"]
+    metadata["researcher_sampling"] = None
+    metadata["selection_repair_pending"] = False
+    if reading["status"] != "complete":
+        metadata["sampling_stop"] = str(reading["reason"] or "selection_incomplete")
+    for row in directions:
+        row["model_selected"] = row.get("direction_id") in set(kept_directions)
+        row["action"] = ""
+        row["sampled_passage_ids"] = []
+    warnings = list(state.get("warnings") or [])
+    if reading["status"] != "complete":
+        for note in reading["warnings"]:
+            if note not in warnings:
+                warnings.append(note)
+    _sync_allowance(metadata, runtime)
+    return {
+        "directions": directions,
+        "metadata": metadata,
+        "prompt_log": logs,
+        "warnings": warnings,
+    }
+
+
+async def _select_with_model(runtime: SamplingRuntime, state: SamplingState) -> dict:
+    metadata = dict(state.get("metadata") or {})
+    logs = list(state.get("prompt_log") or [])
+    directions = [dict(row) for row in (state.get("directions") or [])]
+    proposals = list(state.get("passage_proposals") or [])
+    if metadata.get("selection_repair_pending"):
+        return await _repair_model_selection(runtime, state, metadata, directions, logs)
+    allowance = runtime.limiter.provider_allowance
+    if runtime.reviewer is None or allowance is None or allowance.remaining_calls("review") == 0:
+        _sync_allowance(metadata, runtime)
+        return _selection_stopped(metadata, directions, logs, status="budget_limited", reason="call_allowance")
+    messages = _messages("sampling_selection", _selection_payload(directions, proposals))
     result = await _sampling_call(
         runtime,
         runtime.reviewer,
@@ -1239,75 +1321,78 @@ async def _select_with_model(runtime: SamplingRuntime, state: SamplingState) -> 
         metadata=metadata,
         logs=logs,
         reserved_output=400,
+        attempt_repair=False,
     )
+    if result.get("repair_pending"):
+        metadata["selection_repair_pending"] = True
+        metadata["selection_repair_error"] = str((result.get("parsed") or {}).get("error") or "")
+        metadata.pop("sampling_stop", None)
+        metadata["model_sampling_status"] = "repair_pending"
+        _sync_allowance(metadata, runtime)
+        return {"directions": directions, "metadata": metadata, "prompt_log": logs}
     if result["refused"] or result["unparsed"]:
         reason = str(result["reason"] or "")
-        if result["unparsed"] or reason in {"request_budget", "token_allowance", "schema_unparsed"}:
-            metadata["model_sampling_status"] = "incomplete"
-        else:
-            metadata["model_sampling_status"] = "budget_limited"
-        metadata["model_direction_ids"] = []
-        metadata["model_passage_ids"] = []
-        metadata["model_sampling_pairs"] = []
-        metadata["model_sampling_rationale"] = ""
-        metadata["sampling_stop"] = reason or metadata.get("sampling_stop") or "incomplete"
+        status = "incomplete" if result["unparsed"] or reason in {"request_budget", "token_allowance", "schema_unparsed"} else "budget_limited"
         _sync_allowance(metadata, runtime)
-        return {"directions": directions, "metadata": metadata, "prompt_log": logs}
-    parsed = dict(result["parsed"] or {})
-    known_directions = {str(row.get("direction_id") or "") for row in directions}
-    known_passages = _known_passages(state)
-    proposed_passages = set()
-    for group in proposals:
-        for row in group.get("proposals") or []:
-            proposed_passages.add(str(row.get("passage_id") or ""))
-    if parsed.get("_agt_unparsed"):
+        return _selection_stopped(metadata, directions, logs, status=status, reason=reason or "incomplete")
+    return _store_model_selection(runtime, state, metadata, directions, dict(result["parsed"] or {}), logs)
+
+
+async def _repair_model_selection(
+    runtime: SamplingRuntime,
+    state: SamplingState,
+    metadata: dict[str, Any],
+    directions: list,
+    logs: list,
+) -> dict:
+    """Send only the repair. The failed first response is already checkpointed."""
+    allowance = runtime.limiter.provider_allowance
+    if runtime.reviewer is None or allowance is None or allowance.remaining_calls("review") == 0:
+        metadata["selection_repair_pending"] = False
         metadata["model_sampling_status"] = "incomplete"
-        metadata["model_direction_ids"] = []
-        metadata["model_passage_ids"] = []
-        metadata["model_sampling_pairs"] = []
+        if metadata.get("stop") != "timeout":
+            metadata["sampling_stop"] = "call_allowance"
         _sync_allowance(metadata, runtime)
         return {"directions": directions, "metadata": metadata, "prompt_log": logs}
-    requested_directions = [str(item) for item in (parsed.get("direction_ids") or [])]
-    requested_passages = [str(item) for item in (parsed.get("passage_ids") or [])]
-    unknown_directions = [item for item in requested_directions if item not in known_directions]
-    unknown_passages = [item for item in requested_passages if item not in known_passages]
-    kept_directions = [item for item in requested_directions if item in known_directions]
-    kept_passages = [item for item in requested_passages if item in known_passages and (not proposed_passages or item in proposed_passages or item in known_passages)]
-    # A passage id must exist in the corpus. Ranking it outside the proposal list is flagged, not dropped.
-    off_proposal = [item for item in kept_passages if proposed_passages and item not in proposed_passages]
-    pairs, unpaired = _model_sampling_pairs(
-        parsed,
-        kept_directions,
-        kept_passages,
-        proposals,
-    )
-    metadata["model_direction_ids"] = kept_directions
-    metadata["model_passage_ids"] = kept_passages
-    metadata["model_sampling_pairs"] = pairs
-    metadata["model_passages_without_direction"] = unpaired
-    metadata["model_unknown_direction_ids"] = unknown_directions
-    metadata["model_unknown_passage_ids"] = unknown_passages
-    metadata["model_passages_outside_proposal"] = off_proposal
-    metadata["model_sampling_rationale"] = str(parsed.get("rationale") or "")
-    metadata["model_sampling_judgment"] = True
-    metadata["model_sampling_status"] = "complete"
-    metadata["researcher_sampling"] = None
-    for row in directions:
-        row["model_selected"] = row.get("direction_id") in kept_directions
-        row["action"] = ""
-        row["sampled_passage_ids"] = []
-    warnings = list(state.get("warnings") or [])
-    if unknown_directions or unknown_passages:
-        warnings.append("The model named direction or passage ids that are not in this corpus. Those ids were flagged and were not used as evidence.")
-    if unpaired:
-        warnings.append(
-            "A selected passage was not paired with a direction. "
-            "It was not assigned to the first retrieval proposal."
+    error = str(metadata.get("selection_repair_error") or "the output did not match the schema")
+    messages = _messages("sampling_selection", _selection_payload(directions, state.get("passage_proposals") or []))
+    messages.append(
+        HumanMessage(
+            content=(
+                "REPAIR THIS OUTPUT\n"
+                f"The previous output was not valid ModelSamplingSelection: {error}\n"
+                "Return only the structured object."
+            )
         )
-    _sync_allowance(metadata, runtime)
-    if warnings != list(state.get("warnings") or []):
-        return {"directions": directions, "metadata": metadata, "prompt_log": logs, "warnings": warnings}
-    return {"directions": directions, "metadata": metadata, "prompt_log": logs}
+    )
+    result = await _sampling_call(
+        runtime,
+        runtime.reviewer,
+        ModelSamplingSelection,
+        messages,
+        kind="schema_repair",
+        stage="review",
+        metadata=metadata,
+        logs=logs,
+        reserved_output=400,
+        attempt_repair=False,
+    )
+    metadata["selection_repair_pending"] = False
+    if result.get("repair_pending") or result["refused"] or result["unparsed"]:
+        reason = "schema_unparsed" if result.get("repair_pending") or result["unparsed"] else str(result["reason"] or "incomplete")
+        status = "incomplete" if result["unparsed"] or result.get("repair_pending") or reason in {"request_budget", "token_allowance", "schema_unparsed"} else "budget_limited"
+        _sync_allowance(metadata, runtime)
+        held = _selection_stopped(metadata, directions, logs, status=status, reason=reason)
+        if metadata.get("stop") == "timeout":
+            metadata["sampling_stop"] = "timeout"
+            metadata["model_sampling_status"] = "incomplete"
+        return held
+    if metadata.get("stop") == "timeout":
+        metadata["stop"] = ""
+        metadata["timeout_recovered"] = True
+        if metadata.get("sampling_stop") == "timeout":
+            metadata["sampling_stop"] = ""
+    return _store_model_selection(runtime, state, metadata, directions, dict(result["parsed"] or {}), logs)
 
 
 def _sampling_checkpoint(runtime: SamplingRuntime):
@@ -1485,36 +1570,19 @@ def _model_sampling_pairs(
 ) -> tuple[list[dict[str, str]], list[str]]:
     """Pair each selected passage with the directions that should reread it.
 
-    An explicit ``selections`` list is the model's pairing. When that list is
-    empty, a passage proposed under two selected directions becomes two pairs.
-    A passage in no selected proposal is paired only when one direction was
-    selected. Otherwise it is flagged and is not given to the first proposal.
+    An explicit ``selections`` list is the model's pairing. It is not filtered
+    by the flat id lists. ``_read_model_selection`` checks each pair against
+    the directions and the corpus. When ``selections`` is empty, a passage
+    proposed under two selected directions becomes two pairs. A passage in no
+    selected proposal is paired only when one direction was selected. Otherwise
+    it is flagged and is not given to the first proposal.
     """
     direction_ids = [str(item) for item in kept_directions if str(item)]
     passage_ids = [str(item) for item in kept_passages if str(item)]
-    direction_set = set(direction_ids)
-    passage_set = set(passage_ids)
-    explicit = []
-    for item in parsed.get("selections") or []:
-        if isinstance(item, Mapping):
-            explicit.append(
-                {
-                    "direction_id": str(item.get("direction_id") or ""),
-                    "passage_id": str(item.get("passage_id") or ""),
-                }
-            )
+    explicit = _explicit_selection_rows(parsed)
     if any(item["direction_id"] or item["passage_id"] for item in explicit):
-        kept = [
-            item
-            for item in explicit
-            if item["direction_id"] in direction_set and item["passage_id"] in passage_set
-        ]
-        flagged = [
-            item["passage_id"] or item["direction_id"]
-            for item in explicit
-            if item not in kept and (item["passage_id"] or item["direction_id"])
-        ]
-        return _dedupe_pairs(kept), flagged
+        kept = [item for item in explicit if item["direction_id"] and item["passage_id"]]
+        return _dedupe_pairs(kept), []
     index = _proposal_index(proposals)
     pairs: list[dict[str, str]] = []
     unpaired: list[str] = []
@@ -1528,6 +1596,138 @@ def _model_sampling_pairs(
         elif passage_id not in unpaired:
             unpaired.append(passage_id)
     return _dedupe_pairs(pairs), unpaired
+
+
+def _explicit_selection_rows(parsed: Mapping[str, Any]) -> list[dict[str, str]]:
+    rows = []
+    for item in parsed.get("selections") or []:
+        if isinstance(item, Mapping):
+            rows.append(
+                {
+                    "direction_id": str(item.get("direction_id") or ""),
+                    "passage_id": str(item.get("passage_id") or ""),
+                }
+            )
+    return rows
+
+
+def _unique_ids(values: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    rows: list[str] = []
+    for value in values:
+        text = str(value or "")
+        if text and text not in seen:
+            seen.add(text)
+            rows.append(text)
+    return rows
+
+
+def _read_model_selection(
+    parsed: Mapping[str, Any],
+    known_directions: set[str],
+    known_passages: set[str],
+    proposals: Sequence[Any],
+) -> dict[str, Any]:
+    """Explicit pairs are the rereads. Flat lists are derived, or a mismatch.
+
+    Empty flat lists were not sent. A non-empty flat list that is not the
+    derived set does not replace the pairs. Unknown ids are rejected. Any
+    dropped request leaves ``status`` incomplete, so a warning is not paired
+    with a completed stage.
+    """
+    explicit = _explicit_selection_rows(parsed)
+    if any(item["direction_id"] or item["passage_id"] for item in explicit):
+        rejected: list[dict[str, Any]] = []
+        kept: list[dict[str, str]] = []
+        for item in explicit:
+            reasons = []
+            if not item["direction_id"] or not item["passage_id"]:
+                reasons.append("missing_id")
+            if item["direction_id"] and item["direction_id"] not in known_directions:
+                reasons.append("unknown_direction")
+            if item["passage_id"] and item["passage_id"] not in known_passages:
+                reasons.append("unknown_passage")
+            if reasons:
+                rejected.append({**item, "reasons": reasons})
+            else:
+                kept.append(item)
+        pairs = _dedupe_pairs(kept)
+        direction_ids = _unique_ids([row["direction_id"] for row in pairs])
+        passage_ids = _unique_ids([row["passage_id"] for row in pairs])
+        flat_directions = [str(item) for item in (parsed.get("direction_ids") or [])]
+        flat_passages = [str(item) for item in (parsed.get("passage_ids") or [])]
+        mismatch = None
+        if flat_directions or flat_passages:
+            if set(flat_directions) != set(direction_ids) or set(flat_passages) != set(passage_ids):
+                mismatch = {
+                    "direction_ids": flat_directions,
+                    "passage_ids": flat_passages,
+                    "derived_direction_ids": direction_ids,
+                    "derived_passage_ids": passage_ids,
+                    "wins": "selections",
+                }
+        warnings = []
+        if rejected:
+            warnings.append(
+                "The model named a selection whose direction or passage is not in this corpus. "
+                "That pair was rejected and was not reread."
+            )
+        if mismatch:
+            warnings.append(
+                "The model's selections and its flat id lists do not name the same pairs. "
+                "The selections were used. The stage is incomplete."
+            )
+        status = "incomplete" if rejected or mismatch else "complete"
+        reason = "rejected_selection" if rejected else ("flat_list_mismatch" if mismatch else "")
+        return {
+            "pairs": pairs,
+            "direction_ids": direction_ids,
+            "passage_ids": passage_ids,
+            "unpaired": [],
+            "rejected": rejected,
+            "mismatch": mismatch,
+            "unknown_directions": _unique_ids(
+                [row["direction_id"] for row in rejected if "unknown_direction" in row["reasons"]]
+            ),
+            "unknown_passages": _unique_ids(
+                [row["passage_id"] for row in rejected if "unknown_passage" in row["reasons"]]
+            ),
+            "status": status,
+            "reason": reason,
+            "warnings": warnings,
+        }
+    requested_directions = [str(item) for item in (parsed.get("direction_ids") or [])]
+    requested_passages = [str(item) for item in (parsed.get("passage_ids") or [])]
+    unknown_directions = [item for item in requested_directions if item not in known_directions]
+    unknown_passages = [item for item in requested_passages if item not in known_passages]
+    kept_directions = [item for item in requested_directions if item in known_directions]
+    kept_passages = [item for item in requested_passages if item in known_passages]
+    pairs, unpaired = _model_sampling_pairs(parsed, kept_directions, kept_passages, proposals)
+    warnings = []
+    if unknown_directions or unknown_passages:
+        warnings.append(
+            "The model named direction or passage ids that are not in this corpus. "
+            "Those ids were flagged and were not used as evidence."
+        )
+    if unpaired:
+        warnings.append(
+            "A selected passage was not paired with a direction. "
+            "It was not assigned to the first retrieval proposal."
+        )
+    dropped = bool(unknown_directions or unknown_passages or unpaired)
+    return {
+        "pairs": pairs,
+        "direction_ids": kept_directions,
+        "passage_ids": kept_passages,
+        "unpaired": unpaired,
+        "rejected": [],
+        "mismatch": None,
+        "unknown_directions": unknown_directions,
+        "unknown_passages": unknown_passages,
+        "status": "incomplete" if dropped else "complete",
+        "reason": "selection_incomplete" if dropped else "",
+        "warnings": warnings,
+    }
 
 
 def _selected_pairs(state: Mapping[str, Any]) -> list[dict[str, str]]:
@@ -1588,7 +1788,74 @@ def _reread_payload(
     }
 
 
+def _reread_pair_key(row: Mapping[str, Any]) -> tuple[str, str]:
+    return (str(row.get("direction_id") or ""), str(row.get("passage_id") or ""))
+
+
+def _pending_reread_pairs(state: Mapping[str, Any]) -> list[dict[str, str]]:
+    wanted = _selected_pairs(state)
+    metadata = state.get("metadata") or {}
+    done = {_reread_pair_key(row) for row in (state.get("reread_notes") or []) if isinstance(row, Mapping)}
+    done |= {_reread_pair_key(row) for row in (metadata.get("reread_unsent_pairs") or []) if isinstance(row, Mapping)}
+    return [pair for pair in wanted if _reread_pair_key(pair) not in done]
+
+
+def _reread_partition(state: Mapping[str, Any], *, failed: int) -> tuple[list[dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
+    """Completed notes, the in-flight pair, and pairs not yet sent."""
+    wanted = _selected_pairs(state)
+    done = {_reread_pair_key(row) for row in (state.get("reread_notes") or []) if isinstance(row, Mapping)}
+    completed = [pair for pair in wanted if _reread_pair_key(pair) in done]
+    rest = [pair for pair in wanted if _reread_pair_key(pair) not in done]
+    failed_rows = rest[: max(0, failed)]
+    return completed, failed_rows, rest[len(failed_rows) :]
+
+
+def _finish_reread(
+    metadata: dict[str, Any],
+    notes: Sequence[Mapping[str, Any]],
+    wanted: Sequence[Mapping[str, Any]],
+    unsent: Sequence[Mapping[str, Any]],
+) -> None:
+    done = {_reread_pair_key(row) for row in notes}
+    metadata["reread_unsent_pairs"] = [dict(row) for row in unsent]
+    metadata["reread_unsent_passage_ids"] = [str(row.get("passage_id") or "") for row in unsent]
+    metadata["reread_completed_pairs"] = [dict(pair) for pair in wanted if _reread_pair_key(pair) in done]
+    metadata["reread_notes_do_not_change_saturation_indicators"] = True
+    if metadata.get("reread_incomplete"):
+        metadata["reread_status"] = "incomplete"
+        metadata["sampling_stop"] = str(metadata.get("reread_stop") or metadata.get("sampling_stop") or "incomplete")
+        return
+    if unsent:
+        if metadata.get("stop") == "timeout":
+            metadata["reread_status"] = "incomplete"
+            metadata["reread_stop"] = "timeout"
+            metadata["sampling_stop"] = "timeout"
+        else:
+            metadata["reread_status"] = "budget_limited"
+            metadata["reread_stop"] = str(metadata.get("reread_stop") or "call_allowance")
+            if not notes and wanted:
+                metadata["sampling_stop"] = metadata.get("sampling_stop") or "call_allowance"
+        return
+    metadata["reread_status"] = "complete" if wanted else "skipped"
+    metadata["reread_failed_pairs"] = []
+    metadata["reread_unattempted_pairs"] = []
+    if metadata.get("stop") == "timeout":
+        metadata["stop"] = ""
+        metadata["timeout_recovered"] = True
+        if metadata.get("sampling_stop") == "timeout":
+            metadata["sampling_stop"] = ""
+
+
+def _reread_return(notes: list, metadata: dict[str, Any], logs: list, warnings: list) -> dict:
+    return {"reread_notes": notes, "metadata": metadata, "prompt_log": logs, "warnings": warnings}
+
+
 async def _reread(runtime: SamplingRuntime, state: SamplingState) -> dict:
+    """One direction-passage request, then return so the checkpoint keeps it.
+
+    The next visit skips pairs that already have a note. A timeout on a later
+    visit therefore leaves the earlier note and its prompt row in the checkpoint.
+    """
     metadata = dict(state.get("metadata") or {})
     procedure = metadata.get("procedure") or {}
     notes = list(state.get("reread_notes") or [])
@@ -1597,79 +1864,96 @@ async def _reread(runtime: SamplingRuntime, state: SamplingState) -> dict:
     if procedure.get("pursuit") != "reread":
         return {"reread_notes": notes, "metadata": metadata}
     wanted = _selected_pairs(state)
+    unsent = [dict(row) for row in (metadata.get("reread_unsent_pairs") or []) if isinstance(row, Mapping)]
+    pending = _pending_reread_pairs({"reread_notes": notes, "metadata": {**metadata, "reread_unsent_pairs": unsent}, "directions": state.get("directions"), "passage_proposals": state.get("passage_proposals")})
+    if not pending:
+        _finish_reread(metadata, notes, wanted, unsent)
+        _sync_allowance(metadata, runtime)
+        return _reread_return(notes, metadata, logs, warnings)
+    pair = pending[0]
     passages = {
         str(row.get("passage_id") or ""): row
         for row in (state.get("passages") or [])
         if isinstance(row, Mapping)
     }
+    passage = passages.get(pair["passage_id"])
     allowance = runtime.limiter.provider_allowance
-    unsent: list[dict[str, str]] = []
-    for pair in wanted:
-        passage_id = pair["passage_id"]
-        direction = _direction_row(state, pair["direction_id"])
-        passage = passages.get(passage_id)
+    if passage is None or (allowance is not None and allowance.remaining_calls("coding") == 0):
         if passage is None:
             unsent.append(dict(pair))
-            continue
-        if allowance is not None and allowance.remaining_calls("coding") == 0:
-            unsent.append(dict(pair))
-            metadata["reread_stop"] = "call_allowance"
-            continue
-        messages = _messages("sampling_reread", _reread_payload(state, passage_id, passage, direction))
-        result = await _sampling_call(
-            runtime,
-            runtime.coder,
-            SamplingRereadNote,
-            messages,
-            kind="sampling_reread",
-            stage="coding",
-            metadata=metadata,
-            logs=logs,
-            reserved_output=300,
-        )
-        if result["refused"] or result["unparsed"]:
-            unsent.append(dict(pair))
-            metadata["reread_stop"] = str(result["reason"] or metadata.get("reread_stop") or "incomplete")
-            if result["reason"] in {"request_budget", "token_allowance"} or result["unparsed"]:
-                metadata["reread_status"] = "incomplete"
-            continue
-        parsed = dict(result["parsed"] or {})
-        quote = str(parsed.get("quote") or "")
-        flags = []
-        stored_quote = ""
-        if quote.strip():
-            anchor = anchor_quote(quote, str(passage.get("text") or ""))
-            if anchor.status == "unanchored":
-                flags.append("quote_unanchored")
-            else:
-                stored_quote = anchor.quote or quote
-        notes.append(
-            {
-                "passage_id": passage_id,
-                "direction_id": str(direction.get("direction_id") or pair["direction_id"]),
-                "target_id": str(direction.get("target_id") or ""),
-                "kind": str(direction.get("kind") or ""),
-                "sampling_query": str(direction.get("sampling_query") or ""),
-                "note": str(parsed.get("note") or ""),
-                "quote": stored_quote,
-                "flags": flags,
-                "model_judgment": True,
-                "actor": "llm",
-            }
-        )
-    metadata["reread_unsent_pairs"] = unsent
-    metadata["reread_unsent_passage_ids"] = [item["passage_id"] for item in unsent]
-    if metadata.get("reread_status") == "incomplete":
-        metadata["sampling_stop"] = str(metadata.get("reread_stop") or metadata.get("sampling_stop") or "incomplete")
-    elif unsent:
-        metadata["reread_status"] = "budget_limited"
-        if not notes and wanted:
-            metadata["sampling_stop"] = metadata.get("sampling_stop") or "call_allowance"
+        else:
+            unsent.extend(dict(item) for item in pending)
+            metadata["reread_unattempted_pairs"] = [dict(item) for item in pending]
+            if metadata.get("stop") != "timeout":
+                metadata["reread_stop"] = "call_allowance"
+        metadata["reread_unsent_pairs"] = unsent
+        metadata["reread_unsent_passage_ids"] = [item["passage_id"] for item in unsent]
+        if passage is None and len(pending) > 1:
+            metadata.pop("reread_status", None)
+        else:
+            _finish_reread(metadata, notes, wanted, unsent)
+        metadata["reread_notes_do_not_change_saturation_indicators"] = True
+        _sync_allowance(metadata, runtime)
+        return _reread_return(notes, metadata, logs, warnings)
+    direction = _direction_row(state, pair["direction_id"])
+    messages = _messages("sampling_reread", _reread_payload(state, pair["passage_id"], passage, direction))
+    result = await _sampling_call(
+        runtime,
+        runtime.coder,
+        SamplingRereadNote,
+        messages,
+        kind="sampling_reread",
+        stage="coding",
+        metadata=metadata,
+        logs=logs,
+        reserved_output=300,
+    )
+    if result["refused"] or result["unparsed"]:
+        unsent.append(dict(pair))
+        metadata["reread_unsent_pairs"] = unsent
+        metadata["reread_unsent_passage_ids"] = [item["passage_id"] for item in unsent]
+        metadata["reread_stop"] = str(result["reason"] or metadata.get("reread_stop") or "incomplete")
+        if result["reason"] in {"request_budget", "token_allowance"} or result["unparsed"]:
+            metadata["reread_incomplete"] = True
+        if len(pending) == 1:
+            _finish_reread(metadata, notes, wanted, unsent)
+        else:
+            metadata.pop("reread_status", None)
+        _sync_allowance(metadata, runtime)
+        return _reread_return(notes, metadata, logs, warnings)
+    parsed = dict(result["parsed"] or {})
+    quote = str(parsed.get("quote") or "")
+    flags = []
+    stored_quote = ""
+    if quote.strip():
+        anchor = anchor_quote(quote, str(passage.get("text") or ""))
+        if anchor.status == "unanchored":
+            flags.append("quote_unanchored")
+        else:
+            stored_quote = anchor.quote or quote
+    notes.append(
+        {
+            "passage_id": pair["passage_id"],
+            "direction_id": str(direction.get("direction_id") or pair["direction_id"]),
+            "target_id": str(direction.get("target_id") or ""),
+            "kind": str(direction.get("kind") or ""),
+            "sampling_query": str(direction.get("sampling_query") or ""),
+            "note": str(parsed.get("note") or ""),
+            "quote": stored_quote,
+            "flags": flags,
+            "model_judgment": True,
+            "actor": "llm",
+        }
+    )
+    done = {_reread_pair_key(row) for row in notes}
+    metadata["reread_completed_pairs"] = [dict(item) for item in wanted if _reread_pair_key(item) in done]
+    if len(pending) == 1:
+        _finish_reread(metadata, notes, wanted, unsent)
     else:
-        metadata["reread_status"] = "complete" if wanted else "skipped"
+        metadata.pop("reread_status", None)
     metadata["reread_notes_do_not_change_saturation_indicators"] = True
     _sync_allowance(metadata, runtime)
-    return {"reread_notes": notes, "metadata": metadata, "prompt_log": logs, "warnings": warnings}
+    return _reread_return(notes, metadata, logs, warnings)
 
 
 def _pursuit(runtime: SamplingRuntime):
@@ -1995,6 +2279,11 @@ def export_sampling_state(state: Mapping[str, Any], directory: str | Path) -> di
         "model_saturation_judgment": metadata.get("model_saturation_judgment"),
         "model_direction_ids": metadata.get("model_direction_ids"),
         "model_passage_ids": metadata.get("model_passage_ids"),
+        "model_sampling_pairs": metadata.get("model_sampling_pairs"),
+        "model_rejected_selections": metadata.get("model_rejected_selections"),
+        "reread_completed_pairs": metadata.get("reread_completed_pairs"),
+        "reread_failed_pairs": metadata.get("reread_failed_pairs"),
+        "reread_unattempted_pairs": metadata.get("reread_unattempted_pairs"),
         "researcher_sampling": metadata.get("researcher_sampling"),
         "corpus_status": metadata.get("corpus_status"),
         "new_data_collection": metadata.get("new_data_collection"),
@@ -2057,6 +2346,25 @@ def _export(output_dir: str | Path | None):
     return export_sampling
 
 
+def _route_after_checkpoint(state: SamplingState) -> str:
+    """Repair is a second visit. A human interrupt is not asked again."""
+    if (state.get("metadata") or {}).get("selection_repair_pending"):
+        return "sampling_checkpoint"
+    return "record_ledger"
+
+
+def _route_after_reread(state: SamplingState) -> str:
+    """One more reread step while a pair has not been stored or withheld."""
+    metadata = state.get("metadata") or {}
+    if str((metadata.get("procedure") or {}).get("pursuit") or "") != "reread":
+        return "update_ledger"
+    if metadata.get("reread_status") in {"complete", "skipped", "budget_limited", "incomplete"}:
+        return "update_ledger"
+    if _pending_reread_pairs(state):
+        return "pursuit_reread"
+    return "update_ledger"
+
+
 def build_sampling_graph(runtime: SamplingRuntime | None = None, *, output_dir: str | Path | None = None):
     """Uncompiled theoretical-sampling graph. It is not inserted into axial or selective coding."""
     runtime = runtime or SamplingRuntime(coder=_IdleModel(), request_timeout=0)
@@ -2074,9 +2382,17 @@ def build_sampling_graph(runtime: SamplingRuntime | None = None, *, output_dir: 
     builder.add_edge("load_sampling_state", "rank_directions")
     builder.add_edge("rank_directions", "retrieve_passages")
     builder.add_edge("retrieve_passages", "sampling_checkpoint")
-    builder.add_edge("sampling_checkpoint", "record_ledger")
+    builder.add_conditional_edges(
+        "sampling_checkpoint",
+        _route_after_checkpoint,
+        ["sampling_checkpoint", "record_ledger"],
+    )
     builder.add_edge("record_ledger", "pursuit_reread")
-    builder.add_edge("pursuit_reread", "update_ledger")
+    builder.add_conditional_edges(
+        "pursuit_reread",
+        _route_after_reread,
+        ["pursuit_reread", "update_ledger"],
+    )
     builder.add_edge("update_ledger", "saturation_decision")
     builder.add_edge("saturation_decision", "export_sampling")
     builder.add_edge("export_sampling", END)
@@ -2166,19 +2482,47 @@ async def _record_timeout(graph, config, exc: BaseException, output_dir, runtime
         note = f"Theoretical sampling is incomplete because step {step} exceeded its timeout. Work already written is kept."
     if note not in warnings:
         warnings.append(note)
+    logs = list(state.get("prompt_log") or [])
+    before_calls = int((metadata.get("provider_budget") or {}).get("calls_used") or 0)
     if runtime is not None:
         _sync_allowance(metadata, runtime)
+    after_calls = int((metadata.get("provider_budget") or {}).get("calls_used") or 0)
+    if after_calls > before_calls:
+        logs.append(
+            _prompt_row(
+                "provider",
+                [],
+                {},
+                status="timeout",
+                reason="timeout",
+                needs_review=True,
+                flagged=True,
+                calls=after_calls - before_calls,
+            )
+        )
+    if step == "pursuit_reread":
+        completed, failed_rows, unattempted = _reread_partition(
+            {**state, "metadata": metadata},
+            failed=1 if after_calls > before_calls else 0,
+        )
+        metadata["reread_completed_pairs"] = completed
+        metadata["reread_failed_pairs"] = failed_rows
+        metadata["reread_unattempted_pairs"] = unattempted
+        # Not "incomplete": that status would route past this node. Resume
+        # re-enters it, skips stored notes, and retries the failed pair.
+        metadata["reread_status"] = "timeout"
+        metadata["reread_stop"] = "timeout"
     metadata.update(status="incomplete", complete=False, stop="timeout", timeout_error=str(exc), timeout_step=step, saturation_judgment=None, graph_finished=False)
     paths = dict(state.get("export_paths") or {})
     place = output_dir or metadata.get("output_dir")
-    held = {**state, "metadata": metadata, "warnings": warnings}
+    held = {**state, "metadata": metadata, "warnings": warnings, "prompt_log": logs}
     if place:
         try:
             paths = export_sampling_state(held, place)
             metadata["partial_export"] = True
         except Exception:
             logger.warning("Partial sampling export failed after a timeout", exc_info=True)
-    update = {"metadata": metadata, "warnings": warnings, "export_paths": paths}
+    update = {"metadata": metadata, "warnings": warnings, "prompt_log": logs, "export_paths": paths}
     try:
         nodes = getattr(graph, "nodes", {})
         if step and step in nodes:
@@ -2235,7 +2579,11 @@ def _restore(runtime: SamplingRuntime, metadata: Mapping[str, Any]) -> None:
 
 
 def _sampling_recursion_limit(procedure: Mapping[str, Any], *, override: int | None = None) -> int:
-    """Steps for the linear sampling graph, plus the planned calls as headroom."""
+    """Steps for the sampling graph, plus the planned calls as headroom.
+
+    Each reread is one step, and a selection repair is one extra visit. Both
+    sit inside the call ceilings. The overhead is not a new analytic setting.
+    """
     if override is not None:
         return max(1, int(override))
     calls = int(procedure.get("max_sampling_review_calls") or 0) + int(procedure.get("max_decision_calls") or 0)
@@ -2262,7 +2610,12 @@ async def _invoke(builder, saver, initial, *, thread_id: str, resume, resuming: 
             saved = dict((snapshot.values or {}).get("metadata") or {})
             _check_resume(saved.get("procedure") or {}, procedure, allow_changes=allow_changes)
             _restore(runtime, saved)
-            await graph.ainvoke(Command(resume=resume), config)
+            if getattr(snapshot, "interrupts", ()):
+                await graph.ainvoke(Command(resume=resume), config)
+            else:
+                # A timeout is not a human interrupt. Continue the node that
+                # did not return. Command(resume=...) is only for interrupt().
+                await graph.ainvoke(None, config)
         else:
             if has_state:
                 raise SamplingError(f"Thread {thread_id!r} already has a run. Pass resuming=True or a new thread_id.")
@@ -2299,7 +2652,15 @@ async def _invoke(builder, saver, initial, *, thread_id: str, resume, resuming: 
                 raise
             raise TimeoutError(str(exc)) from exc
         snapshot = await graph.aget_state(config)
-        return _result_from_state(dict(getattr(snapshot, "values", None) or {}), interrupted=False, payload=None, thread_id=thread_id, resumable=False)
+        nxt = [str(item) for item in (getattr(snapshot, "next", ()) or ()) if item]
+        resumable = any(item in {"pursuit_reread", "sampling_checkpoint"} for item in nxt)
+        return _result_from_state(
+            dict(getattr(snapshot, "values", None) or {}),
+            interrupted=False,
+            payload=None,
+            thread_id=thread_id,
+            resumable=resumable,
+        )
     snapshot = await graph.aget_state(config)
     payloads = _payloads(snapshot)
     interrupted = bool(payloads)
