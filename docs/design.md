@@ -401,7 +401,11 @@ Package 0.9.3 classifies a negative case for the respondent after that responden
 
 Package 0.9.4 keeps a sampling reread on the direction the researcher or the model paired with that passage. A passage selected for two directions is two rereads, and each one spends a coding call. A quotation found in a complementary passage is stored with `quote_passage_id` and offsets, while `passage_id` stays the selected candidate. Older records that omit `quote_passage_id` are still read. Axial coding reconciles pairs that have no category passage before the proposal loop, and the derived step allowance includes a defer or split return for each planned pair. A step limit that is still hit returns the partial result. The design is [design-review-fixes-094.md](design-review-fixes-094.md).
 
-`policy_version` is `0.9.4`.
+`policy_version` was `0.9.4`.
+
+Package 0.9.5 stores each sampling reread before the next request. A later timeout keeps the completed note, its usage, and its prompt row, and lists the failed and unattempted pairs. Resume does not send a reread that already has a note, and it does not reset the allowance. An explicit model selection is the set of rereads. A flat id list that disagrees is reported, and the stage is incomplete when any requested pair was dropped. The design is [design-review-fixes-095.md](design-review-fixes-095.md).
+
+`policy_version` is `0.9.5`.
 
 ## 26. Out of scope
 

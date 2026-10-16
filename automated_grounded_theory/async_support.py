@@ -1301,6 +1301,7 @@ async def ainvoke_structured(
     raw_out: list | None = None,
     preserve_failed: bool = False,
     send_repair_overflow: bool = True,
+    attempt_repair: bool = True,
     allowance_kind: str = "structured",
     allowance_stage: str | None = None,
     call_audits: list | None = None,
@@ -1321,9 +1322,13 @@ async def ainvoke_structured(
     Both acquisitions use ``allowance_stage``, so a repair spends the
     originating stage's call allowance. When the repair does not fit and
     ``preserve_failed`` is true, the failed output is returned with
-    ``_agt_unparsed`` instead of being dropped. A repair that also fails to
+    ``_agt_unparsed`` instead of being dropped.     A repair that also fails to
     parse keeps that second response and its usage, and the returned usage
     is the sum of both responses.
+
+    ``attempt_repair=False`` returns after the first response. A parse failure
+    is ``_agt_unparsed`` with ``needs_repair`` and is not followed by a second
+    provider call. The caller can checkpoint that response before repairing.
     """
     from langchain_core.messages import HumanMessage
 
@@ -1405,6 +1410,17 @@ async def ainvoke_structured(
                 "raw_response": failed_raw,
             }
         )
+        if not attempt_repair:
+            payload = {
+                "_agt_unparsed": True,
+                "needs_review": True,
+                "flagged": True,
+                "needs_repair": True,
+                "reason": "parse_failed",
+                "error": str(first),
+                "raw_response": failed_raw,
+            }
+            return (payload, failed_usage), sent
         repair = list(messages) + [
             HumanMessage(
                 content=(

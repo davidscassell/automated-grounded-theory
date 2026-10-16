@@ -33,8 +33,8 @@ from tests.test_v074 import _passage, _segment
 
 
 def test_version_is_075():
-    assert __version__ == "0.9.4"
-    assert POLICY_VERSION == "0.9.4"
+    assert __version__ == "0.9.5"
+    assert POLICY_VERSION == "0.9.5"
 
 
 def _prompt_text(result) -> str:

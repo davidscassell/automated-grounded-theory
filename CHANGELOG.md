@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.5
+
+- Each sampling reread is one graph step. A later timeout keeps the notes, usage, and prompt rows already stored. The partial result lists completed, failed, and unattempted pairs. Resume skips completed rereads and keeps the consumed allowance. A selection that does not parse is checkpointed before its repair, so a repair timeout keeps that first response.
+- Explicit `selections` are the rereads. They are checked against the directions and the corpus. The flat id lists are derived from the pairs that pass. Empty flat lists were not sent. A non-empty flat list that names a different set does not replace the pairs, and the stage is incomplete. A pair that names an unknown direction or passage is rejected. Dropped reread work is not reported as complete.
+- The design is [docs/design-review-fixes-095.md](docs/design-review-fixes-095.md). `policy_version` is `0.9.5`.
+
 ## 0.9.4
 
 - A sampling reread is a `(direction_id, passage_id)` pair. A researcher's passage assignment is not moved to a direction that only retrieved the passage. A passage selected for two directions is reread once per direction, and each reread spends its own coding call. An unsent pair names the direction.
