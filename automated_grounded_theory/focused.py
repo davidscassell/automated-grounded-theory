@@ -4567,6 +4567,10 @@ def _claim_test_relevance(
                     judgment = str(row.get("judgment") or "")
                     if judgment not in {"supports", "contradicts", "qualifies", "irrelevant"}:
                         continue
+                    if row.get("synthetic") or row.get("excluded_from_research_outputs"):
+                        continue
+                    if str(row.get("passage_id") or "") == SYNTHETIC_PASSAGE_ID:
+                        continue
                     rows.append(row)
             for row in rows:
                 judgments += 1
@@ -4675,7 +4679,9 @@ def _apply_claim_test(
     judgment = str(row.get("judgment") or "").strip().casefold()
     if judgment not in {"supports", "contradicts", "qualifies", "irrelevant"}:
         return None
-    counts[judgment] = int(counts.get(judgment) or 0) + 1
+    synthetic_judgment = passage_id == SYNTHETIC_PASSAGE_ID or bool(row.get("synthetic"))
+    if not synthetic_judgment:
+        counts[judgment] = int(counts.get(judgment) or 0) + 1
     entry_id = str(row.get("entry_id") or "")
     reason = str(invalid_reason or "")
     if reason:
@@ -4874,7 +4880,7 @@ def _commit_node(runtime: FocusedRuntime):
             parsed = proposal.get("coding") or {}
             sent_ids = [str(item) for item in (proposal.get("passage_ids") or [])]
             returned = [dict(item) for item in (parsed.get("passages") or []) if isinstance(item, Mapping)]
-            returned_ids = {str(item.get("passage_id") or "") for item in returned}
+            returned_ids = {_canonical_passage_id(str(item.get("passage_id") or "")) for item in returned}
             if any(pid and pid in sent_ids for pid in returned_ids):
                 addressed = True
             extra_calls += max(0, int(proposal.get("calls") or 1) - 1)

@@ -200,6 +200,297 @@ def thematic_saturation_report(
     }
 
 
+STOPPING_QUIET_ROUNDS = 2
+LOW_PAIR_COVERAGE_MIN_PLANNED = 10
+LOW_PAIR_COVERAGE_RATE = 0.05
+LOW_PAIR_COVERAGE_MIN_RELATIONSHIPS = 2
+_REJECTED_RELATION_DISPOSITIONS = frozenset({"rejected", "merged"})
+
+
+def pair_coverage_reading(
+    planned: int | None,
+    completed: int | None,
+    relationships_found: int | None,
+) -> dict:
+    """Whether the pairs actually examined can support a saturation reading.
+
+    Below 10 planned pairs the criterion stays undefined. At or above that
+    bar, coverage under 0.05 or fewer than 2 relationships is unmet. A missing
+    planned count stays undefined. The rate is not filled in as zero.
+    """
+    threshold = {
+        "min_planned": LOW_PAIR_COVERAGE_MIN_PLANNED,
+        "max_low_rate": LOW_PAIR_COVERAGE_RATE,
+        "min_relationships": LOW_PAIR_COVERAGE_MIN_RELATIONSHIPS,
+    }
+    found = None if relationships_found is None else int(relationships_found)
+    if planned is None:
+        return {
+            "status": "undefined",
+            "low": False,
+            "pair_coverage": None,
+            "pairs_planned": None,
+            "pairs_completed": None if completed is None else int(completed),
+            "relationships_found": found,
+            "caveat": "",
+            "threshold": threshold,
+        }
+    planned_n = int(planned)
+    completed_n = 0 if completed is None else int(completed)
+    if planned_n <= 0:
+        return {
+            "status": "undefined",
+            "low": False,
+            "pair_coverage": None,
+            "pairs_planned": planned_n,
+            "pairs_completed": completed_n,
+            "relationships_found": found,
+            "caveat": "",
+            "threshold": threshold,
+        }
+    rate = round(completed_n / planned_n, 4)
+    low_rate = planned_n >= LOW_PAIR_COVERAGE_MIN_PLANNED and rate < LOW_PAIR_COVERAGE_RATE
+    thin = (
+        planned_n >= LOW_PAIR_COVERAGE_MIN_PLANNED
+        and found is not None
+        and found < LOW_PAIR_COVERAGE_MIN_RELATIONSHIPS
+    )
+    low = low_rate or thin
+    if planned_n < LOW_PAIR_COVERAGE_MIN_PLANNED:
+        status = "undefined"
+    elif low:
+        status = "unmet"
+    else:
+        status = "met"
+    caveat = ""
+    if low:
+        found_text = "undefined" if found is None else str(found)
+        caveat = (
+            f"{completed_n} of {planned_n} pairs were examined (coverage {rate}). "
+            f"Relationships found: {found_text}. "
+            "That coverage is not interpretable as sufficient_for_this_question."
+        )
+    return {
+        "status": status,
+        "low": low,
+        "pair_coverage": rate,
+        "pairs_planned": planned_n,
+        "pairs_completed": completed_n,
+        "relationships_found": found,
+        "caveat": caveat,
+        "threshold": threshold,
+    }
+
+
+def gate_model_saturation(record: Mapping | None, reading: Mapping | None) -> dict:
+    """Keep a low-coverage sufficiency claim from standing as a judgment.
+
+    The model's words stay on ``model_said``. ``sufficient_for_this_question``
+    is withheld. Other assessments stay, with the caveat required. ``judgment``
+    is not a field this function sets.
+    """
+    row = dict(record or {})
+    if not reading or not reading.get("low"):
+        row.setdefault("status", "recorded")
+        return row
+    said = row.get("assessment")
+    row["model_said"] = said
+    row["status"] = "not_interpretable"
+    row["coverage_caveat"] = str(reading.get("caveat") or "")
+    row["pair_coverage"] = reading.get("pair_coverage")
+    row["pairs_planned"] = reading.get("pairs_planned")
+    row["pairs_completed"] = reading.get("pairs_completed")
+    row["relationships_found"] = reading.get("relationships_found")
+    if said == "sufficient_for_this_question":
+        row["assessment"] = None
+        row["withheld_reason"] = "low_pair_coverage"
+    return row
+
+
+def _window_rate(report: Mapping, key: str, point_key: str) -> float | None:
+    """A rate already on the report, or the mean of document points. Missing stays missing."""
+    if key in report and report.get(key) is not None:
+        return float(report[key])
+    points = [row for row in (report.get("points") or []) if isinstance(row, Mapping)]
+    if not points or any(point_key not in row or row.get(point_key) is None for row in points):
+        return None
+    total = sum(int(row.get(point_key) or 0) for row in points)
+    return round(total / len(points), 4)
+
+
+def _rate_criterion(
+    name: str,
+    observed: float | None,
+    *,
+    n_documents: int | None,
+    min_documents: int,
+) -> dict:
+    threshold = {"window_rate_at_most": 0.0, "min_documents": min_documents}
+    if n_documents is None or int(n_documents) < min_documents or observed is None:
+        status = "undefined"
+    elif float(observed) <= 0.0:
+        status = "met"
+    else:
+        status = "unmet"
+    return {
+        "criterion": name,
+        "status": status,
+        "threshold": threshold,
+        "observed": observed,
+        "n_documents": n_documents,
+    }
+
+
+def _core_has_endpoint(core_id: str, relationships: Sequence[Mapping] | None) -> bool:
+    for row in relationships or []:
+        if not isinstance(row, Mapping) or row.get("synthetic"):
+            continue
+        if "statement" in row and not str(row.get("statement") or "").strip():
+            continue
+        if str(row.get("disposition") or "") in _REJECTED_RELATION_DISPOSITIONS:
+            continue
+        if core_id and core_id in {str(row.get("from_id") or ""), str(row.get("to_id") or "")}:
+            return True
+    return False
+
+
+def stopping_criteria_report(
+    saturation: Mapping | None,
+    ledger: Sequence[Mapping] | None = None,
+    *,
+    core_id: str = "",
+    relationships: Sequence[Mapping] | None = None,
+    quiet_rounds: int = STOPPING_QUIET_ROUNDS,
+    min_documents: int = SATURATION_MIN_DOCUMENTS,
+) -> dict:
+    """Which stopping criteria are met, unmet, or undefined.
+
+    The report does not decide that a theory is saturated. ``judgment`` stays
+    null. A rate that was not computed stays undefined rather than zero.
+    """
+    report = dict(saturation or {})
+    points = [row for row in (report.get("points") or []) if isinstance(row, Mapping)]
+    n_documents = report.get("n_documents")
+    if n_documents is None:
+        n_documents = len(points) if points else None
+    else:
+        n_documents = int(n_documents)
+    rounds = [row for row in (ledger or []) if isinstance(row, Mapping)]
+    quiet = max(1, int(quiet_rounds))
+    criteria = [
+        _rate_criterion(
+            "new_codes",
+            _window_rate(report, "window_new_code_rate", "new_codes"),
+            n_documents=n_documents,
+            min_documents=min_documents,
+        ),
+        _rate_criterion(
+            "new_properties",
+            _window_rate(report, "window_new_property_rate", "new_properties"),
+            n_documents=n_documents,
+            min_documents=min_documents,
+        ),
+        _rate_criterion(
+            "new_relationships",
+            _window_rate(report, "window_new_relationship_rate", "new_relationships"),
+            n_documents=n_documents,
+            min_documents=min_documents,
+        ),
+    ]
+    shift = report.get("code_frequency_shift")
+    shift_threshold = {"total_variation_at_most": 0.0, "min_documents": 2}
+    if shift is None or n_documents is None or int(n_documents) < 2:
+        shift_status = "undefined"
+    elif float(shift) <= 0.0:
+        shift_status = "met"
+    else:
+        shift_status = "unmet"
+    criteria.append(
+        {
+            "criterion": "code_frequency_shift",
+            "status": shift_status,
+            "threshold": shift_threshold,
+            "observed": None if shift is None else float(shift),
+            "n_documents": n_documents,
+            "label": CODE_FREQUENCY_SHIFT_LABEL,
+        }
+    )
+    if len(rounds) < quiet:
+        quiet_status = "undefined"
+        quiet_observed = None
+    else:
+        recent = rounds[-quiet:]
+        introduced = [list(row.get("new_direction_keys") or []) for row in recent]
+        quiet_observed = introduced
+        quiet_status = "met" if all(not row for row in introduced) else "unmet"
+    criteria.append(
+        {
+            "criterion": "sampling_rounds_without_new_directions",
+            "status": quiet_status,
+            "threshold": {"quiet_rounds": quiet},
+            "observed": quiet_observed,
+            "sampling_rounds": len(rounds),
+        }
+    )
+    chosen = str(core_id or "")
+    if not chosen:
+        core_status = "undefined"
+        core_supported = None
+    else:
+        core_supported = _core_has_endpoint(chosen, relationships)
+        core_status = "met" if core_supported else "unmet"
+    criteria.append(
+        {
+            "criterion": "core_category_coverage",
+            "status": core_status,
+            "threshold": {"requires_relationship_endpoint": True},
+            "observed": None if not chosen else {"core_id": chosen, "endpoint": core_supported},
+        }
+    )
+    reading = pair_coverage_reading(
+        report.get("pairs_planned") if "pairs_planned" in report else None,
+        report.get("pairs_completed") if "pairs_planned" in report else None,
+        report.get("relationships_found") if "relationships_found" in report else None,
+    )
+    criteria.append(
+        {
+            "criterion": "pair_coverage",
+            "status": reading["status"],
+            "threshold": reading["threshold"],
+            "observed": {
+                "pairs_planned": reading.get("pairs_planned"),
+                "pairs_completed": reading.get("pairs_completed"),
+                "pair_coverage": reading.get("pair_coverage"),
+                "relationships_found": reading.get("relationships_found"),
+            },
+            "low": reading["low"],
+            "caveat": reading.get("caveat") or None,
+        }
+    )
+    if reading["low"]:
+        for row in criteria:
+            if row.get("criterion") == "new_relationships" and row.get("status") == "met":
+                row["status"] = "undefined"
+                row["undefined_reason"] = "low_pair_coverage"
+                row["coverage_caveat"] = reading.get("caveat") or ""
+    return {
+        "model": "stopping_criteria",
+        "declares_saturation": False,
+        "judgment": None,
+        "criteria": criteria,
+        "thresholds_note": (
+            "A criterion is met only at the threshold written on that row. "
+            "met does not mean the theory is saturated. "
+            "undefined stays undefined when the window, the rate, the core, or the sampling ledger cannot support the comparison."
+        ),
+        "note": (
+            "This report states which stopping criteria are met, unmet, or undefined. "
+            "It does not declare the theory saturated. judgment stays null. "
+            "A researcher decision and a model judgment are separate records."
+        ),
+    }
+
+
 def saturation_report(points: Sequence[Mapping]) -> dict:
     rows = [dict(point) for point in points]
     latest = rows[-1] if rows else None

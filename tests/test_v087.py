@@ -25,8 +25,8 @@ from tests.test_v080 import QUOTE, FakeAxialCoder, _corpus
 
 
 def test_version_is_087():
-    assert __version__ == "0.8.7"
-    assert POLICY_VERSION == "0.8.7"
+    assert __version__ == "0.9.1"
+    assert POLICY_VERSION == "0.9.1"
 
 
 def test_generic_stem_does_not_anchor_and_disagreement_is_reported():
@@ -70,8 +70,22 @@ def test_generic_stem_does_not_anchor_and_disagreement_is_reported():
 
 def test_cross_respondent_quotes_do_not_count_as_citation_support():
     book = {
-        "collab": {"code_id": "collab", "code": "improved collaboration", "definition": "planning and service"},
-        "hybrid": {"code_id": "hybrid", "code": "keep hybrid schedule", "definition": "pleading to keep hybrid"},
+        "collab": {"code_id": "collab", "code": "improved collaboration", "definition": "improved collaboration"},
+        "hybrid": {"code_id": "hybrid", "code": "hybrid schedule", "definition": "keep hybrid schedule"},
+    }
+    passages = {
+        "p-collab": {
+            "passage_id": "p-collab",
+            "doc_id": "d-a",
+            "respondent_id": "r-a",
+            "text": "improved collaboration between planning and customer service",
+        },
+        "p-hybrid": {
+            "passage_id": "p-hybrid",
+            "doc_id": "d-b",
+            "respondent_id": "r-b",
+            "text": "Keep the hybrid schedule please",
+        },
     }
     row = {
         "relationship_id": "rel-0001",
@@ -81,7 +95,7 @@ def test_cross_respondent_quotes_do_not_count_as_citation_support():
         "statement": "improved collaboration leads to pleading to keep hybrid schedule",
         "passage_id": "p-collab",
         "quote": "",
-        "quote_from": "Collaborative environment between planning and customer service",
+        "quote_from": "improved collaboration between planning and customer service",
         "quote_to": "Keep the hybrid schedule please",
         "flags": [],
         "endpoint_anchoring": [
@@ -108,12 +122,21 @@ def test_cross_respondent_quotes_do_not_count_as_citation_support():
             ]
         },
         {},
+        passages=passages,
+        codebook=book,
     )[0]
     assert decided["disposition"] == "provisional"
-    assert decided["evidence_status"] == "cross_respondent_pattern"
+    assert decided["evidence_tier"] == 1
+    assert decided["evidence_label"] == "hypothesis"
+    assert decided["evidence_status"] == "hypothesis"
+    assert decided["cross_case"] is True
     assert "acceptance_withheld" in decided["flags"]
+    assert "cross_case" in decided["flags"]
     assert "reviewer_same_passage_mismatch" in decided["flags"]
     assert decided["downstream_eligible"] is False
+    held = _coverage({"codebook": book, "relationships": [decided], "storyline": [], "metadata": {}, "empty_slots": []})
+    assert held["citation_anchoring_rate"] is None
+    assert held["citation_anchoring_by_tier"]["hypothesis"]["citation_rate"] is None
 
 
 def test_empty_statement_is_not_a_relationship_and_blank_rows_are_counted():

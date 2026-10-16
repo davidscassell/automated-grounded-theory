@@ -62,6 +62,12 @@ SELECTIVE_RE = re.compile(
     re.escape(SELECTIVE_BEGIN) + r"\n```mermaid\n(.*?)```\n" + re.escape(SELECTIVE_END),
     re.DOTALL,
 )
+SAMPLING_BEGIN = "<!-- graph:sampling:begin -->"
+SAMPLING_END = "<!-- graph:sampling:end -->"
+SAMPLING_RE = re.compile(
+    re.escape(SAMPLING_BEGIN) + r"\n```mermaid\n(.*?)```\n" + re.escape(SAMPLING_END),
+    re.DOTALL,
+)
 
 
 def _runtime(**overrides) -> RunConfig:
@@ -132,6 +138,11 @@ def axial_mermaid() -> str:
 def selective_mermaid() -> str:
     """Mermaid for ``get_graph("selective")``."""
     return get_graph("selective").compile().get_graph().draw_mermaid()
+
+
+def sampling_mermaid() -> str:
+    """Mermaid for ``get_graph("sampling")``."""
+    return get_graph("sampling").compile().get_graph().draw_mermaid()
 
 
 def readme_mermaid(readme: str) -> str:
@@ -261,12 +272,14 @@ def main(argv: list[str] | None = None) -> int:
     focused = focused_mermaid()
     axial = axial_mermaid()
     selective = selective_mermaid()
+    sampling = sampling_mermaid()
     readme = README_PATH.read_text(encoding="utf-8")
     try:
         current = readme_mermaid(readme)
         current_focused = readme_focused_mermaid(readme)
         current_axial = readme_named_mermaid(readme, AXIAL_RE, AXIAL_BEGIN, AXIAL_END)
         current_selective = readme_named_mermaid(readme, SELECTIVE_RE, SELECTIVE_BEGIN, SELECTIVE_END)
+        current_sampling = readme_named_mermaid(readme, SAMPLING_RE, SAMPLING_BEGIN, SAMPLING_END)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     if args.check:
@@ -278,12 +291,15 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("README axial mermaid block does not match get_graph('axial').draw_mermaid().")
         if current_selective != selective:
             raise SystemExit("README selective mermaid block does not match get_graph('selective').draw_mermaid().")
-        print("README open_code, focused, axial, and selective diagrams match the compiled graphs.")
+        if current_sampling != sampling:
+            raise SystemExit("README sampling mermaid block does not match get_graph('sampling').draw_mermaid().")
+        print("README open_code, focused, axial, selective, and sampling diagrams match the compiled graphs.")
         return 0
     updated = replace_readme_mermaid(readme, mermaid)
     updated = replace_focused_mermaid(updated, focused)
     updated = _replace_block(updated, AXIAL_RE, AXIAL_BEGIN, AXIAL_END, axial)
     updated = _replace_block(updated, SELECTIVE_RE, SELECTIVE_BEGIN, SELECTIVE_END, selective)
+    updated = _replace_block(updated, SAMPLING_RE, SAMPLING_BEGIN, SAMPLING_END, sampling)
     if updated != readme:
         README_PATH.write_text(updated, encoding="utf-8")
         print(f"Updated {README_PATH.relative_to(ROOT)}")

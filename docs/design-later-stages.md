@@ -318,6 +318,8 @@ Incomplete later stages leave `category_saturation.status` as `incomplete` and n
 
 ## 10. Theoretical sampling inside a fixed corpus
 
+Package 0.9.0 implements this stage as `get_graph("sampling")`, written up in [design-sampling-0900.md](design-sampling-0900.md). The graph proposes directions and passages already in the corpus. It does not collect new data. `pursuit` still defaults to a brief rather than a recode. The notes below are the literature design this implementation followed.
+
 ### What the literature requires
 
 Theoretical sampling directs further analysis by the categories already earned (Glaser & Strauss, 1967; Charmaz, 2006). Aldiabat and Le Navenec (2018) treat it as part of how saturation is reached. The constant comparative chapter allows that sampling on new data or on qualitative data already collected (Glaser & Strauss, 2008). When a category is thin, the analyst can return to the notes or return to the field. Charmaz (2006) stresses the return to the field: sampling fills gaps that the initial sample was not built to fill, and it starts after categories exist. A seed shuffle of a corpus chosen in advance is neither of those returns. The methodology document already says the default run is not theoretical sampling.

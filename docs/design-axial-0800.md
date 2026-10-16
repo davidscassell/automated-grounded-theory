@@ -2,7 +2,7 @@
 
 This note is the design for package 0.8.0, with the 0.8.1, 0.8.2, 0.8.3, 0.8.4, 0.8.5, 0.8.6, and 0.8.7 corrections below. It sits on the focused-coding graph from 0.7.9. The default run is still initial coding plus a theme report. Focused coding is unchanged. Axial coding, saturation indicators, and selective coding are separate graphs. [design-later-stages.md](design-later-stages.md) is the longer literature note. This file is the slice that is implemented.
 
-`policy_version` is `0.8.7`.
+`policy_version` was `0.8.7` for this axial note. Package `policy_version` is `0.9.1`. 0.9.0 did not rebuild these graphs. It does record the v29 citation, memo, counterexample, and saturation-review fixes on them. 0.9.1 replaces the both-quotes-in-one-passage acceptance rule with evidence tiers. Sampling and the saturation decision are in [design-sampling-0900.md](design-sampling-0900.md). The tiers are in [design-relationship-tiers.md](design-relationship-tiers.md).
 
 ## 0.8.7 corrections
 

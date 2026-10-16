@@ -30,8 +30,8 @@ from tests.test_v080 import QUOTE, FakeAxialCoder, _corpus
 
 
 def test_version_is_085():
-    assert __version__ == "0.8.7"
-    assert POLICY_VERSION == "0.8.7"
+    assert __version__ == "0.9.1"
+    assert POLICY_VERSION == "0.9.1"
 
 
 def test_endpoint_anchoring_is_not_a_single_quote():
@@ -71,7 +71,9 @@ def test_endpoint_anchoring_is_not_a_single_quote():
     assert rows[0]["reason"] == "quote_misses_category"
     assert rows[1]["anchored"] is True
     only = _coverage({"codebook": book, "relationships": [both], "storyline": [], "metadata": {}, "empty_slots": []})
-    assert only["citation_anchoring_rate"] == 1.0
+    assert only["citation_anchoring_rate"] is None
+    assert only["citation_anchoring_by_tier"]["pattern_supported"]["citation_rate"] is None
+    assert only["citation_anchoring_by_tier"]["pattern_supported"]["n"] == 0
     assert only["endpoint_anchoring_rate"] == 1.0
 
 
