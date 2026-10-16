@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.6
+
+- A relationship is accepted only when each endpoint has its own evidence: `quote_from` and `quote_to`, or one quote that matches both. A match is a content stem shared with the category label, its definition, or a segment quote, or an embedding at or above 0.55. Stopwords, including `from`, do not count. `matched_tokens` records the stems. A one-sided row stays in the run as `provisional` with `acceptance_withheld`, and the reviewer and the storyline see that status.
+- Counterexample passages are retrieved by meaningful overlap with both endpoints, or by an embedding at the evidence threshold. One-sided overlap is skipped. `relationships_with_negative_case_search` and the claim `relevance_rate` are null when no relevant judgment was made, including a round that is entirely irrelevant.
+- A storyline statement that cites a passage the request did not send is flagged `storyline_unsent_passage`. A statement with no relationship is flagged `storyline_no_relationship`. Packing drops an uncited passage before a relationship's own passage.
+- `memo_quote_unsupported` fires only when the memo shares no meaningful token with the quote. A memo that says a partial row is supported is `memo_overclaims_support`. A memo that contradicts the relationship's own rationale is `memo_contradicts_relationship`. Memos are asked to state whether the evidence is two-sided or partial. `memo_accounting.produced` counts memos written in this run. `preexisting` is separate.
+- An omitted planning seed is derived from the corpus hash and recorded as `seed_source`. An explicit seed, including 0, is kept. `pair_coverage_statement` reports examined pairs over the unordered pair count. The same seed examines the same pairs.
+- A focused queue that finished is stage status `complete`. `complete_for_queue` remains the run status when passages were never queued, and the stage reason is `queue_complete`.
+- Temperature is set to 0 when the chat model allows it and it was unset. `model_temperature`, `model_seed`, and `model_determinism` are on the run. `unset` means the instance did not take a temperature.
+- After a call reports provider input tokens, an over-prediction at or below 3 times is compared as raw times 1.10 divided by that ratio, and never above the raw heuristic. An under-prediction, the first call, and a ratio above 3 stay on the raw heuristic. `token_estimate_ratio` is the raw heuristic divided by provider input tokens. The 1.28 adjusted reading is still not the stopper.
+- A saturation window below 3 documents is `not_interpretable`. `n_documents` is on the report and in the reviewer prompt. `new_code_rate` is not treated as a saturation claim on that window. `judgment` stays null.
+- The synthetic counterexample text sent to the model does not announce itself. The label and the limitation stay in the audit. The injection only checks that a contradicting passage can be recorded. Research exports omit it.
+- `policy_version` is `0.8.6`.
+
 ## 0.8.5
 
 - A relationship quote anchors an endpoint only when it shares a content token with that category. `citation_anchoring_rate` is 1 only when both endpoints are anchored, and otherwise null. `endpoint_anchoring_rate` is the share of endpoints the quote names.

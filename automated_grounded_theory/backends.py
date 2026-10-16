@@ -145,6 +145,29 @@ def _clean_setting(name: str, value: Any) -> Any:
     return _MISSING
 
 
+def record_model_determinism(model: BaseChatModel | str | None) -> dict[str, Any]:
+    """Record temperature and seed. Set temperature 0 only when the instance allows it.
+
+    An already-set temperature is left alone. When the instance has no
+    temperature and assignment fails, ``model_determinism`` is ``unset``.
+    """
+    if model is not None and not isinstance(model, str):
+        current = _declared_setting(model, "temperature")
+        if current is _MISSING or current is None:
+            try:
+                setattr(model, "temperature", 0.0)
+            except Exception:
+                pass
+    settings = chat_model_settings(model)
+    temperature = settings.get("temperature")
+    return {
+        "chat_model_settings": settings,
+        "model_temperature": temperature if temperature is not None else None,
+        "model_seed": settings.get("seed"),
+        "model_determinism": "recorded" if temperature is not None else "unset",
+    }
+
+
 def chat_model_settings(model: BaseChatModel | str | None) -> dict[str, Any]:
     """Non-secret settings from the chat model that will actually run.
 

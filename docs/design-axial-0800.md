@@ -1,8 +1,20 @@
-# Axial coding, saturation, and later steps (0.8.0, fixes in 0.8.1, 0.8.2, 0.8.3, 0.8.4, and 0.8.5)
+# Axial coding, saturation, and later steps (0.8.0, fixes in 0.8.1, 0.8.2, 0.8.3, 0.8.4, 0.8.5, and 0.8.6)
 
-This note is the design for package 0.8.0, with the 0.8.1, 0.8.2, 0.8.3, 0.8.4, and 0.8.5 corrections below. It sits on the focused-coding graph from 0.7.9. The default run is still initial coding plus a theme report. Focused coding is unchanged. Axial coding, saturation indicators, and selective coding are separate graphs. [design-later-stages.md](design-later-stages.md) is the longer literature note. This file is the slice that is implemented.
+This note is the design for package 0.8.0, with the 0.8.1, 0.8.2, 0.8.3, 0.8.4, 0.8.5, and 0.8.6 corrections below. It sits on the focused-coding graph from 0.7.9. The default run is still initial coding plus a theme report. Focused coding is unchanged. Axial coding, saturation indicators, and selective coding are separate graphs. [design-later-stages.md](design-later-stages.md) is the longer literature note. This file is the slice that is implemented.
 
-`policy_version` is `0.8.5`.
+`policy_version` is `0.8.6`.
+
+## 0.8.6 corrections
+
+**Both endpoints, or the row stays provisional.** A proposal can cite `quote_from` and `quote_to`, or one quote that names both categories. An endpoint anchors when that quote shares a content stem with the label, the definition, or a segment quote, or when an embedding is at or above 0.55. Stopwords, including `from`, are not stems. `matched_tokens` lists what matched. A passage assignment is still not that evidence. Human accept and model accept of a one-sided row set `disposition` to `provisional`, `acceptance_requested` to `accepted`, and `acceptance_withheld`. The row is kept. The reviewer payload includes `endpoint_anchoring`, and the storyline is told not to present a provisional row as accepted.
+
+**Tests of the claim.** Counterexample search queues a passage that shares a meaningful stem with both endpoints, or an embedding at the threshold. Opposite-pole wording about both endpoints is first. One-sided overlap is counted and not sent. `relationships_with_negative_case_search` is relevant judgments over all relationships. It is null, with `negative_case_relevance` `undefined_no_relevant_judgment`, when judgments exist and none are relevant. Focused `relevance_rate` follows the same rule.
+
+**Storyline and memos.** `storyline_unsent_passage` flags a statement whose passage was not in the request. `storyline_no_relationship` flags a statement with no relationship id. Packing drops an uncited passage before it drops a relationship's passage. `memo_quote_unsupported` is only a memo that shares no meaningful token with the quote. `memo_overclaims_support` is support language on a partial row. `memo_contradicts_relationship` is a memo that fights the row's own rationale. A memo that does not say whether the evidence is two-sided or partial is `memo_evidence_strength_unstated`. `memo_accounting.produced` counts memos created in this run. `preexisting` is the count already in state.
+
+**Planning, windows, and the allowance.** An omitted `seed` is derived from the corpus hash (`seed_source` `source_hash`). Seed 0 and any other explicit seed stay the caller's (`seed_source` `caller`). The same seed examines the same pairs. `pair_coverage_statement` is "N of M unordered pairs examined". A saturation window with `n_documents` below 3 is `saturation_window` `not_interpretable`. The reviewer prompt states the window size. `judgment` stays null. After one call reports provider input tokens, an over-prediction at or below 3 times is compared as raw times 1.10 divided by the observed ratio, never above the raw heuristic. A larger ratio is reported and does not open the ceiling. `token_estimate_ratio` is on the run. `model_determinism` is `recorded` when temperature is set, including a temperature of 0 applied because the instance had none, and `unset` when it cannot be set.
+
+**Synthetic check.** The passage text sent to the model is a contradicting account. It does not contain the marker. `synthetic_counterexample.label` remains `[synthetic counterexample]`, and `limitation` says the injection only checks that a contradicting passage can be recorded. Research exports omit the passage.
 
 ## 0.8.5 corrections
 

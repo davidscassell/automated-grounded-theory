@@ -64,6 +64,7 @@ def _total_variation(left: Mapping[str, float], right: Mapping[str, float]) -> f
     return 0.5 * sum(abs(float(left.get(key, 0.0)) - float(right.get(key, 0.0))) for key in keys)
 
 
+SATURATION_MIN_DOCUMENTS = 3
 CODE_FREQUENCY_SHIFT_LABEL = (
     "Total variation between the last two documents' code mixes. "
     "0 is the same mix. 1 is maximal change. This is not a stabilization score."
@@ -140,12 +141,19 @@ def thematic_saturation_report(
         "code_frequency_stabilization stores that same total variation for older readers. "
         "A 0.8.0 report stored presence bits (1 once a code had been seen) and is not comparable.",
     ]
+    n_documents = len(rows)
+    window = "not_interpretable" if n_documents < SATURATION_MIN_DOCUMENTS else "interpretable"
     if not rows:
         notes.append("Saturation rates are undefined: there are no documents.")
     elif too_few:
         notes.append("Code-frequency shift is undefined: fewer than two documents.")
     elif empty_comparison:
         notes.append("Code-frequency shift is undefined: a document has no code assignments.")
+    if n_documents < SATURATION_MIN_DOCUMENTS:
+        notes.append(
+            f"The saturation window is {n_documents} document(s), below {SATURATION_MIN_DOCUMENTS}. "
+            "That window is not interpretable. new_code_rate on it is not a saturation claim."
+        )
     if property_stability_report is None or property_stability_report.get("name_level") is None:
         notes.append("Property stability across passes is undefined until two runs name properties.")
     if relationship_stability_report is None or relationship_stability_report.get("role_level") is None:
@@ -165,6 +173,8 @@ def thematic_saturation_report(
         "relationship_stability": None if relationship_stability_report is None else dict(relationship_stability_report),
         "property_name_level": property_level,
         "relationship_role_level": relationship_level,
+        "n_documents": n_documents,
+        "saturation_window": window,
         "judgment": None,
         "researcher_saturation": None,
         "model_saturation": None,

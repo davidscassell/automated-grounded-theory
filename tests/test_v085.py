@@ -30,8 +30,8 @@ from tests.test_v080 import QUOTE, FakeAxialCoder, _corpus
 
 
 def test_version_is_085():
-    assert __version__ == "0.8.5"
-    assert POLICY_VERSION == "0.8.5"
+    assert __version__ == "0.8.6"
+    assert POLICY_VERSION == "0.8.6"
 
 
 def test_endpoint_anchoring_is_not_a_single_quote():
@@ -77,13 +77,32 @@ def test_endpoint_anchoring_is_not_a_single_quote():
 
 def test_negative_case_rate_uses_every_relationship():
     book = {"a": {"code": "alpha side"}, "b": {"code": "beta side"}}
-    judged = {"relationship_id": "rel-1", "from_id": "a", "to_id": "b", "quote": "alpha", "negative_case_search": True, "flags": []}
-    untouched = {"relationship_id": "rel-2", "from_id": "a", "to_id": "b", "quote": "alpha", "negative_case_search": False, "flags": []}
-    searched_only = {"relationship_id": "rel-3", "from_id": "a", "to_id": "b", "quote": "alpha", "negative_case_search": False, "flags": []}
+    judged = {
+        "relationship_id": "rel-1",
+        "from_id": "a",
+        "to_id": "b",
+        "quote": "alpha",
+        "flags": [],
+        "counterexamples": [{"judgment": "contradicts", "valid_test": True, "synthetic": False}],
+    }
+    untouched = {"relationship_id": "rel-2", "from_id": "a", "to_id": "b", "quote": "alpha", "flags": [], "counterexamples": []}
+    irrelevant = {
+        "relationship_id": "rel-3",
+        "from_id": "a",
+        "to_id": "b",
+        "quote": "alpha",
+        "flags": [],
+        "counterexamples": [{"judgment": "irrelevant", "valid_test": True, "synthetic": False}],
+    }
     coverage = _coverage(
-        {"codebook": book, "relationships": [judged, untouched, searched_only], "storyline": [], "metadata": {}, "empty_slots": []}
+        {"codebook": book, "relationships": [judged, untouched, irrelevant], "storyline": [], "metadata": {}, "empty_slots": []}
     )
     assert coverage["relationships_with_negative_case_search"] == round(1 / 3, 4)
+    uninformative = _coverage(
+        {"codebook": book, "relationships": [irrelevant], "storyline": [], "metadata": {}, "empty_slots": []}
+    )
+    assert uninformative["relationships_with_negative_case_search"] is None
+    assert uninformative["negative_case_relevance"] == "undefined_no_relevant_judgment"
 
 
 def test_axial_counterexample_rejects_irrelevant_rationales():
@@ -182,7 +201,8 @@ def test_memos_reserve_a_storyline_call(tmp_path):
     assert "p1" in story_passages
     assert "p-none" not in story_passages
     assert both.memos
-    assert "memo_quote_unsupported" in both.memos[0]["flags"]
+    assert "memo_quote_unsupported" not in both.memos[0]["flags"]
+    assert "memo_evidence_strength_unstated" in both.memos[0]["flags"]
     assert both.memos[0]["needs_review"] is True
     story = json.loads((tmp_path / "storyline.json").read_text(encoding="utf-8"))
     assert "core_id" in story and "core_provenance" in story

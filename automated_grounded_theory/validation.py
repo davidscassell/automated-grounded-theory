@@ -78,6 +78,147 @@ GENERIC_CODES = frozenset(
     }
 )
 _STOPWORDS = frozenset({"a", "an", "the", "of", "and", "to", "in", "on", "for", "with", "or"})
+# Length >= 4 words that are not category content. One of these must not
+# count as evidence that a quote names a category.
+CONTENT_STOPWORDS = frozenset(
+    {
+        "from",
+        "with",
+        "that",
+        "this",
+        "have",
+        "been",
+        "were",
+        "they",
+        "them",
+        "your",
+        "their",
+        "would",
+        "could",
+        "should",
+        "about",
+        "into",
+        "over",
+        "than",
+        "then",
+        "also",
+        "just",
+        "only",
+        "more",
+        "some",
+        "such",
+        "what",
+        "when",
+        "where",
+        "which",
+        "while",
+        "whose",
+        "because",
+        "through",
+        "during",
+        "after",
+        "before",
+        "being",
+        "other",
+        "these",
+        "those",
+        "there",
+        "here",
+        "very",
+        "much",
+        "many",
+        "most",
+        "each",
+        "both",
+        "same",
+        "well",
+        "back",
+        "even",
+        "still",
+        "like",
+        "make",
+        "made",
+        "want",
+        "need",
+        "used",
+        "using",
+        "does",
+        "dont",
+        "didnt",
+        "doesnt",
+        "wasnt",
+        "werent",
+        "wont",
+        "cant",
+        "cannot",
+        "must",
+        "might",
+        "shall",
+        "upon",
+        "onto",
+        "among",
+        "between",
+        "within",
+        "without",
+        "across",
+        "around",
+        "under",
+        "above",
+        "below",
+        "again",
+        "already",
+        "always",
+        "never",
+        "often",
+        "really",
+        "something",
+        "anything",
+        "nothing",
+        "everything",
+        "someone",
+        "anyone",
+        "everyone",
+        "people",
+        "person",
+        "thing",
+        "things",
+        "stuff",
+        "ways",
+        "time",
+        "times",
+        "year",
+        "years",
+        "said",
+        "says",
+        "saying",
+        "went",
+        "come",
+        "came",
+        "going",
+        "getting",
+        "gotten",
+        "having",
+        "valuing",
+        "wanting",
+        "feeling",
+        "making",
+        "doing",
+        "done",
+        "happened",
+        "happen",
+        "elsewhere",
+        "wouldnt",
+        "helped",
+        "help",
+        "move",
+        "moved",
+        "will",
+        "been",
+        "being",
+        "them",
+        "they",
+    }
+)
 _FALSE_GERUNDS = frozenset(
     {
         "something",
@@ -108,6 +249,34 @@ FUZZY_MATCH_MIN = 0.90
 POSSIBLY_MODIFIED_MIN = 0.60
 QUOTE_FLAG_STATUSES = frozenset({"possibly_modified", "unanchored"})
 _ELLIPSIS = re.compile(r"\.\.\.|…|\[(?:\.\.\.|…|\.\s\.\s\.)\]")
+
+
+def content_stem(token: str) -> str:
+    """A light stem so ``mentoring`` matches ``mentor`` and ``returning`` matches ``return``."""
+    word = str(token or "").casefold()
+    if len(word) > 5 and word.endswith("ing") and word not in _FALSE_GERUNDS:
+        word = word[:-3]
+    elif len(word) > 4 and word.endswith("s") and not word.endswith("ss"):
+        word = word[:-1]
+    return word
+
+
+def meaningful_tokens(text: str) -> set[str]:
+    """Content stems. Stopwords and generic analytic verbs are not overlap.
+
+    A token shorter than 4 characters is dropped. ``from`` is dropped. The
+    stem is what an endpoint test reports, so the match can be audited.
+    """
+    stems: set[str] = set()
+    for raw in str(text or "").casefold().replace("-", " ").replace("_", " ").split():
+        cleaned = "".join(character for character in raw if character.isalnum() or character == "'")
+        if len(cleaned) < 4 or cleaned in CONTENT_STOPWORDS or cleaned in _STOPWORDS:
+            continue
+        stem = content_stem(cleaned)
+        if len(stem) < 4 or stem in CONTENT_STOPWORDS:
+            continue
+        stems.add(stem)
+    return stems
 
 
 def _is_letter_or_number(char: str) -> bool:
