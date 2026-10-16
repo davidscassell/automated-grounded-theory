@@ -328,8 +328,8 @@ def _run(model=None, **kwargs):
 
 
 def test_version_and_graphs():
-    assert __version__ == "0.9.1"
-    assert POLICY_VERSION == "0.9.1"
+    assert __version__ == "0.9.2"
+    assert POLICY_VERSION == "0.9.2"
     from automated_grounded_theory.axial import aaxial_code
 
     assert inspect.signature(aaxial_code).parameters["batch_size"].default == 1
@@ -439,10 +439,11 @@ def test_human_checkpoints_accept_and_record_saturation(tmp_path):
     assert row["negative_case_search"] is True
     assert row["negative_cases"]
     assert row["negative_cases"][0]["quote"] == "had no issues however"
-    assert all(item["judgment"] != "irrelevant" for item in row["counterexamples"])
+    assert any(item["judgment"] == "contradicts" for item in row["counterexamples"])
     assert "relationship_negative" in row["flags"]
+    assert "relationship_contradicted" in row["flags"]
     relevance = reviewed.metadata["axial_counterexample_relevance"]
-    assert relevance["skipped_low_relevance"] >= 1
+    assert relevance["candidates_considered"] >= 1
     assert relevance["skipped_no_relevant_passage"] >= 1
     assert reviewed.metadata["procedure"]["reallocated_propose_calls"] is True
     assert any("embedding" in json.dumps(entry) for entry in reviewed.prompt_log)

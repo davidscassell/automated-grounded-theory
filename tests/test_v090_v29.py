@@ -329,10 +329,12 @@ def test_counterexample_search_reports_why_and_falls_back_to_the_opposite_pole()
         segments=[],
     )
     assert stats["both_endpoint_queued"] == 0
-    assert stats["fallback"] == "opposite_pole"
-    assert stats["fallback_reason"] == "no_candidates_meeting_both_endpoint_overlap"
-    assert queued[0]["source"] == "opposite_pole_fallback"
+    assert stats["fallback"] is None
+    assert queued[0]["source"] == "opposite_pole"
     assert queued[0]["passage_id"] == "opposite"
+    assert stats["candidates_considered"] >= 1
+    assert stats["cooccurrence_2x2"]["a_only"] >= 1
+    assert "not a validity" in stats["cooccurrence_2x2"]["note"] or "do not validate" in stats["cooccurrence_2x2"]["note"]
     empty, none = _select_counterexamples(
         [relationship],
         [{"passage_id": "cited", "doc_id": "d1", "text": "Packing the suitcase before departure."}],
@@ -341,8 +343,8 @@ def test_counterexample_search_reports_why_and_falls_back_to_the_opposite_pole()
         codebook=book,
     )
     assert empty == []
-    assert none["no_call_reason"] == "no_candidates_meeting_both_endpoint_overlap"
-    assert none["fallback"] == "no_opposite_pole_candidates"
+    assert none["no_call_reason"] == "no_plausible_candidates"
+    assert none["fallback"] is None
     _budget_rows, budget = _select_counterexamples([relationship], passages, slots=0, synthetic=False, codebook=book)
     assert budget["no_call_reason"] == "budget"
 
@@ -380,11 +382,14 @@ def test_core_chooser_prefers_a_relationship_endpoint_and_stability_stays_undefi
         interrupt=False,
     )
     assert chosen.model_core_id == "lonely"
+    assert chosen.researcher_core_id == ""
     assert chosen.metadata["core_unsupported_by_graph"] is True
-    assert chosen.metadata["relationship_preferred_core_id"] in {"c-prep", "c-return"}
+    assert chosen.metadata.get("relationship_preferred_core_ids") == []
+    assert "relationship_preferred_core_id" not in chosen.metadata
     assert chosen.metadata["core_stability"]["score"] is None
     assert chosen.metadata["core_stability"]["n"] == 1
     assert core_stability([{"metadata": {}}])["score"] is None
+    assert rows[0]["graph_supported"] is False
 
 
 def test_blank_rows_are_counted_separately_from_unknown_passages():

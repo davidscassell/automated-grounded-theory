@@ -148,6 +148,7 @@ from automated_grounded_theory.codebook import (
 )
 from automated_grounded_theory.context import parse_context
 from automated_grounded_theory.export import _write_csv, _write_json
+from automated_grounded_theory.negative_case_search import claim_respondent_search
 from automated_grounded_theory.prompts import validation_feedback
 from automated_grounded_theory.records import POLICY_VERSION, freeze_snapshot, proposal_buffer_reducer, select_committable
 from automated_grounded_theory.results import OpenCodeResult, load_run
@@ -3823,10 +3824,16 @@ def _claim_compete_items(
         stats["notes"] = notes
         if report is not None:
             report.update(stats)
+            search = holder.get("search")
+            if isinstance(search, dict):
+                report["respondent_search"] = search
+                report["candidates_considered"] = search.get("candidates_considered")
+                report["filtered_count"] = search.get("filtered_count")
+                if not rows and search.get("no_call_reason"):
+                    report["no_call_reason"] = search.get("no_call_reason")
         return rows
 
-    if slots <= 0:
-        return finish([])
+    holder: dict[str, Any] = {}
     raw_claims = [dict(item) for item in (state.get("properties") or []) if isinstance(item, Mapping)]
     raw_claims += [dict(item) for item in (state.get("dimensions") or []) if isinstance(item, Mapping)]
     claims = _usable_claims(raw_claims)
@@ -3840,6 +3847,14 @@ def _claim_compete_items(
     seen: set[str] = set()
     empty_ids: set[str] = set()
     by_entry = {str(claim.get("entry_id") or ""): claim for claim in claims if claim.get("entry_id")}
+    search = claim_respondent_search(claims, passages, segments, codebook)
+    if slots <= 0 and int(search.get("plausible_count") or 0):
+        search = {**search, "no_call_reason": "budget"}
+    elif slots <= 0 and not search.get("no_call_reason"):
+        search = {**search, "no_call_reason": "no_plausible_candidates"}
+    holder["search"] = search
+    if slots <= 0:
+        return finish([])
 
     def add(passage_id: str, source: str, claim: Mapping[str, Any] | None) -> None:
         if len(extra) >= slots or not claim:
@@ -3962,6 +3977,16 @@ def _claim_compete_items(
             ranked.append((best_score, passage_id, best_claim))
     for _score, passage_id, best_claim in sorted(ranked, key=lambda item: (-item[0], item[1])):
         add(passage_id, "claim_similarity", best_claim)
+    for item in search.get("plausible") or []:
+        claim = by_entry.get(str(item.get("claim_id") or ""))
+        passage = by_id.get(str(item.get("passage_id") or ""))
+        kind = str(item.get("kind") or "")
+        if claim is None or passage is None or not kind:
+            continue
+        if kind in {"category_without_outcome", "outcome_without_category"}:
+            if not _claim_pair_relevant(passage, claim, same_category=True, opposite=False):
+                continue
+        add(str(item.get("passage_id") or ""), f"respondent_{kind}", claim)
     return finish(extra)
 
 
