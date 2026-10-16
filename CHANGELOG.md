@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.4
+
+- A sampling reread is a `(direction_id, passage_id)` pair. A researcher's passage assignment is not moved to a direction that only retrieved the passage. A passage selected for two directions is reread once per direction, and each reread spends its own coding call. An unsent pair names the direction.
+- A counterexample keeps the selected passage on `passage_id` and records `quote_passage_id`, `quote_start`, and `quote_end` for the passage that contains the quotation. Endpoint anchoring, quote locations, supporting cases, and the storyline passage list use that passage. A record without `quote_passage_id` is still read as the selected passage. Offsets are null when the quotation is not anchored.
+- Pairs with no category passage are reconciled once before the proposal loop. The derived step allowance is the planned proposal requests, plus one defer or split return per planned pair, plus the existing overhead. A caller can still set `recursion_limit`. Hitting it returns the partial result.
+- The design is [docs/design-review-fixes-094.md](docs/design-review-fixes-094.md). `policy_version` is `0.9.4`.
+
 ## 0.9.3
 
 - Negative-case classification is per respondent. Passages from one respondent are combined before a type is assigned. A split interview is not queued as both `a_without_b` and `b_without_a`. The request includes a complementary passage when that passage changes the reading. One representative candidate is queued per respondent.

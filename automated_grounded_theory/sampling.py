@@ -124,10 +124,23 @@ class SamplingCheckpointMismatch(SamplingError):
         super().__init__("Sampling resume would change locked procedure: " + ", ".join(self.differences))
 
 
+class SamplingSelectionPair(BaseModel):
+    """One reread: this direction, this passage.
+
+    The two flat lists stay so an older response still parses. ``selections``
+    is the pairing. An empty list means the response did not name pairs.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    direction_id: str = ""
+    passage_id: str = ""
+
+
 class ModelSamplingSelection(BaseModel):
     model_config = ConfigDict(extra="forbid")
     direction_ids: list[str] = Field(default_factory=list)
     passage_ids: list[str] = Field(default_factory=list)
+    selections: list[SamplingSelectionPair] = Field(default_factory=list)
     rationale: str = Field(min_length=1)
 
 
@@ -1123,6 +1136,7 @@ def _apply_human_sampling(state: SamplingState, decision: Mapping[str, Any]) -> 
             "actor": "human",
             "direction_ids": [row["direction_id"] for row in directions],
             "sampled_passage_ids": [],
+            "pairs": [],
             "note": "Directions were accepted. No sampled passage ids were recorded on this resume.",
         }
         return {"directions": directions, "metadata": metadata}
@@ -1169,10 +1183,12 @@ def _apply_human_sampling(state: SamplingState, decision: Mapping[str, Any]) -> 
         row.setdefault("action", "reject")
         row.setdefault("sampled_passage_ids", [])
     metadata = dict(state.get("metadata") or {})
+    accepted = [row for row in directions if row.get("action") in {"accept", "edit"}]
     metadata["researcher_sampling"] = {
         "actor": "human",
-        "direction_ids": [row["direction_id"] for row in directions if row.get("action") in {"accept", "edit"}],
+        "direction_ids": [row["direction_id"] for row in accepted],
         "sampled_passage_ids": sampled,
+        "pairs": _human_sampling_pairs(accepted),
         "outside_corpus_ids": outside,
         "new_data_collection": "recorded_by_researcher" if outside else "not_recorded",
     }
@@ -1188,6 +1204,7 @@ async def _select_with_model(runtime: SamplingRuntime, state: SamplingState) -> 
     if runtime.reviewer is None or allowance is None or allowance.remaining_calls("review") == 0:
         metadata["model_direction_ids"] = []
         metadata["model_passage_ids"] = []
+        metadata["model_sampling_pairs"] = []
         metadata["model_sampling_rationale"] = ""
         metadata["model_sampling_status"] = "budget_limited"
         metadata["sampling_stop"] = "call_allowance"
@@ -1205,7 +1222,11 @@ async def _select_with_model(runtime: SamplingRuntime, state: SamplingState) -> 
             for row in directions
         ],
         "passage_proposals": proposals,
-        "instruction": "Return direction_ids and passage_ids from this payload only.",
+        "instruction": (
+            "Return direction_ids, passage_ids, and selections from this payload only. "
+            "Each selection is one direction_id with one passage_id. "
+            "A passage chosen for two directions is two selections."
+        ),
     }
     messages = _messages("sampling_selection", payload)
     result = await _sampling_call(
@@ -1227,6 +1248,7 @@ async def _select_with_model(runtime: SamplingRuntime, state: SamplingState) -> 
             metadata["model_sampling_status"] = "budget_limited"
         metadata["model_direction_ids"] = []
         metadata["model_passage_ids"] = []
+        metadata["model_sampling_pairs"] = []
         metadata["model_sampling_rationale"] = ""
         metadata["sampling_stop"] = reason or metadata.get("sampling_stop") or "incomplete"
         _sync_allowance(metadata, runtime)
@@ -1242,6 +1264,7 @@ async def _select_with_model(runtime: SamplingRuntime, state: SamplingState) -> 
         metadata["model_sampling_status"] = "incomplete"
         metadata["model_direction_ids"] = []
         metadata["model_passage_ids"] = []
+        metadata["model_sampling_pairs"] = []
         _sync_allowance(metadata, runtime)
         return {"directions": directions, "metadata": metadata, "prompt_log": logs}
     requested_directions = [str(item) for item in (parsed.get("direction_ids") or [])]
@@ -1252,8 +1275,16 @@ async def _select_with_model(runtime: SamplingRuntime, state: SamplingState) -> 
     kept_passages = [item for item in requested_passages if item in known_passages and (not proposed_passages or item in proposed_passages or item in known_passages)]
     # A passage id must exist in the corpus. Ranking it outside the proposal list is flagged, not dropped.
     off_proposal = [item for item in kept_passages if proposed_passages and item not in proposed_passages]
+    pairs, unpaired = _model_sampling_pairs(
+        parsed,
+        kept_directions,
+        kept_passages,
+        proposals,
+    )
     metadata["model_direction_ids"] = kept_directions
     metadata["model_passage_ids"] = kept_passages
+    metadata["model_sampling_pairs"] = pairs
+    metadata["model_passages_without_direction"] = unpaired
     metadata["model_unknown_direction_ids"] = unknown_directions
     metadata["model_unknown_passage_ids"] = unknown_passages
     metadata["model_passages_outside_proposal"] = off_proposal
@@ -1265,12 +1296,17 @@ async def _select_with_model(runtime: SamplingRuntime, state: SamplingState) -> 
         row["model_selected"] = row.get("direction_id") in kept_directions
         row["action"] = ""
         row["sampled_passage_ids"] = []
+    warnings = list(state.get("warnings") or [])
     if unknown_directions or unknown_passages:
-        warnings = list(state.get("warnings") or [])
         warnings.append("The model named direction or passage ids that are not in this corpus. Those ids were flagged and were not used as evidence.")
-        _sync_allowance(metadata, runtime)
-        return {"directions": directions, "metadata": metadata, "prompt_log": logs, "warnings": warnings}
+    if unpaired:
+        warnings.append(
+            "A selected passage was not paired with a direction. "
+            "It was not assigned to the first retrieval proposal."
+        )
     _sync_allowance(metadata, runtime)
+    if warnings != list(state.get("warnings") or []):
+        return {"directions": directions, "metadata": metadata, "prompt_log": logs, "warnings": warnings}
     return {"directions": directions, "metadata": metadata, "prompt_log": logs}
 
 
@@ -1339,8 +1375,10 @@ def _record_ledger(state: SamplingState) -> dict:
         "new_direction_keys": new_keys,
         "accepted_direction_ids": accepted,
         "sampled_passage_ids": sampled,
+        "sampled_pairs": _selected_pairs({"directions": directions, "metadata": metadata, "passage_proposals": proposals}),
         "model_direction_ids": list(metadata.get("model_direction_ids") or []),
         "model_passage_ids": list(metadata.get("model_passage_ids") or []),
+        "model_sampling_pairs": list(metadata.get("model_sampling_pairs") or []),
         "proposal_counts": {str(row.get("direction_id")): len(row.get("proposals") or []) for row in proposals},
         "directions_without_passages": exhausted,
         "new_data_collection": metadata.get("new_data_collection"),
@@ -1392,46 +1430,134 @@ def _target_evidence(state: Mapping[str, Any], direction: Mapping[str, Any]) -> 
     }
 
 
-def _direction_for_passage(state: Mapping[str, Any], passage_id: str) -> dict[str, Any]:
-    directions = [row for row in (state.get("directions") or []) if isinstance(row, Mapping)]
-    by_id = {str(row.get("direction_id") or ""): row for row in directions}
-    matched: list[str] = []
-    for group in state.get("passage_proposals") or []:
+def _dedupe_pairs(pairs: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    rows: list[dict[str, str]] = []
+    for item in pairs:
+        if not isinstance(item, Mapping):
+            continue
+        direction_id = str(item.get("direction_id") or "")
+        passage_id = str(item.get("passage_id") or "")
+        key = (direction_id, passage_id)
+        if not direction_id or not passage_id or key in seen:
+            continue
+        seen.add(key)
+        rows.append({"direction_id": direction_id, "passage_id": passage_id})
+    return rows
+
+
+def _proposal_index(proposals: Sequence[Any]) -> dict[str, list[str]]:
+    index: dict[str, list[str]] = {}
+    for group in proposals:
         if not isinstance(group, Mapping):
             continue
-        ids = {
-            str(item.get("passage_id") or "")
-            for item in (group.get("proposals") or [])
-            if isinstance(item, Mapping)
-        }
-        if passage_id in ids:
-            matched.append(str(group.get("direction_id") or ""))
+        direction_id = str(group.get("direction_id") or "")
+        if not direction_id:
+            continue
+        ids: list[str] = []
+        for row in group.get("proposals") or []:
+            if not isinstance(row, Mapping):
+                continue
+            passage_id = str(row.get("passage_id") or "")
+            if passage_id and passage_id not in ids:
+                ids.append(passage_id)
+        index[direction_id] = ids
+    return index
+
+
+def _human_sampling_pairs(directions: Sequence[Any]) -> list[dict[str, str]]:
+    """Passages the researcher assigned. Retrieval proposals are not a selection."""
+    pairs = []
     for row in directions:
-        if passage_id in {str(item) for item in (row.get("sampled_passage_ids") or [])}:
-            matched.append(str(row.get("direction_id") or ""))
+        if not isinstance(row, Mapping) or row.get("action") not in {"accept", "edit"}:
+            continue
+        direction_id = str(row.get("direction_id") or "")
+        for passage_id in row.get("sampled_passage_ids") or []:
+            pairs.append({"direction_id": direction_id, "passage_id": str(passage_id)})
+    return _dedupe_pairs(pairs)
+
+
+def _model_sampling_pairs(
+    parsed: Mapping[str, Any],
+    kept_directions: Sequence[str],
+    kept_passages: Sequence[str],
+    proposals: Sequence[Any],
+) -> tuple[list[dict[str, str]], list[str]]:
+    """Pair each selected passage with the directions that should reread it.
+
+    An explicit ``selections`` list is the model's pairing. When that list is
+    empty, a passage proposed under two selected directions becomes two pairs.
+    A passage in no selected proposal is paired only when one direction was
+    selected. Otherwise it is flagged and is not given to the first proposal.
+    """
+    direction_ids = [str(item) for item in kept_directions if str(item)]
+    passage_ids = [str(item) for item in kept_passages if str(item)]
+    direction_set = set(direction_ids)
+    passage_set = set(passage_ids)
+    explicit = []
+    for item in parsed.get("selections") or []:
+        if isinstance(item, Mapping):
+            explicit.append(
+                {
+                    "direction_id": str(item.get("direction_id") or ""),
+                    "passage_id": str(item.get("passage_id") or ""),
+                }
+            )
+    if any(item["direction_id"] or item["passage_id"] for item in explicit):
+        kept = [
+            item
+            for item in explicit
+            if item["direction_id"] in direction_set and item["passage_id"] in passage_set
+        ]
+        flagged = [
+            item["passage_id"] or item["direction_id"]
+            for item in explicit
+            if item not in kept and (item["passage_id"] or item["direction_id"])
+        ]
+        return _dedupe_pairs(kept), flagged
+    index = _proposal_index(proposals)
+    pairs: list[dict[str, str]] = []
+    unpaired: list[str] = []
+    for passage_id in passage_ids:
+        owners = [direction_id for direction_id in direction_ids if passage_id in set(index.get(direction_id) or [])]
+        if owners:
+            for direction_id in owners:
+                pairs.append({"direction_id": direction_id, "passage_id": passage_id})
+        elif len(direction_ids) == 1:
+            pairs.append({"direction_id": direction_ids[0], "passage_id": passage_id})
+        elif passage_id not in unpaired:
+            unpaired.append(passage_id)
+    return _dedupe_pairs(pairs), unpaired
+
+
+def _selected_pairs(state: Mapping[str, Any]) -> list[dict[str, str]]:
+    """One row per reread. A human assignment is not reordered by retrieval."""
     metadata = state.get("metadata") or {}
     if str(metadata.get("decision_mode") or "") == "llm":
-        selected = [str(item) for item in (metadata.get("model_direction_ids") or [])]
-    else:
-        selected = [
-            str(row.get("direction_id") or "")
-            for row in directions
-            if row.get("action") in {"accept", "edit"}
-        ]
-    chosen = ""
-    for direction_id in matched:
-        if not selected or direction_id in selected:
-            chosen = direction_id
-            break
-    if not chosen and len(selected) == 1:
-        chosen = selected[0]
-    if not chosen and matched:
-        chosen = matched[0]
-    return dict(by_id.get(chosen) or {})
+        if "model_sampling_pairs" in metadata:
+            return _dedupe_pairs(metadata.get("model_sampling_pairs") or [])
+        return _model_sampling_pairs(
+            {},
+            list(metadata.get("model_direction_ids") or []),
+            list(metadata.get("model_passage_ids") or []),
+            list(state.get("passage_proposals") or []),
+        )[0]
+    return _human_sampling_pairs(state.get("directions") or [])
 
 
-def _reread_payload(state: Mapping[str, Any], passage_id: str, passage: Mapping[str, Any]) -> dict[str, Any]:
-    direction = _direction_for_passage(state, passage_id)
+def _direction_row(state: Mapping[str, Any], direction_id: str) -> dict[str, Any]:
+    for row in state.get("directions") or []:
+        if isinstance(row, Mapping) and str(row.get("direction_id") or "") == direction_id:
+            return dict(row)
+    return {}
+
+
+def _reread_payload(
+    state: Mapping[str, Any],
+    passage_id: str,
+    passage: Mapping[str, Any],
+    direction: Mapping[str, Any],
+) -> dict[str, Any]:
     target = _target_evidence(state, direction) if direction else {}
     query = str(direction.get("sampling_query") or "")
     comparison = ""
@@ -1462,17 +1588,6 @@ def _reread_payload(state: Mapping[str, Any], passage_id: str, passage: Mapping[
     }
 
 
-def _selected_passages(state: Mapping[str, Any]) -> list[str]:
-    metadata = state.get("metadata") or {}
-    if str(metadata.get("decision_mode") or "") == "llm":
-        return [str(item) for item in (metadata.get("model_passage_ids") or [])]
-    found = []
-    for row in state.get("directions") or []:
-        if isinstance(row, Mapping) and row.get("action") in {"accept", "edit"}:
-            found.extend(str(item) for item in (row.get("sampled_passage_ids") or []))
-    return found
-
-
 async def _reread(runtime: SamplingRuntime, state: SamplingState) -> dict:
     metadata = dict(state.get("metadata") or {})
     procedure = metadata.get("procedure") or {}
@@ -1481,25 +1596,26 @@ async def _reread(runtime: SamplingRuntime, state: SamplingState) -> dict:
     warnings = list(state.get("warnings") or [])
     if procedure.get("pursuit") != "reread":
         return {"reread_notes": notes, "metadata": metadata}
-    wanted = _selected_passages(state)
+    wanted = _selected_pairs(state)
     passages = {
         str(row.get("passage_id") or ""): row
         for row in (state.get("passages") or [])
         if isinstance(row, Mapping)
     }
     allowance = runtime.limiter.provider_allowance
-    unsent = []
-    for passage_id in wanted:
+    unsent: list[dict[str, str]] = []
+    for pair in wanted:
+        passage_id = pair["passage_id"]
+        direction = _direction_row(state, pair["direction_id"])
         passage = passages.get(passage_id)
         if passage is None:
-            unsent.append(passage_id)
+            unsent.append(dict(pair))
             continue
         if allowance is not None and allowance.remaining_calls("coding") == 0:
-            unsent.append(passage_id)
+            unsent.append(dict(pair))
             metadata["reread_stop"] = "call_allowance"
             continue
-        direction = _direction_for_passage(state, passage_id)
-        messages = _messages("sampling_reread", _reread_payload(state, passage_id, passage))
+        messages = _messages("sampling_reread", _reread_payload(state, passage_id, passage, direction))
         result = await _sampling_call(
             runtime,
             runtime.coder,
@@ -1512,7 +1628,7 @@ async def _reread(runtime: SamplingRuntime, state: SamplingState) -> dict:
             reserved_output=300,
         )
         if result["refused"] or result["unparsed"]:
-            unsent.append(passage_id)
+            unsent.append(dict(pair))
             metadata["reread_stop"] = str(result["reason"] or metadata.get("reread_stop") or "incomplete")
             if result["reason"] in {"request_budget", "token_allowance"} or result["unparsed"]:
                 metadata["reread_status"] = "incomplete"
@@ -1530,7 +1646,7 @@ async def _reread(runtime: SamplingRuntime, state: SamplingState) -> dict:
         notes.append(
             {
                 "passage_id": passage_id,
-                "direction_id": str(direction.get("direction_id") or ""),
+                "direction_id": str(direction.get("direction_id") or pair["direction_id"]),
                 "target_id": str(direction.get("target_id") or ""),
                 "kind": str(direction.get("kind") or ""),
                 "sampling_query": str(direction.get("sampling_query") or ""),
@@ -1541,17 +1657,16 @@ async def _reread(runtime: SamplingRuntime, state: SamplingState) -> dict:
                 "actor": "llm",
             }
         )
+    metadata["reread_unsent_pairs"] = unsent
+    metadata["reread_unsent_passage_ids"] = [item["passage_id"] for item in unsent]
     if metadata.get("reread_status") == "incomplete":
-        metadata["reread_unsent_passage_ids"] = unsent
         metadata["sampling_stop"] = str(metadata.get("reread_stop") or metadata.get("sampling_stop") or "incomplete")
     elif unsent:
         metadata["reread_status"] = "budget_limited"
-        metadata["reread_unsent_passage_ids"] = unsent
         if not notes and wanted:
             metadata["sampling_stop"] = metadata.get("sampling_stop") or "call_allowance"
     else:
         metadata["reread_status"] = "complete" if wanted else "skipped"
-        metadata["reread_unsent_passage_ids"] = []
     metadata["reread_notes_do_not_change_saturation_indicators"] = True
     _sync_allowance(metadata, runtime)
     return {"reread_notes": notes, "metadata": metadata, "prompt_log": logs, "warnings": warnings}
@@ -1573,6 +1688,7 @@ def _update_ledger(state: SamplingState) -> dict:
     last["reread_status"] = metadata.get("reread_status") or last.get("reread_status")
     last["reread_note_count"] = len(state.get("reread_notes") or [])
     last["reread_unsent_passage_ids"] = list(metadata.get("reread_unsent_passage_ids") or [])
+    last["reread_unsent_pairs"] = list(metadata.get("reread_unsent_pairs") or [])
     last["indicator_effect"] = (
         "The reread notes are not written back into the saturation curve. "
         "Indicator deltas stay the comparison recorded for this round."
