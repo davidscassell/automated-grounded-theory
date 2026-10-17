@@ -189,8 +189,7 @@ def test_brief_only_keeps_the_selection_when_no_reread_is_requested():
         decision_mode="llm",
         pursuit="brief_only",
         interrupt=False,
-        max_sampling_review_calls=0,
-        **_kwargs(max_decision_calls=4),
+        **_kwargs(max_sampling_review_calls=0, max_decision_calls=4),
     )
     assert sent.metadata["model_sampling_pairs"]
     assert sent.metadata["model_sampling_status"] != "budget_limited"
