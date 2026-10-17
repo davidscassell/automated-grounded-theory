@@ -152,3 +152,9 @@ Each `(direction_id, passage_id)` reread returns before the next request, so a l
 ## Reread repairs and the active pair (0.9.6)
 
 A reread repair is its own visit. The malformed response and its usage are stored before the repair is sent. Resume sends the repair and does not repeat the initial request. Before each provider call the visit records `reread_active_pair`. A timeout uses that pair as `reread_failed_pairs`. Pairs already in `reread_unsent_pairs` stay there. An empty flat list is omitted and derived from the selections. Each nonempty list is compared on its own. The note is [design-review-fixes-096.md](design-review-fixes-096.md).
+
+## Sampling stage allowance, packed selection, and reread notes (0.9.7)
+
+`max_sampling_review_calls` counts calls made in this sampling stage. Upstream `stage_used` is stored on `sampling_call_baseline` and is not charged again. `calls_used` still carries the earlier total. `sampling_token_budget` stays the per-request ceiling. A selection that does not fit drops the lowest-ranked directions until it does. One direction that still does not fit is omitted with `request_budget`. Pairs beyond the remaining coding calls are stored on `reread_unsent_pairs` with reason `call_allowance`. That is the stop. A flat-list mismatch stays on `model_flat_list_mismatch` and does not replace it.
+
+Reread notes are copied onto the ledger row with the direction key. An irrelevant note, or a rejected direction, is removed from `analytic_new_direction_keys`, and the next round does not issue that key again. A note that is not irrelevant adds a follow-up direction. A null window rate is filled from complete document points. The ledger indicator and the stopping criterion use that value. `judgment` stays null. Empty paradigm slots for different roles do not share one direction key. The note is [design-review-fixes-097.md](design-review-fixes-097.md).

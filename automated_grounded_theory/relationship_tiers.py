@@ -25,7 +25,23 @@ TIER_LABELS = {
     3: "attribution",
     4: "verified",
 }
-_CAUSAL_WORD = frozenset({"reduce", "lead", "cause", "foster", "result", "produce", "because"})
+_CAUSAL_WORD = frozenset({"reduce", "lead", "cause", "foster", "result", "produce", "because", "consequence", "effect"})
+_CAUSAL_PHRASES = (
+    "leads to",
+    "lead to",
+    "results in",
+    "result of",
+    "results from",
+    "as a result",
+    "because",
+    "caused",
+    "causes",
+    "due to",
+    "effect of",
+    "consequence",
+    "consequences of",
+)
+_CAUSAL_ROLES = frozenset({"consequence", "cause"})
 _ATTRIBUTION = (
     "because",
     "due to",
@@ -34,8 +50,12 @@ _ATTRIBUTION = (
     "caused",
     "causes",
     "results in",
+    "result of",
+    "effect of",
+    "consequence",
     "attributed to",
 )
+_GROUNDED_STEMS = 2
 _WHY = ("because", "due to", "the reason", "why ")
 _RELEVANT = frozenset({"supports", "contradicts", "qualifies"})
 
@@ -179,7 +199,8 @@ def _add_quote(
     text = str(quote or "").strip()
     if not text or not terms or _is_label(text, labels):
         return
-    if not (_distinctive(text) & terms):
+    overlap = _distinctive(text) & terms
+    if not overlap:
         return
     found = _locate(text, passages, passage_id)
     if not found:
@@ -196,6 +217,8 @@ def _add_quote(
         start=None if span is None else span[0],
         end=None if span is None else span[1],
     )
+    row["grounded"] = len(overlap) >= _GROUNDED_STEMS
+    row["matched_stems"] = sorted(overlap)
     existing = bucket.setdefault(case_id, [])
     key = (endpoint, _norm(text), found)
     if key not in {(item["endpoint"], _norm(item["quote"]), item["passage_id"]) for item in existing}:
@@ -265,8 +288,12 @@ def _supporting_cases(found: Mapping[str, Mapping[str, list[dict[str, Any]]]]) -
         for item in quotes:
             if item["passage_id"] not in passage_ids:
                 passage_ids.append(item["passage_id"])
-        from_passages = {item["passage_id"] for item in quotes if item["endpoint"] == "from"}
-        to_passages = {item["passage_id"] for item in quotes if item["endpoint"] == "to"}
+        from_passages = {
+            item["passage_id"] for item in quotes if item["endpoint"] == "from" and item.get("grounded", True)
+        }
+        to_passages = {
+            item["passage_id"] for item in quotes if item["endpoint"] == "to" and item.get("grounded", True)
+        }
         both = bool(from_passages) and bool(to_passages)
         same = bool(from_passages & to_passages)
         rows.append(
@@ -522,12 +549,41 @@ def assess_relationship(
     }
 
 
-def wording_overreach(text: str, tier: int | None) -> bool:
-    """True when ``text`` uses wording a higher tier would be needed to license.
+def has_causal_wording(text: str) -> bool:
+    """True when ``text`` uses causal or consequence language."""
+    if not str(text or "").strip():
+        return False
+    return _causal(f" {_norm(text)} ")
 
-    A missing tier is undefined and is not an overreach.
+
+def denies_causal_language(text: str) -> bool:
+    """True when a reviewer says the text does not use causal language."""
+    folded = f" {_norm(text)} "
+    return any(
+        phrase in folded
+        for phrase in (
+            "no causal",
+            "not causal",
+            "without causal",
+            "no cause ",
+            "not a cause",
+            "no causal language",
+        )
+    )
+
+
+def wording_overreach(text: str, tier: int | None, *, role: str = "") -> bool:
+    """True when ``text`` or ``role`` uses wording a higher tier would be needed to license.
+
+    A missing tier is undefined and is not an overreach. Role ``consequence``
+    or ``cause`` at tier 1 or 2 is causal wording even when the sentence is mild.
     """
-    if tier is None or not str(text or "").strip():
+    if tier is None:
+        return False
+    chosen = str(role or "").strip().casefold().replace(" ", "_")
+    if tier < 3 and chosen in _CAUSAL_ROLES:
+        return True
+    if not str(text or "").strip():
         return False
     folded = f" {_norm(text)} "
     if tier < 4 and re.search(r"\bverified\b", folded):
@@ -542,7 +598,7 @@ def wording_overreach(text: str, tier: int | None) -> bool:
 
 
 def _causal(folded: str) -> bool:
-    if "leads to" in folded or "results in" in folded or " because " in folded:
+    if any(phrase in folded for phrase in _CAUSAL_PHRASES):
         return True
     stems = meaningful_tokens(folded)
     return bool(stems & _CAUSAL_WORD)
@@ -561,7 +617,10 @@ def apply_evidence_tier(relationship: dict, **kwargs: Any) -> dict[str, Any]:
     statement = " ".join(
         str(relationship.get(key) or "") for key in ("statement", "human_statement", "model_statement")
     )
-    if wording_overreach(statement, tier if isinstance(tier, int) else None) and "wording_exceeds_tier" not in flags:
+    role = str(
+        relationship.get("human_paradigm_role") or relationship.get("paradigm_role") or relationship.get("model_paradigm_role") or ""
+    )
+    if wording_overreach(statement, tier if isinstance(tier, int) else None, role=role) and "wording_exceeds_tier" not in flags:
         flags.append("wording_exceeds_tier")
         relationship["needs_review"] = True
     relationship["flags"] = flags

@@ -63,6 +63,8 @@ from automated_grounded_theory.relationship_tiers import (
     candidate_cross_case_passages,
     case_id_of,
     citation_qualifies,
+    denies_causal_language,
+    has_causal_wording,
     promote_verified,
     wording_overreach,
 )
@@ -782,6 +784,18 @@ def core_stability(runs: Sequence[Any], *, minimum_n: int = CORE_STABILITY_MIN_N
     return core_agreement(runs, minimum_n=minimum_n)
 
 
+def _stability_runs(metadata: Mapping[str, Any], core_id: str = "") -> list[Any]:
+    """Prior runs plus this run, so the current core enters the pairwise score."""
+    runs = list(metadata.get("comparison_runs") or [])
+    current = {
+        "metadata": {
+            "researcher_core_id": str(metadata.get("researcher_core_id") or ""),
+            "model_core_id": str(metadata.get("model_core_id") or core_id or ""),
+        }
+    }
+    return [*runs, current]
+
+
 def _core_has_relationship(state: Mapping[str, Any], core_id: str) -> bool:
     """True only when ``core_id`` is an endpoint of a tier-2 or higher row."""
     if not core_id:
@@ -795,13 +809,13 @@ def _core_has_relationship(state: Mapping[str, Any], core_id: str) -> bool:
 
 
 def _note_core_support(state: Mapping[str, Any], metadata: dict[str, Any], core_id: str) -> None:
-    runs = list(metadata.get("comparison_runs") or [])
+    runs = _stability_runs(metadata, core_id)
     procedure = metadata.get("procedure") or {}
     try:
         minimum = int(procedure.get("core_stability_min_n") or CORE_STABILITY_MIN_N)
     except (TypeError, ValueError):
         minimum = CORE_STABILITY_MIN_N
-    metadata["core_stability"] = core_stability(runs if runs else [metadata], minimum_n=minimum)
+    metadata["core_stability"] = core_stability(runs, minimum_n=minimum)
     metadata["graph_snapshot"] = graph_snapshot(state.get("relationships") or [])
     if not core_id:
         metadata["core_emphasis"] = False
@@ -881,7 +895,7 @@ def _saturation(state: Mapping[str, Any]) -> dict[str, Any]:
     )
     report["researcher_saturation"] = metadata.get("researcher_saturation")
     report["model_saturation"] = metadata.get("model_saturation")
-    report["core_stability"] = core_stability(comparison) if comparison else core_stability([metadata] if metadata else [])
+    report["core_stability"] = core_stability(_stability_runs(metadata) if metadata else comparison)
     report["judgment"] = None
     accounting = metadata.get("pair_accounting") or {}
     remaining = int(accounting.get("remaining_count") or 0)
@@ -1005,10 +1019,15 @@ def _endpoint_anchoring(
             anchored, reason, matched = False, "unknown_category", []
         elif not label_tokens and signal is not True:
             anchored, reason, matched = False, "missing_category_label", []
-        elif distinctive:
+        elif len(distinctive) >= 2:
             anchored, reason = True, ""
             if signal is False:
                 disagreement = "lexical_anchored_embedding_unanchored"
+        elif len(distinctive) == 1:
+            anchored, reason = False, "stem_only"
+            if signal is True:
+                anchored, reason, matched = True, "embedding", ["embedding"]
+                disagreement = "lexical_stem_only_embedding_anchored"
         elif matched and signal is True:
             anchored, reason, matched = True, "embedding", ["embedding"]
             disagreement = "lexical_generic_only_embedding_anchored"
@@ -1174,6 +1193,9 @@ def _annotate_endpoints(
         if "endpoint_evidence_partial" not in flags:
             flags.append("endpoint_evidence_partial")
         relationship["needs_review"] = True
+    if any(str(row.get("reason") or "") == "stem_only" for row in rows) and "weak_stem_anchor" not in flags:
+        flags.append("weak_stem_anchor")
+        relationship["needs_review"] = True
     disagreements = [row.get("anchoring_disagreement") for row in rows if row.get("anchoring_disagreement")]
     if disagreements and "anchoring_disagreement" not in flags:
         flags.append("anchoring_disagreement")
@@ -1226,11 +1248,7 @@ _CAUSAL_WORD = (
 
 def _causal_language(text: str) -> bool:
     """Causal wording in a storyline or memo. A pattern sentence does not match."""
-    folded = f" {str(text or '').casefold()} "
-    if "leads to" in folded or "results in" in folded or " because " in folded:
-        return True
-    stems = meaningful_tokens(text)
-    return bool(stems & set(_CAUSAL_WORD))
+    return has_causal_wording(text)
 
 
 def _unaccepted_for_causal_claim(row: Mapping[str, Any]) -> bool:
@@ -1733,6 +1751,26 @@ def _quote_provenance(quote: str, passages: Sequence[Mapping[str, Any]]) -> dict
     return {"quote_passage_id": None, "quote_start": None, "quote_end": None}
 
 
+def _flag_reviewer_causal_claim(target: dict, rationale: str) -> None:
+    """A reviewer's denial of causal language is checked against the detector."""
+    if not denies_causal_language(rationale):
+        return
+    statement = " ".join(str(target.get(key) or "") for key in ("statement", "human_statement", "model_statement"))
+    role = str(target.get("model_paradigm_role") or target.get("paradigm_role") or target.get("human_paradigm_role") or "")
+    if not has_causal_wording(statement) and not has_causal_wording(role) and str(role).casefold() not in {"consequence", "cause", "causal_condition"}:
+        return
+    flags = list(target.get("flags") or [])
+    if "reviewer_causal_claim_mismatch" not in flags:
+        flags.append("reviewer_causal_claim_mismatch")
+    target["flags"] = flags
+    target["needs_review"] = True
+
+
+_ABSENCE_CANDIDATES = frozenset(
+    {"a_without_b", "b_without_a", "category_without_outcome", "outcome_without_category"}
+)
+
+
 def _apply_counterexample(
     relationship: dict,
     verdict: Mapping[str, Any],
@@ -1741,10 +1779,17 @@ def _apply_counterexample(
     also_texts: Sequence[str] = (),
     complementary_passage_ids: Sequence[str] = (),
     complementary_passages: Sequence[Mapping[str, Any]] = (),
+    candidate_type: str = "",
 ) -> None:
     judgment = str(verdict.get("judgment") or "").strip().casefold()
     if judgment not in {"supports", "contradicts", "qualifies", "irrelevant"}:
         return
+    source = str(candidate_type or verdict.get("candidate_type") or "").strip()
+    model_judgment = judgment
+    reclassification = ""
+    if judgment == "contradicts" and source in _ABSENCE_CANDIDATES:
+        judgment = "qualifies"
+        reclassification = "absence_is_not_contradiction"
     quote = str(verdict.get("quote") or "")
     ordered: list[Mapping[str, Any]] = [passage]
     seen = {str(passage.get("passage_id") or "")}
@@ -1781,10 +1826,14 @@ def _apply_counterexample(
         "quote_start": provenance["quote_start"],
         "quote_end": provenance["quote_end"],
         "judgment": judgment,
+        "model_judgment": model_judgment,
+        "candidate_type": source,
+        "reclassified_from": model_judgment if reclassification else "",
+        "reclassification_reason": reclassification,
         "quote": quote,
         "rationale": rationale,
         "valid_test": valid,
-        "reason": reason,
+        "reason": reason or reclassification,
         "actor": "model",
         "synthetic": synthetic,
         "excluded_from_research_outputs": synthetic,
@@ -1822,6 +1871,8 @@ def _apply_counterexample(
         flags = list(relationship.get("flags") or [])
         if "relationship_qualified" not in flags:
             flags.append("relationship_qualified")
+        if reclassification and reclassification not in flags:
+            flags.append(reclassification)
         relationship["flags"] = flags
 
 
@@ -1972,7 +2023,8 @@ def _tiered_accept(
     else:
         target["downstream_eligible"] = True
     statement = " ".join(str(target.get(key) or "") for key in ("statement", "human_statement", "model_statement"))
-    if wording_overreach(statement, tier):
+    role = str(target.get("human_paradigm_role") or target.get("paradigm_role") or target.get("model_paradigm_role") or role or "")
+    if wording_overreach(statement, tier, role=role):
         flags = list(target.get("flags") or [])
         if "wording_exceeds_tier" not in flags:
             flags.append("wording_exceeds_tier")
@@ -2119,6 +2171,7 @@ def _apply_model_relations(
         row["model_paradigm_role"] = decision.get("paradigm_role")
         row["model_rationale"] = decision.get("rationale")
         _flag_same_passage_claim(row, str(decision.get("rationale") or ""), flag="reviewer_same_passage_mismatch")
+        _flag_reviewer_causal_claim(row, str(decision.get("rationale") or ""))
         row["review_actor"] = "llm"
         row["review_model"] = (audit or {}).get("model")
         history = list(row.get("review_history") or [])
@@ -2425,6 +2478,10 @@ def _plan_node(state: AxialState) -> dict:
     effective_seed = int(procedure.get("seed") or 0)
     metadata["seed"] = effective_seed
     metadata["seed_source"] = procedure.get("seed_source") or "caller"
+    metadata["axial_token_plan"] = _axial_token_plan(metadata, procedure)
+    plan_note = str((metadata["axial_token_plan"] or {}).get("warning") or "")
+    if plan_note and plan_note not in warnings:
+        warnings.append(plan_note)
     metadata["pair_coverage"] = {
         "pair_count": plan["pair_count"],
         "examined_count": plan["examined_count"],
@@ -2441,6 +2498,47 @@ def _plan_node(state: AxialState) -> dict:
         "warnings": warnings,
         "relationships": list(state.get("relationships") or []),
         "metadata": metadata,
+    }
+
+
+def _axial_token_plan(metadata: Mapping[str, Any], procedure: Mapping[str, Any]) -> dict[str, Any]:
+    """A planning estimate. It does not change the token ceiling.
+
+    The estimate charges each planned coding, counterexample, memo, and
+    storyline call at the per-request budget. A pool-sized corpus can spend
+    most of a larger ceiling on proposals. The default ceiling stays where
+    the caller set it. The shortfall is a warning, not a new analytic default.
+    """
+    ceiling = int(procedure.get("max_axial_review_tokens") or 0)
+    per_request = _request_token_budget(metadata)
+    propose_calls = int(procedure.get("propose_calls") or 0)
+    counter_calls = int(procedure.get("counterexample_calls") or 0)
+    memo_calls, storyline_calls = _selective_allowances(procedure)
+    planned_calls = propose_calls + counter_calls + memo_calls + storyline_calls
+    estimate = planned_calls * per_request
+    shortfall = max(0, estimate - ceiling) if ceiling else 0
+    warning = ""
+    if ceiling and shortfall:
+        warning = (
+            "Axial token plan exceeds max_axial_review_tokens. "
+            f"The planning estimate is {estimate} and the ceiling is {ceiling}, "
+            f"a shortfall of {shortfall}. "
+            "This does not change the ceiling. Proposals can leave counterexamples, "
+            "review, the core, and memos budget_limited on a pool-sized run."
+        )
+    return {
+        "ceiling": ceiling,
+        "per_request_budget": per_request,
+        "planned_calls": planned_calls,
+        "estimate": estimate,
+        "shortfall": shortfall,
+        "warning": warning,
+        "changes_default": False,
+        "note": (
+            "Planning estimate only. max_axial_review_tokens is unchanged. "
+            "The package default remains 24000. Raise the ceiling for a larger corpus "
+            "when this estimate exceeds it."
+        ),
     }
 
 
@@ -2565,6 +2663,94 @@ def _account_responses(metadata: dict[str, Any], audits: Sequence[Mapping[str, A
     """Count each received provider response once, whether or not it parsed."""
     for audit in audits:
         _record_audit_usage(metadata, audit)
+
+
+def _prompt_accounting(logs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Split the prompt log into provider calls and rows that were not sent."""
+    rows = [row for row in logs if isinstance(row, Mapping)]
+    unsent_status = {"omitted", "deferred", "not_sent"}
+    unsent = [
+        row
+        for row in rows
+        if str(row.get("status") or "") in unsent_status or row.get("received") is False
+    ]
+    unsent_ids = {id(row) for row in unsent}
+    received = [row for row in rows if id(row) not in unsent_ids]
+
+    def _tokens(row: Mapping[str, Any]) -> int:
+        usage = row.get("usage") if isinstance(row.get("usage"), Mapping) else {}
+        return int(usage.get("total_tokens") or 0)
+
+    return {
+        "prompt_log_rows": len(rows),
+        "provider_call_rows": len(received),
+        "unsent_rows": len(unsent),
+        "provider_total_tokens": sum(_tokens(row) for row in received),
+        "unsent_total_tokens": sum(_tokens(row) for row in unsent),
+        "note": (
+            "prompt_log_rows equals provider_call_rows plus unsent_rows. "
+            "Unsent rows were omitted, deferred, or not sent. They are not provider calls. "
+            "Their tokens are not added to the provider total."
+        ),
+    }
+
+
+def _note_counterexample_accounting(
+    relevance: dict[str, Any],
+    logs: Sequence[Mapping[str, Any]],
+    judgments: Sequence[Mapping[str, Any]],
+) -> None:
+    """One accounting for prompts and judgments, including the synthetic check."""
+    counter_rows = [row for row in logs if isinstance(row, Mapping) and str(row.get("kind") or "") == "axial_counterexample"]
+    omitted = [
+        row
+        for row in counter_rows
+        if str(row.get("status") or "") in {"omitted", "deferred", "not_sent"} or row.get("received") is False
+    ]
+    stored = [row for row in judgments if isinstance(row, Mapping)]
+    synthetic = [row for row in stored if row.get("synthetic") or str(row.get("passage_id") or "") == SYNTHETIC_PASSAGE_ID]
+    research = [row for row in stored if row not in synthetic]
+    other = len(counter_rows) - len(stored) - len(omitted)
+    relevance["counterexample_prompt_rows"] = len(counter_rows)
+    relevance["counterexample_judgments_stored"] = len(stored)
+    relevance["research_judgments"] = len(research)
+    relevance["synthetic_judgments"] = len(synthetic)
+    relevance["omitted_counterexample_prompts"] = len(omitted)
+    relevance["prompt_judgment_gap"] = len(counter_rows) - len(research)
+    relevance["prompt_judgment_note"] = (
+        "Research judgments exclude the synthetic check. "
+        f"Counterexample prompt rows ({len(counter_rows)}) = stored judgments ({len(stored)}) "
+        f"+ omitted prompts ({len(omitted)}) + prompts without a stored verdict ({max(0, other)}). "
+        "A prompt that was not sent is not a judgment."
+    )
+    relevance["prompt_accounting"] = _prompt_accounting(logs)
+
+
+def _synthetic_reading(judgment: str) -> dict[str, Any]:
+    """An irrelevant or missing synthetic judgment is not a pass."""
+    folded = str(judgment or "").strip().casefold()
+    if folded in {"contradicts", "qualifies"}:
+        return {"status": "interpretable", "detected": True, "reason": ""}
+    if folded == "supports":
+        return {"status": "interpretable", "detected": False, "reason": "supports"}
+    if not folded:
+        return {"status": "not_interpretable", "detected": None, "reason": "no_call"}
+    return {"status": "not_interpretable", "detected": None, "reason": "irrelevant"}
+
+
+def _finish_synthetic_status(metadata: dict[str, Any], *, reason: str) -> None:
+    current = dict(metadata.get("synthetic_counterexample") or {})
+    if current.get("status"):
+        return
+    reading = _synthetic_reading(str(current.get("judgment") or ""))
+    if not current.get("judgment"):
+        reading = {"status": "not_interpretable", "detected": None, "reason": reason}
+    current.update(reading)
+    current.setdefault("passage_id", SYNTHETIC_PASSAGE_ID)
+    current.setdefault("label", SYNTHETIC_MARKER)
+    current.setdefault("excluded_from_research_outputs", True)
+    current.setdefault("limitation", SYNTHETIC_LIMITATION)
+    metadata["synthetic_counterexample"] = current
 
 
 def _log_call_audits(logs: list, audits: Sequence[Mapping[str, Any]], *, extra: Mapping[str, Any] | None = None) -> None:
@@ -3449,10 +3635,6 @@ def _counterexample_node(runtime: AxialRuntime):
             segments=state.get("segments") or [],
             enabled=search_enabled,
         )
-        for row in relationships:
-            record = (stats.get("by_relationship") or {}).get(str(row.get("relationship_id") or ""))
-            if isinstance(record, Mapping):
-                row["negative_case_search_record"] = dict(record)
         by_id = {str(row.get("relationship_id") or ""): row for row in relationships}
         for note in stats["notes"]:
             if note not in warnings:
@@ -3578,15 +3760,19 @@ def _counterexample_node(runtime: AxialRuntime):
                     also_texts=[str(item.get("text") or "") for item in complementary_passages],
                     complementary_passage_ids=complementary_ids,
                     complementary_passages=complementary_passages,
+                    candidate_type=str(queued_item.get("source") or ""),
                 )
                 if passage.get("synthetic") or key[1] == SYNTHETIC_PASSAGE_ID:
                     judgment = str(verdict.get("judgment") or "")
+                    reading = _synthetic_reading(judgment)
                     metadata["synthetic_counterexample"] = {
                         "passage_id": SYNTHETIC_PASSAGE_ID,
                         "label": SYNTHETIC_MARKER,
                         "excluded_from_research_outputs": True,
-                        "judgment": judgment,
-                        "detected": judgment in {"contradicts", "qualifies"},
+                        "judgment": judgment or None,
+                        "detected": reading["detected"],
+                        "status": reading["status"],
+                        "reason": reading["reason"],
                         "limitation": SYNTHETIC_LIMITATION,
                     }
                     if SYNTHETIC_LIMITATION not in warnings:
@@ -3655,9 +3841,22 @@ def _counterexample_node(runtime: AxialRuntime):
             research_attempted += attempted
         plausible_total = int(relevance_record.get("plausible_candidates") or 0)
         relevance_record["attempted"] = research_attempted
-        relevance_record["remaining_candidates"] = max(0, plausible_total - research_attempted)
-        if relevance_record["remaining_candidates"]:
+        row_remaining = 0
+        for relationship in relationships:
+            record = by_relationship.get(str(relationship.get("relationship_id") or ""))
+            if not isinstance(record, dict):
+                continue
+            public = {key: value for key, value in record.items() if not str(key).startswith("_")}
+            relationship["negative_case_search_record"] = public
+            row_remaining += int(public.get("remaining") or 0)
+        relevance_record["remaining_candidates"] = row_remaining
+        if row_remaining:
             relevance_record["no_call_reason"] = "budget"
+        elif plausible_total and research_attempted >= plausible_total:
+            relevance_record["no_call_reason"] = None
+        _note_counterexample_accounting(relevance_record, logs, judgments)
+        if procedure.get("axial_synthetic_counterexample"):
+            _finish_synthetic_status(metadata, reason="no_call")
         counter_required = int(procedure.get("counterexample_calls") or 0) > 0 and bool(queued or relationships)
         counter_stop = str(metadata.get("axial_stop") or "")
         proposals_done = (metadata.get("stage_outcomes") or {}).get("proposals") or {}
@@ -4205,6 +4404,19 @@ def _relationship_rejected(row: Mapping[str, Any]) -> bool:
     return False
 
 
+_MEMO_PROMPT_SPANS = (
+    "when contradiction_note is set, the memo has to account for that contradicting quote",
+    "do not decide saturation and do not set human claim support",
+    "a sentence that only says the evidence is two-sided is not a memo",
+    "do not write a cause, such as foster, reduce, or leads to, below tier 3",
+)
+
+
+def _memo_echoes_prompt(text: str) -> bool:
+    folded = " ".join(str(text or "").casefold().split())
+    return any(span in folded for span in _MEMO_PROMPT_SPANS)
+
+
 def _memo_claims_support(text: str) -> bool:
     folded = f" {str(text or '').casefold()} "
     return any(token in folded for token in (" supports ", " supported ", " explicitly "))
@@ -4255,6 +4467,10 @@ def _memo_flags(text: str, relationship: Mapping[str, Any]) -> list[str]:
         flags.append("memo_wording_exceeds_tier")
     if _claims_same_passage(text) and relationship.get("quotes_share_passage") is False:
         flags.append("memo_same_passage_mismatch")
+    if _memo_echoes_prompt(text):
+        flags.append("memo_echoes_prompt")
+    if _relationship_rejected(relationship):
+        flags.append("memo_for_rejected_row")
     if _memo_claims_support(text) and not _both_endpoints_anchored(relationship):
         flags.append("memo_overclaims_support")
     if _row_contradicted(relationship) and not has_qualifier(text):
@@ -4299,7 +4515,12 @@ def _memo_node(runtime: AxialRuntime):
         metadata = metadata_early
         memo_calls, _storyline_calls = _selective_allowances(metadata.get("procedure") or {})
         batch = max(1, int(((state.get("metadata") or {}).get("performance") or {}).get("batch_size") or 1))
-        pending = list(relationships)
+        pending = [row for row in relationships if not _relationship_rejected(row)]
+        metadata["memo_skipped_rejected_ids"] = [
+            str(row.get("relationship_id") or "")
+            for row in relationships
+            if _relationship_rejected(row) and str(row.get("relationship_id") or "")
+        ]
         token_budget = _request_token_budget(metadata)
         max_tokens = int(((metadata.get("procedure") or {}).get("max_axial_review_tokens") or 0))
         estimated = int(metadata.get("axial_tokens_estimated") or 0)
@@ -4770,12 +4991,19 @@ def _story_node(runtime: AxialRuntime):
                 flags.append("storyline_no_relationship")
             if cited_relationships and all(item in rejected_ids for item in cited_relationships):
                 flags.append("storyline_rejected_relationship")
-            unaccepted = [
-                item
-                for item in cited_relationships
-                if item in by_relationship and _unaccepted_for_causal_claim(by_relationship[item])
-            ]
             text = str(draft.get("text") or "")
+            causal_sentence = _causal_language(text)
+            unaccepted = []
+            for item in cited_relationships:
+                cited = by_relationship.get(item)
+                if not isinstance(cited, Mapping) or _relationship_rejected(cited):
+                    continue
+                disposition = str(cited.get("human_disposition") or cited.get("disposition") or "").strip().casefold()
+                accepted = disposition in {"accepted", "verified"}
+                if not accepted:
+                    unaccepted.append(item)
+                elif causal_sentence and _unaccepted_for_causal_claim(cited):
+                    unaccepted.append(item)
             if unaccepted:
                 flags.append("storyline_unaccepted_relationship")
             cited_tiers: dict[str, int | None] = {}
@@ -4926,6 +5154,7 @@ def _result_from_state(state: Mapping[str, Any], *, interrupted: bool, payload: 
         metadata["stop"] = str((payload or {}).get("kind") or "checkpoint")
     metadata["saturation_judgment"] = None
     metadata["package_version"] = __version__
+    metadata["prompt_accounting"] = _prompt_accounting(state.get("prompt_log") or [])
     saturation = dict(state.get("saturation") or {})
     if "judgment" not in saturation:
         saturation = _saturation({**state, "metadata": metadata})

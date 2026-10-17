@@ -2912,6 +2912,18 @@ def _coverage_statement(state: Mapping[str, Any], not_reread: Sequence[str]) -> 
     }
 
 
+def _compared_token_estimate(state: Mapping[str, Any]) -> int | None:
+    """The guarded figure the ceiling uses. Null when that figure was not recorded.
+
+    ``focused_tokens_estimated`` stays the raw heuristic. A raw total can sit
+    above the ceiling while this compared figure still fits.
+    """
+    budget = (state.get("metadata") or {}).get("provider_budget") or {}
+    if not isinstance(budget, Mapping) or budget.get("tokens_estimated_compared") is None:
+        return None
+    return int(budget.get("tokens_estimated_compared") or 0)
+
+
 def _token_estimate_ratio(estimated: int, usage: Mapping[str, Any]) -> float | None:
     """Heuristic estimate divided by provider input tokens.
 
@@ -2952,6 +2964,20 @@ def _claim_round_stage(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
     relevance = metadata.get("claim_test_relevance") or {}
     judgments = int(relevance.get("judgments") or 0)
     relevant = int(relevance.get("relevant_judgments") or 0)
+    search = relevance.get("respondent_search") if isinstance(relevance.get("respondent_search"), Mapping) else {}
+    plausible = int(search.get("plausible_count") or claim.get("plausible_count") or 0)
+    queued = int(claim.get("items_queued") if claim.get("items_queued") is not None else relevance.get("queued") or 0)
+    unsent = int(claim.get("plausible_unsent") or 0)
+    if not unsent and plausible:
+        unsent = max(0, plausible - queued)
+    if plausible and unsent:
+        return {
+            "required": True,
+            "status": "budget_limited",
+            "reason": "budget",
+            "plausible_count": plausible,
+            "plausible_unsent": unsent,
+        }
     if judgments == 0:
         return {"required": True, "status": "complete_no_negative_search", "reason": "no_calls"}
     if relevant == 0:
@@ -2993,6 +3019,9 @@ def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
         "focused_calls_used": int(state.get("focused_calls_used") or 0),
         "focused_tokens_used": int(state.get("focused_tokens_used") or 0),
         "focused_tokens_estimated": int(state.get("focused_tokens_estimated") or 0),
+        "focused_tokens_estimated_compared": _compared_token_estimate(state),
+        "focused_tokens_estimated_is_raw": True,
+        "ceiling_comparison": "guarded",
         "focused_tokens_adjusted": calibrated_token_estimate(int(state.get("focused_tokens_estimated") or 0)),
         "focused_tokens_calibrated": calibrated_token_estimate(int(state.get("focused_tokens_estimated") or 0)),
         "provider_token_usage": dict(state.get("provider_token_usage") or _empty_provider_usage()),
@@ -4176,10 +4205,14 @@ def _prepare_node(state: FocusedState) -> dict:
             filled_calls = 0 if not extra else min(claim_calls, (len(extra) + batch_size - 1) // batch_size)
             unspent_calls = claim_calls - filled_calls
             claim_meta = dict(updates.get("metadata") or state.get("metadata") or {})
+            search = relevance.get("respondent_search") if isinstance(relevance.get("respondent_search"), Mapping) else {}
+            plausible_count = int(search.get("plausible_count") or 0)
             claim_meta["claim_round"] = {
                 "requested": True,
                 "calls_scheduled": int(claim_calls),
                 "items_queued": len(extra),
+                "plausible_count": plausible_count,
+                "plausible_unsent": max(0, plausible_count - len(extra)),
             }
             updates["metadata"] = claim_meta
             if unspent_calls > 0:
@@ -4980,16 +5013,26 @@ def _commit_node(runtime: FocusedRuntime):
                     if recorded and invalid_reason:
                         prompt_log[-1].setdefault("claim_test_rejections", []).append(recorded)
                     if recorded and recorded.get("synthetic"):
+                        judgment = str(recorded.get("judgment") or "")
+                        if judgment in {"contradicts", "qualifies"}:
+                            synthetic_status, detected, synthetic_reason = "interpretable", True, ""
+                        elif judgment == "supports":
+                            synthetic_status, detected, synthetic_reason = "interpretable", False, "supports"
+                        else:
+                            synthetic_status, detected, synthetic_reason = "not_interpretable", None, "irrelevant"
                         synthetic_result = {
                             "passage_id": passage_id,
                             "label": SYNTHETIC_MARKER,
                             "excluded_from_research_outputs": True,
-                            "judgment": recorded.get("judgment"),
+                            "judgment": judgment or None,
                             "entry_id": recorded.get("entry_id"),
-                            "detected": recorded.get("judgment") in {"contradicts", "qualifies"},
+                            "detected": detected,
+                            "status": synthetic_status,
+                            "reason": synthetic_reason,
                             "limitation": (
                                 "The synthetic counterexample only checks that a contradicting passage can be recorded. "
-                                "It is not a test of analytic judgment. The passage text sent to the model does not "
+                                "It is not a test of analytic judgment. An irrelevant judgment is not_interpretable, "
+                                "not a pass. The passage text sent to the model does not "
                                 "announce itself; the label stays in the audit. Research exports omit the passage."
                             ),
                         }
@@ -5091,8 +5134,25 @@ def _commit_node(runtime: FocusedRuntime):
         version = int(state.get("snapshot_version") or 0) + 1
         consolidation = consolidate_code_proposals(segments)
         metadata = dict(state.get("metadata") or {})
+        procedure = metadata.get("procedure") or {}
+        existing_synthetic = metadata.get("synthetic_counterexample")
         if synthetic_result is not None:
             metadata["synthetic_counterexample"] = synthetic_result
+        elif procedure.get("focused_synthetic_counterexample") and not (
+            isinstance(existing_synthetic, Mapping) and existing_synthetic.get("status")
+        ):
+            metadata["synthetic_counterexample"] = {
+                "passage_id": SYNTHETIC_PASSAGE_ID,
+                "label": SYNTHETIC_MARKER,
+                "excluded_from_research_outputs": True,
+                "judgment": None,
+                "detected": None,
+                "status": "not_interpretable",
+                "reason": "no_call",
+                "limitation": (
+                    "No synthetic counterexample call ran. That is not_interpretable, not a pass."
+                ),
+            }
         metadata["claim_test_counts"] = claim_counts
         metadata["claim_test_relevance"] = _claim_test_relevance(
             properties,

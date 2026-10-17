@@ -167,6 +167,7 @@ class SamplingRereadNote(BaseModel):
     passage_id: str
     note: str = ""
     quote: str = ""
+    judgment: str = ""
 
 
 class SamplingState(TypedDict, total=False):
@@ -601,6 +602,29 @@ def rank_sampling_directions(state: Mapping[str, Any], *, coding_family: str = "
                 criteria=[f"a passage that bears on the question in memo {memo_id}", "do not treat the memo text as a quotation"],
             )
         )
+    ledger = [row for row in ((metadata.get("sampling_ledger") or [])) if isinstance(row, Mapping)]
+    closed = _closed_direction_keys(ledger)
+    directions = [row for row in directions if _target_key(row) not in closed]
+    for row in ledger:
+        for note in row.get("reread_notes") or []:
+            if not isinstance(note, Mapping) or _note_irrelevant(note):
+                continue
+            key = str(note.get("direction_key") or "")
+            if not key or key in closed:
+                continue
+            directions.append(
+                _direction(
+                    kind="reread_follow_up",
+                    target_type="direction",
+                    target_id=key,
+                    label=str(note.get("note") or key),
+                    why=f"The reread of {key} recorded material the next round should use.",
+                    audit={"prior_direction_key": key, "passage_id": note.get("passage_id")},
+                    coding_family=_family_for("open_memo", coding_family),
+                    criteria=["a passage that bears on the reread note", "do not repeat an irrelevant reread"],
+                )
+            )
+    directions = _dedupe_directions(directions)
     directions.sort(key=lambda row: (-int(row["score"]), str(row["kind"]), str(row["target_id"]), str(row["why"])))
     return directions
 
@@ -756,7 +780,107 @@ def _number_directions(rows: Sequence[Mapping], *, round_index: int) -> list[dic
 
 
 def _target_key(direction: Mapping[str, Any]) -> str:
-    return f"{direction.get('kind')}:{direction.get('target_id')}"
+    kind = str(direction.get("kind") or "")
+    target = str(direction.get("target_id") or "")
+    audit = direction.get("audit") if isinstance(direction.get("audit"), Mapping) else {}
+    role = str(audit.get("paradigm_role") or "") if kind == "empty_paradigm_slot" else ""
+    if role:
+        return f"{kind}:{target}:{role}"
+    return f"{kind}:{target}"
+
+
+def _dedupe_directions(rows: Sequence[Mapping[str, Any]]) -> list[dict]:
+    seen: set[str] = set()
+    kept = []
+    for row in rows:
+        key = _target_key(row)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        kept.append(dict(row))
+    return kept
+
+
+def _note_irrelevant(note: Mapping[str, Any]) -> bool:
+    judgment = str(note.get("judgment") or "").casefold()
+    text = str(note.get("note") or "").casefold()
+    return judgment == "irrelevant" or "irrelevant" in text
+
+
+def _closed_direction_keys(ledger: Sequence[Mapping[str, Any]]) -> set[str]:
+    closed: set[str] = set()
+    for row in ledger:
+        if not isinstance(row, Mapping):
+            continue
+        for key in row.get("rejected_direction_keys") or []:
+            if key:
+                closed.add(str(key))
+        for note in row.get("reread_notes") or []:
+            if isinstance(note, Mapping) and _note_irrelevant(note) and note.get("direction_key"):
+                closed.add(str(note.get("direction_key")))
+    return closed
+
+
+def publish_sampling_indicators(indicators: Mapping[str, Any]) -> dict[str, Any]:
+    """Write the same window rates the stopping criteria read.
+
+    A null window rate is filled from complete document points. A rate that
+    still cannot be computed stays null. ``judgment`` stays null.
+    """
+    from automated_grounded_theory.saturation import _window_rate
+
+    published = dict(indicators)
+    published["judgment"] = None
+    for key, point_key in (
+        ("window_new_code_rate", "new_codes"),
+        ("window_new_property_rate", "new_properties"),
+        ("window_new_relationship_rate", "new_relationships"),
+    ):
+        if published.get(key) is not None:
+            continue
+        rate = _window_rate(published, key, point_key)
+        if rate is not None:
+            published[key] = rate
+    return published
+
+
+def _ledger_indicator_snapshot(indicators: Mapping[str, Any]) -> dict[str, Any]:
+    """The window rates stored on a ledger row. Same values the criteria read."""
+    published = publish_sampling_indicators(indicators)
+    return {
+        "n_documents": published.get("n_documents"),
+        "saturation_window": published.get("saturation_window"),
+        "window_new_code_rate": published.get("window_new_code_rate"),
+        "window_new_property_rate": published.get("window_new_property_rate"),
+        "window_new_relationship_rate": published.get("window_new_relationship_rate"),
+        "code_frequency_shift": published.get("code_frequency_shift"),
+        "judgment": None,
+    }
+
+
+def _baseline_sampling_stages(allowance: ProviderAllowance | None, metadata: dict[str, Any]) -> None:
+    """Sampling ceilings count calls spent in this stage.
+
+    Upstream coding and review calls stay on ``calls_used`` and on
+    ``sampling_call_baseline``. They are not charged against
+    ``max_sampling_review_calls`` or ``max_decision_calls``.
+    """
+    if allowance is None:
+        return
+    owned = [name for name in ("coding", "review") if name in allowance.stage_ceilings]
+    upstream = {name: int(allowance.stage_used.get(name, 0) or 0) for name in owned}
+    for name in owned:
+        allowance.stage_used[name] = 0
+    metadata["sampling_call_baseline"] = {
+        "upstream_stage_calls": upstream,
+        "calls_used_carried": int(allowance.calls_used),
+        "note": (
+            "Sampling stage ceilings count calls spent in this stage. "
+            "Upstream coding and review calls are recorded here and are not charged "
+            "against max_sampling_review_calls or max_decision_calls. "
+            "calls_used stays the carried total."
+        ),
+    }
 
 
 def _sync_allowance(metadata: dict[str, Any], runtime: SamplingRuntime) -> None:
@@ -1211,6 +1335,168 @@ def _apply_human_sampling(state: SamplingState, decision: Mapping[str, Any]) -> 
     return {"directions": directions, "metadata": metadata}
 
 
+def _proposals_for(proposals: Sequence[Any], directions: Sequence[Mapping[str, Any]]) -> list:
+    ids = {str(row.get("direction_id") or "") for row in directions}
+    return [
+        row
+        for row in proposals
+        if isinstance(row, Mapping) and str(row.get("direction_id") or "") in ids
+    ]
+
+
+def _selection_over_budget(metadata: Mapping[str, Any], estimate: int, runtime: SamplingRuntime) -> str | None:
+    if estimate > _budget(metadata):
+        return "request_budget"
+    allowance = getattr(runtime.limiter, "provider_allowance", None)
+    if allowance is not None and int(getattr(allowance, "max_tokens", 0) or 0) > 0:
+        remaining = allowance.remaining_tokens()
+        if remaining is not None and estimate > remaining:
+            return "token_allowance"
+    return None
+
+
+def _pack_selection(
+    metadata: Mapping[str, Any],
+    directions: Sequence[Mapping[str, Any]],
+    proposals: Sequence[Any],
+    runtime: SamplingRuntime,
+) -> dict[str, Any]:
+    """Drop lowest-ranked directions until the selection request fits.
+
+    The per-request budget is unchanged. A single direction that still does
+    not fit is omitted, and the caller records ``request_budget``.
+    """
+    from automated_grounded_theory.batching import request_input_tokens
+
+    ordered = sorted(
+        [dict(row) for row in directions],
+        key=lambda row: (int(row.get("rank") or 10**6), str(row.get("direction_id") or "")),
+    )
+    omitted: list[dict] = []
+    payload = _selection_payload(ordered, _proposals_for(proposals, ordered))
+    messages = _messages("sampling_selection", payload)
+    estimate = request_input_tokens(messages, ModelSamplingSelection)
+    unpacked = estimate
+    reason = _selection_over_budget(metadata, estimate, runtime)
+    while reason and ordered:
+        if len(ordered) == 1:
+            omitted.append(ordered.pop())
+            break
+        omitted.append(ordered.pop())
+        payload = _selection_payload(ordered, _proposals_for(proposals, ordered))
+        messages = _messages("sampling_selection", payload)
+        estimate = request_input_tokens(messages, ModelSamplingSelection)
+        reason = _selection_over_budget(metadata, estimate, runtime)
+    return {
+        "directions": ordered,
+        "messages": messages,
+        "estimate": estimate,
+        "unpacked_estimate": unpacked,
+        "omitted": omitted,
+        "reason": reason,
+    }
+
+
+def _selection_pack_record(packed: Mapping[str, Any], metadata: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "unpacked_estimated_input_tokens": packed.get("unpacked_estimate"),
+        "packed_estimated_input_tokens": packed.get("estimate"),
+        "per_request_budget": _budget(metadata),
+        "omitted_direction_ids": [str(row.get("direction_id") or "") for row in (packed.get("omitted") or [])],
+        "sent_direction_ids": [str(row.get("direction_id") or "") for row in (packed.get("directions") or [])],
+        "note": (
+            "sampling_token_budget is the per-request ceiling and is unchanged. "
+            "Directions that do not fit are omitted from this request, lowest rank first. "
+            "A request that cannot fit even one direction is not sent."
+        ),
+    }
+
+
+def _limit_pairs_to_allowance(
+    runtime: SamplingRuntime,
+    metadata: dict[str, Any],
+    directions: Sequence[Mapping[str, Any]],
+    pairs: Sequence[Mapping[str, str]],
+) -> tuple[list[dict[str, str]], bool]:
+    """Keep as many pairs as the sampling coding ceiling can pay for.
+
+    The rest are unsent with reason ``call_allowance``. A flat-list mismatch
+    stays on its own field. It does not replace this stop.
+    """
+    allowance = getattr(runtime.limiter, "provider_allowance", None)
+    remaining = None if allowance is None else allowance.remaining_calls("coding")
+    rows = [dict(row) for row in pairs]
+    if remaining is None or len(rows) <= remaining:
+        return rows, False
+    rank_of = {str(row.get("direction_id") or ""): int(row.get("rank") or 10**6) for row in directions}
+    ordered = sorted(
+        rows,
+        key=lambda row: (rank_of.get(row["direction_id"], 10**6), row["direction_id"], row["passage_id"]),
+    )
+    kept = ordered[: max(0, int(remaining))]
+    cut = ordered[max(0, int(remaining)) :]
+    unsent = [dict(row) for row in (metadata.get("reread_unsent_pairs") or []) if isinstance(row, Mapping)]
+    existing = {(str(row.get("direction_id") or ""), str(row.get("passage_id") or "")) for row in unsent}
+    for row in cut:
+        key = (row["direction_id"], row["passage_id"])
+        if key in existing:
+            continue
+        unsent.append({"direction_id": row["direction_id"], "passage_id": row["passage_id"], "reason": "call_allowance"})
+        existing.add(key)
+    metadata["reread_unsent_pairs"] = unsent
+    metadata["reread_unsent_passage_ids"] = [str(row.get("passage_id") or "") for row in unsent]
+    metadata["sampling_selection_unsent_pairs"] = [
+        dict(row) for row in unsent if str(row.get("reason") or "") == "call_allowance"
+    ]
+    metadata["sampling_stop"] = "call_allowance"
+    return kept, True
+
+
+def _stored_reread_notes(state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    directions = {
+        str(row.get("direction_id") or ""): row
+        for row in (state.get("directions") or [])
+        if isinstance(row, Mapping)
+    }
+    stored = []
+    for note in state.get("reread_notes") or []:
+        if not isinstance(note, Mapping):
+            continue
+        direction = directions.get(str(note.get("direction_id") or ""), {})
+        key = str(note.get("direction_key") or "") or (_target_key(direction) if direction else "")
+        stored.append(
+            {
+                "direction_key": key,
+                "direction_id": str(note.get("direction_id") or ""),
+                "passage_id": str(note.get("passage_id") or ""),
+                "note": str(note.get("note") or ""),
+                "judgment": str(note.get("judgment") or ""),
+                "quote": str(note.get("quote") or ""),
+            }
+        )
+    return stored
+
+
+def _analytic_new_keys(
+    new_keys: Sequence[str],
+    notes: Sequence[Mapping[str, Any]],
+    directions: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """New keys that a reread did not close.
+
+    An irrelevant note or a rejected direction is not new analytic material.
+    Keys that were not judged stay.
+    """
+    closed: set[str] = set()
+    for note in notes:
+        if _note_irrelevant(note) and note.get("direction_key"):
+            closed.add(str(note.get("direction_key")))
+    for row in directions:
+        if isinstance(row, Mapping) and str(row.get("action") or "") == "reject":
+            closed.add(_target_key(row))
+    return [key for key in new_keys if key not in closed]
+
+
 def _selection_payload(directions: Sequence[Mapping[str, Any]], proposals: Sequence[Any]) -> dict[str, Any]:
     return {
         "directions": [
@@ -1263,12 +1549,16 @@ def _store_model_selection(
         for row in group.get("proposals") or []:
             if isinstance(row, Mapping):
                 proposed_passages.add(str(row.get("passage_id") or ""))
+    sent_ids = {str(item) for item in (metadata.get("selection_sent_direction_ids") or []) if item}
+    if sent_ids:
+        known_directions = {item for item in known_directions if item in sent_ids}
     reading = _read_model_selection(parsed, known_directions, known_passages, proposals)
-    kept_directions = list(reading["direction_ids"])
-    kept_passages = list(reading["passage_ids"])
+    pairs, cut_for_allowance = _limit_pairs_to_allowance(runtime, metadata, directions, list(reading["pairs"]))
+    kept_directions = _unique_ids([row["direction_id"] for row in pairs])
+    kept_passages = _unique_ids([row["passage_id"] for row in pairs])
     metadata["model_direction_ids"] = kept_directions
     metadata["model_passage_ids"] = kept_passages
-    metadata["model_sampling_pairs"] = list(reading["pairs"])
+    metadata["model_sampling_pairs"] = pairs
     metadata["model_passages_without_direction"] = list(reading["unpaired"])
     metadata["model_unknown_direction_ids"] = list(reading["unknown_directions"])
     metadata["model_unknown_passage_ids"] = list(reading["unknown_passages"])
@@ -1278,20 +1568,31 @@ def _store_model_selection(
     metadata["model_passages_outside_proposal"] = off_proposal
     metadata["model_sampling_rationale"] = str(parsed.get("rationale") or "")
     metadata["model_sampling_judgment"] = True
-    metadata["model_sampling_status"] = reading["status"]
+    status = "budget_limited" if cut_for_allowance else reading["status"]
+    metadata["model_sampling_status"] = status
     metadata["researcher_sampling"] = None
     metadata["selection_repair_pending"] = False
-    if reading["status"] != "complete":
+    if cut_for_allowance:
+        metadata["sampling_stop"] = "call_allowance"
+    elif reading["status"] != "complete":
         metadata["sampling_stop"] = str(reading["reason"] or "selection_incomplete")
     for row in directions:
         row["model_selected"] = row.get("direction_id") in set(kept_directions)
         row["action"] = ""
         row["sampled_passage_ids"] = []
     warnings = list(state.get("warnings") or [])
-    if reading["status"] != "complete":
+    if status != "complete" or reading.get("mismatch"):
         for note in reading["warnings"]:
             if note not in warnings:
                 warnings.append(note)
+    if cut_for_allowance:
+        note = (
+            "The model selected more pairs than the sampling call allowance can pay for. "
+            "The extra pairs are on reread_unsent_pairs with reason call_allowance. "
+            "The stop is call_allowance."
+        )
+        if note not in warnings:
+            warnings.append(note)
     _sync_allowance(metadata, runtime)
     return {
         "directions": directions,
@@ -1312,7 +1613,33 @@ async def _select_with_model(runtime: SamplingRuntime, state: SamplingState) -> 
     if runtime.reviewer is None or allowance is None or allowance.remaining_calls("review") == 0:
         _sync_allowance(metadata, runtime)
         return _selection_stopped(metadata, directions, logs, status="budget_limited", reason="call_allowance")
-    messages = _messages("sampling_selection", _selection_payload(directions, proposals))
+    packed = _pack_selection(metadata, directions, proposals, runtime)
+    metadata["selection_pack"] = _selection_pack_record(packed, metadata)
+    metadata["selection_sent_direction_ids"] = list(metadata["selection_pack"]["sent_direction_ids"])
+    if packed["reason"]:
+        logs.append(
+            _prompt_row(
+                "sampling_selection",
+                packed["messages"],
+                {},
+                extra_status=str(packed["reason"]),
+            )
+        )
+        logs[-1]["status"] = "omitted"
+        logs[-1]["reason"] = str(packed["reason"])
+        logs[-1]["estimated_input_tokens"] = packed["estimate"]
+        logs[-1]["received"] = False
+        logs[-1]["needs_review"] = True
+        logs[-1]["flagged"] = True
+        _sync_allowance(metadata, runtime)
+        return _selection_stopped(
+            metadata,
+            directions,
+            logs,
+            status="incomplete",
+            reason=str(packed["reason"]),
+        )
+    messages = list(packed["messages"])
     result = await _sampling_call(
         runtime,
         runtime.reviewer,
@@ -1357,7 +1684,12 @@ async def _repair_model_selection(
         _sync_allowance(metadata, runtime)
         return {"directions": directions, "metadata": metadata, "prompt_log": logs}
     error = str(metadata.get("selection_repair_error") or "the output did not match the schema")
-    messages = _messages("sampling_selection", _selection_payload(directions, state.get("passage_proposals") or []))
+    sent_ids = {str(item) for item in (metadata.get("selection_sent_direction_ids") or []) if item}
+    repair_directions = [row for row in directions if not sent_ids or str(row.get("direction_id") or "") in sent_ids]
+    messages = _messages(
+        "sampling_selection",
+        _selection_payload(repair_directions, state.get("passage_proposals") or []),
+    )
     messages.append(
         HumanMessage(
             content=(
@@ -1469,15 +1801,8 @@ def _record_ledger(state: SamplingState) -> dict:
         "proposal_counts": {str(row.get("direction_id")): len(row.get("proposals") or []) for row in proposals},
         "directions_without_passages": exhausted,
         "new_data_collection": metadata.get("new_data_collection"),
-        "indicators": {
-            "n_documents": indicators.get("n_documents"),
-            "saturation_window": indicators.get("saturation_window"),
-            "window_new_code_rate": indicators.get("window_new_code_rate"),
-            "window_new_property_rate": indicators.get("window_new_property_rate"),
-            "window_new_relationship_rate": indicators.get("window_new_relationship_rate"),
-            "code_frequency_shift": indicators.get("code_frequency_shift"),
-            "judgment": None,
-        },
+        "analytic_new_direction_keys": list(new_keys),
+        "indicators": _ledger_indicator_snapshot(indicators),
         "constant_comparison": _compare(previous, indicators, new_keys),
         "reread_status": "pending" if str((metadata.get("procedure") or {}).get("pursuit") or "") == "reread" else "skipped",
     }
@@ -1923,6 +2248,7 @@ def _append_reread_note(
             "kind": str(direction.get("kind") or ""),
             "sampling_query": str(direction.get("sampling_query") or ""),
             "note": str(parsed.get("note") or ""),
+            "judgment": str(parsed.get("judgment") or ""),
             "quote": stored_quote,
             "flags": flags,
             "model_judgment": True,
@@ -2159,18 +2485,30 @@ def _update_ledger(state: SamplingState) -> dict:
     if not ledger:
         return {"sampling_ledger": ledger, "metadata": metadata}
     last = dict(ledger[-1])
+    notes = _stored_reread_notes(state)
+    directions = [row for row in (state.get("directions") or []) if isinstance(row, Mapping)]
+    rejected = sorted({_target_key(row) for row in directions if str(row.get("action") or "") == "reject"})
+    new_keys = [str(item) for item in (last.get("new_direction_keys") or [])]
+    last["reread_notes"] = notes
+    last["rejected_direction_keys"] = rejected
+    last["analytic_new_direction_keys"] = _analytic_new_keys(new_keys, notes, directions)
     last["reread_status"] = metadata.get("reread_status") or last.get("reread_status")
-    last["reread_note_count"] = len(state.get("reread_notes") or [])
+    last["reread_note_count"] = len(notes)
     last["reread_unsent_passage_ids"] = list(metadata.get("reread_unsent_passage_ids") or [])
     last["reread_unsent_pairs"] = list(metadata.get("reread_unsent_pairs") or [])
+    published = publish_sampling_indicators(_indicators(state))
+    last["indicators"] = _ledger_indicator_snapshot(published)
     last["indicator_effect"] = (
-        "The reread notes are not written back into the saturation curve. "
-        "Indicator deltas stay the comparison recorded for this round."
+        "Reread notes are written onto this ledger row. "
+        "Window rates on the row are the same values the stopping criteria read. "
+        "A null rate is filled from complete document points when those points exist. "
+        "judgment stays null. A note does not by itself rewrite the saturation curve."
     )
     ledger[-1] = last
     metadata["sampling_ledger"] = ledger
+    metadata["reread_notes_do_not_change_saturation_indicators"] = False
     criteria = stopping_criteria_report(
-        _indicators(state),
+        published,
         ledger,
         core_id=_core_id(state),
         relationships=state.get("relationships") or [],
@@ -3003,6 +3341,7 @@ async def atheoretical_sample(
     )
     if not resuming:
         _carry_budget(runtime.limiter.provider_allowance, upstream.get("provider_budget"))
+        _baseline_sampling_stages(runtime.limiter.provider_allowance, metadata)
         _sync_allowance(metadata, runtime)
     from langgraph.checkpoint.memory import InMemorySaver
 

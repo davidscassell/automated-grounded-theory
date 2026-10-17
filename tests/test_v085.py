@@ -30,8 +30,8 @@ from tests.test_v080 import QUOTE, FakeAxialCoder, _corpus
 
 
 def test_version_is_085():
-    assert __version__ == "0.9.6"
-    assert POLICY_VERSION == "0.9.6"
+    assert __version__ == "0.9.7"
+    assert POLICY_VERSION == "0.9.7"
 
 
 def test_endpoint_anchoring_is_not_a_single_quote():
@@ -61,15 +61,16 @@ def test_endpoint_anchoring_is_not_a_single_quote():
     held = {"codebook": book, "relationships": [one_sided, both], "storyline": [], "metadata": {}, "empty_slots": []}
     coverage = _coverage(held)
     assert coverage["citation_anchoring_rate"] is None
-    assert coverage["endpoint_anchoring_rate"] == 0.75
-    assert coverage["endpoint_anchored"] == 3
+    assert coverage["endpoint_anchoring_rate"] == 0.5
+    assert coverage["endpoint_anchored"] == 2
     assert coverage["endpoint_total"] == 4
     from automated_grounded_theory.axial import _endpoint_anchoring
 
     rows = _endpoint_anchoring(one_sided, book)
     assert rows[0]["anchored"] is False
     assert rows[0]["reason"] == "quote_misses_category"
-    assert rows[1]["anchored"] is True
+    assert rows[1]["anchored"] is False
+    assert rows[1]["reason"] == "stem_only"
     only = _coverage({"codebook": book, "relationships": [both], "storyline": [], "metadata": {}, "empty_slots": []})
     assert only["citation_anchoring_rate"] is None
     assert only["citation_anchoring_by_tier"]["pattern_supported"]["citation_rate"] is None

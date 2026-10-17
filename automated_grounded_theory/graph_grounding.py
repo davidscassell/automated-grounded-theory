@@ -142,7 +142,8 @@ def named_core_id(run: Any) -> str:
 
 def core_agreement(runs: Sequence[Any], *, minimum_n: int = CORE_STABILITY_MIN_N) -> dict[str, Any]:
     """Pairwise agreement of named cores. Null below ``minimum_n`` named cores."""
-    named = [named_core_id(run) for run in runs]
+    records = list(runs)
+    named = [named_core_id(run) for run in records]
     named = [item for item in named if item]
     floor = max(2, int(minimum_n or CORE_STABILITY_MIN_N))
     if len(named) < floor:
@@ -155,14 +156,17 @@ def core_agreement(runs: Sequence[Any], *, minimum_n: int = CORE_STABILITY_MIN_N
         score = sum(scores) / len(scores) if scores else None
     return {
         "name": "core_stability",
-        "n": len(list(runs)),
+        "n": len(named),
+        "runs": len(records),
+        "cores": named,
         "named_cores": len(named),
         "score": score,
         "minimum_n": floor,
         "minimum_n_note": CORE_STABILITY_MIN_N_NOTE,
         "note": (
-            "Pairwise agreement of the core id each run named. "
-            "The score is null when fewer than minimum_n runs name a core. "
+            "Pairwise agreement of the named cores in cores. "
+            "n is the length of that list, including this run when it names a core. "
+            "The score is null when fewer than minimum_n cores are named. "
             "Disagreeing cores score 0. They are not averaged into one core."
         ),
     }

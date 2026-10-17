@@ -409,7 +409,11 @@ Package 0.9.5 stores each sampling reread before the next request. A later timeo
 
 Package 0.9.6 checkpoints a malformed sampling reread before its repair, so a repair timeout keeps the original response and its usage. Resume sends the repair and does not repeat the initial request. The pair that is about to be sent is recorded first. A timeout names that pair, and a pair already withheld stays unsent. An omitted flat id list is derived from the selections. Only a nonempty list is compared. The design is [design-review-fixes-096.md](design-review-fixes-096.md).
 
-`policy_version` is `0.9.6`.
+`policy_version` was `0.9.6`.
+
+Package 0.9.7 checks causal and consequence wording, including the role `consequence` or `cause`, before a tier 1 or 2 relationship is accepted, and checks a reviewer who says no causal language was used. `core_stability.n` counts named cores and includes the current run. One distinctive stem does not count as a same-passage anchor. An absence candidate cannot contradict a relationship. Negative-case rows and the aggregate share one record, and prompt rows are split into calls and unsent rows. Sampling call ceilings start at zero for the sampling stage. A selection request is packed to `sampling_token_budget`. Pairs beyond the coding allowance are unsent with reason `call_allowance`. Reread notes are written onto the ledger, and the next round drops a direction those notes closed. A focused claim round with plausible candidates left unsent is `budget_limited`. Memos that echo the prompt are flagged, and a rejected row is not sent for a memo. A non-causal storyline sentence does not flag an accepted relationship. The raw focused token estimate and the guarded ceiling figure are both reported. The axial token ceiling is unchanged, and a planning estimate warns when it is short. An irrelevant or missing synthetic check is `not_interpretable`. The design is [design-review-fixes-097.md](design-review-fixes-097.md).
+
+`policy_version` is `0.9.7`.
 
 ## 26. Out of scope
 

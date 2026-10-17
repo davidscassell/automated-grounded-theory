@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.7
+
+- Causal and consequence wording, including the roles `consequence` and `cause`, fails the tier gate below tier 3. A reviewer who says no causal language was used is checked against that detector.
+- `core_stability` includes the current run's named core. `n` is the number of named cores.
+- One distinctive stem is a weak anchor. It does not count as `same_passage` or `cases_with_both_endpoints`. An absence candidate is not stored as a contradiction.
+- Negative-case rows and the aggregate share one attempted and remaining count. Prompt rows are split into provider calls and unsent rows. Research judgments exclude the synthetic check.
+- Sampling call ceilings count this stage. Upstream calls stay on `sampling_call_baseline`. A selection request is packed to `sampling_token_budget`. Pairs beyond the coding allowance are unsent with reason `call_allowance`.
+- Reread notes are written onto the ledger. The next round drops a direction an irrelevant note or a reject closed. The window rate on the ledger is the rate the stopping criteria read. `judgment` stays null.
+- A focused claim round with plausible candidates left unsent is `budget_limited`. A memo that echoes the prompt is flagged, and a rejected row is not sent for a memo. A non-causal storyline sentence does not flag an accepted relationship. The raw focused token estimate and the guarded ceiling figure are both reported. The axial token ceiling is unchanged, and a planning estimate warns when it is short. An irrelevant or missing synthetic check is `not_interpretable`.
+- The design is [docs/design-review-fixes-097.md](docs/design-review-fixes-097.md). `policy_version` is `0.9.7`.
+
 ## 0.9.6
 
 - A malformed sampling reread is checkpointed, with its usage, before the repair is sent. A repair timeout keeps that response. Resume sends the repair and does not repeat the initial request. The consumed allowance stays consumed.
