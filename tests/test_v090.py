@@ -26,8 +26,8 @@ from tests.test_v080 import FakeAxialCoder, _corpus
 
 
 def test_version_is_090():
-    assert __version__ == "0.9.6"
-    assert POLICY_VERSION == "0.9.6"
+    assert __version__ == "0.9.7"
+    assert POLICY_VERSION == "0.9.7"
 
 
 def _payload(messages) -> dict:
@@ -388,7 +388,8 @@ def test_unanchored_reread_quote_is_not_stored():
     assert result.reread_notes
     assert result.reread_notes[0]["quote"] == ""
     assert "quote_unanchored" in result.reread_notes[0]["flags"]
-    assert result.metadata["reread_notes_do_not_change_saturation_indicators"] is True
+    assert result.metadata["reread_notes_do_not_change_saturation_indicators"] is False
+    assert result.sampling_ledger[-1]["reread_notes"]
 
 
 def test_later_round_appends_the_ledger():

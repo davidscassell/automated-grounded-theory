@@ -420,7 +420,14 @@ def stopping_criteria_report(
         quiet_observed = None
     else:
         recent = rounds[-quiet:]
-        introduced = [list(row.get("new_direction_keys") or []) for row in recent]
+        introduced = [
+            list(
+                row.get("analytic_new_direction_keys")
+                if "analytic_new_direction_keys" in row
+                else row.get("new_direction_keys") or []
+            )
+            for row in recent
+        ]
         quiet_observed = introduced
         quiet_status = "met" if all(not row for row in introduced) else "unmet"
     criteria.append(

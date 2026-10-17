@@ -20,8 +20,8 @@ from tests.test_v080 import QUOTE, STATEMENT, FakeAxialCoder, _corpus
 
 
 def test_version_is_086():
-    assert __version__ == "0.9.6"
-    assert POLICY_VERSION == "0.9.6"
+    assert __version__ == "0.9.7"
+    assert POLICY_VERSION == "0.9.7"
 
 
 def test_from_does_not_anchor_both_endpoints_and_matched_tokens_are_reported():
@@ -47,7 +47,8 @@ def test_from_does_not_anchor_both_endpoints_and_matched_tokens_are_reported():
     )
     assert rows[0]["anchored"] is False
     assert rows[0]["matched_tokens"] == []
-    assert rows[1]["anchored"] is True
+    assert rows[1]["anchored"] is False
+    assert rows[1]["reason"] == "stem_only"
     assert "from" not in rows[1]["matched_tokens"]
     assert "mentor" in rows[1]["matched_tokens"]
     separate = _endpoint_anchoring(
@@ -62,7 +63,8 @@ def test_from_does_not_anchor_both_endpoints_and_matched_tokens_are_reported():
     )
     assert separate[0]["anchored"] is True
     assert "family" in separate[0]["matched_tokens"] or "flexibility" in separate[0]["matched_tokens"]
-    assert separate[1]["anchored"] is True
+    assert separate[1]["anchored"] is False
+    assert separate[1]["reason"] == "stem_only"
 
 
 def test_partial_evidence_cannot_be_accepted():
