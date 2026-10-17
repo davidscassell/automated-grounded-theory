@@ -188,7 +188,10 @@ def test_human_pause_resume_keeps_the_carried_budget(tmp_path: Path):
     assert paused.interrupted
     assert paused.interrupt_payload["kind"] == "theoretical_sampling"
     assert paused.metadata["provider_budget"]["calls_used"] == 2
-    assert paused.metadata["provider_budget"]["tokens_estimated"] == 100
+    # 0.9.10 baselines carried token estimates. calls_used stays. This stage's
+    # tokens_estimated starts at 0 so upstream tokens are not charged.
+    assert paused.metadata["sampling_token_baseline"]["tokens_estimated_carried"] == 100
+    assert paused.metadata["provider_budget"]["tokens_estimated"] == 0
     direction_id = paused.directions[0]["direction_id"]
     mid = theoretical_sample(
         _carried_corpus(),
@@ -214,7 +217,7 @@ def test_human_pause_resume_keeps_the_carried_budget(tmp_path: Path):
     assert mid.interrupt_payload["stopping_criteria"]["declares_saturation"] is False
     budget = mid.metadata["provider_budget"]
     assert budget["calls_used"] == 3
-    assert budget["tokens_estimated"] > 100
+    assert budget["tokens_estimated"] > 0
     assert mid.sampling_ledger[-1]["sampled_passage_ids"] == ["p-low"]
     assert mid.reread_notes
     assert mid.reread_notes[0]["quote"]
