@@ -5135,9 +5135,12 @@ def _commit_node(runtime: FocusedRuntime):
         consolidation = consolidate_code_proposals(segments)
         metadata = dict(state.get("metadata") or {})
         procedure = metadata.get("procedure") or {}
+        existing_synthetic = metadata.get("synthetic_counterexample")
         if synthetic_result is not None:
             metadata["synthetic_counterexample"] = synthetic_result
-        elif procedure.get("focused_synthetic_counterexample"):
+        elif procedure.get("focused_synthetic_counterexample") and not (
+            isinstance(existing_synthetic, Mapping) and existing_synthetic.get("status")
+        ):
             metadata["synthetic_counterexample"] = {
                 "passage_id": SYNTHETIC_PASSAGE_ID,
                 "label": SYNTHETIC_MARKER,
