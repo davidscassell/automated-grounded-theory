@@ -166,3 +166,13 @@ The structured `judgment` is the only reading of a passage. The note text is not
 A direction closes when the human action is `reject`, or when the model sets `direction_decision` to `close` and writes a non-empty `direction_close_reason`. A close without a reason does not close the direction. `closed_direction_keys` is that set. `analytic_new_direction_keys` drops those keys and keeps a key whose passage was rejected. Quiet rounds read `analytic_new_direction_keys` when the field is present. A later round that offers an already seen open direction does not count it as new, so the quiet-round criterion can be met while the direction stays open. Older ledger rows that omit the field still use `new_direction_keys`.
 
 `model_sampling_pairs` is the validated selection. When `pursuit` is `reread`, pairs beyond the remaining coding calls are `reread_unsent_pairs` with reason `call_allowance`, `scheduled_reread_pairs` is the subset that will be sent, and the stop is `call_allowance`. `brief_only` stores the full selection and does not set that stop. A selection repair sends the packed payload again, including only the passage proposals that fit the request. The note is [design-review-fixes-098.md](design-review-fixes-098.md).
+
+## Stable question identity (0.9.9)
+
+A research question keeps the key `kind:target` or `empty_paradigm_slot:target:role`. A reread note is stored on that key as `question_key`. Relevance does not create `reread_follow_up:<previous key>`.
+
+A distinct question is a different key. The note must set `follow_up_kind` to one of the record-grounded direction kinds and `follow_up_target_id` to a code, relationship, or core id already on the run. `empty_paradigm_slot` also needs `follow_up_role`. The same fields always produce the same key. The note text is not compared. A target that is not on the run does not become a question.
+
+`completed_pairs` records each `(question_key, passage_id)` that was reread. Retrieval does not offer that passage for that question again, and the reread loop does not send it. A pair withheld for that reason uses `completed_pair` and does not make the stage `budget_limited`.
+
+Loading a ledger strips leading `reread_follow_up:` prefixes. `direction_keys`, `new_direction_keys`, `analytic_new_direction_keys`, closed keys, rejected passages, and notes are rewritten to the stable key. The original nested key is kept on `recorded_direction_key` when it differed. A nested key is not new when its stable question was already on an earlier round. A close stored against a nested key closes that stable question. The note is [design-review-fixes-099.md](design-review-fixes-099.md).

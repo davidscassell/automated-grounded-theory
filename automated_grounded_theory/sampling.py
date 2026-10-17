@@ -170,6 +170,9 @@ class SamplingRereadNote(BaseModel):
     judgment: str = ""
     direction_decision: str = ""
     direction_close_reason: str = ""
+    follow_up_kind: str = ""
+    follow_up_target_id: str = ""
+    follow_up_role: str = ""
 
 
 class SamplingState(TypedDict, total=False):
@@ -604,31 +607,44 @@ def rank_sampling_directions(state: Mapping[str, Any], *, coding_family: str = "
                 criteria=[f"a passage that bears on the question in memo {memo_id}", "do not treat the memo text as a quotation"],
             )
         )
-    ledger = [row for row in ((metadata.get("sampling_ledger") or [])) if isinstance(row, Mapping)]
+    ledger = normalize_sampling_ledger(
+        [row for row in ((metadata.get("sampling_ledger") or [])) if isinstance(row, Mapping)]
+    )
     closed = _closed_direction_keys(ledger)
-    directions = [row for row in directions if _target_key(row) not in closed]
+    directions = [row for row in directions if _question_key(row) not in closed]
+    introduced = {_question_key(row) for row in directions}
     for row in ledger:
         for note in row.get("reread_notes") or []:
             if not isinstance(note, Mapping) or _note_judgment(note) != "relevant":
                 continue
-            key = str(note.get("direction_key") or "")
-            if not key or key in closed:
+            parent = stable_question_key(str(note.get("question_key") or note.get("direction_key") or ""))
+            distinct = _distinct_question_key(note, state)
+            if not distinct or distinct == parent or distinct in closed or distinct in introduced:
                 continue
+            kind, target, role = _split_question_key(distinct)
+            audit = {
+                "prior_question_key": parent,
+                "passage_id": note.get("passage_id"),
+                "introduced_by": "reread_observation",
+            }
+            if role:
+                audit["paradigm_role"] = role
             directions.append(
                 _direction(
-                    kind="reread_follow_up",
-                    target_type="direction",
-                    target_id=key,
-                    label=str(note.get("note") or key),
-                    why=f"The reread of {key} recorded material the next round should use.",
-                    audit={"prior_direction_key": key, "passage_id": note.get("passage_id")},
-                    coding_family=_family_for("open_memo", coding_family),
+                    kind=kind,
+                    target_type=_KIND_TARGET_TYPE.get(kind, "category"),
+                    target_id=target,
+                    label=target,
+                    why=f"A reread of {parent} named {distinct} as a separate question already on this run.",
+                    audit=audit,
+                    coding_family=_family_for(kind, coding_family),
                     criteria=[
-                        "a passage that bears on the reread note",
-                        "do not offer a passage already rejected for this direction",
+                        "a passage that bears on this question",
+                        "do not offer a passage already read or rejected for this question",
                     ],
                 )
             )
+            introduced.add(distinct)
     directions = _dedupe_directions(directions)
     directions.sort(key=lambda row: (-int(row["score"]), str(row["kind"]), str(row["target_id"]), str(row["why"])))
     return directions
@@ -722,11 +738,13 @@ def retrieve_sampling_passages(
         wanted = _distinctive(blob)
         claim_vector = direction.get("embedding") if isinstance(direction.get("embedding"), list) else None
         used = _used_passages(direction, state)
-        blocked = rejected.get(_target_key(direction), set())
+        question = _question_key(direction)
+        blocked = rejected.get(question, set())
+        completed = _completed_pairs(_ledger_rows(state))
         ranked = []
         for passage in passages:
             passage_id = str(passage.get("passage_id") or "")
-            if not passage_id or passage_id in used or passage_id in blocked:
+            if not passage_id or passage_id in used or passage_id in blocked or (question, passage_id) in completed:
                 continue
             overlap = wanted & _distinctive(str(passage.get("text") or ""))
             semantic = 0.0
@@ -796,6 +814,205 @@ def _target_key(direction: Mapping[str, Any]) -> str:
     return f"{kind}:{target}"
 
 
+_FOLLOW_UP_PREFIX = "reread_follow_up:"
+_KIND_TARGET_TYPE = {
+    "partial_relationship": "relationship",
+    "cross_respondent_relationship": "relationship",
+    "weak_core": "core",
+}
+
+
+def stable_question_key(key: str) -> str:
+    """Strip nested ``reread_follow_up:`` wrappers down to the underlying question.
+
+    A 0.9.7 or 0.9.8 ledger stored ``reread_follow_up:reread_follow_up:thin_category:c-prep``.
+    That string is the same question as ``thin_category:c-prep``. The note text is not read.
+    """
+    text = str(key or "").strip()
+    while text.startswith(_FOLLOW_UP_PREFIX):
+        text = text[len(_FOLLOW_UP_PREFIX) :]
+    return text
+
+
+def _question_key(direction: Mapping[str, Any]) -> str:
+    if str(direction.get("kind") or "") == "reread_follow_up":
+        return stable_question_key(str(direction.get("target_id") or ""))
+    return stable_question_key(_target_key(direction))
+
+
+def _split_question_key(key: str) -> tuple[str, str, str]:
+    stable = stable_question_key(key)
+    if stable.startswith("empty_paradigm_slot:"):
+        rest = stable[len("empty_paradigm_slot:") :]
+        for role in PARADIGM_ROLES:
+            suffix = f":{role}"
+            if rest.endswith(suffix) and rest[: -len(suffix)]:
+                return "empty_paradigm_slot", rest[: -len(suffix)], role
+        return "empty_paradigm_slot", rest, ""
+    kind, _, target = stable.partition(":")
+    return kind, target, ""
+
+
+def _known_question_targets(state: Mapping[str, Any]) -> dict[str, set[str]]:
+    book = state.get("codebook") if isinstance(state.get("codebook"), Mapping) else {}
+    codes: set[str] = set()
+    for code_id, row in (book or {}).items():
+        codes.add(str(code_id))
+        if isinstance(row, Mapping) and row.get("code_id"):
+            codes.add(str(row.get("code_id")))
+    codes.discard("")
+    relationships: set[str] = set()
+    for row in state.get("relationships") or []:
+        if isinstance(row, Mapping) and row.get("relationship_id") and not row.get("synthetic"):
+            relationships.add(str(row.get("relationship_id")))
+    cores: set[str] = set()
+    metadata = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
+    for value in ((metadata or {}).get("researcher_core_id"), (metadata or {}).get("model_core_id")):
+        if value:
+            cores.add(str(value))
+    for row in state.get("core_candidates") or []:
+        if isinstance(row, Mapping):
+            cores.add(str(row.get("code_id") or row.get("category_id") or row.get("core_id") or ""))
+    cores.discard("")
+    return {"category": codes, "relationship": relationships, "core": cores}
+
+
+def _distinct_question_key(note: Mapping[str, Any], state: Mapping[str, Any]) -> str | None:
+    """A new question only when the note names a different recorded target.
+
+    ``follow_up_kind`` must be one of the record-grounded direction kinds.
+    ``follow_up_target_id`` must already be a code, relationship, or core id on
+    this run. ``empty_paradigm_slot`` also needs ``follow_up_role`` in the
+    paradigm roles. The note text is ignored. The same fields always yield the
+    same key, and that key is not wrapped in ``reread_follow_up:``.
+    """
+    kind = str(note.get("follow_up_kind") or "").strip()
+    target = str(note.get("follow_up_target_id") or "").strip()
+    role = str(note.get("follow_up_role") or "").strip()
+    if kind not in _DIRECTION_SCORES or not target:
+        return None
+    bucket = "relationship" if _KIND_TARGET_TYPE.get(kind) == "relationship" else "core" if kind == "weak_core" else "category"
+    if target not in _known_question_targets(state).get(bucket, set()):
+        return None
+    if kind == "empty_paradigm_slot":
+        if role not in PARADIGM_ROLES:
+            return None
+        return f"{kind}:{target}:{role}"
+    return f"{kind}:{target}"
+
+
+def _completed_pairs(ledger: Sequence[Mapping[str, Any]]) -> set[tuple[str, str]]:
+    found: set[tuple[str, str]] = set()
+    for row in ledger:
+        if not isinstance(row, Mapping):
+            continue
+        for item in list(row.get("completed_pairs") or []) + list(row.get("reread_notes") or []):
+            if not isinstance(item, Mapping):
+                continue
+            question = stable_question_key(str(item.get("question_key") or item.get("direction_key") or ""))
+            passage_id = str(item.get("passage_id") or "")
+            if question and passage_id:
+                found.add((question, passage_id))
+    return found
+
+
+def _pair_already_completed(state: Mapping[str, Any], pair: Mapping[str, Any], direction: Mapping[str, Any]) -> bool:
+    question = _question_key(direction) if direction else ""
+    passage_id = str(pair.get("passage_id") or "")
+    if not question or not passage_id:
+        return False
+    return (question, passage_id) in _completed_pairs(_ledger_rows(state))
+
+
+def _completed_pair_rows(notes: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for note in notes:
+        if not isinstance(note, Mapping):
+            continue
+        question = stable_question_key(str(note.get("question_key") or note.get("direction_key") or ""))
+        passage_id = str(note.get("passage_id") or "")
+        pair = (question, passage_id)
+        if not question or not passage_id or pair in seen:
+            continue
+        seen.add(pair)
+        rows.append({"question_key": question, "passage_id": passage_id})
+    return rows
+
+
+def normalize_sampling_ledger(ledger: Sequence[Mapping[str, Any]]) -> list[dict]:
+    """Read an older ledger and store every question under its stable key.
+
+    Nested ``reread_follow_up:`` keys collapse to the underlying question.
+    A key is new only when that stable question was not already on an earlier
+    round. Completed ``(question, passage)`` pairs are copied onto the row.
+    """
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for row in ledger:
+        if not isinstance(row, Mapping):
+            continue
+        item = dict(row)
+        keys: list[str] = []
+        for key in item.get("direction_keys") or []:
+            stable = stable_question_key(str(key))
+            if stable and stable not in keys:
+                keys.append(stable)
+        if "direction_keys" in item:
+            item["direction_keys"] = keys
+
+        def _keep_new(values: Sequence[Any]) -> list[str]:
+            kept: list[str] = []
+            for key in values or []:
+                stable = stable_question_key(str(key))
+                if stable and stable not in seen and stable not in kept:
+                    kept.append(stable)
+            return kept
+
+        if "new_direction_keys" in item:
+            item["new_direction_keys"] = _keep_new(item.get("new_direction_keys") or [])
+        if "analytic_new_direction_keys" in item:
+            item["analytic_new_direction_keys"] = _keep_new(item.get("analytic_new_direction_keys") or [])
+        notes: list[dict] = []
+        for note in item.get("reread_notes") or []:
+            if not isinstance(note, Mapping):
+                continue
+            stored = dict(note)
+            raw = str(stored.get("direction_key") or "")
+            stable = stable_question_key(str(stored.get("question_key") or raw))
+            if raw and raw != stable:
+                stored["recorded_direction_key"] = raw
+            stored["direction_key"] = stable
+            stored["question_key"] = stable
+            notes.append(stored)
+        if "reread_notes" in item or notes:
+            item["reread_notes"] = notes
+        for field_name in ("rejected_direction_keys", "closed_direction_keys"):
+            if field_name not in item:
+                continue
+            item[field_name] = sorted(
+                {stable_question_key(str(key)) for key in (item.get(field_name) or []) if stable_question_key(str(key))}
+            )
+        if "rejected_passages" in item:
+            rejected_rows = []
+            rejected_seen: set[tuple[str, str]] = set()
+            for rejected in item.get("rejected_passages") or []:
+                if not isinstance(rejected, Mapping):
+                    continue
+                question = stable_question_key(str(rejected.get("direction_key") or rejected.get("question_key") or ""))
+                passage_id = str(rejected.get("passage_id") or "")
+                pair = (question, passage_id)
+                if not question or not passage_id or pair in rejected_seen:
+                    continue
+                rejected_seen.add(pair)
+                rejected_rows.append({"direction_key": question, "passage_id": passage_id})
+            item["rejected_passages"] = rejected_rows
+        item["completed_pairs"] = _completed_pair_rows(list(item.get("completed_pairs") or []) + notes)
+        seen.update(keys)
+        rows.append(item)
+    return rows
+
+
 def _dedupe_directions(rows: Sequence[Mapping[str, Any]]) -> list[dict]:
     seen: set[str] = set()
     kept = []
@@ -827,7 +1044,8 @@ def _explicit_direction_close(note: Mapping[str, Any]) -> bool:
     """A model closes a direction only when it records that decision and a reason."""
     decision = str(note.get("direction_decision") or "").strip().casefold()
     reason = str(note.get("direction_close_reason") or "").strip()
-    return decision == "close" and bool(reason) and bool(str(note.get("direction_key") or "").strip())
+    question = stable_question_key(str(note.get("question_key") or note.get("direction_key") or ""))
+    return decision == "close" and bool(reason) and bool(question)
 
 
 def _closed_direction_keys(ledger: Sequence[Mapping[str, Any]]) -> set[str]:
@@ -841,11 +1059,12 @@ def _closed_direction_keys(ledger: Sequence[Mapping[str, Any]]) -> set[str]:
         if not isinstance(row, Mapping):
             continue
         for key in list(row.get("rejected_direction_keys") or []) + list(row.get("closed_direction_keys") or []):
-            if key:
-                closed.add(str(key))
+            stable = stable_question_key(str(key or ""))
+            if stable:
+                closed.add(stable)
         for note in row.get("reread_notes") or []:
             if isinstance(note, Mapping) and _explicit_direction_close(note):
-                closed.add(str(note.get("direction_key")))
+                closed.add(stable_question_key(str(note.get("question_key") or note.get("direction_key") or "")))
     return closed
 
 
@@ -866,10 +1085,16 @@ def _rejected_passages(ledger: Sequence[Mapping[str, Any]]) -> dict[str, set[str
             continue
         for item in row.get("rejected_passages") or []:
             if isinstance(item, Mapping):
-                _add(str(item.get("direction_key") or ""), str(item.get("passage_id") or ""))
+                _add(
+                    stable_question_key(str(item.get("direction_key") or item.get("question_key") or "")),
+                    str(item.get("passage_id") or ""),
+                )
         for note in row.get("reread_notes") or []:
             if isinstance(note, Mapping) and _note_irrelevant(note):
-                _add(str(note.get("direction_key") or ""), str(note.get("passage_id") or ""))
+                _add(
+                    stable_question_key(str(note.get("question_key") or note.get("direction_key") or "")),
+                    str(note.get("passage_id") or ""),
+                )
     return rejected
 
 
@@ -1218,7 +1443,10 @@ def _core_id(state: Mapping[str, Any]) -> str:
 def _prior_keys(ledger: Sequence[Mapping]) -> set[str]:
     found = set()
     for row in ledger:
-        found.update(str(item) for item in (row.get("direction_keys") or []))
+        for item in row.get("direction_keys") or []:
+            stable = stable_question_key(str(item))
+            if stable:
+                found.add(stable)
     return found
 
 
@@ -1254,7 +1482,9 @@ def _compare(previous: Mapping[str, Any] | None, indicators: Mapping[str, Any], 
 
 def _load(state: SamplingState) -> dict:
     metadata = dict(state.get("metadata") or {})
-    ledger = [dict(row) for row in (metadata.get("sampling_ledger") or state.get("sampling_ledger") or []) if isinstance(row, Mapping)]
+    ledger = normalize_sampling_ledger(
+        [dict(row) for row in (metadata.get("sampling_ledger") or state.get("sampling_ledger") or []) if isinstance(row, Mapping)]
+    )
     metadata["sampling_ledger"] = ledger
     return {"sampling_ledger": ledger, "metadata": metadata, "saturation": _indicators(state)}
 
@@ -1516,10 +1746,13 @@ def _stored_reread_notes(state: Mapping[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(note, Mapping):
             continue
         direction = directions.get(str(note.get("direction_id") or ""), {})
-        key = str(note.get("direction_key") or "") or (_target_key(direction) if direction else "")
+        raw = str(note.get("direction_key") or "") or (_question_key(direction) if direction else "")
+        key = stable_question_key(raw)
         stored.append(
             {
                 "direction_key": key,
+                "question_key": key,
+                "recorded_direction_key": raw if raw and raw != key else "",
                 "direction_id": str(note.get("direction_id") or ""),
                 "passage_id": str(note.get("passage_id") or ""),
                 "note": str(note.get("note") or ""),
@@ -1527,6 +1760,9 @@ def _stored_reread_notes(state: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "quote": str(note.get("quote") or ""),
                 "direction_decision": str(note.get("direction_decision") or ""),
                 "direction_close_reason": str(note.get("direction_close_reason") or ""),
+                "follow_up_kind": str(note.get("follow_up_kind") or ""),
+                "follow_up_target_id": str(note.get("follow_up_target_id") or ""),
+                "follow_up_role": str(note.get("follow_up_role") or ""),
             }
         )
     return stored
@@ -1545,10 +1781,10 @@ def _analytic_new_keys(
     closed: set[str] = set()
     for note in notes:
         if isinstance(note, Mapping) and _explicit_direction_close(note):
-            closed.add(str(note.get("direction_key")))
+            closed.add(stable_question_key(str(note.get("question_key") or note.get("direction_key") or "")))
     for row in directions:
         if isinstance(row, Mapping) and str(row.get("action") or "") == "reject":
-            closed.add(_target_key(row))
+            closed.add(_question_key(row))
     return [key for key in new_keys if key not in closed]
 
 
@@ -1558,7 +1794,7 @@ def _rejected_passage_rows(notes: Sequence[Mapping[str, Any]]) -> list[dict[str,
     for note in notes:
         if not isinstance(note, Mapping) or not _note_irrelevant(note):
             continue
-        key = str(note.get("direction_key") or "")
+        key = stable_question_key(str(note.get("question_key") or note.get("direction_key") or ""))
         passage_id = str(note.get("passage_id") or "")
         pair = (key, passage_id)
         if not key or not passage_id or pair in seen:
@@ -1870,7 +2106,11 @@ def _record_ledger(state: SamplingState) -> dict:
     metadata = dict(state.get("metadata") or {})
     directions = [dict(row) for row in (state.get("directions") or [])]
     prior = [dict(row) for row in (state.get("sampling_ledger") or [])]
-    keys = [_target_key(row) for row in directions]
+    keys = []
+    for row in directions:
+        question = _question_key(row)
+        if question and question not in keys:
+            keys.append(question)
     seen = _prior_keys(prior)
     new_keys = [key for key in keys if key not in seen]
     indicators = _indicators(state)
@@ -2222,7 +2462,10 @@ def _reread_payload(
             "judgment is the structured reading of this passage: relevant, irrelevant, or empty. "
             "The note does not change that judgment. "
             "An irrelevant passage does not close the direction. "
-            "Set direction_decision to close and give direction_close_reason only when this direction should stop."
+            "Set direction_decision to close and give direction_close_reason only when this direction should stop. "
+            "To name a different question, set follow_up_kind and follow_up_target_id to a kind and an id already in this run. "
+            "empty_paradigm_slot also needs follow_up_role. "
+            "The note text does not create a question. Leave those fields empty to keep this observation on the current question."
         ),
     }
 
@@ -2298,7 +2541,8 @@ def _finish_reread(
         metadata["reread_status"] = "incomplete"
         metadata["sampling_stop"] = str(metadata.get("reread_stop") or metadata.get("sampling_stop") or "incomplete")
         return
-    if unsent:
+    actionable = [row for row in unsent if str(row.get("reason") or "") != "completed_pair"]
+    if actionable:
         if metadata.get("stop") == "timeout":
             metadata["reread_status"] = "incomplete"
             metadata["reread_stop"] = "timeout"
@@ -2309,7 +2553,7 @@ def _finish_reread(
             if not notes and wanted:
                 metadata["sampling_stop"] = metadata.get("sampling_stop") or "call_allowance"
         return
-    metadata["reread_status"] = "complete" if wanted else "skipped"
+    metadata["reread_status"] = "complete" if notes else "skipped"
     metadata["reread_failed_pairs"] = []
     metadata["reread_unattempted_pairs"] = []
     if metadata.get("stop") == "timeout":
@@ -2351,6 +2595,9 @@ def _append_reread_note(
             "judgment": str(parsed.get("judgment") or ""),
             "direction_decision": str(parsed.get("direction_decision") or ""),
             "direction_close_reason": str(parsed.get("direction_close_reason") or ""),
+            "follow_up_kind": str(parsed.get("follow_up_kind") or ""),
+            "follow_up_target_id": str(parsed.get("follow_up_target_id") or ""),
+            "follow_up_role": str(parsed.get("follow_up_role") or ""),
             "quote": stored_quote,
             "flags": flags,
             "model_judgment": True,
@@ -2473,6 +2720,16 @@ async def _reread(runtime: SamplingRuntime, state: SamplingState) -> dict:
         _sync_allowance(metadata, runtime)
         return _reread_return(notes, metadata, logs, warnings)
 
+    if _pair_already_completed(state, pair, direction):
+        metadata["reread_active_pair"] = None
+        _withhold_reread(metadata, unsent, pair, reason="completed_pair")
+        if len(pending) > 1:
+            metadata.pop("reread_status", None)
+        else:
+            _finish_reread(metadata, notes, wanted, unsent)
+        metadata["reread_notes_do_not_change_saturation_indicators"] = True
+        _sync_allowance(metadata, runtime)
+        return _reread_return(notes, metadata, logs, warnings)
     armed = active is not None and _reread_pair_key(active) == _reread_pair_key(pair)
     if passage is None or calls_left == 0:
         metadata["reread_active_pair"] = None
@@ -2589,15 +2846,21 @@ def _update_ledger(state: SamplingState) -> dict:
     last = dict(ledger[-1])
     notes = _stored_reread_notes(state)
     directions = [row for row in (state.get("directions") or []) if isinstance(row, Mapping)]
-    rejected = sorted({_target_key(row) for row in directions if str(row.get("action") or "") == "reject"})
+    rejected = sorted({_question_key(row) for row in directions if str(row.get("action") or "") == "reject" and _question_key(row)})
     closed_by_model = sorted(
-        {str(note.get("direction_key") or "") for note in notes if _explicit_direction_close(note)} - {""}
+        {
+            stable_question_key(str(note.get("question_key") or note.get("direction_key") or ""))
+            for note in notes
+            if _explicit_direction_close(note)
+        }
+        - {""}
     )
     new_keys = [str(item) for item in (last.get("new_direction_keys") or [])]
     last["reread_notes"] = notes
     last["rejected_direction_keys"] = rejected
     last["closed_direction_keys"] = sorted(set(rejected) | set(closed_by_model))
     last["rejected_passages"] = _rejected_passage_rows(notes)
+    last["completed_pairs"] = _completed_pair_rows(notes)
     last["analytic_new_direction_keys"] = _analytic_new_keys(new_keys, notes, directions)
     last["reread_status"] = metadata.get("reread_status") or last.get("reread_status")
     last["reread_note_count"] = len(notes)

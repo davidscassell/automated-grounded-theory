@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.9
+
+- A sampling question keeps a stable key. A relevant reread is an observation of that question and does not wrap it in another `reread_follow_up:` direction. A new question is added only when `follow_up_kind` and `follow_up_target_id` name a different code, relationship, or core already on the run. The note text is not matched.
+- `completed_pairs` records each question and passage that was reread. That pair is not offered or reread again. Older nested `reread_follow_up:` keys are read as the underlying question.
+- `export_gate_relationships` lists accepted and withheld relationships with the rules already stored on each row. `load_adjudications` and `score_gate_adjudications` score a separate adjudication file. A rate with no adjudicated rows stays null. The gates are unchanged.
+- The design notes are [docs/design-review-fixes-099.md](docs/design-review-fixes-099.md) and [docs/design-gate-evaluation.md](docs/design-gate-evaluation.md). `policy_version` is `0.9.9`.
+
 ## 0.9.8
 
 - A reread judgment is the structured field. Free text is not read for the word irrelevant. An irrelevant passage is not offered again for that direction, and the direction stays open. Closing a direction takes a human reject or a model close recorded with a reason.

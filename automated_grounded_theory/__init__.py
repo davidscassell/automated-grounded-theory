@@ -40,6 +40,11 @@ from automated_grounded_theory.decision_review import (
     claims_payload,
     selection_payload,
 )
+from automated_grounded_theory.gate_evaluation import (
+    export_gate_relationships,
+    load_adjudications,
+    score_gate_adjudications,
+)
 from automated_grounded_theory.focused import (
     FocusedError,
     FocusedResult,
@@ -103,6 +108,9 @@ __all__ = [
     "chen_metrics",
     "compare_runs",
     "evaluate_run",
+    "export_gate_relationships",
+    "load_adjudications",
+    "score_gate_adjudications",
     "focused_code",
     "get_graph",
     "load_run",

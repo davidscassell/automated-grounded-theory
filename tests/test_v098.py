@@ -33,8 +33,8 @@ from tests.test_v090 import FakeSamplingCoder, _kwargs, _payload
 
 
 def test_version_is_098():
-    assert __version__ == "0.9.8"
-    assert POLICY_VERSION == "0.9.8"
+    assert __version__ == "0.9.9"
+    assert POLICY_VERSION == "0.9.9"
 
 
 def _prep_group(groups, directions):
@@ -57,7 +57,7 @@ def test_a_relevant_note_does_not_close_the_direction():
     after = rank_sampling_directions(corpus)
     assert any(_target_key(item) == "thin_category:c-prep" for item in after)
     assert "thin_category:c-prep" not in _closed_direction_keys(corpus["metadata"]["sampling_ledger"])
-    assert any(item["kind"] == "reread_follow_up" for item in after)
+    assert all(item["kind"] != "reread_follow_up" for item in after)
 
     rejected = {
         "direction_key": "thin_category:c-prep",

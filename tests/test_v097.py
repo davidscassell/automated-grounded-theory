@@ -40,8 +40,8 @@ from tests.test_v090 import FakeSamplingCoder, _kwargs
 
 
 def test_version_is_097():
-    assert __version__ == "0.9.8"
-    assert POLICY_VERSION == "0.9.8"
+    assert __version__ == "0.9.9"
+    assert POLICY_VERSION == "0.9.9"
 
 
 def test_consequence_wording_fails_the_tier_gate_and_the_reviewer_is_checked():
@@ -434,7 +434,8 @@ def test_reread_notes_change_the_next_round_and_the_ledger_rate():
         ]
     }
     followed = rank_sampling_directions(follow)
-    assert any(item["kind"] == "reread_follow_up" for item in followed)
+    assert any(_target_key(item) == "thin_category:c-prep" for item in followed)
+    assert all(item["kind"] != "reread_follow_up" for item in followed)
     assert updated["sampling_ledger"][-1]["indicators"]["judgment"] is None
 
 
