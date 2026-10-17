@@ -40,8 +40,8 @@ from tests.test_v090 import FakeSamplingCoder, _kwargs
 
 
 def test_version_is_097():
-    assert __version__ == "0.9.7"
-    assert POLICY_VERSION == "0.9.7"
+    assert __version__ == "0.9.8"
+    assert POLICY_VERSION == "0.9.8"
 
 
 def test_consequence_wording_fails_the_tier_gate_and_the_reviewer_is_checked():
@@ -310,12 +310,17 @@ def test_selection_above_the_call_allowance_stops_for_that_allowance():
         "passage_ids": ["p1", "p2", "p3"],
         "rationale": "Three pairs, and the flat list names a different direction.",
     }
-    metadata = {"decision_mode": "llm"}
+    metadata = {"decision_mode": "llm", "procedure": {"pursuit": "reread"}}
     _store_model_selection(runtime, state, metadata, directions, parsed, [])
     assert metadata["sampling_stop"] == "call_allowance"
     assert metadata["model_sampling_status"] == "budget_limited"
     assert metadata["model_flat_list_mismatch"]["disagreed"]
-    assert metadata["model_sampling_pairs"] == [{"direction_id": "dir-1-0001", "passage_id": "p1"}]
+    assert metadata["model_sampling_pairs"] == [
+        {"direction_id": "dir-1-0001", "passage_id": "p1"},
+        {"direction_id": "dir-1-0002", "passage_id": "p2"},
+        {"direction_id": "dir-1-0003", "passage_id": "p3"},
+    ]
+    assert metadata["scheduled_reread_pairs"] == [{"direction_id": "dir-1-0001", "passage_id": "p1"}]
     assert len(metadata["sampling_selection_unsent_pairs"]) == 2
     assert {row["reason"] for row in metadata["sampling_selection_unsent_pairs"]} == {"call_allowance"}
 
@@ -368,7 +373,9 @@ def test_reread_notes_change_the_next_round_and_the_ledger_rate():
     assert row["indicators"]["window_new_property_rate"] == 0.5
     assert row["indicators"]["judgment"] is None
     assert row["reread_notes"][0]["direction_key"] == "thin_category:c-prep"
-    assert row["analytic_new_direction_keys"] == []
+    assert row["analytic_new_direction_keys"] == ["thin_category:c-prep"]
+    assert row["rejected_passages"] == [{"direction_key": "thin_category:c-prep", "passage_id": "p1"}]
+    assert "thin_category:c-prep" not in row["closed_direction_keys"]
     assert updated["metadata"]["reread_notes_do_not_change_saturation_indicators"] is False
     observed = next(
         item["observed"]
@@ -410,7 +417,7 @@ def test_reread_notes_change_the_next_round_and_the_ledger_rate():
         ]
     }
     reranked = rank_sampling_directions(closed)
-    assert all(_target_key(item) != "thin_category:c-prep" for item in reranked)
+    assert any(_target_key(item) == "thin_category:c-prep" for item in reranked)
     follow = _corpus()
     follow["metadata"] = {
         "sampling_ledger": [

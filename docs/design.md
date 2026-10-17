@@ -413,7 +413,11 @@ Package 0.9.6 checkpoints a malformed sampling reread before its repair, so a re
 
 Package 0.9.7 checks causal and consequence wording, including the role `consequence` or `cause`, before a tier 1 or 2 relationship is accepted, and checks a reviewer who says no causal language was used. `core_stability.n` counts named cores and includes the current run. One distinctive stem does not count as a same-passage anchor. An absence candidate cannot contradict a relationship. Negative-case rows and the aggregate share one record, and prompt rows are split into calls and unsent rows. Sampling call ceilings start at zero for the sampling stage. A selection request is packed to `sampling_token_budget`. Pairs beyond the coding allowance are unsent with reason `call_allowance`. Reread notes are written onto the ledger, and the next round drops a direction those notes closed. A focused claim round with plausible candidates left unsent is `budget_limited`. Memos that echo the prompt are flagged, and a rejected row is not sent for a memo. A non-causal storyline sentence does not flag an accepted relationship. The raw focused token estimate and the guarded ceiling figure are both reported. The axial token ceiling is unchanged, and a planning estimate warns when it is short. An irrelevant or missing synthetic check is `not_interpretable`. The design is [design-review-fixes-097.md](design-review-fixes-097.md).
 
-`policy_version` is `0.9.7`.
+`policy_version` was `0.9.7`.
+
+Package 0.9.8 reads a reread judgment only from the structured field. An irrelevant passage is not offered again for that direction, and the direction stays open until a person rejects it or a model records a close with a reason. Quiet rounds still read `analytic_new_direction_keys` when that field is present, and that list omits only an explicitly closed key. `model_sampling_pairs` keeps the validated selection. The coding-call cap applies only when `pursuit` is `reread`, and the pairs that will be reread are `scheduled_reread_pairs`. `brief_only` does not become `budget_limited` because no reread was requested. A selection repair reuses the packed payload, so proposals removed to fit `sampling_token_budget` are not restored. The design is [design-review-fixes-098.md](design-review-fixes-098.md).
+
+`policy_version` is `0.9.8`.
 
 ## 26. Out of scope
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.8
+
+- A reread judgment is the structured field. Free text is not read for the word irrelevant. An irrelevant passage is not offered again for that direction, and the direction stays open. Closing a direction takes a human reject or a model close recorded with a reason.
+- `model_sampling_pairs` keeps the validated selection. The coding-call cap applies only when `pursuit` is `reread`, and those pairs are `scheduled_reread_pairs`. `brief_only` is not `budget_limited` because no reread was requested. Pairs beyond the allowance stay unsent with reason `call_allowance` when a reread was requested.
+- A selection repair reuses the packed directions and passage proposals. Proposals dropped to fit `sampling_token_budget` are not restored.
+- The design is [docs/design-review-fixes-098.md](docs/design-review-fixes-098.md). `policy_version` is `0.9.8`.
+
 ## 0.9.7
 
 - Causal and consequence wording, including the roles `consequence` and `cause`, fails the tier gate below tier 3. A reviewer who says no causal language was used is checked against that detector.

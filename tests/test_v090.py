@@ -26,8 +26,8 @@ from tests.test_v080 import FakeAxialCoder, _corpus
 
 
 def test_version_is_090():
-    assert __version__ == "0.9.7"
-    assert POLICY_VERSION == "0.9.7"
+    assert __version__ == "0.9.8"
+    assert POLICY_VERSION == "0.9.8"
 
 
 def _payload(messages) -> dict:
