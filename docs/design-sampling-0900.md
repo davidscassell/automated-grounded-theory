@@ -176,3 +176,13 @@ A distinct question is a different key. The note must set `follow_up_kind` to on
 `completed_pairs` records each `(question_key, passage_id)` that was reread. Retrieval does not offer that passage for that question again, and the reread loop does not send it. A pair withheld for that reason uses `completed_pair` and does not make the stage `budget_limited`.
 
 Loading a ledger strips leading `reread_follow_up:` prefixes. `direction_keys`, `new_direction_keys`, `analytic_new_direction_keys`, closed keys, rejected passages, and notes are rewritten to the stable key. The original nested key is kept on `recorded_direction_key` when it differed. A nested key is not new when its stable question was already on an earlier round. A close stored against a nested key closes that stable question. The note is [design-review-fixes-099.md](design-review-fixes-099.md).
+
+## Sampling spend and quiet rounds (0.9.10)
+
+`sampling_token_baseline` records token estimates carried from earlier stages and sets this stage's `tokens_estimated` to 0. The first sampling round is not stopped because axial or focused coding already spent tokens. `max_sampling_review_tokens` and `sampling_token_budget` (default 6000) still bound what this stage spends. `calls_used` stays the carried total.
+
+The saturation request is packed the same way the selection request is packed. Oldest ledger rows are dropped first, then `stopping_criteria`, then indicator fields. `n_documents` and the instruction stay. `saturation_pack` records the omitted fields. A request that still exceeds `sampling_token_budget` is not sent.
+
+A human resume that lists some directions does not set `reject` on the rest. An unlisted direction stays open. An explicit `reject` still closes that direction.
+
+`sampling_rounds_without_new_directions` is `not_evaluable`, and `observed` is null, when a recent quiet round left a selected pair unsent for `call_allowance`, or when `reread_unsent_pairs` was not recorded. The criterion can be met when those pairs were sent, or when each remaining unsent pair is in `closed_direction_keys`. The note is [design-review-fixes-0910.md](design-review-fixes-0910.md).

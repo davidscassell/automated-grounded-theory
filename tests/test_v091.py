@@ -91,8 +91,8 @@ def _both_cases(row: dict) -> dict:
 
 
 def test_version_is_091():
-    assert __version__ == "0.9.9"
-    assert POLICY_VERSION == "0.9.9"
+    assert __version__ == "0.9.10"
+    assert POLICY_VERSION == "0.9.10"
 
 
 def test_tier_zero_is_category_evidence_and_a_label_is_not_a_quote():

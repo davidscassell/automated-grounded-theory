@@ -77,11 +77,21 @@ def allowed_wording(tier: int | None, n: int | None = None) -> str | None:
 
 
 def case_id_of(passage: Mapping[str, Any] | None) -> str:
-    """Respondent when the passage names one, otherwise the document."""
+    """Respondent when the passage names one, otherwise the document.
+
+    Passages keep ``respondent_id`` on ``metadata``. A top-level id still wins.
+    Reading the metadata id collapses a respondent's question-documents into
+    one case, so a tier-2 count on a multi-question corpus gets stricter.
+    """
     if not isinstance(passage, Mapping):
         return ""
     for key in ("respondent_id", "participant_id", "case_id"):
         value = str(passage.get(key) or "").strip()
+        if value:
+            return value
+    metadata = passage.get("metadata") if isinstance(passage.get("metadata"), Mapping) else {}
+    for key in ("respondent_id", "participant_id", "case_id"):
+        value = str(metadata.get(key) or "").strip()
         if value:
             return value
     for key in ("doc_id", "document_id"):
@@ -568,6 +578,12 @@ def denies_causal_language(text: str) -> bool:
             "no cause ",
             "not a cause",
             "no causal language",
+            "non-causal wording",
+            "non causal wording",
+            "non-causal language",
+            "non causal language",
+            "uses non-causal",
+            "uses non causal",
         )
     )
 
@@ -623,6 +639,11 @@ def apply_evidence_tier(relationship: dict, **kwargs: Any) -> dict[str, Any]:
     if wording_overreach(statement, tier if isinstance(tier, int) else None, role=role) and "wording_exceeds_tier" not in flags:
         flags.append("wording_exceeds_tier")
         relationship["needs_review"] = True
+    if "wording_exceeds_tier" in flags and isinstance(tier, int) and tier < 3:
+        relationship["downstream_eligible"] = False
+        relationship["needs_review"] = True
+        if "causal_wording_withheld" not in flags:
+            flags.append("causal_wording_withheld")
     relationship["flags"] = flags
     disposition = str(relationship.get("disposition") or "")
     if disposition not in {"rejected", "merged"} and isinstance(tier, int):
@@ -712,10 +733,14 @@ def candidate_cross_case_passages(
     excluded_ids: set[str] | None = None,
     selected_case_ids: set[str] | None = None,
     limit: int = 0,
+    lexical_only: list | None = None,
 ) -> list[dict[str, Any]]:
     """Passages from other respondents whose text contains both endpoints' distinctive terms.
 
-    The list is empty when no slot remains. Callers keep this inside the evidence budget.
+    A passage that shares only one distinctive stem with either endpoint is not
+    offered. When ``lexical_only`` is a list, those passages are appended there
+    with ``support_cap`` 1. The returned list is empty when no slot remains.
+    Callers keep this inside the evidence budget.
     """
     if limit <= 0:
         return []
@@ -737,9 +762,29 @@ def candidate_cross_case_passages(
             if occupied and case_id in occupied:
                 continue
             tokens = meaningful_tokens(str(passage.get("text") or ""))
-            if not (tokens & from_terms) or not (tokens & to_terms):
+            from_overlap = tokens & from_terms
+            to_overlap = tokens & to_terms
+            if not from_overlap or not to_overlap:
                 continue
             seen.add(passage_id)
+            # One distinctive stem on either side is the seed11 "training" shape.
+            # It is labeled and withheld. It is not offered as cross-case evidence
+            # and it cannot support a tier above 1.
+            if len(from_overlap) < _GROUNDED_STEMS or len(to_overlap) < _GROUNDED_STEMS:
+                if lexical_only is not None:
+                    lexical_only.append(
+                        {
+                            "passage_id": passage_id,
+                            "doc_id": passage.get("doc_id") or passage.get("document_id"),
+                            "respondent_id": case_id,
+                            "code_ids": list(code_ids),
+                            "matched_stems": sorted(from_overlap | to_overlap),
+                            "lexical_only": True,
+                            "candidate_cross_case": False,
+                            "support_cap": 1,
+                        }
+                    )
+                continue
             chosen.append(
                 {
                     "passage_id": passage_id,
@@ -748,8 +793,126 @@ def candidate_cross_case_passages(
                     "text": passage.get("text"),
                     "code_ids": list(code_ids),
                     "candidate_cross_case": True,
+                    "lexical_only": False,
+                    "matched_stems": sorted(from_overlap | to_overlap),
                 }
             )
             if len(chosen) >= limit:
                 return chosen
     return chosen
+
+
+_EVIDENCE_CLASSES = ("same_passage", "same_respondent", "lexical_cross_case")
+
+
+def _doc_id_of(passage: Mapping[str, Any]) -> str:
+    return str(passage.get("doc_id") or passage.get("document_id") or passage.get("passage_id") or "")
+
+
+def classify_pair_evidence(
+    category_ids: Sequence[str],
+    passages: Sequence[Mapping[str, Any]] | None,
+    segments: Sequence[Mapping[str, Any]] | None,
+    codebook: Mapping[str, Any] | None = None,
+    *,
+    pattern_min_cases: int = PATTERN_MIN_CASES,
+) -> dict[str, Any]:
+    """Strongest evidence class for each unordered pair, in a stable order.
+
+    Same-passage co-occurrence comes first, then the same respondent, then a
+    lexical cross-case candidate that shares at least two distinctive stems
+    with each endpoint. A one-stem overlap is counted as ``lexical_only`` and
+    is not an evidence class. The result does not change which pairs exist.
+    """
+    ids: list[str] = []
+    for item in category_ids:
+        text = str(item)
+        if text and text not in ids:
+            ids.append(text)
+    by_id: dict[str, Mapping[str, Any]] = {}
+    ordered_passages: list[Mapping[str, Any]] = []
+    for item in passages or []:
+        if not isinstance(item, Mapping) or item.get("synthetic"):
+            continue
+        passage_id = str(item.get("passage_id") or "")
+        if not passage_id or passage_id in by_id:
+            continue
+        by_id[passage_id] = item
+        ordered_passages.append(item)
+    occurrences: dict[str, list[str]] = {code_id: [] for code_id in ids}
+    for segment in segments or []:
+        if not isinstance(segment, Mapping):
+            continue
+        code_id = str(segment.get("code_id") or "")
+        passage_id = str(segment.get("passage_id") or "")
+        if code_id not in occurrences or passage_id not in by_id:
+            continue
+        if passage_id not in occurrences[code_id]:
+            occurrences[code_id].append(passage_id)
+    cases: dict[str, list[str]] = {}
+    docs: dict[str, list[str]] = {}
+    for code_id, passage_ids in occurrences.items():
+        case_ids: list[str] = []
+        doc_ids: list[str] = []
+        for passage_id in passage_ids:
+            passage = by_id[passage_id]
+            case_id = case_id_of(passage)
+            doc_id = _doc_id_of(passage)
+            if case_id and case_id not in case_ids:
+                case_ids.append(case_id)
+            if doc_id and doc_id not in doc_ids:
+                doc_ids.append(doc_id)
+        cases[code_id] = case_ids
+        docs[code_id] = doc_ids
+    classes: dict[str, list[tuple[str, str]]] = {name: [] for name in _EVIDENCE_CLASSES}
+    lexical_only_pairs = 0
+    reaching = 0
+    minimum = max(1, int(pattern_min_cases or PATTERN_MIN_CASES))
+    for index, left in enumerate(ids):
+        for right in ids[index + 1 :]:
+            left_passages = set(occurrences.get(left) or [])
+            right_passages = set(occurrences.get(right) or [])
+            shared_cases = [case_id for case_id in cases.get(left) or [] if case_id in set(cases.get(right) or [])]
+            if len(shared_cases) >= minimum:
+                reaching += 1
+            if left_passages and right_passages and left_passages & right_passages:
+                classes["same_passage"].append((left, right))
+                continue
+            if shared_cases:
+                classes["same_respondent"].append((left, right))
+                continue
+            from_terms = _endpoint_terms(left, codebook, segments)
+            to_terms = _endpoint_terms(right, codebook, segments)
+            if not from_terms or not to_terms:
+                continue
+            lexical = False
+            stem_only = False
+            occupied = set(cases.get(left) or []) | set(cases.get(right) or [])
+            for passage in ordered_passages:
+                case_id = case_id_of(passage)
+                if occupied and case_id in occupied:
+                    continue
+                tokens = meaningful_tokens(str(passage.get("text") or ""))
+                from_overlap = tokens & from_terms
+                to_overlap = tokens & to_terms
+                if not from_overlap or not to_overlap:
+                    continue
+                if len(from_overlap) >= _GROUNDED_STEMS and len(to_overlap) >= _GROUNDED_STEMS:
+                    lexical = True
+                    break
+                stem_only = True
+            if lexical:
+                classes["lexical_cross_case"].append((left, right))
+            elif stem_only:
+                lexical_only_pairs += 1
+    single_document = sum(1 for code_id in ids if len(docs.get(code_id) or []) == 1)
+    return {
+        "by_class": {name: [{"from_id": left, "to_id": right} for left, right in rows] for name, rows in classes.items()},
+        "evidence_available": {name: len(rows) for name, rows in classes.items()},
+        "plausible_count": sum(len(rows) for rows in classes.values()),
+        "lexical_only_count": lexical_only_pairs,
+        "single_document_code_count": single_document,
+        "pairs_reaching_pattern_min_cases": reaching,
+        "pattern_min_cases": minimum,
+        "code_count": len(ids),
+    }

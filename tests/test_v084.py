@@ -16,8 +16,8 @@ from tests.test_v082 import _install_estimates
 
 
 def test_version_is_084():
-    assert __version__ == "0.9.9"
-    assert POLICY_VERSION == "0.9.9"
+    assert __version__ == "0.9.10"
+    assert POLICY_VERSION == "0.9.10"
 
 
 def _three_codes():
@@ -185,7 +185,9 @@ def test_empty_memo_stays_incomplete():
     assert accounting["requested"] == 1
     assert accounting["produced"] == 0
     assert accounting["empty"] == 1
-    assert accounting["failed"] == 0
+    assert accounting["failed"] == 1
+    assert accounting["not_attempted_rejected"] == 0
+    assert accounting["requested"] == accounting["produced"] + accounting["omitted"] + accounting["failed"] + accounting["not_attempted_rejected"]
     assert result.metadata["stage_outcomes"]["memos"]["status"] == "incomplete"
     assert result.metadata["stage_outcomes"]["memos"]["reason"] == "memo_empty"
     assert result.metadata["status"] == "incomplete"

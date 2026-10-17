@@ -421,7 +421,11 @@ Package 0.9.8 reads a reread judgment only from the structured field. An irrelev
 
 Package 0.9.9 keeps a sampling question on a stable key. A relevant reread is an observation of that question. It does not wrap the key in another `reread_follow_up:` direction. A new question is added only when the note's `follow_up_kind` and `follow_up_target_id` name a different recorded target. The note text is not matched. A completed `(question, passage)` pair is stored on the ledger and is not reread again. Older nested keys are normalized to the stable question when the ledger is loaded. `export_gate_relationships` lists accepted and withheld relationships with the rules already stored on each row, and `score_gate_adjudications` leaves a rate null when no adjudicated rows support it. The gates, `pattern_min_cases`, and the axial ceiling are unchanged. The design notes are [design-review-fixes-099.md](design-review-fixes-099.md) and [design-gate-evaluation.md](design-gate-evaluation.md).
 
-`policy_version` is `0.9.9`.
+`policy_version` was `0.9.9`.
+
+Package 0.9.10 plans axial pairs that already have evidence before the seeded fill, and it reports that coverage. `max_axial_review_calls` still defaults to 8, so a default series examines a small fraction of the pairs. A corpus where no pair can reach `pattern_min_cases` records a warning. The minimum stays 2. `case_id_of` reads `metadata.respondent_id`, so question-documents from one respondent are one case. A one-stem lexical overlap is not offered as cross-case evidence. A tier-1 hypothesis may rest on one passage or one respondent, and a statement stitched from unrelated passages is still rejected. Causal wording below tier 3 is not downstream eligible. An absence qualification keeps its reason. A same-passage stem-only quote stays proposed, with scope `same_passage_stem_only`. Sampling baselines carried token estimates, packs the saturation request, and leaves an unlisted human direction open. Quiet rounds are not evaluable while selected pairs remain unsent. Memo counts balance. The token plan estimates the planned round. A synthetic check with no relationship is `not_run`. Proposed gate rows are listed. A focused timeout reports how long it ran after the last completed call. The axial ceiling stays 24000. The design is [design-review-fixes-0910.md](design-review-fixes-0910.md).
+
+`policy_version` is `0.9.10`.
 
 ## 26. Out of scope
 

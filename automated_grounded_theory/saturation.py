@@ -354,6 +354,29 @@ def _core_has_endpoint(core_id: str, relationships: Sequence[Mapping] | None) ->
     return False
 
 
+def _quiet_rounds_not_evaluable(rounds: Sequence[Mapping]) -> bool:
+    """True when a quiet reading would treat unsent selected pairs as silence.
+
+    A round is evaluable when ``reread_unsent_pairs`` is present and every
+    pair left unsent for ``call_allowance`` is explicitly closed. A ledger
+    that does not record the field cannot be read as met.
+    """
+    for row in rounds:
+        if not isinstance(row, Mapping) or "reread_unsent_pairs" not in row:
+            return True
+        closed = {str(item) for item in (row.get("closed_direction_keys") or []) if str(item)}
+        for item in row.get("reread_unsent_pairs") or []:
+            if not isinstance(item, Mapping):
+                continue
+            if str(item.get("reason") or "") != "call_allowance":
+                continue
+            key = str(item.get("direction_key") or item.get("question_key") or item.get("direction_id") or "")
+            if key and key in closed:
+                continue
+            return True
+    return False
+
+
 def stopping_criteria_report(
     saturation: Mapping | None,
     ledger: Sequence[Mapping] | None = None,
@@ -420,25 +443,36 @@ def stopping_criteria_report(
         quiet_observed = None
     else:
         recent = rounds[-quiet:]
-        introduced = [
-            list(
-                row.get("analytic_new_direction_keys")
-                if "analytic_new_direction_keys" in row
-                else row.get("new_direction_keys") or []
-            )
-            for row in recent
-        ]
-        quiet_observed = introduced
-        quiet_status = "met" if all(not row for row in introduced) else "unmet"
-    criteria.append(
-        {
-            "criterion": "sampling_rounds_without_new_directions",
-            "status": quiet_status,
-            "threshold": {"quiet_rounds": quiet},
-            "observed": quiet_observed,
-            "sampling_rounds": len(rounds),
-        }
-    )
+        unevaluable = _quiet_rounds_not_evaluable(recent)
+        if unevaluable:
+            quiet_status = "not_evaluable"
+            quiet_observed = None
+        else:
+            introduced = [
+                list(
+                    row.get("analytic_new_direction_keys")
+                    if "analytic_new_direction_keys" in row
+                    else row.get("new_direction_keys") or []
+                )
+                for row in recent
+            ]
+            quiet_observed = introduced
+            quiet_status = "met" if all(not row for row in introduced) else "unmet"
+    quiet_row = {
+        "criterion": "sampling_rounds_without_new_directions",
+        "status": quiet_status,
+        "threshold": {"quiet_rounds": quiet},
+        "observed": quiet_observed,
+        "sampling_rounds": len(rounds),
+    }
+    if quiet_status == "not_evaluable":
+        quiet_row["reason"] = "selected_pairs_unsent_or_unrecorded"
+        quiet_row["note"] = (
+            "Quiet rounds are not met while selected pairs remain unsent for call_allowance, "
+            "or when the ledger does not say whether those pairs were sent. "
+            "observed stays null."
+        )
+    criteria.append(quiet_row)
     chosen = str(core_id or "")
     if not chosen:
         core_status = "undefined"

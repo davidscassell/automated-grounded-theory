@@ -1315,6 +1315,9 @@ def parse_incidents(decision: Any, known_ids: set[str]) -> list[dict[str, str]]:
     return parsed
 
 
+_EVIDENCE_CLASS_ORDER = ("same_passage", "same_respondent", "lexical_cross_case")
+
+
 def plan_relation_pairs(
     category_ids: Sequence[str],
     *,
@@ -1322,13 +1325,17 @@ def plan_relation_pairs(
     round_size: int = 8,
     obvious_share: float = 0.5,
     seed: int = 0,
+    evidence_classes: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """Choose the next axial pairs and report the pairs this round does not examine.
 
-    Categories are taken in the order given, which is a salience order. Adjacent
-    ids are the obvious band. Other pairs are the less-obvious band. A round
-    mixes both. Fifty categories have 1,225 unordered pairs; one allowance does
-    not examine them. Allowances are ceilings, not measured costs.
+    Categories are taken in the order given, which is a salience order. When
+    ``evidence_classes`` is set, pairs with evidence are taken first:
+    same-passage co-occurrence, then the same respondent, then a lexical
+    cross-case candidate. The rest of the round is the older mix. Adjacent
+    ids are the obvious band. Other pairs are the less-obvious band. The same
+    seed examines the same fill. Fifty categories have 1,225 unordered pairs;
+    one allowance does not examine them. Allowances are ceilings, not measured costs.
     """
     if round_size < 0:
         raise ValueError("round_size must be zero or more.")
@@ -1340,6 +1347,7 @@ def plan_relation_pairs(
         if item not in seen_ids:
             seen_ids.append(item)
     pairs = [(left, right) for index, left in enumerate(seen_ids) for right in seen_ids[index + 1 :]]
+    oriented = {tuple(sorted(pair)): pair for pair in pairs}
     position = {item: index for index, item in enumerate(seen_ids)}
     obvious = [(left, right) for left, right in pairs if abs(position[left] - position[right]) == 1]
     less = [(left, right) for left, right in pairs if abs(position[left] - position[right]) != 1]
@@ -1347,16 +1355,38 @@ def plan_relation_pairs(
     less = list(less)
     rng.shuffle(less)
     examined_keys = {tuple(sorted((str(pair[0]), str(pair[1])))) for pair in examined}
+
     def pending(rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
         return [pair for pair in rows if tuple(sorted(pair)) not in examined_keys]
-    obvious_pending = pending(obvious)
-    less_pending = pending(less)
+
+    prioritized: list[tuple[str, tuple[str, str]]] = []
+    prioritized_keys: set[tuple[str, str]] = set()
+    seen_evidence: set[tuple[str, str]] = set()
+    available = {name: 0 for name in _EVIDENCE_CLASS_ORDER}
+    if evidence_classes:
+        for class_name in _EVIDENCE_CLASS_ORDER:
+            rows = evidence_classes.get(class_name) or []
+            for item in rows:
+                if not isinstance(item, Mapping):
+                    continue
+                key = tuple(sorted((str(item.get("from_id") or ""), str(item.get("to_id") or ""))))
+                if key not in oriented or not key[0] or not key[1] or key in seen_evidence:
+                    continue
+                seen_evidence.add(key)
+                available[class_name] += 1
+                if key in examined_keys or len(prioritized) >= round_size:
+                    continue
+                prioritized.append((class_name, oriented[key]))
+                prioritized_keys.add(key)
+    fill_size = max(0, round_size - len(prioritized))
+    obvious_pending = [pair for pair in pending(obvious) if tuple(sorted(pair)) not in prioritized_keys]
+    less_pending = [pair for pair in pending(less) if tuple(sorted(pair)) not in prioritized_keys]
     if obvious_pending:
         offset = int(seed) % len(obvious_pending)
         if offset:
             obvious_pending = obvious_pending[offset:] + obvious_pending[:offset]
-    take_obvious = int(round(round_size * obvious_share))
-    take_less = round_size - take_obvious
+    take_obvious = int(round(fill_size * obvious_share))
+    take_less = fill_size - take_obvious
     chosen_obvious = obvious_pending[:take_obvious]
     chosen_less = less_pending[:take_less]
     short_obvious = take_obvious - len(chosen_obvious)
@@ -1365,13 +1395,29 @@ def plan_relation_pairs(
         chosen_less = less_pending[: take_less + short_obvious]
     if short_less > 0:
         chosen_obvious = obvious_pending[: take_obvious + short_less]
-    chosen = [("obvious", pair) for pair in chosen_obvious] + [("less_obvious", pair) for pair in chosen_less]
+    chosen = list(prioritized) + [("obvious", pair) for pair in chosen_obvious] + [("less_obvious", pair) for pair in chosen_less]
     chosen_keys = {tuple(sorted(pair)) for _band, pair in chosen}
     unexamined = [pair for pair in pairs if tuple(sorted(pair)) not in examined_keys | chosen_keys]
     examined_count = len(examined_keys | chosen_keys)
+    prioritized_by_class = {name: 0 for name in _EVIDENCE_CLASS_ORDER}
+    for band, _pair in prioritized:
+        prioritized_by_class[band] = prioritized_by_class.get(band, 0) + 1
+    plausible_count = sum(available.values()) if evidence_classes is not None else None
+    examined_plausible = None
+    if evidence_classes is not None:
+        plausible_keys = set()
+        for class_name in _EVIDENCE_CLASS_ORDER:
+            for item in evidence_classes.get(class_name) or []:
+                if isinstance(item, Mapping):
+                    plausible_keys.add(tuple(sorted((str(item.get("from_id") or ""), str(item.get("to_id") or "")))))
+        examined_plausible = len((examined_keys | chosen_keys) & plausible_keys)
     return {
         "pair_count": len(pairs),
         "examined_count": examined_count,
+        "plausible_count": plausible_count,
+        "examined_plausible": examined_plausible,
+        "evidence_available": None if evidence_classes is None else dict(available),
+        "prioritized_by_class": prioritized_by_class,
         "pair_coverage": None if not pairs else round(examined_count / len(pairs), 4),
         "pair_coverage_statement": f"{examined_count} of {len(pairs)} unordered pairs examined",
         "round": [

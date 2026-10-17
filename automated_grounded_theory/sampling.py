@@ -1148,6 +1148,8 @@ def _baseline_sampling_stages(allowance: ProviderAllowance | None, metadata: dic
     upstream = {name: int(allowance.stage_used.get(name, 0) or 0) for name in owned}
     for name in owned:
         allowance.stage_used[name] = 0
+    carried_tokens = int(allowance.tokens_estimated)
+    allowance.tokens_estimated = 0
     metadata["sampling_call_baseline"] = {
         "upstream_stage_calls": upstream,
         "calls_used_carried": int(allowance.calls_used),
@@ -1156,6 +1158,14 @@ def _baseline_sampling_stages(allowance: ProviderAllowance | None, metadata: dic
             "Upstream coding and review calls are recorded here and are not charged "
             "against max_sampling_review_calls or max_decision_calls. "
             "calls_used stays the carried total."
+        ),
+    }
+    metadata["sampling_token_baseline"] = {
+        "tokens_estimated_carried": carried_tokens,
+        "note": (
+            "Upstream token estimates are recorded here and are not charged against "
+            "this stage's token allowance. max_sampling_review_tokens and "
+            "sampling_token_budget still bound tokens this stage spends."
         ),
     }
 
@@ -1602,8 +1612,8 @@ def _apply_human_sampling(state: SamplingState, decision: Mapping[str, Any]) -> 
             target["sampled_passage_ids"] = ids
             sampled.extend(ids)
     for row in directions:
-        row.setdefault("action", "reject")
-        row.setdefault("sampled_passage_ids", [])
+        if row.get("action"):
+            row.setdefault("sampled_passage_ids", [])
     metadata = dict(state.get("metadata") or {})
     accepted = [row for row in directions if row.get("action") in {"accept", "edit"}]
     metadata["researcher_sampling"] = {
@@ -1692,6 +1702,87 @@ def _selection_pack_record(packed: Mapping[str, Any], metadata: Mapping[str, Any
             "Directions that do not fit are omitted from this request, lowest rank first. "
             "A request that cannot fit even one direction is not sent."
         ),
+    }
+
+
+_SATURATION_INDICATOR_DROP = (
+    "relationships_found",
+    "pair_coverage",
+    "pairs_completed",
+    "pairs_planned",
+    "code_frequency_shift",
+    "window_new_relationship_rate",
+    "window_new_property_rate",
+    "window_new_code_rate",
+    "window_definition",
+    "saturation_window",
+)
+
+
+def _pack_saturation(
+    metadata: Mapping[str, Any],
+    indicators: Mapping[str, Any],
+    ledger: Sequence[Mapping[str, Any]],
+    criteria: Mapping[str, Any],
+    runtime: SamplingRuntime,
+) -> dict[str, Any]:
+    """Drop saturation fields until the request fits ``sampling_token_budget``.
+
+    Oldest ledger rows go first, then the stopping report, then indicator
+    fields. ``n_documents`` and the instruction stay. A request that still
+    does not fit is not sent.
+    """
+    from automated_grounded_theory.batching import request_input_tokens
+
+    kept_indicators = dict(indicators)
+    kept_ledger = [dict(row) for row in ledger if isinstance(row, Mapping)]
+    kept_criteria: Mapping[str, Any] | None = dict(criteria) if isinstance(criteria, Mapping) else None
+    omitted: list[str] = []
+
+    def _body() -> dict[str, Any]:
+        payload = {
+            "indicators": dict(kept_indicators),
+            "sampling_ledger": [dict(row) for row in kept_ledger],
+            "instruction": (
+                "Use the window-wide rates, the pair coverage, the number of relationships found, and the sampling ledger. "
+                "When 10 or more pairs were planned, coverage below 0.05 or fewer than 2 relationships "
+                "is not interpretable. Do not assess sufficient_for_this_question in that case. "
+                "Your assessment is a model judgment. It does not set judgment and it is not a researcher decision."
+            ),
+        }
+        if kept_criteria is not None:
+            payload["stopping_criteria"] = dict(kept_criteria)
+        return payload
+
+    def _measure():
+        messages = _messages("saturation_decision", _body())
+        estimate = request_input_tokens(messages, ModelSaturationJudgment)
+        return messages, estimate, _selection_over_budget(metadata, estimate, runtime)
+
+    messages, estimate, reason = _measure()
+    unpacked = estimate
+    while reason and kept_ledger:
+        dropped = kept_ledger.pop(0)
+        label = dropped.get("round_index")
+        omitted.append(f"sampling_ledger:{label if label is not None else len(omitted)}")
+        messages, estimate, reason = _measure()
+    if reason and kept_criteria is not None:
+        kept_criteria = None
+        omitted.append("stopping_criteria")
+        messages, estimate, reason = _measure()
+    for key in _SATURATION_INDICATOR_DROP:
+        if not reason or key not in kept_indicators:
+            continue
+        kept_indicators.pop(key, None)
+        omitted.append(f"indicators.{key}")
+        messages, estimate, reason = _measure()
+    return {
+        "messages": messages,
+        "estimate": estimate,
+        "unpacked_estimate": unpacked,
+        "omitted_fields": omitted,
+        "reason": reason,
+        "body": _body(),
     }
 
 
@@ -2967,32 +3058,32 @@ def _saturation_decision(runtime: SamplingRuntime):
                         "note": "No model assessment was produced. judgment stays null.",
                     }
                 else:
-                    messages = _messages(
-                        "saturation_decision",
-                        {
-                            "indicators": {
-                                "n_documents": indicators.get("n_documents"),
-                                "saturation_window": indicators.get("saturation_window"),
-                                "window_new_code_rate": indicators.get("window_new_code_rate"),
-                                "window_new_property_rate": indicators.get("window_new_property_rate"),
-                                "window_new_relationship_rate": indicators.get("window_new_relationship_rate"),
-                                "window_definition": indicators.get("window_definition"),
-                                "code_frequency_shift": indicators.get("code_frequency_shift"),
-                                "pairs_planned": indicators.get("pairs_planned"),
-                                "pairs_completed": indicators.get("pairs_completed"),
-                                "pair_coverage": indicators.get("pair_coverage"),
-                                "relationships_found": indicators.get("relationships_found"),
-                            },
-                            "sampling_ledger": ledger,
-                            "stopping_criteria": criteria,
-                            "instruction": (
-                                "Use the window-wide rates, the pair coverage, the number of relationships found, and the sampling ledger. "
-                                "When 10 or more pairs were planned, coverage below 0.05 or fewer than 2 relationships "
-                                "is not interpretable. Do not assess sufficient_for_this_question in that case. "
-                                "Your assessment is a model judgment. It does not set judgment and it is not a researcher decision."
-                            ),
-                        },
-                    )
+                    indicator_payload = {
+                        "n_documents": indicators.get("n_documents"),
+                        "saturation_window": indicators.get("saturation_window"),
+                        "window_new_code_rate": indicators.get("window_new_code_rate"),
+                        "window_new_property_rate": indicators.get("window_new_property_rate"),
+                        "window_new_relationship_rate": indicators.get("window_new_relationship_rate"),
+                        "window_definition": indicators.get("window_definition"),
+                        "code_frequency_shift": indicators.get("code_frequency_shift"),
+                        "pairs_planned": indicators.get("pairs_planned"),
+                        "pairs_completed": indicators.get("pairs_completed"),
+                        "pair_coverage": indicators.get("pair_coverage"),
+                        "relationships_found": indicators.get("relationships_found"),
+                    }
+                    packed = _pack_saturation(metadata, indicator_payload, ledger, criteria, runtime)
+                    metadata["saturation_pack"] = {
+                        "unpacked_estimated_input_tokens": packed.get("unpacked_estimate"),
+                        "packed_estimated_input_tokens": packed.get("estimate"),
+                        "per_request_budget": _budget(metadata),
+                        "omitted_fields": list(packed.get("omitted_fields") or []),
+                        "note": (
+                            "sampling_token_budget is the per-request ceiling. "
+                            "Fields that do not fit are omitted, oldest ledger rows first. "
+                            "A request that still does not fit is not sent."
+                        ),
+                    }
+                    messages = list(packed["messages"])
                     result = await _sampling_call(
                         runtime,
                         reviewer,

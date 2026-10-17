@@ -40,8 +40,8 @@ from tests.test_v090 import FakeSamplingCoder, _kwargs
 
 
 def test_version_is_097():
-    assert __version__ == "0.9.9"
-    assert POLICY_VERSION == "0.9.9"
+    assert __version__ == "0.9.10"
+    assert POLICY_VERSION == "0.9.10"
 
 
 def test_consequence_wording_fails_the_tier_gate_and_the_reviewer_is_checked():
@@ -386,8 +386,8 @@ def test_reread_notes_change_the_next_round_and_the_ledger_rate():
     quiet = stopping_criteria_report(
         {"n_documents": 4},
         [
-            {"new_direction_keys": ["thin_category:c-prep"], "analytic_new_direction_keys": []},
-            {"new_direction_keys": ["thin_category:c-prep"], "analytic_new_direction_keys": []},
+            {"new_direction_keys": ["thin_category:c-prep"], "analytic_new_direction_keys": [], "reread_unsent_pairs": []},
+            {"new_direction_keys": ["thin_category:c-prep"], "analytic_new_direction_keys": [], "reread_unsent_pairs": []},
         ],
         quiet_rounds=2,
     )

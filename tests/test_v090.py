@@ -26,8 +26,8 @@ from tests.test_v080 import FakeAxialCoder, _corpus
 
 
 def test_version_is_090():
-    assert __version__ == "0.9.9"
-    assert POLICY_VERSION == "0.9.9"
+    assert __version__ == "0.9.10"
+    assert POLICY_VERSION == "0.9.10"
 
 
 def _payload(messages) -> dict:
@@ -328,8 +328,8 @@ def test_stopping_criteria_name_thresholds_without_a_saturation_claim():
     quiet = stopping_criteria_report(
         saturation,
         [
-            {"new_direction_keys": []},
-            {"new_direction_keys": []},
+            {"new_direction_keys": [], "reread_unsent_pairs": []},
+            {"new_direction_keys": [], "reread_unsent_pairs": []},
         ],
         core_id="c-prep",
         relationships=[{"from_id": "c-prep", "to_id": "c-return", "statement": "A link.", "disposition": "accepted"}],
