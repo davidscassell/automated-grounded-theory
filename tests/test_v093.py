@@ -19,8 +19,8 @@ from tests.test_v090 import _kwargs
 
 
 def test_version_is_093():
-    assert __version__ == "0.9.9"
-    assert POLICY_VERSION == "0.9.9"
+    assert __version__ == "0.9.10"
+    assert POLICY_VERSION == "0.9.10"
 
 
 def _book():

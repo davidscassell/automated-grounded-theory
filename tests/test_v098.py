@@ -33,8 +33,8 @@ from tests.test_v090 import FakeSamplingCoder, _kwargs, _payload
 
 
 def test_version_is_098():
-    assert __version__ == "0.9.9"
-    assert POLICY_VERSION == "0.9.9"
+    assert __version__ == "0.9.10"
+    assert POLICY_VERSION == "0.9.10"
 
 
 def _prep_group(groups, directions):
@@ -113,8 +113,8 @@ def test_a_relevant_note_does_not_close_the_direction():
     quiet = stopping_criteria_report(
         {"n_documents": 4},
         [
-            {"new_direction_keys": [], "analytic_new_direction_keys": []},
-            {"new_direction_keys": [], "analytic_new_direction_keys": []},
+            {"new_direction_keys": [], "analytic_new_direction_keys": [], "reread_unsent_pairs": []},
+            {"new_direction_keys": [], "analytic_new_direction_keys": [], "reread_unsent_pairs": []},
         ],
         quiet_rounds=2,
     )
@@ -123,8 +123,8 @@ def test_a_relevant_note_does_not_close_the_direction():
     closed_quiet = stopping_criteria_report(
         {"n_documents": 4},
         [
-            {"new_direction_keys": ["thin_category:c-prep"], "analytic_new_direction_keys": []},
-            {"new_direction_keys": [], "analytic_new_direction_keys": []},
+            {"new_direction_keys": ["thin_category:c-prep"], "analytic_new_direction_keys": [], "reread_unsent_pairs": []},
+            {"new_direction_keys": [], "analytic_new_direction_keys": [], "reread_unsent_pairs": []},
         ],
         quiet_rounds=2,
     )

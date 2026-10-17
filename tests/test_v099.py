@@ -30,8 +30,8 @@ from tests.test_v090 import FakeSamplingCoder, _kwargs, _payload
 
 
 def test_version_is_099():
-    assert __version__ == "0.9.9"
-    assert POLICY_VERSION == "0.9.9"
+    assert __version__ == "0.9.10"
+    assert POLICY_VERSION == "0.9.10"
 
 
 class _SameRelevantNote(FakeSamplingCoder):
@@ -132,6 +132,7 @@ def test_nested_follow_up_keys_normalize_and_a_distinct_question_does_not_nest()
             "direction_keys": ["thin_category:c-prep"],
             "new_direction_keys": ["thin_category:c-prep"],
             "analytic_new_direction_keys": ["thin_category:c-prep"],
+            "reread_unsent_pairs": [],
         },
         {
             "direction_keys": ["thin_category:c-prep", "reread_follow_up:thin_category:c-prep"],
@@ -146,11 +147,13 @@ def test_nested_follow_up_keys_normalize_and_a_distinct_question_does_not_nest()
                 }
             ],
             "closed_direction_keys": ["reread_follow_up:thin_category:c-other"],
+            "reread_unsent_pairs": [],
         },
         {
             "direction_keys": ["reread_follow_up:reread_follow_up:thin_category:c-prep"],
             "new_direction_keys": ["reread_follow_up:reread_follow_up:thin_category:c-prep"],
             "analytic_new_direction_keys": ["reread_follow_up:reread_follow_up:thin_category:c-prep"],
+            "reread_unsent_pairs": [],
             "reread_notes": [
                 {
                     "direction_key": "reread_follow_up:thin_category:c-prep",
@@ -275,8 +278,9 @@ def test_gate_export_labels_rules_and_leaves_undefined_metrics_null(tmp_path):
     assert "acceptance_withheld" in withheld["rules"]
     assert "stem_only" in withheld["rules"]
     assert "absence_reclassified" in withheld["rules"]
+    assert [row["relationship_id"] for row in exported["proposed"]] == ["rel-proposed"]
     assert all(row["relationship_id"] != "rel-proposed" for row in exported["accepted"] + exported["withheld"])
-    assert all(row["relationship_id"] != "rel-synthetic" for row in exported["accepted"] + exported["withheld"])
+    assert all(row["relationship_id"] != "rel-synthetic" for row in exported["accepted"] + exported["withheld"] + exported["proposed"])
 
     empty = score_gate_adjudications(exported, [])
     assert empty["accept_precision"] is None

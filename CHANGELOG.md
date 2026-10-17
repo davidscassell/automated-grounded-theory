@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.10
+
+- Axial pair planning takes same-passage, same-respondent, and lexical cross-case pairs before the seeded fill, and reports how many pairs were examined against how many were plausible. `max_axial_review_calls` still defaults to 8, so a default series examines a small fraction of the pairs. A corpus where no pair can reach `pattern_min_cases` records a warning. The minimum stays 2 and the axial token ceiling stays 24000.
+- A tier-1 hypothesis may rest on one passage or one respondent. A statement stitched from unrelated passages is still rejected. `nothing_to_propose` is an explicit empty outcome. Blank rows and statement-less rows are counted apart.
+- `case_id_of` reads `metadata.respondent_id`. A one-stem lexical overlap is `lexical_only` with support cap 1 and is not offered as cross-case evidence. Causal wording below tier 3 is not `downstream_eligible`. An absence qualification keeps its reason. A same-passage stem-only quote is `same_passage_stem_only` and stays proposed.
+- Sampling baselines carried token estimates. The saturation request is packed to `sampling_token_budget`, and omitted fields are recorded. An unlisted human direction stays open. Quiet rounds are `not_evaluable` while selected pairs remain unsent.
+- Memo accounting balances requested, produced, omitted, failed, and rejected rows. The axial token plan estimates the planned round. A focused raw estimate above the cap is labeled apart from the guarded figure. A synthetic check with no relationship is `not_run`. `export_gate_relationships` lists proposed rows. A focused timeout reports `timeout_elapsed_seconds`.
+- The design is [docs/design-review-fixes-0910.md](docs/design-review-fixes-0910.md). `policy_version` is `0.9.10`.
+
 ## 0.9.9
 
 - A sampling question keeps a stable key. A relevant reread is an observation of that question and does not wrap it in another `reread_follow_up:` direction. A new question is added only when `follow_up_kind` and `follow_up_target_id` name a different code, relationship, or core already on the run. The note text is not matched.

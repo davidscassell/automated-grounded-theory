@@ -82,18 +82,21 @@ def _outcome(row: Mapping[str, Any], rules: Sequence[str]) -> str | None:
         return "accepted"
     if disposition in _WITHHELD or "acceptance_withheld" in set(rules):
         return "withheld"
-    return None
+    if disposition in {"", "proposed", "revised"}:
+        return "proposed"
+    return "proposed"
 
 
 def export_gate_relationships(relationships: Sequence[Mapping[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """List accepted and withheld relationships with the rules already stored on each row.
+    """List accepted, withheld, and still-proposed relationships.
 
-    A synthetic row is omitted. A row that is still only proposed, with no
-    withhold disposition and no gate flag, is omitted. The input rows are not
-    modified.
+    A synthetic row is omitted. A row that has not been accepted or withheld
+    is listed under ``proposed`` and is not scored as either. The input rows
+    are not modified.
     """
     accepted: list[dict[str, Any]] = []
     withheld: list[dict[str, Any]] = []
+    proposed: list[dict[str, Any]] = []
     for row in relationships:
         if not isinstance(row, Mapping):
             continue
@@ -108,9 +111,11 @@ def export_gate_relationships(relationships: Sequence[Mapping[str, Any]]) -> dic
         }
         if outcome == "accepted":
             accepted.append(item)
-        else:
+        elif outcome == "withheld":
             withheld.append(item)
-    return {"accepted": accepted, "withheld": withheld}
+        else:
+            proposed.append(item)
+    return {"accepted": accepted, "withheld": withheld, "proposed": proposed}
 
 
 def _require_text(row: Mapping[str, Any], field: str) -> str:

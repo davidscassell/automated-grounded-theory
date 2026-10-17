@@ -91,8 +91,8 @@ def _both_cases(row: dict) -> dict:
 
 
 def test_version_is_091():
-    assert __version__ == "0.9.9"
-    assert POLICY_VERSION == "0.9.9"
+    assert __version__ == "0.9.10"
+    assert POLICY_VERSION == "0.9.10"
 
 
 def test_tier_zero_is_category_evidence_and_a_label_is_not_a_quote():
@@ -527,6 +527,14 @@ def test_cross_case_candidates_stay_inside_the_evidence_budget():
     assert [row["passage_id"] for row in found] == ["p4"]
     assert found[0]["candidate_cross_case"] is True
     corpus = _corpus()
+    # 0.9.10 offers a lexical cross-case passage only when each endpoint shares
+    # at least two distinctive stems. "returning to work" has one, so the
+    # return category names the desk as well.
+    corpus["codebook"]["c-return"] = {
+        "code_id": "c-return",
+        "code": "returning to the desk",
+        "definition": "returning to the desk",
+    }
     corpus["passages"].append(
         {
             "passage_id": "p-cross",
