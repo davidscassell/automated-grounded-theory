@@ -168,6 +168,8 @@ class SamplingRereadNote(BaseModel):
     note: str = ""
     quote: str = ""
     judgment: str = ""
+    direction_decision: str = ""
+    direction_close_reason: str = ""
 
 
 class SamplingState(TypedDict, total=False):
@@ -607,7 +609,7 @@ def rank_sampling_directions(state: Mapping[str, Any], *, coding_family: str = "
     directions = [row for row in directions if _target_key(row) not in closed]
     for row in ledger:
         for note in row.get("reread_notes") or []:
-            if not isinstance(note, Mapping) or _note_irrelevant(note):
+            if not isinstance(note, Mapping) or _note_judgment(note) != "relevant":
                 continue
             key = str(note.get("direction_key") or "")
             if not key or key in closed:
@@ -621,7 +623,10 @@ def rank_sampling_directions(state: Mapping[str, Any], *, coding_family: str = "
                     why=f"The reread of {key} recorded material the next round should use.",
                     audit={"prior_direction_key": key, "passage_id": note.get("passage_id")},
                     coding_family=_family_for("open_memo", coding_family),
-                    criteria=["a passage that bears on the reread note", "do not repeat an irrelevant reread"],
+                    criteria=[
+                        "a passage that bears on the reread note",
+                        "do not offer a passage already rejected for this direction",
+                    ],
                 )
             )
     directions = _dedupe_directions(directions)
@@ -710,16 +715,18 @@ def retrieve_sampling_passages(
         document = str(segment.get("document_id") or passage.get("doc_id") or passage.get("document_id") or "")
         if document:
             coded_documents.add(document)
+    rejected = _rejected_passages(_ledger_rows(state))
     groups = []
     for direction in directions:
         blob = _search_text(direction, state)
         wanted = _distinctive(blob)
         claim_vector = direction.get("embedding") if isinstance(direction.get("embedding"), list) else None
         used = _used_passages(direction, state)
+        blocked = rejected.get(_target_key(direction), set())
         ranked = []
         for passage in passages:
             passage_id = str(passage.get("passage_id") or "")
-            if not passage_id or passage_id in used:
+            if not passage_id or passage_id in used or passage_id in blocked:
                 continue
             overlap = wanted & _distinctive(str(passage.get("text") or ""))
             semantic = 0.0
@@ -801,24 +808,69 @@ def _dedupe_directions(rows: Sequence[Mapping[str, Any]]) -> list[dict]:
     return kept
 
 
+def _ledger_rows(state: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    metadata = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
+    rows = (metadata or {}).get("sampling_ledger") or state.get("sampling_ledger") or []
+    return [row for row in rows if isinstance(row, Mapping)]
+
+
+def _note_judgment(note: Mapping[str, Any]) -> str:
+    """The structured judgment. Free text is never read as a judgment."""
+    return str(note.get("judgment") or "").strip().casefold()
+
+
 def _note_irrelevant(note: Mapping[str, Any]) -> bool:
-    judgment = str(note.get("judgment") or "").casefold()
-    text = str(note.get("note") or "").casefold()
-    return judgment == "irrelevant" or "irrelevant" in text
+    return _note_judgment(note) == "irrelevant"
+
+
+def _explicit_direction_close(note: Mapping[str, Any]) -> bool:
+    """A model closes a direction only when it records that decision and a reason."""
+    decision = str(note.get("direction_decision") or "").strip().casefold()
+    reason = str(note.get("direction_close_reason") or "").strip()
+    return decision == "close" and bool(reason) and bool(str(note.get("direction_key") or "").strip())
 
 
 def _closed_direction_keys(ledger: Sequence[Mapping[str, Any]]) -> set[str]:
+    """Directions a person rejected, or a model closed with a recorded reason.
+
+    An irrelevant passage is not in this set. Rejecting the passage does not
+    resolve the question that retrieved it.
+    """
     closed: set[str] = set()
     for row in ledger:
         if not isinstance(row, Mapping):
             continue
-        for key in row.get("rejected_direction_keys") or []:
+        for key in list(row.get("rejected_direction_keys") or []) + list(row.get("closed_direction_keys") or []):
             if key:
                 closed.add(str(key))
         for note in row.get("reread_notes") or []:
-            if isinstance(note, Mapping) and _note_irrelevant(note) and note.get("direction_key"):
+            if isinstance(note, Mapping) and _explicit_direction_close(note):
                 closed.add(str(note.get("direction_key")))
     return closed
+
+
+def _rejected_passages(ledger: Sequence[Mapping[str, Any]]) -> dict[str, set[str]]:
+    """Passage ids a direction should not be offered again.
+
+    The structured judgment ``irrelevant`` rejects that passage. The direction
+    stays open. A stored ``rejected_passages`` list is honored the same way.
+    """
+    rejected: dict[str, set[str]] = {}
+
+    def _add(key: str, passage_id: str) -> None:
+        if key and passage_id:
+            rejected.setdefault(key, set()).add(passage_id)
+
+    for row in ledger:
+        if not isinstance(row, Mapping):
+            continue
+        for item in row.get("rejected_passages") or []:
+            if isinstance(item, Mapping):
+                _add(str(item.get("direction_key") or ""), str(item.get("passage_id") or ""))
+        for note in row.get("reread_notes") or []:
+            if isinstance(note, Mapping) and _note_irrelevant(note):
+                _add(str(note.get("direction_key") or ""), str(note.get("passage_id") or ""))
+    return rejected
 
 
 def publish_sampling_indicators(indicators: Mapping[str, Any]) -> dict[str, Any]:
@@ -1390,6 +1442,7 @@ def _pack_selection(
     return {
         "directions": ordered,
         "messages": messages,
+        "payload": payload,
         "estimate": estimate,
         "unpacked_estimate": unpacked,
         "omitted": omitted,
@@ -1472,6 +1525,8 @@ def _stored_reread_notes(state: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "note": str(note.get("note") or ""),
                 "judgment": str(note.get("judgment") or ""),
                 "quote": str(note.get("quote") or ""),
+                "direction_decision": str(note.get("direction_decision") or ""),
+                "direction_close_reason": str(note.get("direction_close_reason") or ""),
             }
         )
     return stored
@@ -1482,19 +1537,35 @@ def _analytic_new_keys(
     notes: Sequence[Mapping[str, Any]],
     directions: Sequence[Mapping[str, Any]],
 ) -> list[str]:
-    """New keys that a reread did not close.
+    """New keys that were not explicitly closed this round.
 
-    An irrelevant note or a rejected direction is not new analytic material.
-    Keys that were not judged stay.
+    An irrelevant passage stays in the list. A human reject, or a model close
+    recorded with a reason, does not.
     """
     closed: set[str] = set()
     for note in notes:
-        if _note_irrelevant(note) and note.get("direction_key"):
+        if isinstance(note, Mapping) and _explicit_direction_close(note):
             closed.add(str(note.get("direction_key")))
     for row in directions:
         if isinstance(row, Mapping) and str(row.get("action") or "") == "reject":
             closed.add(_target_key(row))
     return [key for key in new_keys if key not in closed]
+
+
+def _rejected_passage_rows(notes: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for note in notes:
+        if not isinstance(note, Mapping) or not _note_irrelevant(note):
+            continue
+        key = str(note.get("direction_key") or "")
+        passage_id = str(note.get("passage_id") or "")
+        pair = (key, passage_id)
+        if not key or not passage_id or pair in seen:
+            continue
+        seen.add(pair)
+        rows.append({"direction_key": key, "passage_id": passage_id})
+    return rows
 
 
 def _selection_payload(directions: Sequence[Mapping[str, Any]], proposals: Sequence[Any]) -> dict[str, Any]:
@@ -1517,6 +1588,11 @@ def _selection_payload(directions: Sequence[Mapping[str, Any]], proposals: Seque
             "When you send selections, those pairs are the rereads."
         ),
     }
+
+
+def _pursuit_name(metadata: Mapping[str, Any]) -> str:
+    procedure = metadata.get("procedure") if isinstance(metadata.get("procedure"), Mapping) else {}
+    return str((procedure or {}).get("pursuit") or metadata.get("pursuit") or "")
 
 
 def _selection_stopped(metadata: dict[str, Any], directions: list, logs: list, *, status: str, reason: str) -> dict:
@@ -1553,12 +1629,18 @@ def _store_model_selection(
     if sent_ids:
         known_directions = {item for item in known_directions if item in sent_ids}
     reading = _read_model_selection(parsed, known_directions, known_passages, proposals)
-    pairs, cut_for_allowance = _limit_pairs_to_allowance(runtime, metadata, directions, list(reading["pairs"]))
-    kept_directions = _unique_ids([row["direction_id"] for row in pairs])
-    kept_passages = _unique_ids([row["passage_id"] for row in pairs])
+    selected = [dict(row) for row in reading["pairs"]]
+    scheduled = list(selected)
+    cut_for_allowance = False
+    if _pursuit_name(metadata) == "reread":
+        scheduled, cut_for_allowance = _limit_pairs_to_allowance(runtime, metadata, directions, selected)
+    metadata["selected_sampling_pairs"] = selected
+    metadata["scheduled_reread_pairs"] = scheduled if _pursuit_name(metadata) == "reread" else []
+    kept_directions = _unique_ids([row["direction_id"] for row in selected])
+    kept_passages = _unique_ids([row["passage_id"] for row in selected])
     metadata["model_direction_ids"] = kept_directions
     metadata["model_passage_ids"] = kept_passages
-    metadata["model_sampling_pairs"] = pairs
+    metadata["model_sampling_pairs"] = selected
     metadata["model_passages_without_direction"] = list(reading["unpaired"])
     metadata["model_unknown_direction_ids"] = list(reading["unknown_directions"])
     metadata["model_unknown_passage_ids"] = list(reading["unknown_passages"])
@@ -1588,6 +1670,8 @@ def _store_model_selection(
     if cut_for_allowance:
         note = (
             "The model selected more pairs than the sampling call allowance can pay for. "
+            "model_sampling_pairs keeps the full selection. "
+            "scheduled_reread_pairs is the subset this round can reread. "
             "The extra pairs are on reread_unsent_pairs with reason call_allowance. "
             "The stop is call_allowance."
         )
@@ -1616,6 +1700,7 @@ async def _select_with_model(runtime: SamplingRuntime, state: SamplingState) -> 
     packed = _pack_selection(metadata, directions, proposals, runtime)
     metadata["selection_pack"] = _selection_pack_record(packed, metadata)
     metadata["selection_sent_direction_ids"] = list(metadata["selection_pack"]["sent_direction_ids"])
+    metadata["selection_packed_payload"] = packed.get("payload") or {}
     if packed["reason"]:
         logs.append(
             _prompt_row(
@@ -1686,10 +1771,19 @@ async def _repair_model_selection(
     error = str(metadata.get("selection_repair_error") or "the output did not match the schema")
     sent_ids = {str(item) for item in (metadata.get("selection_sent_direction_ids") or []) if item}
     repair_directions = [row for row in directions if not sent_ids or str(row.get("direction_id") or "") in sent_ids]
-    messages = _messages(
-        "sampling_selection",
-        _selection_payload(repair_directions, state.get("passage_proposals") or []),
-    )
+    stored = metadata.get("selection_packed_payload")
+    if isinstance(stored, Mapping) and "passage_proposals" in stored:
+        payload = {
+            "directions": list(stored.get("directions") or []),
+            "passage_proposals": list(stored.get("passage_proposals") or []),
+            "instruction": str(stored.get("instruction") or ""),
+        }
+    else:
+        payload = _selection_payload(
+            repair_directions,
+            _proposals_for(state.get("passage_proposals") or [], repair_directions),
+        )
+    messages = _messages("sampling_selection", payload)
     messages.append(
         HumanMessage(
             content=(
@@ -2073,6 +2167,8 @@ def _selected_pairs(state: Mapping[str, Any]) -> list[dict[str, str]]:
     """One row per reread. A human assignment is not reordered by retrieval."""
     metadata = state.get("metadata") or {}
     if str(metadata.get("decision_mode") or "") == "llm":
+        if _pursuit_name(metadata) == "reread" and "scheduled_reread_pairs" in metadata:
+            return _dedupe_pairs(metadata.get("scheduled_reread_pairs") or [])
         if "model_sampling_pairs" in metadata:
             return _dedupe_pairs(metadata.get("model_sampling_pairs") or [])
         return _model_sampling_pairs(
@@ -2122,7 +2218,11 @@ def _reread_payload(
         "comparison": comparison,
         "instruction": (
             "quote must be copied from text. "
-            "If the passage does not bear on this direction and this comparison, leave quote empty."
+            "If the passage does not bear on this direction and this comparison, leave quote empty. "
+            "judgment is the structured reading of this passage: relevant, irrelevant, or empty. "
+            "The note does not change that judgment. "
+            "An irrelevant passage does not close the direction. "
+            "Set direction_decision to close and give direction_close_reason only when this direction should stop."
         ),
     }
 
@@ -2249,6 +2349,8 @@ def _append_reread_note(
             "sampling_query": str(direction.get("sampling_query") or ""),
             "note": str(parsed.get("note") or ""),
             "judgment": str(parsed.get("judgment") or ""),
+            "direction_decision": str(parsed.get("direction_decision") or ""),
+            "direction_close_reason": str(parsed.get("direction_close_reason") or ""),
             "quote": stored_quote,
             "flags": flags,
             "model_judgment": True,
@@ -2488,9 +2590,14 @@ def _update_ledger(state: SamplingState) -> dict:
     notes = _stored_reread_notes(state)
     directions = [row for row in (state.get("directions") or []) if isinstance(row, Mapping)]
     rejected = sorted({_target_key(row) for row in directions if str(row.get("action") or "") == "reject"})
+    closed_by_model = sorted(
+        {str(note.get("direction_key") or "") for note in notes if _explicit_direction_close(note)} - {""}
+    )
     new_keys = [str(item) for item in (last.get("new_direction_keys") or [])]
     last["reread_notes"] = notes
     last["rejected_direction_keys"] = rejected
+    last["closed_direction_keys"] = sorted(set(rejected) | set(closed_by_model))
+    last["rejected_passages"] = _rejected_passage_rows(notes)
     last["analytic_new_direction_keys"] = _analytic_new_keys(new_keys, notes, directions)
     last["reread_status"] = metadata.get("reread_status") or last.get("reread_status")
     last["reread_note_count"] = len(notes)
@@ -2500,6 +2607,8 @@ def _update_ledger(state: SamplingState) -> dict:
     last["indicators"] = _ledger_indicator_snapshot(published)
     last["indicator_effect"] = (
         "Reread notes are written onto this ledger row. "
+        "A rejected passage is not offered again for that direction. "
+        "The direction stays open unless a person rejects it or a model records a close with a reason. "
         "Window rates on the row are the same values the stopping criteria read. "
         "A null rate is filled from complete document points when those points exist. "
         "judgment stays null. A note does not by itself rewrite the saturation curve."
