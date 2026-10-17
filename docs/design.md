@@ -417,7 +417,11 @@ Package 0.9.7 checks causal and consequence wording, including the role `consequ
 
 Package 0.9.8 reads a reread judgment only from the structured field. An irrelevant passage is not offered again for that direction, and the direction stays open until a person rejects it or a model records a close with a reason. Quiet rounds still read `analytic_new_direction_keys` when that field is present, and that list omits only an explicitly closed key. `model_sampling_pairs` keeps the validated selection. The coding-call cap applies only when `pursuit` is `reread`, and the pairs that will be reread are `scheduled_reread_pairs`. `brief_only` does not become `budget_limited` because no reread was requested. A selection repair reuses the packed payload, so proposals removed to fit `sampling_token_budget` are not restored. The design is [design-review-fixes-098.md](design-review-fixes-098.md).
 
-`policy_version` is `0.9.8`.
+`policy_version` was `0.9.8`.
+
+Package 0.9.9 keeps a sampling question on a stable key. A relevant reread is an observation of that question. It does not wrap the key in another `reread_follow_up:` direction. A new question is added only when the note's `follow_up_kind` and `follow_up_target_id` name a different recorded target. The note text is not matched. A completed `(question, passage)` pair is stored on the ledger and is not reread again. Older nested keys are normalized to the stable question when the ledger is loaded. `export_gate_relationships` lists accepted and withheld relationships with the rules already stored on each row, and `score_gate_adjudications` leaves a rate null when no adjudicated rows support it. The gates, `pattern_min_cases`, and the axial ceiling are unchanged. The design notes are [design-review-fixes-099.md](design-review-fixes-099.md) and [design-gate-evaluation.md](design-gate-evaluation.md).
+
+`policy_version` is `0.9.9`.
 
 ## 26. Out of scope
 
