@@ -766,10 +766,10 @@ def candidate_cross_case_passages(
             to_overlap = tokens & to_terms
             if not from_overlap or not to_overlap:
                 continue
-            seen.add(passage_id)
             # One distinctive stem on either side is the seed11 "training" shape.
             # It is labeled and withheld. It is not offered as cross-case evidence
-            # and it cannot support a tier above 1.
+            # and it cannot support a tier above 1. A weak match does not reserve
+            # the passage: a later pair may still qualify it.
             if len(from_overlap) < _GROUNDED_STEMS or len(to_overlap) < _GROUNDED_STEMS:
                 if lexical_only is not None:
                     lexical_only.append(
@@ -785,6 +785,7 @@ def candidate_cross_case_passages(
                         }
                     )
                 continue
+            seen.add(passage_id)
             chosen.append(
                 {
                     "passage_id": passage_id,
@@ -868,11 +869,29 @@ def classify_pair_evidence(
     lexical_only_pairs = 0
     reaching = 0
     minimum = max(1, int(pattern_min_cases or PATTERN_MIN_CASES))
+    occurrence_sets = {code_id: set(passage_ids) for code_id, passage_ids in occurrences.items()}
+    case_sets = {code_id: set(case_ids) for code_id, case_ids in cases.items()}
+    endpoint_terms = {code_id: _endpoint_terms(code_id, codebook, segments) for code_id in ids}
+    passage_tokens: dict[str, set[str]] = {}
+    passage_case: dict[str, str] = {}
+    token_index: dict[str, list[str]] = {}
+    passage_order: list[str] = []
+    for passage in ordered_passages:
+        passage_id = str(passage.get("passage_id") or "")
+        if not passage_id or passage_id in passage_tokens:
+            continue
+        tokens = meaningful_tokens(str(passage.get("text") or ""))
+        passage_tokens[passage_id] = tokens
+        passage_case[passage_id] = case_id_of(passage)
+        passage_order.append(passage_id)
+        for token in tokens:
+            token_index.setdefault(token, []).append(passage_id)
     for index, left in enumerate(ids):
         for right in ids[index + 1 :]:
-            left_passages = set(occurrences.get(left) or [])
-            right_passages = set(occurrences.get(right) or [])
-            shared_cases = [case_id for case_id in cases.get(left) or [] if case_id in set(cases.get(right) or [])]
+            left_passages = occurrence_sets.get(left) or set()
+            right_passages = occurrence_sets.get(right) or set()
+            right_cases = case_sets.get(right) or set()
+            shared_cases = [case_id for case_id in cases.get(left) or [] if case_id in right_cases]
             if len(shared_cases) >= minimum:
                 reaching += 1
             if left_passages and right_passages and left_passages & right_passages:
@@ -881,18 +900,26 @@ def classify_pair_evidence(
             if shared_cases:
                 classes["same_respondent"].append((left, right))
                 continue
-            from_terms = _endpoint_terms(left, codebook, segments)
-            to_terms = _endpoint_terms(right, codebook, segments)
+            from_terms = endpoint_terms.get(left) or set()
+            to_terms = endpoint_terms.get(right) or set()
             if not from_terms or not to_terms:
                 continue
             lexical = False
             stem_only = False
-            occupied = set(cases.get(left) or []) | set(cases.get(right) or [])
-            for passage in ordered_passages:
-                case_id = case_id_of(passage)
+            occupied = (case_sets.get(left) or set()) | (case_sets.get(right) or set())
+            from_hits: set[str] = set()
+            for token in from_terms:
+                from_hits.update(token_index.get(token) or ())
+            to_hits: set[str] = set()
+            for token in to_terms:
+                to_hits.update(token_index.get(token) or ())
+            for passage_id in passage_order:
+                if passage_id not in from_hits or passage_id not in to_hits:
+                    continue
+                case_id = passage_case.get(passage_id) or ""
                 if occupied and case_id in occupied:
                     continue
-                tokens = meaningful_tokens(str(passage.get("text") or ""))
+                tokens = passage_tokens.get(passage_id) or set()
                 from_overlap = tokens & from_terms
                 to_overlap = tokens & to_terms
                 if not from_overlap or not to_overlap:

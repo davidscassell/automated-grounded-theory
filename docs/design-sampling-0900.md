@@ -186,3 +186,9 @@ The saturation request is packed the same way the selection request is packed. O
 A human resume that lists some directions does not set `reject` on the rest. An unlisted direction stays open. An explicit `reject` still closes that direction.
 
 `sampling_rounds_without_new_directions` is `not_evaluable`, and `observed` is null, when a recent quiet round left a selected pair unsent for `call_allowance`, or when `reread_unsent_pairs` was not recorded. The criterion can be met when those pairs were sent, or when each remaining unsent pair is in `closed_direction_keys`. The note is [design-review-fixes-0910.md](design-review-fixes-0910.md).
+
+## Quiet rounds after a failed reread (0.9.11)
+
+A quiet round is evaluable when every selected pair was completed or explicitly exempted. `completed_pair` is completed. A direction key, question key, or direction id in `closed_direction_keys` is exempt, including when the unsent reason is `request_budget` or `call_allowance`.
+
+Any other unsent or failed reason leaves the criterion `not_evaluable` and `observed` null. That includes `request_budget`, `token_allowance`, `schema_unparsed`, `parse_failed`, `timeout`, `incomplete`, `missing_passage`, and a reason the ledger does not name. `reread_failed_pairs` are read the same way. An `reread_status` or `reread_stop` of `timeout` with no listed pair, or with a listed pair that was not exempted, is an unresolved timeout and is not silence. The note is [design-review-fixes-0911.md](design-review-fixes-0911.md).

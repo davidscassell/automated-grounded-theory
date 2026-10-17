@@ -425,7 +425,11 @@ Package 0.9.9 keeps a sampling question on a stable key. A relevant reread is an
 
 Package 0.9.10 plans axial pairs that already have evidence before the seeded fill, and it reports that coverage. `max_axial_review_calls` still defaults to 8, so a default series examines a small fraction of the pairs. A corpus where no pair can reach `pattern_min_cases` records a warning. The minimum stays 2. `case_id_of` reads `metadata.respondent_id`, so question-documents from one respondent are one case. A one-stem lexical overlap is not offered as cross-case evidence. A tier-1 hypothesis may rest on one passage or one respondent, and a statement stitched from unrelated passages is still rejected. Causal wording below tier 3 is not downstream eligible. An absence qualification keeps its reason. A same-passage stem-only quote stays proposed, with scope `same_passage_stem_only`. Sampling baselines carried token estimates, packs the saturation request, and leaves an unlisted human direction open. Quiet rounds are not evaluable while selected pairs remain unsent. Memo counts balance. The token plan estimates the planned round. A synthetic check with no relationship is `not_run`. Proposed gate rows are listed. A focused timeout reports how long it ran after the last completed call. The axial ceiling stays 24000. The design is [design-review-fixes-0910.md](design-review-fixes-0910.md).
 
-`policy_version` is `0.9.10`.
+`policy_version` was `0.9.10`.
+
+Package 0.9.11 keeps the full list of stem-only lexical matches in the run export and sends the proposal model a count. Those optional diagnostics are dropped before any passage is shortened. Quiet rounds stay `not_evaluable` when a selected pair was refused for a request budget, a token allowance, a parse failure, or an unresolved timeout, as well as for `call_allowance`. Pair evidence is classified from tokens and case memberships computed once, and that classification is skipped when no proposal is scheduled. A weak overlap does not hide a later pair's grounded passage. `pattern_min_cases` stays 2 and the axial ceiling stays 24000. The design is [design-review-fixes-0911.md](design-review-fixes-0911.md).
+
+`policy_version` is `0.9.11`.
 
 ## 26. Out of scope
 

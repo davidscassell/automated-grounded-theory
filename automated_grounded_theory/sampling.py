@@ -2954,6 +2954,8 @@ def _update_ledger(state: SamplingState) -> dict:
     last["completed_pairs"] = _completed_pair_rows(notes)
     last["analytic_new_direction_keys"] = _analytic_new_keys(new_keys, notes, directions)
     last["reread_status"] = metadata.get("reread_status") or last.get("reread_status")
+    last["reread_stop"] = str(metadata.get("reread_stop") or "")
+    last["reread_failed_pairs"] = [dict(item) for item in (metadata.get("reread_failed_pairs") or []) if isinstance(item, Mapping)]
     last["reread_note_count"] = len(notes)
     last["reread_unsent_passage_ids"] = list(metadata.get("reread_unsent_passage_ids") or [])
     last["reread_unsent_pairs"] = list(metadata.get("reread_unsent_pairs") or [])
@@ -3501,6 +3503,7 @@ async def _record_timeout(graph, config, exc: BaseException, output_dir, runtime
                 pair=metadata.get("reread_active_pair"),
             )
         )
+    patched_ledger = None
     if step == "pursuit_reread":
         completed, failed_rows, unattempted = _reread_partition(
             {**state, "metadata": metadata},
@@ -3513,10 +3516,25 @@ async def _record_timeout(graph, config, exc: BaseException, output_dir, runtime
         # re-enters it, skips stored notes, and retries the failed pair.
         metadata["reread_status"] = "timeout"
         metadata["reread_stop"] = "timeout"
+        ledger = [dict(item) for item in (state.get("sampling_ledger") or []) if isinstance(item, Mapping)]
+        if ledger:
+            last = dict(ledger[-1])
+            last["reread_status"] = "timeout"
+            last["reread_stop"] = "timeout"
+            last["reread_failed_pairs"] = [dict(item) for item in failed_rows]
+            if "reread_unsent_pairs" not in last:
+                last["reread_unsent_pairs"] = [
+                    dict(item) for item in (metadata.get("reread_unsent_pairs") or []) if isinstance(item, Mapping)
+                ]
+            ledger[-1] = last
+            metadata["sampling_ledger"] = ledger
+            patched_ledger = ledger
     metadata.update(status="incomplete", complete=False, stop="timeout", timeout_error=str(exc), timeout_step=step, saturation_judgment=None, graph_finished=False)
     paths = dict(state.get("export_paths") or {})
     place = output_dir or metadata.get("output_dir")
     held = {**state, "metadata": metadata, "warnings": warnings, "prompt_log": logs}
+    if patched_ledger is not None:
+        held["sampling_ledger"] = patched_ledger
     if place:
         try:
             paths = export_sampling_state(held, place)
@@ -3524,6 +3542,8 @@ async def _record_timeout(graph, config, exc: BaseException, output_dir, runtime
         except Exception:
             logger.warning("Partial sampling export failed after a timeout", exc_info=True)
     update = {"metadata": metadata, "warnings": warnings, "prompt_log": logs, "export_paths": paths}
+    if patched_ledger is not None:
+        update["sampling_ledger"] = patched_ledger
     try:
         nodes = getattr(graph, "nodes", {})
         if step and step in nodes:
