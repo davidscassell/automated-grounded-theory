@@ -75,10 +75,12 @@ selection that raises a high fraction of the book is warned on the result.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import logging
 import math
 import re
+import time
 from functools import wraps
 import json
 import random
@@ -3109,6 +3111,40 @@ def _category_development(state: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _token_allowance_why(fields: Mapping[str, Any]) -> str:
+    """Name the raw estimate and the guarded figure separately.
+
+    The ceiling comparison uses the guarded figure. A raw total above the cap
+    is not reported as exceeding the cap when the guarded figure is below it.
+    """
+    cap = fields.get("max_focused_review_tokens")
+    raw = fields.get("focused_tokens_estimated")
+    guarded = fields.get("focused_tokens_estimated_compared")
+    try:
+        cap_n = int(cap or 0)
+        raw_n = int(raw or 0)
+        guarded_n = None if guarded is None else int(guarded)
+    except (TypeError, ValueError):
+        cap_n, raw_n, guarded_n = 0, 0, None
+    if guarded_n is not None and cap_n and guarded_n <= cap_n and raw_n > cap_n:
+        return (
+            f"the focused token allowance is {cap}. "
+            f"The raw pre-call estimate is {raw}, which is above that ceiling. "
+            f"The guarded figure compared with the ceiling is {guarded}, and it is not above the ceiling"
+        )
+    if guarded_n is not None:
+        return (
+            f"the focused token allowance is {cap}. "
+            f"The raw pre-call estimate is {raw}. "
+            f"The guarded figure compared with the ceiling is {guarded}"
+        )
+    return (
+        f"the focused token allowance is {cap} "
+        f"and the raw pre-call estimate reached {raw} tokens. "
+        "No guarded figure was recorded"
+    )
+
+
 def _incomplete_warning(fields: Mapping[str, Any]) -> str:
     ids = list(fields.get("focused_not_reread") or [])
     shown = ", ".join(ids[:30])
@@ -3120,10 +3156,7 @@ def _incomplete_warning(fields: Mapping[str, Any]) -> str:
             f"the focused call allowance is {fields.get('max_focused_review_calls')} "
             f"and {fields.get('focused_calls_used')} calls were used"
         ),
-        "token_allowance": (
-            f"the focused token allowance is {fields.get('max_focused_review_tokens')} "
-            f"and the pre-call estimate reached {fields.get('focused_tokens_estimated')} tokens"
-        ),
+        "token_allowance": _token_allowance_why(fields),
         "no_progress": "a focused reread returned no passage decisions",
         "timeout": "a model call or graph step exceeded its timeout",
     }
@@ -4447,8 +4480,17 @@ def _worker(runtime: FocusedRuntime):
         )
         raw_parts: list[str] = []
         audits: list[dict] = []
+        call_limit = float(runtime.limiter.request_timeout or 0)
+
+        async def _bounded(coro):
+            if call_limit <= 0:
+                return await coro
+            return await asyncio.wait_for(coro, timeout=call_limit + 1.0)
+
+        if call_limit > 0:
+            runtime.limiter.step_deadline = time.monotonic() + call_limit
         try:
-            (parsed, usage), sent = await ainvoke_structured(
+            (parsed, usage), sent = await _bounded(ainvoke_structured(
                 runtime.coder,
                 schema,
                 messages,
@@ -4460,7 +4502,10 @@ def _worker(runtime: FocusedRuntime):
                 send_repair_overflow=False,
                 allowance_kind="focused_recode",
                 call_audits=audits,
-            )
+            ))
+        except TimeoutError:
+            runtime.limiter.step_deadline = None
+            raise
         except AllowanceExhausted as exc:
             parsed = {
                 "_agt_unparsed": True,
@@ -4474,6 +4519,7 @@ def _worker(runtime: FocusedRuntime):
         calls = 1 + sum(1 for row in audits if row.get("kind") == "schema_repair" and row.get("status") == "validated")
         interpreted_retry = False
         if parsed.get("_agt_unparsed"):
+            runtime.limiter.step_deadline = None
             return {
                 "proposal_buffer": {
                     "items": [
@@ -4520,7 +4566,9 @@ def _worker(runtime: FocusedRuntime):
                 kept = parsed
                 kept_sent = sent
                 try:
-                    (retried, retry_usage), retry_sent = await ainvoke_structured(
+                    if call_limit > 0:
+                        runtime.limiter.step_deadline = time.monotonic() + call_limit
+                    (retried, retry_usage), retry_sent = await _bounded(ainvoke_structured(
                         runtime.coder,
                         retry_schema,
                         retry_messages,
@@ -4532,7 +4580,10 @@ def _worker(runtime: FocusedRuntime):
                         send_repair_overflow=False,
                         allowance_kind="focused_label_retry",
                         call_audits=audits,
-                    )
+                    ))
+                except TimeoutError:
+                    runtime.limiter.step_deadline = None
+                    raise
                 except AllowanceExhausted:
                     retried = kept
                     retry_usage = {}
@@ -4569,6 +4620,7 @@ def _worker(runtime: FocusedRuntime):
                 for message in sent
             ],
         }
+        runtime.limiter.step_deadline = None
         return {"proposal_buffer": {"items": [proposal]}}
 
     return recode_worker
@@ -6353,7 +6405,15 @@ def _not_reread_ids(state: Mapping[str, Any]) -> list[str]:
     return ids
 
 
-async def _record_timeout(graph, config, exc: BaseException, output_dir: str | Path | None = None) -> None:
+async def _record_timeout(
+    graph,
+    config,
+    exc: BaseException,
+    output_dir: str | Path | None = None,
+    *,
+    timeout_elapsed_seconds: float | None = None,
+    timeout_limit_seconds: float | None = None,
+) -> None:
     """Keep work already written and mark the checkpoint incomplete.
 
     A later reader sees ``stop`` ``timeout``, which step stopped, and status
@@ -6390,6 +6450,15 @@ async def _record_timeout(graph, config, exc: BaseException, output_dir: str | P
     metadata["stop"] = "timeout"
     metadata["timeout_error"] = str(exc)
     metadata["timeout_step"] = step
+    metadata["timeout_elapsed_seconds"] = timeout_elapsed_seconds
+    metadata["timeout_limit_seconds"] = timeout_limit_seconds
+    if timeout_elapsed_seconds is not None and timeout_limit_seconds and timeout_elapsed_seconds > timeout_limit_seconds:
+        metadata["timeout_overrun_note"] = (
+            "The graph step watchdog is request_timeout times the sequential calls in the step, plus two seconds. "
+            "After a call completes, the remaining step budget can be longer than the stated per-call limit. "
+            "Each call is also waited with that per-call limit. A provider read that ignores cancellation can "
+            "still occupy the rest of the step budget. timeout_elapsed_seconds is the wait after the last completed call."
+        )
     place = output_dir or metadata.get("output_dir")
     export_paths = dict(state.get("export_paths") or {})
     if place:
@@ -6514,7 +6583,17 @@ async def _invoke(
             )
         if not _is_timeout(exc):
             raise
-        await _record_timeout(graph, config, exc, output_dir)
+        finished = getattr(runtime.limiter, "last_successful_call_at", None)
+        elapsed = None if finished is None else round(time.monotonic() - float(finished), 3)
+        limit = float(runtime.limiter.request_timeout or 0)
+        await _record_timeout(
+            graph,
+            config,
+            exc,
+            output_dir,
+            timeout_elapsed_seconds=elapsed,
+            timeout_limit_seconds=limit or None,
+        )
         if raise_on_timeout:
             if isinstance(exc, TimeoutError):
                 raise

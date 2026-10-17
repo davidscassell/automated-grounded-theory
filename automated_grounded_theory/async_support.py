@@ -351,6 +351,9 @@ class CallLimiter:
         self.timeout_retries = 0
         self._success_streak = 0
         self.cache = cache if cache is not None else {}
+        self.last_call_finished_at: float | None = None
+        self.last_successful_call_at: float | None = None
+        self.step_deadline: float | None = None
         self.cache_hits = 0
         self.cache_context: dict = {}
         self.schema_repairs = 0
@@ -393,6 +396,10 @@ class CallLimiter:
         prompt calls the model again.
         """
         key = cache_key(payload, **(self.cache_context or {}))
+        if self.step_deadline is not None and time.monotonic() >= float(self.step_deadline):
+            raise TimeoutError(
+                "The model call was not started because the step deadline had already passed."
+            )
         if use_cache:
             cached = self.cache.get(key)
             if cached is not None:
@@ -422,7 +429,13 @@ class CallLimiter:
                 allowance_stage=allowance_stage,
             )
 
-        result = await self._retry(once, deadline=deadline)
+        try:
+            result = await self._retry(once, deadline=deadline)
+        except Exception:
+            self.last_call_finished_at = time.monotonic()
+            raise
+        self.last_call_finished_at = time.monotonic()
+        self.last_successful_call_at = self.last_call_finished_at
         if use_cache:
             self.cache[key] = result
         return result
