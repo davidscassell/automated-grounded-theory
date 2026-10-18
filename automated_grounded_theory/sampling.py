@@ -840,6 +840,42 @@ def _question_key(direction: Mapping[str, Any]) -> str:
     return stable_question_key(_target_key(direction))
 
 
+def _annotate_pairs(pairs: Sequence[Mapping[str, Any]], directions: Sequence[Mapping[str, Any]] | None) -> list[dict[str, str]]:
+    """Attach the stable question key. The round id stays on ``direction_id``.
+
+    ``question_key`` and ``direction_key`` are the same stable question.
+    A round id such as ``dir-1-0001`` is not copied into those fields.
+    """
+    by_id: dict[str, Mapping[str, Any]] = {}
+    for row in directions or []:
+        if isinstance(row, Mapping) and row.get("direction_id"):
+            by_id[str(row.get("direction_id"))] = row
+    annotated: list[dict[str, str]] = []
+    for item in pairs:
+        if not isinstance(item, Mapping):
+            continue
+        direction_id = str(item.get("direction_id") or "")
+        passage_id = str(item.get("passage_id") or "")
+        if not direction_id or not passage_id:
+            continue
+        question = stable_question_key(str(item.get("question_key") or ""))
+        if not question:
+            direction = by_id.get(direction_id)
+            if direction:
+                question = _question_key(direction)
+        recorded = stable_question_key(str(item.get("direction_key") or ""))
+        if not question and recorded and not recorded.startswith("dir-"):
+            question = recorded
+        row = {"direction_id": direction_id, "passage_id": passage_id}
+        if question:
+            row["question_key"] = question
+            row["direction_key"] = question
+        if item.get("reason"):
+            row["reason"] = str(item.get("reason"))
+        annotated.append(row)
+    return annotated
+
+
 def _split_question_key(key: str) -> tuple[str, str, str]:
     stable = stable_question_key(key)
     if stable.startswith("empty_paradigm_slot:"):
@@ -1807,15 +1843,23 @@ def _limit_pairs_to_allowance(
         rows,
         key=lambda row: (rank_of.get(row["direction_id"], 10**6), row["direction_id"], row["passage_id"]),
     )
-    kept = ordered[: max(0, int(remaining))]
+    kept = _annotate_pairs(ordered[: max(0, int(remaining))], directions)
     cut = ordered[max(0, int(remaining)) :]
     unsent = [dict(row) for row in (metadata.get("reread_unsent_pairs") or []) if isinstance(row, Mapping)]
     existing = {(str(row.get("direction_id") or ""), str(row.get("passage_id") or "")) for row in unsent}
-    for row in cut:
+    for row in _annotate_pairs(cut, directions):
         key = (row["direction_id"], row["passage_id"])
         if key in existing:
             continue
-        unsent.append({"direction_id": row["direction_id"], "passage_id": row["passage_id"], "reason": "call_allowance"})
+        withheld = {
+            "direction_id": row["direction_id"],
+            "passage_id": row["passage_id"],
+            "reason": "call_allowance",
+        }
+        if row.get("question_key"):
+            withheld["question_key"] = row["question_key"]
+            withheld["direction_key"] = row["question_key"]
+        unsent.append(withheld)
         existing.add(key)
     metadata["reread_unsent_pairs"] = unsent
     metadata["reread_unsent_passage_ids"] = [str(row.get("passage_id") or "") for row in unsent]
@@ -2495,20 +2539,28 @@ def _read_model_selection(
 
 
 def _selected_pairs(state: Mapping[str, Any]) -> list[dict[str, str]]:
-    """One row per reread. A human assignment is not reordered by retrieval."""
+    """One row per reread. A human assignment is not reordered by retrieval.
+
+    Each row carries the stable ``question_key``. ``model_sampling_pairs``
+    stays the model's direction and passage ids.
+    """
     metadata = state.get("metadata") or {}
+    directions = [row for row in (state.get("directions") or []) if isinstance(row, Mapping)]
     if str(metadata.get("decision_mode") or "") == "llm":
         if _pursuit_name(metadata) == "reread" and "scheduled_reread_pairs" in metadata:
-            return _dedupe_pairs(metadata.get("scheduled_reread_pairs") or [])
-        if "model_sampling_pairs" in metadata:
-            return _dedupe_pairs(metadata.get("model_sampling_pairs") or [])
-        return _model_sampling_pairs(
-            {},
-            list(metadata.get("model_direction_ids") or []),
-            list(metadata.get("model_passage_ids") or []),
-            list(state.get("passage_proposals") or []),
-        )[0]
-    return _human_sampling_pairs(state.get("directions") or [])
+            raw = _dedupe_pairs(metadata.get("scheduled_reread_pairs") or [])
+        elif "model_sampling_pairs" in metadata:
+            raw = _dedupe_pairs(metadata.get("model_sampling_pairs") or [])
+        else:
+            raw = _model_sampling_pairs(
+                {},
+                list(metadata.get("model_direction_ids") or []),
+                list(metadata.get("model_passage_ids") or []),
+                list(state.get("passage_proposals") or []),
+            )[0]
+    else:
+        raw = _human_sampling_pairs(directions)
+    return _annotate_pairs(raw, directions)
 
 
 def _direction_row(state: Mapping[str, Any], direction_id: str) -> dict[str, Any]:
@@ -2614,7 +2666,21 @@ def _reread_partition(state: Mapping[str, Any], *, failed: int) -> tuple[list[di
         for pair in wanted
         if _reread_pair_key(pair) not in noted and _reread_pair_key(pair) not in withheld and _reread_pair_key(pair) not in failed_keys
     ]
-    return completed, failed_rows, unattempted
+
+    def _identified(pair: Mapping[str, Any]) -> dict[str, str]:
+        question = stable_question_key(str(pair.get("question_key") or ""))
+        if not question:
+            for item in wanted:
+                if _reread_pair_key(item) == _reread_pair_key(pair):
+                    question = stable_question_key(str(item.get("question_key") or ""))
+                    break
+        row = {"direction_id": str(pair.get("direction_id") or ""), "passage_id": str(pair.get("passage_id") or "")}
+        if question:
+            row["question_key"] = question
+            row["direction_key"] = question
+        return row
+
+    return [_identified(pair) for pair in completed], [_identified(pair) for pair in failed_rows], [_identified(pair) for pair in unattempted]
 
 
 def _finish_reread(
@@ -2645,13 +2711,43 @@ def _finish_reread(
                 metadata["sampling_stop"] = metadata.get("sampling_stop") or "call_allowance"
         return
     metadata["reread_status"] = "complete" if notes else "skipped"
+    prior_stop = str(metadata.get("reread_stop") or "")
+    prior_failed = [dict(item) for item in (metadata.get("reread_failed_pairs") or []) if isinstance(item, Mapping)]
+    recovered_timeout = str(metadata.get("stop") or "") == "timeout" or prior_stop == "timeout"
     metadata["reread_failed_pairs"] = []
     metadata["reread_unattempted_pairs"] = []
-    if metadata.get("stop") == "timeout":
+    if str(metadata.get("stop") or "") == "timeout":
         metadata["stop"] = ""
         metadata["timeout_recovered"] = True
-        if metadata.get("sampling_stop") == "timeout":
-            metadata["sampling_stop"] = ""
+    if str(metadata.get("sampling_stop") or "") == "timeout":
+        metadata["sampling_stop"] = ""
+    if recovered_timeout and prior_stop == "timeout":
+        # The active stop is cleared. The timeout stays in the recovery record
+        # and the attempt log, apart from the failure the quiet criterion reads.
+        metadata["reread_stop"] = ""
+        metadata["timeout_recovered"] = True
+        history = [dict(item) for item in (metadata.get("reread_recovered_timeouts") or []) if isinstance(item, Mapping)]
+        history.append(
+            {
+                "recovered": True,
+                "prior_reread_stop": "timeout",
+                "reread_status": metadata.get("reread_status"),
+                "pairs": prior_failed,
+            }
+        )
+        metadata["reread_recovered_timeouts"] = history
+        _remember_attempt(
+            metadata,
+            {
+                "kind": "sampling_reread",
+                "status": "recovered",
+                "reason": "timeout",
+                "recovered": True,
+                "pairs": prior_failed,
+            },
+        )
+    elif recovered_timeout:
+        metadata["timeout_recovered"] = True
 
 
 def _reread_return(notes: list, metadata: dict[str, Any], logs: list, warnings: list) -> dict:
@@ -2698,7 +2794,19 @@ def _append_reread_note(
 
 
 def _withhold_reread(metadata: dict[str, Any], unsent: list, pair: Mapping[str, Any], *, reason: str) -> None:
-    row = {"direction_id": pair["direction_id"], "passage_id": pair["passage_id"], "reason": reason}
+    row = {
+        "direction_id": str(pair.get("direction_id") or ""),
+        "passage_id": str(pair.get("passage_id") or ""),
+        "reason": reason,
+    }
+    question = stable_question_key(str(pair.get("question_key") or ""))
+    if not question:
+        recorded = stable_question_key(str(pair.get("direction_key") or ""))
+        if recorded and not recorded.startswith("dir-"):
+            question = recorded
+    if question:
+        row["question_key"] = question
+        row["direction_key"] = question
     unsent.append(row)
     metadata["reread_unsent_pairs"] = unsent
     metadata["reread_unsent_passage_ids"] = [item["passage_id"] for item in unsent]
@@ -2740,6 +2848,9 @@ async def _reread(runtime: SamplingRuntime, state: SamplingState) -> dict:
     }
     passage = passages.get(pair["passage_id"])
     direction = _direction_row(state, pair["direction_id"])
+    stamped = _annotate_pairs([pair], [direction] if direction else [])
+    if stamped:
+        pair = stamped[0]
     allowance = runtime.limiter.provider_allowance
     calls_left = None if allowance is None else allowance.remaining_calls("coding")
 
@@ -2956,6 +3067,9 @@ def _update_ledger(state: SamplingState) -> dict:
     last["reread_status"] = metadata.get("reread_status") or last.get("reread_status")
     last["reread_stop"] = str(metadata.get("reread_stop") or "")
     last["reread_failed_pairs"] = [dict(item) for item in (metadata.get("reread_failed_pairs") or []) if isinstance(item, Mapping)]
+    last["reread_recovered_timeouts"] = [
+        dict(item) for item in (metadata.get("reread_recovered_timeouts") or []) if isinstance(item, Mapping)
+    ]
     last["reread_note_count"] = len(notes)
     last["reread_unsent_passage_ids"] = list(metadata.get("reread_unsent_passage_ids") or [])
     last["reread_unsent_pairs"] = list(metadata.get("reread_unsent_pairs") or [])

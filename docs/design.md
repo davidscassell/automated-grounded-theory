@@ -429,7 +429,11 @@ Package 0.9.10 plans axial pairs that already have evidence before the seeded fi
 
 Package 0.9.11 keeps the full list of stem-only lexical matches in the run export and sends the proposal model a count. Those optional diagnostics are dropped before any passage is shortened. Quiet rounds stay `not_evaluable` when a selected pair was refused for a request budget, a token allowance, a parse failure, or an unresolved timeout, as well as for `call_allowance`. Pair evidence is classified from tokens and case memberships computed once, and that classification is skipped when no proposal is scheduled. A weak overlap does not hide a later pair's grounded passage. `pattern_min_cases` stays 2 and the axial ceiling stays 24000. The design is [design-review-fixes-0911.md](design-review-fixes-0911.md).
 
-`policy_version` is `0.9.11`.
+`policy_version` was `0.9.11`.
+
+Package 0.9.12 clears `reread_stop` after a reread timeout is recovered, and keeps that timeout on `reread_recovered_timeouts` and in the attempt log. An unresolved timeout still leaves quiet rounds `not_evaluable`. Unsent, failed, and scheduled reread pairs carry the stable question key, and the quiet-round exemption reads that key before the round-specific direction id. `pattern_min_cases` stays 2 and the axial ceiling stays 24000. The design is [design-review-fixes-0912.md](design-review-fixes-0912.md).
+
+`policy_version` is `0.9.12`.
 
 ## 26. Out of scope
 

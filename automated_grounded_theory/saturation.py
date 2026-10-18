@@ -355,10 +355,28 @@ def _core_has_endpoint(core_id: str, relationships: Sequence[Mapping] | None) ->
 
 
 _QUIET_EXEMPT_REASONS = frozenset({"completed_pair"})
+_QUIET_FOLLOW_UP_PREFIX = "reread_follow_up:"
+
+
+def _quiet_key_text(value: str) -> str:
+    text = str(value or "").strip()
+    while text.startswith(_QUIET_FOLLOW_UP_PREFIX):
+        text = text[len(_QUIET_FOLLOW_UP_PREFIX) :]
+    return text
 
 
 def _quiet_direction_key(item: Mapping) -> str:
-    return str(item.get("direction_key") or item.get("question_key") or item.get("direction_id") or "")
+    """The stable question, before a round-specific direction id.
+
+    Closures are stored as question keys such as ``thin_category:c-prep``.
+    A generated pair id such as ``dir-1-0001`` is not that key. ``question_key``
+    is read first so a record that also carries the round id still matches.
+    """
+    for field in ("question_key", "direction_key", "direction_id"):
+        text = _quiet_key_text(str(item.get(field) or ""))
+        if text:
+            return text
+    return ""
 
 
 def _quiet_pair_exempt(item: Mapping, closed: set[str]) -> bool:
@@ -381,7 +399,7 @@ def _quiet_rounds_not_evaluable(rounds: Sequence[Mapping]) -> bool:
     for row in rounds:
         if not isinstance(row, Mapping) or "reread_unsent_pairs" not in row:
             return True
-        closed = {str(item) for item in (row.get("closed_direction_keys") or []) if str(item)}
+        closed = {_quiet_key_text(str(item)) for item in (row.get("closed_direction_keys") or []) if _quiet_key_text(str(item))}
         for item in row.get("reread_unsent_pairs") or []:
             if isinstance(item, Mapping) and not _quiet_pair_exempt(item, closed):
                 return True

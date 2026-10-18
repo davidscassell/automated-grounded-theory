@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.12
+
+- A reread that times out and then completes clears the active `reread_stop`. The timeout is kept on `reread_recovered_timeouts` and in the sampling attempt log. An unresolved timeout still leaves quiet rounds `not_evaluable`.
+- Unsent pairs, failed pairs, and scheduled reread pairs carry the stable `question_key`. Quiet-round exemption reads that key before the round-specific direction id, so a closed question matches the passage that was not sent.
+- `pattern_min_cases` stays 2. The axial token ceiling stays 24000. The design is [docs/design-review-fixes-0912.md](docs/design-review-fixes-0912.md). `policy_version` is `0.9.12`.
+
 ## 0.9.11
 
 - A proposal request no longer includes the full `lexical_only_withheld` list. The model receives a count. The complete list stays on the run metadata and in `axial_run.json`. Optional diagnostics are dropped before passage evidence is shortened.
