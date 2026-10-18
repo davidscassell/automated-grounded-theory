@@ -254,6 +254,7 @@ class SamplingResult:
     warnings: list = field(default_factory=list)
     prompt_log: list = field(default_factory=list)
     export_paths: dict = field(default_factory=dict)
+    completed_pairs: list | None = None
     interrupted: bool = False
     interrupt_payload: dict | None = None
     thread_id: str = ""
@@ -3465,6 +3466,7 @@ def export_sampling_state(state: Mapping[str, Any], directory: str | Path) -> di
         "model_sampling_pairs": metadata.get("model_sampling_pairs"),
         "model_rejected_selections": metadata.get("model_rejected_selections"),
         "reread_completed_pairs": metadata.get("reread_completed_pairs"),
+        "reread_interpretations": reread_interpretation_report(state),
         "reread_failed_pairs": metadata.get("reread_failed_pairs"),
         "reread_unattempted_pairs": metadata.get("reread_unattempted_pairs"),
         "reread_active_pair": metadata.get("reread_active_pair"),
@@ -3591,6 +3593,243 @@ def build_sampling_graph(runtime: SamplingRuntime | None = None, *, output_dir: 
     return builder
 
 
+_INTERPRETATION_BUCKETS = ("relevant", "irrelevant", "unjudged", "unanchored", "failed")
+_FAILED_REREAD_REASONS = frozenset({"schema_unparsed", "timeout", "incomplete"})
+
+
+def _empty_interpretation_counts() -> dict[str, int]:
+    return {name: 0 for name in _INTERPRETATION_BUCKETS}
+
+
+def _interpretation_rate(counts: Mapping[str, int]) -> float | None:
+    denominator = sum(int(counts.get(name) or 0) for name in _INTERPRETATION_BUCKETS)
+    if denominator <= 0:
+        return None
+    return round(int(counts.get("relevant") or 0) / denominator, 4)
+
+
+def _interpretation_block(counts: Mapping[str, int]) -> dict[str, Any]:
+    block = {name: int(counts.get(name) or 0) for name in _INTERPRETATION_BUCKETS}
+    block["non_relevant"] = sum(block[name] for name in _INTERPRETATION_BUCKETS if name != "relevant")
+    block["relevance"] = _interpretation_rate(block)
+    return block
+
+
+def _note_bucket(note: Mapping[str, Any]) -> str:
+    flags = {str(item) for item in (note.get("flags") or [])}
+    if "quote_unanchored" in flags:
+        return "unanchored"
+    judgment = _note_judgment(note)
+    if judgment == "relevant":
+        return "relevant"
+    if judgment == "irrelevant":
+        return "irrelevant"
+    return "unjudged"
+
+
+def _direction_kind(direction_id: str, directions: Sequence[Mapping[str, Any]]) -> str:
+    for row in directions:
+        if str(row.get("direction_id") or "") == direction_id:
+            return str(row.get("kind") or "")
+    return ""
+
+
+def _passage_document(passage: Mapping[str, Any]) -> str:
+    return str(passage.get("doc_id") or passage.get("document_id") or "")
+
+
+def _passage_respondent(passage: Mapping[str, Any]) -> str:
+    named = str(passage.get("respondent_id") or passage.get("case_id") or "")
+    if named:
+        return named
+    meta = passage.get("metadata")
+    if isinstance(meta, Mapping):
+        return str(meta.get("respondent_id") or meta.get("case_id") or "")
+    return ""
+
+
+def _coded_identities(state: Mapping[str, Any]) -> tuple[set[str], set[str]]:
+    passages = {
+        str(row.get("passage_id") or ""): row
+        for row in (state.get("passages") or [])
+        if isinstance(row, Mapping) and row.get("passage_id")
+    }
+    documents: set[str] = set()
+    respondents: set[str] = set()
+    for segment in state.get("segments") or []:
+        if not isinstance(segment, Mapping):
+            continue
+        passage = passages.get(str(segment.get("passage_id") or ""))
+        if not isinstance(passage, Mapping):
+            continue
+        document = _passage_document(passage)
+        respondent = _passage_respondent(passage)
+        if document:
+            documents.add(document)
+        if respondent:
+            respondents.add(respondent)
+    return documents, respondents
+
+
+def _usage_parts(usage: Any) -> tuple[int, int, int] | None:
+    if not isinstance(usage, Mapping):
+        return None
+    try:
+        incoming = int(usage.get("input_tokens") or 0)
+        outgoing = int(usage.get("output_tokens") or 0)
+        total = int(usage.get("total_tokens") or 0)
+    except (TypeError, ValueError):
+        return None
+    if total <= 0:
+        total = incoming + outgoing
+    if incoming <= 0 and outgoing <= 0 and total <= 0:
+        return None
+    return incoming, outgoing, total
+
+
+def _relevant_reread_tokens(
+    notes: Sequence[Mapping[str, Any]],
+    prompt_log: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Tokens for relevant rereads. Missing or unattributable usage stays null."""
+    relevant = [note for note in notes if isinstance(note, Mapping) and _note_bucket(note) == "relevant"]
+    empty = {
+        "relevant_reread_tokens": None,
+        "relevant_reread_input_tokens": None,
+        "relevant_reread_output_tokens": None,
+        "tokens_per_relevant_reread": None,
+        "cost_per_relevant_reread_usd": None,
+        "cost_status": "unset",
+    }
+    if not relevant:
+        return empty
+    passage_ids = [str(note.get("passage_id") or "") for note in relevant]
+    if any(not passage_id for passage_id in passage_ids) or len(passage_ids) != len(set(passage_ids)):
+        return empty
+    gathered: dict[str, list[tuple[int, int, int]]] = {passage_id: [] for passage_id in passage_ids}
+    missing = False
+    for row in prompt_log:
+        if not isinstance(row, Mapping):
+            continue
+        if str(row.get("kind") or "") not in {"sampling_reread", "schema_repair"}:
+            continue
+        if str(row.get("status") or "") not in {"validated", ""}:
+            continue
+        response = row.get("response") if isinstance(row.get("response"), Mapping) else {}
+        passage_id = str(response.get("passage_id") or "")
+        if passage_id not in gathered:
+            continue
+        parts = _usage_parts(row.get("usage"))
+        if parts is None:
+            missing = True
+            continue
+        gathered[passage_id].append(parts)
+    if missing or any(not gathered[passage_id] for passage_id in passage_ids):
+        return empty
+    incoming = outgoing = total = 0
+    for passage_id in passage_ids:
+        for item in gathered[passage_id]:
+            incoming += item[0]
+            outgoing += item[1]
+            total += item[2]
+    empty["relevant_reread_tokens"] = total
+    empty["relevant_reread_input_tokens"] = incoming
+    empty["relevant_reread_output_tokens"] = outgoing
+    empty["tokens_per_relevant_reread"] = round(total / len(relevant), 4)
+    return empty
+
+
+def reread_interpretation_report(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Classify reread notes. This does not change which passages are reread.
+
+    Non-relevant notes are irrelevant, unjudged, unanchored, or failed.
+    An unanchored quote is unanchored even when the judgment says relevant.
+    A missing document or respondent id is not counted as new or known.
+    Token totals stay null when usage cannot be tied to every relevant note.
+    Cost stays null unless the run records both token prices.
+    """
+    metadata = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
+    directions = [row for row in (state.get("directions") or []) if isinstance(row, Mapping)]
+    passages = {
+        str(row.get("passage_id") or ""): row
+        for row in (state.get("passages") or [])
+        if isinstance(row, Mapping) and row.get("passage_id")
+    }
+    coded_documents, coded_respondents = _coded_identities(state)
+    notes = [row for row in (state.get("reread_notes") or []) if isinstance(row, Mapping)]
+    noted = {(str(row.get("direction_id") or ""), str(row.get("passage_id") or "")) for row in notes}
+    items: list[dict[str, str]] = []
+    for note in notes:
+        direction_id = str(note.get("direction_id") or "")
+        kind = str(note.get("kind") or "") or _direction_kind(direction_id, directions)
+        items.append(
+            {
+                "bucket": _note_bucket(note),
+                "kind": kind or "unknown",
+                "passage_id": str(note.get("passage_id") or ""),
+                "direction_id": direction_id,
+            }
+        )
+    failed_rows = [dict(row) for row in (metadata.get("reread_failed_pairs") or []) if isinstance(row, Mapping)]
+    for row in metadata.get("reread_unsent_pairs") or []:
+        if not isinstance(row, Mapping):
+            continue
+        if str(row.get("reason") or "") not in _FAILED_REREAD_REASONS:
+            continue
+        failed_rows.append(dict(row))
+    seen_failed: set[tuple[str, str]] = set()
+    for row in failed_rows:
+        key = (str(row.get("direction_id") or ""), str(row.get("passage_id") or ""))
+        if key in noted or key in seen_failed:
+            continue
+        seen_failed.add(key)
+        kind = _direction_kind(key[0], directions) or "unknown"
+        items.append({"bucket": "failed", "kind": kind, "passage_id": key[1], "direction_id": key[0]})
+
+    overall = _empty_interpretation_counts()
+    by_kind: dict[str, dict[str, int]] = {}
+    by_document: dict[str, dict[str, int]] = {}
+    by_respondent: dict[str, dict[str, int]] = {}
+    for item in items:
+        overall[item["bucket"]] += 1
+        by_kind.setdefault(item["kind"], _empty_interpretation_counts())[item["bucket"]] += 1
+        passage = passages.get(item["passage_id"]) or {}
+        document = _passage_document(passage)
+        respondent = _passage_respondent(passage)
+        if document:
+            label = "new_document" if document not in coded_documents else "known_document"
+            by_document.setdefault(label, _empty_interpretation_counts())[item["bucket"]] += 1
+        if respondent:
+            label = "new_respondent" if respondent not in coded_respondents else "known_respondent"
+            by_respondent.setdefault(label, _empty_interpretation_counts())[item["bucket"]] += 1
+    tokens = _relevant_reread_tokens(notes, list(state.get("prompt_log") or []))
+    prices = metadata.get("token_prices") if isinstance(metadata.get("token_prices"), Mapping) else {}
+    in_rate = prices.get("input_usd_per_million")
+    out_rate = prices.get("output_usd_per_million")
+    incoming = tokens.get("relevant_reread_input_tokens")
+    outgoing = tokens.get("relevant_reread_output_tokens")
+    if (
+        isinstance(in_rate, (int, float))
+        and not isinstance(in_rate, bool)
+        and isinstance(out_rate, (int, float))
+        and not isinstance(out_rate, bool)
+        and isinstance(incoming, int)
+        and isinstance(outgoing, int)
+        and tokens.get("relevant_reread_tokens") is not None
+    ):
+        cost = (incoming / 1_000_000) * float(in_rate) + (outgoing / 1_000_000) * float(out_rate)
+        relevant_n = overall["relevant"]
+        tokens["cost_per_relevant_reread_usd"] = None if relevant_n <= 0 else round(cost / relevant_n, 6)
+        tokens["cost_status"] = "configured"
+    return {
+        **_interpretation_block(overall),
+        "by_direction_type": {kind: _interpretation_block(counts) for kind, counts in sorted(by_kind.items())},
+        "by_document_novelty": {label: _interpretation_block(counts) for label, counts in sorted(by_document.items())},
+        "by_respondent_novelty": {label: _interpretation_block(counts) for label, counts in sorted(by_respondent.items())},
+        **tokens,
+    }
+
+
 def _result_from_state(state: Mapping[str, Any], *, interrupted: bool, payload: dict | None, thread_id: str, resumable: bool) -> SamplingResult:
     metadata = dict(state.get("metadata") or {})
     if interrupted:
@@ -3599,6 +3838,9 @@ def _result_from_state(state: Mapping[str, Any], *, interrupted: bool, payload: 
         metadata["stop"] = str((payload or {}).get("kind") or "checkpoint")
     metadata["saturation_judgment"] = None
     metadata["package_version"] = __version__
+    metadata["reread_interpretations"] = reread_interpretation_report({**state, "metadata": metadata})
+    recorded = metadata.get("reread_completed_pairs")
+    completed_pairs = None if recorded is None else [dict(item) for item in recorded if isinstance(item, Mapping)]
     saturation = dict(state.get("saturation") or {})
     saturation["judgment"] = None
     book = state.get("codebook") or {}
@@ -3623,6 +3865,7 @@ def _result_from_state(state: Mapping[str, Any], *, interrupted: bool, payload: 
         warnings=list(state.get("warnings") or []),
         prompt_log=list(state.get("prompt_log") or []),
         export_paths=dict(state.get("export_paths") or {}),
+        completed_pairs=completed_pairs,
         interrupted=interrupted,
         interrupt_payload=payload,
         thread_id=thread_id,

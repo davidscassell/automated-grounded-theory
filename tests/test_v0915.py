@@ -9,13 +9,14 @@ from pathlib import Path
 import pytest
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
 from automated_grounded_theory import axial_code, selective_code
 from automated_grounded_theory.async_support import CallLimiter, ainvoke_structured, run_sync
 from automated_grounded_theory.axial import AxialProposalBatch, AxialRelationshipDraft, export_axial_state
 from automated_grounded_theory.graph_grounding import graph_supported
 from tests.test_v080 import QUOTE, FakeAxialCoder, _corpus, _payload
+from tests.test_v090 import FakeSamplingCoder
 
 
 _COMMON = dict(
@@ -528,6 +529,7 @@ def test_axial_export_records_attrition_and_refuses_a_version_mismatch(tmp_path:
     with pytest.raises(InstallationMismatch):
         export_axial_state({"relationships": [], "metadata": {}, "codebook": {}}, tmp_path / "mismatch")
 
+
 class _StallCoder(FakeAxialCoder):
     """Sleep on the initial call, the repair call, or neither."""
 
@@ -638,3 +640,139 @@ def test_stalled_initial_and_repair_calls_stay_inside_the_timeout(tmp_path: Path
     )
     assert recovered_payload["relationships"]
     assert recovered_payload["relationships"][0]["statement"]
+
+
+class _RereadReportCoder(FakeSamplingCoder):
+    """Several reread judgments, including one pair that never parses."""
+
+    fails: int = 0
+    chosen: dict = Field(default_factory=dict)
+
+    def with_structured_output(self, schema, **kwargs):
+        include_raw = bool(kwargs.get("include_raw"))
+
+        def _call(messages):
+            self.call_count += 1
+            name = getattr(schema, "__name__", "")
+            body = _payload(messages)
+            if name == "ModelSamplingSelection":
+                kinds = {}
+                for row in body.get("directions") or []:
+                    kinds.setdefault(str(row.get("kind") or ""), str(row.get("direction_id") or ""))
+                thin = kinds["thin_category"]
+                other = kinds.get("no_negative_case") or thin
+                self.chosen = {"thin": thin, "other": other}
+                parsed = schema(
+                    selections=[
+                        {"direction_id": thin, "passage_id": "p1"},
+                        {"direction_id": thin, "passage_id": "p-new"},
+                        {"direction_id": other, "passage_id": "p2"},
+                        {"direction_id": thin, "passage_id": "p-low"},
+                        {"direction_id": thin, "passage_id": "p-none"},
+                        {"direction_id": thin, "passage_id": "p-monday"},
+                    ],
+                    rationale="These pairs are the rereads. The flat lists were not sent.",
+                )
+            elif name == "SamplingRereadNote":
+                passage_id = str(body.get("passage_id") or "")
+                text = str(body.get("text") or "")
+                if passage_id == "p-monday":
+                    self.fails += 1
+                    raw = AIMessage(content="not json")
+                    return {"raw": raw, "parsed": None, "parsing_error": ValueError("not json")}
+                if passage_id == "p2":
+                    parsed = schema(passage_id=passage_id, judgment="irrelevant", note="Not this direction.", quote=text[:24])
+                elif passage_id == "p-low":
+                    parsed = schema(passage_id=passage_id, judgment="", note="No judgment was given.", quote=text[:24])
+                elif passage_id == "p-none":
+                    parsed = schema(
+                        passage_id=passage_id,
+                        judgment="relevant",
+                        note="The quote is not in the passage.",
+                        quote="this sentence was never written",
+                    )
+                else:
+                    parsed = schema(passage_id=passage_id, judgment="relevant", note="This passage bears on the question.", quote=text[:24])
+            elif name == "ModelSaturationJudgment":
+                parsed = schema(
+                    assessment="not_saturated",
+                    rationale="The window is interpretable and a sampling gap is still open.",
+                )
+            else:
+                parsed = schema()
+            if not include_raw:
+                return parsed
+            raw = AIMessage(
+                content="{}",
+                usage_metadata={"input_tokens": 30, "output_tokens": 12, "total_tokens": 42},
+            )
+            return {"raw": raw, "parsed": parsed, "parsing_error": None}
+
+        return RunnableLambda(_call)
+
+
+def test_reread_reporting_splits_non_relevant_and_exposes_completed_pairs(tmp_path: Path):
+    """Reporting only. The same notes are stored; the result names the pairs."""
+    from automated_grounded_theory import theoretical_sample
+    from tests.test_v090 import _kwargs
+
+    corpus = _corpus()
+    for passage in corpus["passages"]:
+        if passage["passage_id"] == "p1":
+            passage["respondent_id"] = "r-known"
+    corpus["passages"].append(
+        {
+            "passage_id": "p-new",
+            "doc_id": "d-new",
+            "respondent_id": "r-new",
+            "text": "A new ward opened after the night shift.",
+        }
+    )
+    coder = _RereadReportCoder()
+    result = theoretical_sample(
+        corpus,
+        coder,
+        decision_mode="llm",
+        pursuit="reread",
+        interrupt=False,
+        output_dir=tmp_path,
+        **_kwargs(max_sampling_review_calls=8),
+    )
+    assert result.completed_pairs is not None
+    assert result.completed_pairs == result.metadata["reread_completed_pairs"]
+    assert {row["passage_id"] for row in result.completed_pairs} == {"p1", "p-new", "p2", "p-low", "p-none"}
+    stored = {row["passage_id"]: row for row in result.reread_notes}
+    assert stored["p-none"]["judgment"] == "relevant"
+    assert "quote_unanchored" in stored["p-none"]["flags"]
+    assert stored["p2"]["judgment"] == "irrelevant"
+    report = result.metadata["reread_interpretations"]
+    assert report["relevant"] == 2
+    assert report["irrelevant"] == 1
+    assert report["unjudged"] == 1
+    assert report["unanchored"] == 1
+    assert report["failed"] == 1
+    assert report["non_relevant"] == 4
+    assert report["relevance"] == round(2 / 6, 4)
+    assert report["by_direction_type"]["thin_category"]["relevant"] == 2
+    assert report["by_direction_type"]["thin_category"]["failed"] == 1
+    other = coder.chosen["other"]
+    other_kind = next(row["kind"] for row in result.directions if row["direction_id"] == other)
+    assert report["by_direction_type"][other_kind]["irrelevant"] == 1
+    assert report["by_document_novelty"]["new_document"]["relevant"] == 1
+    assert report["by_document_novelty"]["known_document"]["relevant"] == 1
+    assert report["by_respondent_novelty"]["new_respondent"]["relevant"] == 1
+    assert report["by_respondent_novelty"]["known_respondent"]["relevant"] == 1
+    assert "unresolved" not in report["by_document_novelty"]
+    assert report["relevant_reread_tokens"] == 84
+    assert report["tokens_per_relevant_reread"] == 42
+    assert report["cost_per_relevant_reread_usd"] is None
+    assert report["cost_status"] == "unset"
+    saved = json.loads((tmp_path / "theoretical_sampling.json").read_text(encoding="utf-8"))
+    assert saved["reread_interpretations"]["failed"] == 1
+    assert saved["reread_completed_pairs"] == result.completed_pairs
+
+    untouched = theoretical_sample(corpus, coder, decision_mode="llm", pursuit="brief_only", interrupt=False, **_kwargs(max_sampling_review_calls=2))
+    assert untouched.completed_pairs is None
+    assert untouched.metadata["reread_interpretations"]["relevance"] is None
+    assert untouched.metadata["reread_interpretations"]["relevant_reread_tokens"] is None
+    assert untouched.reread_notes == []
