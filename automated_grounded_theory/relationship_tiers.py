@@ -64,6 +64,49 @@ _ANALYST_LABELS = (
     "my interpretation",
 )
 ANALYST_WORDING = "analyst interprets X as related to Y"
+_CLAIM_FLAGS = frozenset(
+    {
+        "analyst_interpretation",
+        "participant_denies_link",
+        "participant_direction_reversed",
+        "participant_link_hedged",
+        "participant_link_not_a_relationship",
+        "participant_direction_unspecified",
+        "participant_link_contested",
+    }
+)
+_CONNECTORS = (
+    ("leads to", "forward"),
+    ("lead to", "forward"),
+    ("results in", "forward"),
+    ("because of", "backward"),
+    ("due to", "backward"),
+    ("result of", "backward"),
+    ("consequence of", "backward"),
+    ("attributed to", "backward"),
+    ("effect of", "backward"),
+    ("caused", "forward"),
+    ("causes", "forward"),
+    ("makes", "forward"),
+    ("because", "backward"),
+    ("related to", "undirected"),
+    ("connected to", "undirected"),
+    ("associated with", "undirected"),
+    ("goes with", "undirected"),
+    ("tied to", "undirected"),
+)
+_HEDGE_RE = re.compile(
+    r"\b(?:might|maybe|perhaps|could|seems|seem|possibly|possible|sort of|not sure|i think|may)\b"
+)
+_DENIAL_RE = re.compile(
+    r"\b(?:do not|does not|don't|doesn't|did not|didn't|never|unrelated|not related|"
+    r"no relationship|no connection|not connected|not a cause|not because)\b"
+)
+_LEGACY_ANALYST_NOTE = (
+    "0.9.19 stored this analyst interpretation as a row-level exclusion. "
+    "0.9.20 keeps it as a hypothesis component. "
+    "Eligibility is derived again from the current evidence."
+)
 
 
 def allowed_wording(tier: int | None, n: int | None = None) -> str | None:
@@ -416,34 +459,219 @@ def _search_report(relationship: Mapping[str, Any], *, kind: str) -> str:
     return "undefined"
 
 
-def _participant_attribution(
+def _empty_claims() -> dict[str, Any]:
+    """The three claim components. None of them support a core until evidence says so."""
+    return {
+        "pattern": {
+            "component": "pattern",
+            "present": False,
+            "evidence_tier": None,
+            "allowed_wording": None,
+            "evidence_use": HYPOTHESIS_EXPLORATION,
+            "downstream_eligible": False,
+            "supports_core": False,
+            "validated_by": None,
+        },
+        "participant_explanation": {
+            "component": "participant_explanation",
+            "present": False,
+            "link_text": None,
+            "passage_id": None,
+            "stated_direction": None,
+            "polarity": None,
+            "hedging": None,
+            "status": "absent",
+            "validated_by": None,
+            "qualifications": [],
+            "evidence_use": HYPOTHESIS_EXPLORATION,
+            "downstream_eligible": False,
+            "supports_core": False,
+            "authorizes_tier_3": False,
+        },
+        "analyst_interpretation": {
+            "component": "analyst_interpretation",
+            "present": False,
+            "allowed_wording": None,
+            "evidence_use": HYPOTHESIS_EXPLORATION,
+            "downstream_eligible": False,
+            "supports_core": False,
+            "validated_by": None,
+        },
+    }
+
+
+def _side_has(side: str, terms: set[str]) -> bool:
+    return bool(_distinctive(side) & terms)
+
+
+def _connectors(folded: str) -> list[tuple[int, str, str]]:
+    found: list[tuple[int, int, str, str]] = []
+    for phrase, kind in _CONNECTORS:
+        start = 0
+        while True:
+            pos = folded.find(phrase, start)
+            if pos < 0:
+                break
+            found.append((pos, -len(phrase), phrase, kind))
+            start = pos + len(phrase)
+    found.sort()
+    kept: list[tuple[int, str, str]] = []
+    for pos, _length, phrase, kind in found:
+        if any(pos >= earlier and pos < earlier + len(earlier_phrase) for earlier, earlier_phrase, _kind in kept):
+            continue
+        kept.append((pos, phrase, kind))
+    return kept
+
+
+def _direction_of(folded: str, from_terms: set[str], to_terms: set[str]) -> str | None:
+    """The direction a connector states, or None when the quote does not link the endpoints."""
+    for pos, phrase, kind in _connectors(folded):
+        left = folded[:pos]
+        right = folded[pos + len(phrase) :]
+        left_from = _side_has(left, from_terms)
+        left_to = _side_has(left, to_terms)
+        right_from = _side_has(right, from_terms)
+        right_to = _side_has(right, to_terms)
+        if kind == "forward":
+            if left_from and right_to and not (left_to and right_from):
+                return "from_to"
+            if left_to and right_from and not (left_from and right_to):
+                return "to_from"
+            continue
+        if kind == "backward":
+            if left_to and right_from and not (left_from and right_to):
+                return "from_to"
+            if left_from and right_to and not (left_to and right_from):
+                return "to_from"
+            continue
+        if (left_from and right_to) or (left_to and right_from) or (left_from and left_to) or (right_from and right_to):
+            return "undirected"
+    return None
+
+
+def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dict[str, Any] | None:
+    """Read one candidate quote. A keyword hit is not itself a tier-3 authorization.
+
+    The rule is deterministic. It does not call a model. A quote authorizes
+    tier 3 only when it states an affirmative, unhedged from-to link.
+    """
+    folded = _norm(text)
+    if not folded:
+        return None
+    padded = f" {folded} "
+    if not any(marker in padded for marker in _ATTRIBUTION) and not re.search(r"\bmakes\b", folded):
+        return None
+    tokens = _distinctive(text)
+    if not (tokens & from_terms) or not (tokens & to_terms):
+        return None
+    direction = _direction_of(folded, from_terms, to_terms)
+    polarity = "negative" if _DENIAL_RE.search(padded) else "affirmative"
+    hedging = "hedged" if _HEDGE_RE.search(padded) else "none"
+    if direction is None:
+        status = "not_a_link"
+    elif polarity == "negative":
+        status = "denied"
+    elif direction == "to_from":
+        status = "reversed"
+    elif direction == "undirected":
+        status = "direction_unspecified"
+    elif hedging == "hedged":
+        status = "hedged"
+    elif direction == "from_to":
+        status = "validated"
+    else:
+        status = "unvalidated"
+    qualifications = []
+    if status == "denied":
+        qualifications.append("participant_denies_link")
+    elif status == "reversed":
+        qualifications.append("participant_direction_reversed")
+    elif status == "hedged":
+        qualifications.append("participant_link_hedged")
+    elif status == "not_a_link":
+        qualifications.append("participant_link_not_a_relationship")
+    elif status == "direction_unspecified":
+        qualifications.append("participant_direction_unspecified")
+    return {
+        "link_text": str(text).strip(),
+        "stated_direction": direction,
+        "polarity": polarity,
+        "hedging": hedging,
+        "status": status,
+        "validated_by": "deterministic_rule",
+        "qualifications": qualifications,
+        "authorizes_tier_3": status == "validated",
+    }
+
+
+def _candidate_quotes(
+    relationship: Mapping[str, Any],
+    cases: Sequence[Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    quotes = []
+    for case in cases:
+        for item in case.get("quotes") or []:
+            if isinstance(item, Mapping):
+                quotes.append(
+                    {
+                        "quote": str(item.get("quote") or ""),
+                        "passage_id": str(item.get("passage_id") or ""),
+                    }
+                )
+    for key in ("quote", "quote_from", "quote_to"):
+        text = str(relationship.get(key) or "").strip()
+        if text:
+            quotes.append({"quote": text, "passage_id": str(relationship.get("passage_id") or "")})
+    return quotes
+
+
+def _participant_link(
     relationship: Mapping[str, Any],
     cases: Sequence[Mapping[str, Any]],
     passages: Mapping[str, Mapping[str, Any]],
     from_terms: set[str],
     to_terms: set[str],
-) -> bool:
+) -> dict[str, Any]:
+    """The participant component. Keyword overlap only nominates a quote."""
+    component = _empty_claims()["participant_explanation"]
     if not from_terms or not to_terms:
-        return False
-    quotes = []
-    for case in cases:
-        quotes.extend(case.get("quotes") or [])
-    for key in ("quote", "quote_from", "quote_to"):
-        text = str(relationship.get(key) or "").strip()
-        if text:
-            quotes.append({"quote": text, "passage_id": str(relationship.get("passage_id") or "")})
-    for item in quotes:
-        text = str(item.get("quote") or "")
-        folded = f" {_norm(text)} "
-        if not any(marker in folded for marker in _ATTRIBUTION) and not re.search(r"\bmakes\b", folded):
+        return component
+    readings = []
+    seen: set[tuple[str, str]] = set()
+    for item in _candidate_quotes(relationship, cases):
+        text = item["quote"]
+        key = (_norm(text), item["passage_id"])
+        if not text or key in seen:
             continue
-        tokens = _distinctive(text)
-        if not (tokens & from_terms) or not (tokens & to_terms):
+        seen.add(key)
+        reading = _interpret_quote(text, from_terms, to_terms)
+        if reading is None:
             continue
-        passage_id = _locate(text, passages, str(item.get("passage_id") or ""))
-        if passage_id:
-            return True
-    return False
+        passage_id = _locate(text, passages, item["passage_id"])
+        if not passage_id:
+            continue
+        reading["passage_id"] = passage_id
+        readings.append(reading)
+    if not readings:
+        return component
+    authorizing = [item for item in readings if item["authorizes_tier_3"]]
+    denied = [item for item in readings if item["status"] == "denied"]
+    if authorizing and denied:
+        chosen = dict(authorizing[0])
+        chosen["status"] = "contested"
+        chosen["authorizes_tier_3"] = False
+        chosen["qualifications"] = ["participant_denies_link", "participant_link_contested"]
+    elif authorizing:
+        chosen = authorizing[0]
+    else:
+        order = ("denied", "reversed", "hedged", "direction_unspecified", "not_a_link", "unvalidated")
+        chosen = sorted(readings, key=lambda item: order.index(item["status"]) if item["status"] in order else len(order))[0]
+    component.update(chosen)
+    component["present"] = True
+    component["evidence_use"] = HYPOTHESIS_EXPLORATION
+    component["downstream_eligible"] = False
+    component["supports_core"] = False
+    return component
 
 
 def _model_memo(memo: Mapping[str, Any]) -> bool:
@@ -511,6 +739,9 @@ def _undefined_fields(pattern_min_cases: int, cooccurrence: dict[str, Any] | Non
         "rival_explanation_check": "undefined",
         "attribution_source": None,
         "cases_with_both_endpoints": None,
+        "claims": _empty_claims(),
+        "participant_link": None,
+        "core_support_component": None,
     }
 
 
@@ -525,9 +756,10 @@ def assess_relationship(
 ) -> dict[str, Any]:
     """Score a relationship up to tier 3. Tier 4 is left to ``promote_verified``.
 
-    Tier 3 is a participant quote that states the link. An analyst memo does
-    not raise the tier. A labeled analyst reading stays tier 2 and uses
-    analyst wording.
+    Tier 3 is a participant quote the deterministic rule accepts as an
+    affirmative from-to link. A keyword hit only nominates that quote. An
+    analyst memo stays on its own component and does not change the row tier
+    or the row wording.
     """
     minimum = max(1, int(pattern_min_cases or PATTERN_MIN_CASES))
     if passages is None:
@@ -555,20 +787,40 @@ def assess_relationship(
     variation = _search_report(relationship, kind="variation")
     from_terms = _endpoint_terms(str(relationship.get("from_id") or ""), codebook, segments)
     to_terms = _endpoint_terms(str(relationship.get("to_id") or ""), codebook, segments)
-    participant = _participant_attribution(relationship, cases, usable, from_terms, to_terms)
-    analyst = False if participant else _analyst_interpretation(relationship, from_terms, to_terms, memos)
-    attribution = "participant" if participant else ("analyst_interpretation" if analyst else None)
+    participant = _participant_link(relationship, cases, usable, from_terms, to_terms)
+    analyst_present = _analyst_interpretation(relationship, from_terms, to_terms, memos)
+    authorizes = bool(participant.get("authorizes_tier_3"))
     if not from_cases or not to_cases:
         tier = 0
     elif len(both_cases) >= minimum:
-        # Only a participant quote raises tier 3. An analyst reading stays a pattern.
-        tier = 3 if participant and rival == "reported" else 2
+        tier = 3 if authorizes and rival == "reported" else 2
     else:
         tier = 1
-    if analyst and tier == 2:
-        wording = ANALYST_WORDING
-    else:
-        wording = allowed_wording(tier, len(both_cases) if tier >= 2 else None)
+    wording = allowed_wording(tier, len(both_cases) if tier >= 2 else None)
+    claims = _empty_claims()
+    pattern_supported = tier >= 2
+    claims["pattern"] = {
+        "component": "pattern",
+        "present": pattern_supported,
+        "evidence_tier": 2 if pattern_supported else tier,
+        "allowed_wording": allowed_wording(2, len(both_cases)) if pattern_supported else wording,
+        "evidence_use": SUPPORTED_EVIDENCE if pattern_supported else HYPOTHESIS_EXPLORATION,
+        "downstream_eligible": pattern_supported,
+        "supports_core": pattern_supported,
+        "validated_by": "deterministic_rule" if pattern_supported else None,
+        "cases_with_both_endpoints": len(both_cases),
+    }
+    claims["participant_explanation"] = participant
+    claims["analyst_interpretation"] = {
+        "component": "analyst_interpretation",
+        "present": analyst_present,
+        "allowed_wording": ANALYST_WORDING if analyst_present else None,
+        "evidence_use": HYPOTHESIS_EXPLORATION,
+        "downstream_eligible": False,
+        "supports_core": False,
+        "validated_by": "deterministic_rule" if analyst_present else None,
+    }
+    attribution = "participant" if authorizes and tier >= 2 else None
     return {
         "evidence_tier": tier,
         "evidence_label": TIER_LABELS[tier],
@@ -582,8 +834,11 @@ def assess_relationship(
         "negative_case_search_report": rival,
         "variation_search": variation,
         "rival_explanation_check": rival,
-        "attribution_source": attribution if tier >= 2 else None,
+        "attribution_source": attribution,
         "cases_with_both_endpoints": len(both_cases),
+        "claims": claims,
+        "participant_link": participant if participant.get("present") else None,
+        "core_support_component": "pattern" if pattern_supported else None,
     }
 
 
@@ -701,10 +956,11 @@ def relationship_evidence_use(row: Mapping[str, Any]) -> str:
     """Classify a relationship for later stages.
 
     ``supported_evidence`` is the only class that may set ``downstream_eligible``.
-    A tier-1 proposal, a weak-stem anchor, and an analyst interpretation are
-    ``hypothesis_exploration``. Rejected, empty, synthetic, unanchored,
-    disputed, and causal-wording rows are ``withheld``. A missing tier is not
-    supported evidence.
+    A tier-1 proposal and a weak-stem anchor are ``hypothesis_exploration``.
+    An analyst-interpretation component does not change this class: the pattern
+    component carries eligibility, and the analyst component stays a hypothesis.
+    Rejected, empty, synthetic, unanchored, disputed, and causal-wording rows
+    are ``withheld``. A missing tier is not supported evidence.
     """
     if not isinstance(row, Mapping) or row.get("synthetic"):
         return WITHHELD_EVIDENCE
@@ -728,8 +984,6 @@ def relationship_evidence_use(row: Mapping[str, Any]) -> str:
     if isinstance(tier_n, int) and tier_n < 3 and "wording_exceeds_tier" in flags:
         return WITHHELD_EVIDENCE
     if "acceptance_withheld" in flags or str(row.get("evidence_status") or "") == "cross_respondent_pattern":
-        return HYPOTHESIS_EXPLORATION
-    if "analyst_interpretation" in flags or str(row.get("attribution_source") or "") == "analyst_interpretation":
         return HYPOTHESIS_EXPLORATION
     if weak_stem_relationship(row) or tier_n is None or tier_n < 2:
         return HYPOTHESIS_EXPLORATION
@@ -837,15 +1091,98 @@ def sync_validation_flags(row: dict) -> None:
     ]
 
 
+def _claim_flags(claims: Mapping[str, Any]) -> list[str]:
+    participant = claims.get("participant_explanation") if isinstance(claims.get("participant_explanation"), Mapping) else {}
+    status = str(participant.get("status") or "")
+    flags = []
+    if status in {"denied", "contested"}:
+        flags.append("participant_denies_link")
+    if status == "contested":
+        flags.append("participant_link_contested")
+    if status == "reversed":
+        flags.append("participant_direction_reversed")
+    if status == "hedged":
+        flags.append("participant_link_hedged")
+    if status == "not_a_link":
+        flags.append("participant_link_not_a_relationship")
+    if status == "direction_unspecified":
+        flags.append("participant_direction_unspecified")
+    analyst = claims.get("analyst_interpretation") if isinstance(claims.get("analyst_interpretation"), Mapping) else {}
+    if analyst.get("present"):
+        flags.append("analyst_interpretation")
+    return flags
+
+
+def _claim_snapshot(row: Mapping[str, Any]) -> dict[str, Any] | None:
+    if "claims" not in row:
+        return None
+    claims = row.get("claims") if isinstance(row.get("claims"), Mapping) else {}
+    participant = claims.get("participant_explanation") if isinstance(claims.get("participant_explanation"), Mapping) else {}
+    analyst = claims.get("analyst_interpretation") if isinstance(claims.get("analyst_interpretation"), Mapping) else {}
+    return {
+        "evidence_tier": row.get("evidence_tier"),
+        "attribution_source": row.get("attribution_source"),
+        "downstream_eligible": row.get("downstream_eligible"),
+        "allowed_wording": row.get("allowed_wording"),
+        "claim_flags": [str(item) for item in (row.get("flags") or []) if str(item) in _CLAIM_FLAGS],
+        "participant_status": participant.get("status"),
+        "participant_link_text": participant.get("link_text"),
+        "stated_direction": participant.get("stated_direction"),
+        "polarity": participant.get("polarity"),
+        "hedging": participant.get("hedging"),
+        "analyst_present": bool(analyst.get("present")),
+        "analyst_wording": analyst.get("allowed_wording"),
+    }
+
+
+def _note_legacy_analyst_exclusion(relationship: dict) -> None:
+    """Remember a 0.9.19 row-level exclusion before this reassessment replaces it."""
+    if "claims" in relationship:
+        return
+    flags = {str(item) for item in (relationship.get("flags") or [])}
+    source = str(relationship.get("attribution_source") or "")
+    if "analyst_interpretation" not in flags and source != "analyst_interpretation":
+        return
+    history = [dict(item) for item in (relationship.get("claim_revision_history") or []) if isinstance(item, Mapping)]
+    history.append(
+        {
+            "policy_version": "0.9.19",
+            "attribution_source": relationship.get("attribution_source"),
+            "downstream_eligible": relationship.get("downstream_eligible"),
+            "evidence_tier": relationship.get("evidence_tier"),
+            "allowed_wording": relationship.get("allowed_wording"),
+            "claim_flags": ["analyst_interpretation"],
+            "analyst_present": True,
+            "note": _LEGACY_ANALYST_NOTE,
+        }
+    )
+    relationship["claim_revision_history"] = history
+
+
+def _record_claim_transition(relationship: dict, previous: dict[str, Any] | None) -> None:
+    current = _claim_snapshot(relationship)
+    if previous is None or current is None or previous == current:
+        return
+    history = [dict(item) for item in (relationship.get("claim_revision_history") or []) if isinstance(item, Mapping)]
+    history.append(previous)
+    relationship["claim_revision_history"] = history
+
+
 def apply_evidence_tier(relationship: dict, **kwargs: Any) -> dict[str, Any]:
-    """Write the assessment onto the row. Does not decide disposition or tier 4."""
+    """Write the assessment onto the row. Does not decide disposition or tier 4.
+
+    Claim flags are recomputed from the current evidence. An earlier
+    interpretation stays on ``claim_revision_history`` and does not keep the
+    row ineligible.
+    """
+    _note_legacy_analyst_exclusion(relationship)
+    previous = _claim_snapshot(relationship)
     fields = assess_relationship(relationship, **kwargs)
     relationship.update(fields)
-    if fields.get("attribution_source") == "analyst_interpretation":
-        flags = [str(item) for item in (relationship.get("flags") or [])]
-        if "analyst_interpretation" not in flags:
-            flags.append("analyst_interpretation")
-        relationship["flags"] = flags
+    flags = [str(item) for item in (relationship.get("flags") or []) if str(item) not in _CLAIM_FLAGS]
+    claim_flags = _claim_flags(fields.get("claims") or {})
+    relationship["flags"] = flags + claim_flags
+    if claim_flags:
         relationship["needs_review"] = True
     sync_validation_flags(relationship)
     tier = fields.get("evidence_tier")
@@ -853,6 +1190,7 @@ def apply_evidence_tier(relationship: dict, **kwargs: Any) -> dict[str, Any]:
     if disposition not in {"rejected", "merged"} and isinstance(tier, int):
         relationship["evidence_status"] = fields["evidence_label"]
     assign_relationship_eligibility(relationship)
+    _record_claim_transition(relationship, previous)
     return fields
 
 
@@ -1090,6 +1428,13 @@ def classify_pair_evidence(
         passage_order.append(passage_id)
         for token in tokens:
             token_index.setdefault(token, []).append(passage_id)
+    endpoint_hits: dict[str, set[str]] = {}
+    for code_id, terms in endpoint_terms.items():
+        hits: set[str] = set()
+        for token in terms:
+            hits.update(token_index.get(token) or ())
+        endpoint_hits[code_id] = hits
+    order_index = {passage_id: index for index, passage_id in enumerate(passage_order)}
     for index, left in enumerate(ids):
         for right in ids[index + 1 :]:
             left_passages = occurrence_sets.get(left) or set()
@@ -1111,15 +1456,10 @@ def classify_pair_evidence(
             lexical = False
             stem_only = False
             occupied = (case_sets.get(left) or set()) | (case_sets.get(right) or set())
-            from_hits: set[str] = set()
-            for token in from_terms:
-                from_hits.update(token_index.get(token) or ())
-            to_hits: set[str] = set()
-            for token in to_terms:
-                to_hits.update(token_index.get(token) or ())
-            for passage_id in passage_order:
-                if passage_id not in from_hits or passage_id not in to_hits:
-                    continue
+            from_hits = endpoint_hits.get(left) or set()
+            to_hits = endpoint_hits.get(right) or set()
+            shared_hits = sorted(from_hits & to_hits, key=order_index.__getitem__)
+            for passage_id in shared_hits:
                 case_id = passage_case.get(passage_id) or ""
                 if occupied and case_id in occupied:
                     continue
