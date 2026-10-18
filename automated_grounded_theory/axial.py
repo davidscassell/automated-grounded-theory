@@ -21,7 +21,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.errors import GraphRecursionError, NodeTimeoutError
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, RetryPolicy, interrupt
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import Literal, TypedDict
 
 from automated_grounded_theory.async_support import (
@@ -193,12 +193,23 @@ class AxialRelationshipDraft(BaseModel):
         "consequence",
         "unspecified",
     ] = "unspecified"
-    statement: str | None = None
+    statement: str
     passage_id: str | None = None
     quote: str | None = None
     quote_from: str | None = None
     quote_to: str | None = None
     case_quotes: list[AxialCaseQuote] = Field(default_factory=list)
+
+    @field_validator("statement", mode="before")
+    @classmethod
+    def _statement_required(cls, value: object) -> str:
+        """A relationship is a claim. A missing or whitespace statement is not one."""
+        if value is None:
+            raise ValueError("A blank statement is not a relationship.")
+        text = str(value)
+        if not text.strip():
+            raise ValueError("A blank statement is not a relationship.")
+        return text
 
 
 class AxialProposalBatch(BaseModel):
@@ -343,7 +354,8 @@ _KIND_PROMPTS = {
         "A statement built by joining quotes from unrelated passages is not a hypothesis. Do not return it. "
         "A cross-respondent pattern is not a cause. "
         "When nothing in this request supports even a hypothesis, set nothing_to_propose true and return an empty relationships list. "
-        "Do not return a row of empty strings. A blank statement is not a relationship. "
+        "Do not return a row of empty strings. A blank or whitespace-only statement is not a relationship. "
+        "Every relationship you return must include a nonempty statement. "
         "A function word, or a generic stem such as work, job, or team, is not evidence by itself. "
         "When paradigm_roles lists roles, choose the role the passages support. "
         "unspecified is not the default when those roles are supplied. "
@@ -1130,6 +1142,40 @@ def _locate_quote(quote: str, passages: Mapping[str, Mapping[str, Any]], cited: 
         "doc_id": str(row.get("doc_id") or row.get("document_id") or ""),
         "in_cited_passage": in_cited,
     }
+
+
+def _folded_span(text: object) -> str:
+    return " ".join(str(text or "").split()).casefold()
+
+
+def _statement_is_only_quotes(draft: Mapping[str, Any]) -> bool:
+    """True when the statement adds nothing beyond the quoted spans.
+
+    A verbatim quote, or those quotes joined, is not a relationship. A statement
+    that keeps words of its own after the quotes are removed is a claim.
+    """
+    statement = _folded_span(draft.get("statement"))
+    if not statement:
+        return False
+    quotes: list[str] = []
+    for key in ("quote", "quote_from", "quote_to"):
+        span = _folded_span(draft.get(key))
+        if span:
+            quotes.append(span)
+    for item in draft.get("case_quotes") or []:
+        if isinstance(item, Mapping):
+            span = _folded_span(item.get("quote"))
+            if span:
+                quotes.append(span)
+    if not quotes:
+        return False
+    if statement in quotes:
+        return True
+    remainder = statement
+    for span in sorted(set(quotes), key=len, reverse=True):
+        if span and span in remainder:
+            remainder = remainder.replace(span, " ")
+    return not any(character.isalnum() for character in remainder)
 
 
 def _stitched_unrelated(draft: Mapping[str, Any], passages: Mapping[str, Mapping[str, Any]]) -> bool:
@@ -2906,6 +2952,16 @@ def _finish_synthetic_status(metadata: dict[str, Any], *, reason: str) -> None:
     metadata["synthetic_counterexample"] = current
 
 
+def _note_proposal_repairs(metadata: dict[str, Any], audits: Sequence[Mapping[str, Any]]) -> None:
+    """Count schema repairs on the proposal diagnostics. The prompt log keeps the calls."""
+    repairs = sum(1 for audit in audits if str(audit.get("kind") or "") == "schema_repair")
+    if not repairs:
+        return
+    diagnostics = dict(metadata.get("proposal_diagnostics") or {})
+    diagnostics["schema_repairs"] = int(diagnostics.get("schema_repairs") or 0) + repairs
+    metadata["proposal_diagnostics"] = diagnostics
+
+
 def _log_call_audits(logs: list, audits: Sequence[Mapping[str, Any]], *, extra: Mapping[str, Any] | None = None) -> None:
     for audit in audits:
         status = str(audit.get("status") or "")
@@ -3582,6 +3638,7 @@ def _propose_node(runtime: AxialRuntime):
                 result["audits"],
                 extra={"omitted_evidence": payload.get("omitted_evidence"), "pairs": [_pair_record(pair) for pair in sent_chunk]},
             )
+            _note_proposal_repairs(metadata, result["audits"])
             estimated = int(metadata.get("axial_tokens_estimated") or estimated)
             if result["refused"] or result["unparsed"]:
                 if not result["audits"]:
@@ -3621,7 +3678,7 @@ def _propose_node(runtime: AxialRuntime):
                 reasons[reason] = int(reasons.get(reason) or 0) + 1
                 diagnostics["rejection_reasons"] = reasons
                 metadata["proposal_diagnostics"] = diagnostics
-                logs[-1].setdefault("rejections", []).append({"reason": reason, "draft": draft})
+                logs[-1].setdefault("rejections", []).append({"reason": reason, "draft": dict(draft)})
 
             returned = parsed.get("relationships")
             if parsed.get("nothing_to_propose") is True and not returned:
@@ -3652,6 +3709,10 @@ def _propose_node(runtime: AxialRuntime):
                     diagnostics["empty_statements"] = int(diagnostics["empty_statements"]) + 1
                     _reject("empty_statement", draft)
                     continue
+                if _statement_is_only_quotes(draft):
+                    _reject("verbatim_quote_statement", draft)
+                    continue
+                diagnostics["rejection_reasons"] = reasons
                 metadata["proposal_diagnostics"] = diagnostics
                 relationships.append(
                     _new_relationship(
@@ -3668,6 +3729,8 @@ def _propose_node(runtime: AxialRuntime):
                         pattern_min_cases=_pattern_minimum(procedure),
                     )
                 )
+            diagnostics["rejection_reasons"] = reasons
+            metadata["proposal_diagnostics"] = diagnostics
             break
         unexamined = _finalize_pair_accounting(metadata, pending)
         _sync_allowance(metadata, runtime)
