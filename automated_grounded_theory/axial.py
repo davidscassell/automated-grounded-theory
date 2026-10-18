@@ -34,7 +34,13 @@ from automated_grounded_theory.async_support import (
     structured_runnable,
     usage_from_result,
 )
-from automated_grounded_theory.backends import chat_model_settings, describe_model, record_model_determinism
+from automated_grounded_theory.backends import (
+    InstallationMismatch,
+    chat_model_settings,
+    describe_model,
+    installation_record,
+    record_model_determinism,
+)
 from automated_grounded_theory.batching import request_input_tokens
 from automated_grounded_theory.category_state import plan_relation_pairs, property_stability
 from automated_grounded_theory.focused import _rationale_indicates_irrelevance
@@ -2442,11 +2448,80 @@ def _public_relationships(rows: Sequence[Mapping[str, Any]]) -> list[dict]:
     return cleaned
 
 
+def _relationship_identity(row: Mapping[str, Any]) -> tuple[str, str, str]:
+    statement = " ".join(str(row.get("statement") or "").split()).casefold()
+    return (str(row.get("from_id") or ""), str(row.get("to_id") or ""), statement)
+
+
+def _run_relationships(run: Any) -> list[Mapping[str, Any]]:
+    rows = run.get("relationships") if isinstance(run, Mapping) else getattr(run, "relationships", [])
+    return [row for row in (rows or []) if isinstance(row, Mapping)]
+
+
+def axial_attrition(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Counts from one axial run. A comparison set deduplicates repeated relationships.
+
+    ``unique_pairs`` is null when pair accounting was not recorded.
+    ``evidence_tiers`` is null when no row has a numeric tier.
+    ``deduplicated_relationships`` is null unless ``comparison_runs`` is present.
+    """
+    metadata = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
+    relationships = _public_relationships(state.get("relationships") or [])
+    accounting = metadata.get("pair_accounting") if isinstance(metadata.get("pair_accounting"), Mapping) else {}
+    planned = accounting.get("planned") if isinstance(accounting, Mapping) else None
+    unique_pairs = len(planned) if isinstance(planned, list) else None
+    diagnostics = metadata.get("proposal_diagnostics") if isinstance(metadata.get("proposal_diagnostics"), Mapping) else None
+    reasons = {}
+    if isinstance(diagnostics, Mapping) and isinstance(diagnostics.get("rejection_reasons"), Mapping):
+        reasons = dict(diagnostics.get("rejection_reasons") or {})
+    discarded = sum(int(value or 0) for value in reasons.values())
+    if diagnostics is None and not relationships:
+        proposals = None
+    else:
+        proposals = len(relationships) + discarded
+    valid_statements = sum(1 for row in relationships if str(row.get("statement") or "").strip())
+    grounded = sum(1 for row in relationships if _both_endpoints_anchored(row))
+    tiers: dict[str, int] = {}
+    for row in relationships:
+        tier = row.get("evidence_tier")
+        if isinstance(tier, bool) or not isinstance(tier, int):
+            continue
+        key = str(tier)
+        tiers[key] = tiers.get(key, 0) + 1
+    accepted = sum(
+        1
+        for row in relationships
+        if str(row.get("human_disposition") or row.get("disposition") or "").strip().casefold() in {"accepted", "verified"}
+    )
+    eligible = sum(1 for row in relationships if row.get("downstream_eligible") is True)
+    comparison = metadata.get("comparison_runs") if isinstance(metadata, Mapping) else None
+    if not comparison:
+        deduplicated = None
+    else:
+        identities: set[tuple[str, str, str]] = set()
+        for run in list(comparison) + [{"relationships": relationships}]:
+            for row in _run_relationships(run):
+                identities.add(_relationship_identity(row))
+        deduplicated = len(identities)
+    return {
+        "unique_pairs": unique_pairs,
+        "proposals": proposals,
+        "valid_statements": valid_statements,
+        "grounded_endpoints": grounded,
+        "evidence_tiers": tiers or None,
+        "accepted_rows": accepted,
+        "downstream_eligible_rows": eligible,
+        "deduplicated_relationships": deduplicated,
+    }
+
+
 def export_axial_state(state: Mapping[str, Any], directory: str | Path) -> dict[str, str]:
     place = Path(directory)
     place.mkdir(parents=True, exist_ok=True)
     paths = {}
     metadata = dict(state.get("metadata") or {})
+    metadata["provenance"] = installation_record()
+    metadata["attrition"] = axial_attrition({**dict(state), "metadata": metadata})
     stage = str(metadata.get("stage") or "axial")
 
     def write(name: str, payload: Any) -> None:
@@ -5474,6 +5549,8 @@ def _result_from_state(state: Mapping[str, Any], *, interrupted: bool, payload: 
         metadata["stop"] = str((payload or {}).get("kind") or "checkpoint")
     metadata["saturation_judgment"] = None
     metadata["package_version"] = __version__
+    metadata["provenance"] = installation_record()
+    metadata["attrition"] = axial_attrition({**dict(state), "metadata": metadata})
     metadata["prompt_accounting"] = _prompt_accounting(state.get("prompt_log") or [])
     saturation = dict(state.get("saturation") or {})
     if "judgment" not in saturation:

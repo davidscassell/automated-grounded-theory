@@ -441,3 +441,87 @@ def test_association_may_stay_unspecified_and_role_evidence_is_not_statement_wor
     assert "consequence_wording" not in rules[mild["relationship_id"]]
     assert "consequence_wording" in rules[causal["relationship_id"]]
     assert "role_evidence" not in rules[causal["relationship_id"]]
+
+
+def test_axial_export_records_attrition_and_refuses_a_version_mismatch(tmp_path: Path, monkeypatch):
+    """The funnel deduplicates compared runs. Temperature stays unset unless configured."""
+    import automated_grounded_theory as package
+    from automated_grounded_theory.backends import InstallationMismatch, installation_record
+
+    result = axial_code(
+        _corpus(),
+        FakeAxialCoder(),
+        seed=3,
+        max_axial_review_calls=1,
+        axial_share_propose=1,
+        axial_share_counterexample=0,
+        batch_size=1,
+        interrupt=False,
+    )
+    provenance = result.metadata["provenance"]
+    assert provenance["module_version"] == package.__version__
+    assert provenance["distribution_version"] == package.__version__
+    assert provenance["module_path"].endswith("automated_grounded_theory/__init__.py")
+    assert provenance["commit"]
+    parameters = result.metadata["generation_parameters"]
+    assert parameters["temperature"] is None
+    assert parameters["temperature_status"] == "unset"
+    assert parameters["model"]
+    attrition = result.metadata["attrition"]
+    assert attrition["unique_pairs"] == 1
+    assert attrition["proposals"] is not None and attrition["proposals"] >= 1
+    assert attrition["valid_statements"] == len(result.relationships)
+    assert attrition["deduplicated_relationships"] is None
+    assert "evidence_tiers" in attrition
+
+    class _Hot(FakeAxialCoder):
+        temperature: float = 0.2
+
+    hot = axial_code(
+        _corpus(),
+        _Hot(),
+        seed=3,
+        max_axial_review_calls=1,
+        axial_share_propose=1,
+        axial_share_counterexample=0,
+        batch_size=1,
+        interrupt=False,
+    )
+    assert hot.metadata["generation_parameters"]["temperature"] == 0.2
+    assert hot.metadata["generation_parameters"]["temperature_status"] == "configured"
+
+    repeated = dict(result.relationships[0])
+    compared = axial_code(
+        _corpus(),
+        FakeAxialCoder(),
+        seed=3,
+        max_axial_review_calls=1,
+        axial_share_propose=1,
+        axial_share_counterexample=0,
+        batch_size=1,
+        interrupt=False,
+        comparison_runs=[{"relationships": [repeated, dict(repeated)]}],
+    )
+    assert compared.metadata["attrition"]["deduplicated_relationships"] == len(
+        {(row["from_id"], row["to_id"], row["statement"]) for row in compared.relationships + [repeated]}
+    )
+    paths = export_axial_state(
+        {"relationships": compared.relationships, "metadata": compared.metadata, "codebook": {}},
+        tmp_path,
+    )
+    saved = json.loads(Path(paths["axial_run.json"]).read_text(encoding="utf-8"))
+    assert saved["metadata"]["attrition"]["deduplicated_relationships"] == compared.metadata["attrition"]["deduplicated_relationships"]
+    assert saved["metadata"]["provenance"]["commit"] == installation_record()["commit"]
+
+    def _other(name: str):
+        del name
+        raise AssertionError("distribution should be patched")
+
+    monkeypatch.setattr(
+        "automated_grounded_theory.backends.importlib.metadata.distribution",
+        lambda name: type("Dist", (), {"version": "9.9.9", "locate_file": lambda self, rel: Path("/tmp/other-checkout")})(),
+    )
+    with pytest.raises(InstallationMismatch):
+        installation_record()
+    with pytest.raises(InstallationMismatch):
+        export_axial_state({"relationships": [], "metadata": {}, "codebook": {}}, tmp_path / "mismatch")
