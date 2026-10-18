@@ -12,7 +12,7 @@ The gates are unchanged. `pattern_min_cases` stays 2. The axial token ceiling st
 - `withheld`: `disposition` is `rejected`, `provisional`, or `merged`, or the row already carries `acceptance_withheld`.
 - A row that is still `proposed`, with none of those dispositions, is left out of both lists.
 
-Each copied row has `relationship_id`, `disposition`, and `rules`. The rules are the labels already stored on the row:
+Each copied row has `relationship_id`, `disposition`, `rules`, and `withholding_flags`. `disposition` is the reviewer disposition. `downstream_eligible` is copied only when the source row stores a boolean. A missing field is not filled in as true. `withholding_flags` lists `causal_wording_withheld`, `acceptance_withheld`, `verification_withheld`, `relationship_rejected`, and `relationship_merged` when those flags are already on the row. An accepted row can still have `downstream_eligible` false. That split was added in 0.9.13. The rules are the labels already stored on the row:
 
 | Rule | Where it is read |
 | --- | --- |
@@ -27,7 +27,7 @@ An accepted row can still list a rule. A wording flag does not by itself move th
 
 ## Adjudication record
 
-`load_adjudications` reads a JSON list, or an object with an `adjudications` list. Each object needs:
+`load_adjudications` reads a JSON list, or an object with an `adjudications` list. An optional `downstream_eligible` boolean and an optional `withholding_flags` list are kept when the file includes them. Scoring does not read those optional notes. It reads the export. Each object needs:
 
 | Field | Meaning |
 | --- | --- |
@@ -61,10 +61,14 @@ Example, not a study result:
 
 `score_gate_adjudications(exported, adjudications)` returns:
 
-- `accept_precision`: adjudicated accepted rows whose verdict is `supported`, divided by adjudicated accepted rows. Null when no accepted row was adjudicated.
-- `withheld_supported_recall`: withheld rows whose verdict is `supported`, divided by every adjudicated row whose verdict is `supported`. Null when no adjudicated row is `supported`.
-- `by_rule`: the same two rates for rows whose export lists that rule. A rule that fired on no exported row is omitted. A rule with no adjudicated rows keeps both rates null.
-- Counts of adjudicated accepted, withheld, and supported rows sit beside the rates. A count can be zero. A rate cannot be stored as zero when its denominator is zero.
+- `accept_precision`: adjudicated accepted rows whose verdict is `supported`, divided by adjudicated accepted rows. Null when no accepted row was adjudicated. This follows `disposition`.
+- `withheld_supported_recall`: withheld rows whose verdict is `supported`, divided by every adjudicated row whose verdict is `supported`. Null when no adjudicated row is `supported`. This follows `disposition`.
+- `downstream_precision`: supported verdicts among adjudicated rows whose export says `downstream_eligible` is true. Null when that denominator is zero, and null when the export does not carry the field.
+- `downstream_withheld_supported_recall`: supported rows whose export says `downstream_eligible` is false, divided by every adjudicated row whose verdict is `supported`. Null when no adjudicated row is `supported`. Null when no scored export row carries `downstream_eligible`. A missing field is not treated as eligible and is not treated as withheld.
+- `by_rule`: the same rates for rows whose export lists that rule. A rule that fired on no exported row is omitted. A rule with no adjudicated rows keeps the rates null.
+- Counts of adjudicated accepted, withheld, supported, downstream-eligible, and downstream-withheld rows sit beside the rates. A count can be zero. A rate cannot be stored as zero when its denominator is zero.
 - `unmatched_adjudication_ids`: adjudication ids that are not in the export.
+
+A 0.9.9 export that has `relationship_id`, `disposition`, and `rules` only still scores `accept_precision` and `withheld_supported_recall`. Its downstream rates stay null.
 
 These rates describe agreement with the adjudication file. They do not change `disposition`, a flag, or a tier.

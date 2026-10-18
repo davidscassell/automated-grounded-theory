@@ -431,9 +431,11 @@ Package 0.9.11 keeps the full list of stem-only lexical matches in the run expor
 
 `policy_version` was `0.9.11`.
 
-Package 0.9.12 clears `reread_stop` after a reread timeout is recovered, and keeps that timeout on `reread_recovered_timeouts` and in the attempt log. An unresolved timeout still leaves quiet rounds `not_evaluable`. Unsent, failed, and scheduled reread pairs carry the stable question key, and the quiet-round exemption reads that key before the round-specific direction id. `pattern_min_cases` stays 2 and the axial ceiling stays 24000. The design is [design-review-fixes-0912.md](design-review-fixes-0912.md).
+Package 0.9.12 clears `reread_stop` after a reread timeout is recovered, and keeps that timeout on `reread_recovered_timeouts` and in the attempt log. An unresolved timeout still leaves quiet rounds `not_evaluable`. Unsent, failed, and scheduled reread pairs carry the stable question key, and the quiet-round exemption reads that key before the round-specific direction id. `pattern_min_cases` stays 2 and the axial ceiling stays 24000. The design is [design-review-fixes-0912.md](design-review-fixes-0912.md). `policy_version` was `0.9.12`.
 
-`policy_version` is `0.9.12`.
+Package 0.9.13 retires a recovered pair from `reread_failed_pairs` when that pair succeeds, including when a later pair is withheld for `call_allowance`. The timeout stays on `reread_recovered_timeouts` and in the attempt log. The current `reread_stop` is the remaining blocker. Gate export keeps reviewer `disposition` and `downstream_eligible` apart and copies withholding flags. `downstream_precision` and `downstream_withheld_supported_recall` score downstream use. Disposition metrics keep their names. A missing denominator stays null, and an export without `downstream_eligible` leaves the new rates null. The design is [design-review-fixes-0913.md](design-review-fixes-0913.md).
+
+`policy_version` is `0.9.13`.
 
 ## 26. Out of scope
 

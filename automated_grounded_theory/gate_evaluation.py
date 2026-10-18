@@ -39,6 +39,14 @@ _ANCHOR_RULES = {
     "missing_category_label": "missing_category_label",
 }
 _ABSENCE_RULE = "absence_reclassified"
+# Flags that block a row from downstream use. Disposition can still be accepted.
+_WITHHOLDING_FLAGS = (
+    "causal_wording_withheld",
+    "acceptance_withheld",
+    "verification_withheld",
+    "relationship_rejected",
+    "relationship_merged",
+)
 
 
 class GateEvaluationError(ValueError):
@@ -87,12 +95,33 @@ def _outcome(row: Mapping[str, Any], rules: Sequence[str]) -> str | None:
     return "proposed"
 
 
+def _downstream_eligible(row: Mapping[str, Any]) -> bool | None:
+    """Copy a boolean eligibility. A missing or non-boolean value stays unknown."""
+    if "downstream_eligible" not in row:
+        return None
+    value = row.get("downstream_eligible")
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def _withholding_flags(row: Mapping[str, Any]) -> list[str]:
+    found: list[str] = []
+    for flag in row.get("flags") or []:
+        name = str(flag or "")
+        if name in _WITHHOLDING_FLAGS and name not in found:
+            found.append(name)
+    return found
+
+
 def export_gate_relationships(relationships: Sequence[Mapping[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     """List accepted, withheld, and still-proposed relationships.
 
     A synthetic row is omitted. A row that has not been accepted or withheld
-    is listed under ``proposed`` and is not scored as either. The input rows
-    are not modified.
+    is listed under ``proposed`` and is not scored as either. ``disposition``
+    is the reviewer disposition. ``downstream_eligible`` is copied only when
+    the row stores a boolean, and the withholding flags are copied beside it.
+    The input rows are not modified.
     """
     accepted: list[dict[str, Any]] = []
     withheld: list[dict[str, Any]] = []
@@ -108,7 +137,11 @@ def export_gate_relationships(relationships: Sequence[Mapping[str, Any]]) -> dic
             "relationship_id": str(row.get("relationship_id") or ""),
             "disposition": str(row.get("disposition") or ""),
             "rules": list(rules),
+            "withholding_flags": _withholding_flags(row),
         }
+        eligible = _downstream_eligible(row)
+        if eligible is not None:
+            item["downstream_eligible"] = eligible
         if outcome == "accepted":
             accepted.append(item)
         elif outcome == "withheld":
@@ -132,7 +165,7 @@ def _one_adjudication(row: Mapping[str, Any]) -> dict[str, Any]:
     if verdict not in _VERDICTS:
         raise GateEvaluationError("verdict must be 'supported' or 'unsupported'.")
     rules = [str(item) for item in (row.get("rules") or []) if str(item or "").strip()]
-    return {
+    item = {
         "relationship_id": _require_text(row, "relationship_id"),
         "rules": rules,
         "verdict": verdict,
@@ -140,6 +173,14 @@ def _one_adjudication(row: Mapping[str, Any]) -> dict[str, Any]:
         "timestamp": _require_text(row, "timestamp"),
         "reason": _require_text(row, "reason"),
     }
+    # Optional notes a reviewer file may carry. Scoring reads the export, not these.
+    eligible = _downstream_eligible(row)
+    if eligible is not None:
+        item["downstream_eligible"] = eligible
+    flags = row.get("withholding_flags")
+    if isinstance(flags, Sequence) and not isinstance(flags, (str, bytes)):
+        item["withholding_flags"] = [str(flag) for flag in flags if str(flag or "").strip()]
+    return item
 
 
 def load_adjudications(source: str | Path | Sequence[Any] | Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -165,22 +206,42 @@ def _blank_counts() -> dict[str, Any]:
     return {
         "accept_precision": None,
         "withheld_supported_recall": None,
+        "downstream_precision": None,
+        "downstream_withheld_supported_recall": None,
         "accepted_adjudicated": 0,
         "accepted_supported": 0,
         "withheld_adjudicated": 0,
         "withheld_supported": 0,
         "supported_adjudicated": 0,
+        "downstream_eligible_adjudicated": 0,
+        "downstream_eligible_supported": 0,
+        "downstream_withheld_supported": 0,
+        "_downstream_known": False,
     }
 
 
 def _fill(counts: dict[str, Any]) -> dict[str, Any]:
     accepted = int(counts["accepted_adjudicated"])
     supported = int(counts["supported_adjudicated"])
+    eligible = int(counts["downstream_eligible_adjudicated"])
     counts["accept_precision"] = None if accepted == 0 else round(int(counts["accepted_supported"]) / accepted, 4)
     counts["withheld_supported_recall"] = (
         None if supported == 0 else round(int(counts["withheld_supported"]) / supported, 4)
     )
+    counts["downstream_precision"] = (
+        None if eligible == 0 else round(int(counts["downstream_eligible_supported"]) / eligible, 4)
+    )
+    if not counts.get("_downstream_known") or supported == 0:
+        counts["downstream_withheld_supported_recall"] = None
+    else:
+        counts["downstream_withheld_supported_recall"] = round(int(counts["downstream_withheld_supported"]) / supported, 4)
     return counts
+
+
+def _public_counts(counts: dict[str, Any]) -> dict[str, Any]:
+    filled = _fill(counts)
+    filled.pop("_downstream_known", None)
+    return filled
 
 
 def score_gate_adjudications(
@@ -191,9 +252,17 @@ def score_gate_adjudications(
 
     ``accept_precision`` is supported accepts over adjudicated accepts.
     ``withheld_supported_recall`` is withheld-and-supported over every
-    adjudicated supported relationship. Either value is null when its
-    denominator is zero. Per-rule figures use the same rule and stay null
-    on the same condition. A rule that fired on no exported row is omitted.
+    adjudicated supported relationship. Those two rates follow disposition.
+
+    ``downstream_precision`` is supported rows among adjudicated rows whose
+    export says ``downstream_eligible`` is true. ``downstream_withheld_supported_recall``
+    is supported rows whose export says ``downstream_eligible`` is false, over
+    every adjudicated supported relationship. An export that does not carry
+    ``downstream_eligible`` leaves both rates null. A missing field is not
+    treated as eligible. Either rate is null when its denominator is zero.
+    Per-rule figures use the same rule and stay null on the same condition.
+    A rule that fired on no exported row is omitted. Optional fields on an
+    adjudication are not the source of these rates.
     """
     by_outcome: dict[str, dict[str, Any]] = {}
     for outcome in ("accepted", "withheld"):
@@ -203,9 +272,12 @@ def score_gate_adjudications(
             relationship_id = str(row.get("relationship_id") or "")
             if not relationship_id:
                 continue
+            known = "downstream_eligible" in row and isinstance(row.get("downstream_eligible"), bool)
             by_outcome[relationship_id] = {
                 "outcome": outcome,
                 "rules": [str(item) for item in (row.get("rules") or []) if str(item or "")],
+                "downstream_known": known,
+                "downstream_eligible": row.get("downstream_eligible") if known else None,
             }
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in adjudications:
@@ -229,10 +301,21 @@ def score_gate_adjudications(
         supported = item["verdict"] == "supported"
         outcome = exported_row["outcome"]
         rules = list(exported_row["rules"])
+        known = bool(exported_row.get("downstream_known"))
+        eligible = known and exported_row.get("downstream_eligible") is True
+        blocked = known and exported_row.get("downstream_eligible") is False
         buckets = [overall] + [_rule_bucket(per_rule, rule) for rule in rules]
         for bucket in buckets:
+            if known:
+                bucket["_downstream_known"] = True
             if supported:
                 bucket["supported_adjudicated"] += 1
+                if blocked:
+                    bucket["downstream_withheld_supported"] += 1
+            if eligible:
+                bucket["downstream_eligible_adjudicated"] += 1
+                if supported:
+                    bucket["downstream_eligible_supported"] += 1
             if outcome == "accepted":
                 bucket["accepted_adjudicated"] += 1
                 if supported:
@@ -242,8 +325,8 @@ def score_gate_adjudications(
                 if supported:
                     bucket["withheld_supported"] += 1
     return {
-        **_fill(overall),
-        "by_rule": {rule: _fill(counts) for rule, counts in sorted(per_rule.items())},
+        **_public_counts(overall),
+        "by_rule": {rule: _public_counts(counts) for rule, counts in sorted(per_rule.items())},
         "unmatched_adjudication_ids": unmatched,
         "duplicate_relationship_ids": duplicates,
     }
