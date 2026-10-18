@@ -41,6 +41,13 @@ from automated_grounded_theory.decision_review import (
     claims_payload,
     selection_payload,
 )
+from automated_grounded_theory.discovery_evaluation import (
+    DISCOVERY_SCHEMA_VERSION,
+    DiscoveryEvaluationError,
+    freeze_discovery_set,
+    load_discovery_file,
+    score_discovery,
+)
 from automated_grounded_theory.gate_evaluation import (
     export_gate_relationships,
     load_adjudications,
@@ -80,7 +87,9 @@ __all__ = [
     "ClaimDecisions",
     "CodeRetriever",
     "CodingError",
+    "DISCOVERY_SCHEMA_VERSION",
     "DecisionReviewer",
+    "DiscoveryEvaluationError",
     "EmbeddingCodeRetriever",
     "FocusedError",
     "FocusedResult",
@@ -110,7 +119,10 @@ __all__ = [
     "compare_runs",
     "evaluate_run",
     "export_gate_relationships",
+    "freeze_discovery_set",
     "load_adjudications",
+    "load_discovery_file",
+    "score_discovery",
     "score_gate_adjudications",
     "focused_code",
     "get_graph",

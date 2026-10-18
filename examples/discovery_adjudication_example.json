@@ -1,0 +1,70 @@
+{
+  "schema_version": "discovery-eval-1",
+  "label": "Synthetic example data only. Not a study result.",
+  "note": "Synthetic example data only. Not a study result. These rows are invented so the file shape is visible. They are not adjudications of a corpus.",
+  "adjudications": [
+    {
+      "adjudication_id": "ex-independent-1",
+      "kind": "independent",
+      "adjudicator_id": "example-adjudicator",
+      "rationale": "Synthetic example only. Two invented codes share an invented passage.",
+      "from_id": "c-a",
+      "to_id": "c-b",
+      "direction": "from_to",
+      "role": null,
+      "wording": null,
+      "supporting_passages": [
+        {
+          "passage_id": "p-1",
+          "quote": "Synthetic quote only."
+        }
+      ],
+      "conceptual_distinctions": [
+        "synthetic-distinction"
+      ],
+      "unsupported_interpretation": false,
+      "over_merging": false,
+      "loss_of_minority_account": false,
+      "loss_of_contradictory_account": false,
+      "evidence_supported": true,
+      "system_relationship_id": null,
+      "system_outcome": null
+    },
+    {
+      "adjudication_id": "ex-system-1",
+      "kind": "system_proposal",
+      "adjudicator_id": "example-adjudicator",
+      "rationale": "Synthetic example only. An invented proposal was withheld, and this row marks that invented proposal as supported.",
+      "from_id": "c-b",
+      "to_id": "c-c",
+      "direction": "undirected",
+      "role": null,
+      "wording": null,
+      "supporting_passages": [
+        {
+          "passage_id": "p-2",
+          "quote": "Synthetic quote only."
+        }
+      ],
+      "conceptual_distinctions": [],
+      "unsupported_interpretation": false,
+      "over_merging": true,
+      "loss_of_minority_account": false,
+      "loss_of_contradictory_account": true,
+      "evidence_supported": true,
+      "system_relationship_id": "rel-synthetic",
+      "system_outcome": "withheld"
+    }
+  ],
+  "disagreements": [
+    {
+      "adjudication_id": "ex-independent-1",
+      "adjudicator_id": "example-adjudicator-2",
+      "field": "direction",
+      "value": "undirected",
+      "rationale": "Synthetic disagreement only. Not a second gold row."
+    }
+  ],
+  "frozen_hash": "sha256:3a122494e2c2f8ad8466d4267bd6093b84cc27a679bde4f41b3616d896dcf39a",
+  "frozen_hash_status": "verified"
+}

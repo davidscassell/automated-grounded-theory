@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.21
+
+- Discovery evaluation is separate from gate evaluation. `load_discovery_file`, `freeze_discovery_set`, and `score_discovery` read a frozen human file of independently identified relationships and score recovered, missed, distorted, and unmatched proposals. A relationship the run never proposed can lower recall. Gate scoring still excludes an adjudication id that is absent from the export.
+- The schema version is `discovery-eval-1`. JSON or JSONL is the frozen artifact. A header-only CSV template is the adjudicator worksheet. The SHA-256 `frozen_hash` is checked on load. A file with no hash is not scored. Passing no discovery file leaves every rate null. Disagreements are stored beside the gold row and do not change the rates. The design is [docs/design-discovery-evaluation.md](docs/design-discovery-evaluation.md).
+- Recall, precision, and distortion use explicit denominators and stay null when the denominator is empty. Matching is code ids plus passage ids. A wrong direction is distorted, not recovered. Tier labels and model judgments are not inputs. A withheld but supported proposal is a gate false negative, with the 0.9.14 known-eligibility split. Recovered rows per token and per dollar stay null unless reread expenditure is complete.
+- `examples/discovery_adjudication_example.json` is synthetic example data only. It is not a study result. No real adjudication is included.
+- `pattern_min_cases` stays 2. The axial token ceiling stays 24000. `batch_size` stays 1. Tier 4 stays human-only. The review note is [docs/design-review-fixes-0921.md](docs/design-review-fixes-0921.md). `policy_version` is `0.9.21`.
+
 ## 0.9.20
 
 - Tier 3 wording `participants attribute X to Y` requires a deterministic reading of the quote: affirmative polarity, no hedge, and the stated from-to direction, plus a relevant rival check. A keyword hit only nominates the quote. A topical explanation, a denial, a reversed direction, an undirected association, and a hedge stay below tier 3. The quote text, direction, polarity, hedging, and `validated_by` stay on the participant claim. Validation does not call a model.
