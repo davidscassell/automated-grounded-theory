@@ -2508,23 +2508,51 @@ def _plan_node(state: AxialState) -> dict:
     ids = list(book.keys())
     calls = int(procedure.get("propose_calls") or 0)
     batch = max(1, int((metadata.get("performance") or {}).get("batch_size") or 1))
-    evidence = classify_pair_evidence(
-        ids,
-        state.get("passages") or [],
-        state.get("segments") or [],
-        book if isinstance(book, Mapping) else {},
-        pattern_min_cases=_pattern_minimum(procedure),
-    )
+    # Classification walks the full pair space. Skip it when this round will
+    # not send a proposal. The pattern-reach warning is part of that
+    # classification, so it is not computed either.
+    if calls > 0:
+        evidence = classify_pair_evidence(
+            ids,
+            state.get("passages") or [],
+            state.get("segments") or [],
+            book if isinstance(book, Mapping) else {},
+            pattern_min_cases=_pattern_minimum(procedure),
+        )
+        evidence_classes = evidence["by_class"]
+        metadata["pair_evidence"] = {
+            "classification_skipped": False,
+            "lexical_only_count": evidence.get("lexical_only_count"),
+        }
+    else:
+        evidence = {
+            "classification_skipped": True,
+            "reason": "no_proposal_requests",
+            "lexical_only_count": None,
+            "by_class": None,
+        }
+        evidence_classes = None
+        metadata["pair_evidence"] = {
+            "classification_skipped": True,
+            "reason": "no_proposal_requests",
+            "lexical_only_count": None,
+            "by_class": None,
+        }
     plan = plan_relation_pairs(
         ids,
         round_size=calls * batch,
         obvious_share=float(procedure.get("obvious_share") or 0.5),
         seed=int(procedure.get("seed") or 0),
-        evidence_classes=evidence["by_class"],
+        evidence_classes=evidence_classes,
     )
     warnings = list(state.get("warnings") or [])
-    reach = int(evidence.get("pairs_reaching_pattern_min_cases") or 0)
-    if ids and reach == 0:
+    # The warning is a result of classification. A skipped classification has
+    # no observed reach, so it must not be read as zero.
+    if calls > 0:
+        reach = int(evidence.get("pairs_reaching_pattern_min_cases") or 0)
+    else:
+        reach = None
+    if calls > 0 and ids and reach == 0:
         pattern_warning = {
             "field": "pattern_reach",
             "pattern_min_cases": evidence.get("pattern_min_cases"),
@@ -3014,6 +3042,41 @@ def _protected_indexes(chunk: Sequence[Mapping[str, Any]], passages: Sequence[Ma
     return protected
 
 
+_OPTIONAL_PROPOSAL_DIAGNOSTICS = ("lexical_only_withheld", "lexical_only_withheld_summary")
+
+
+def _drop_optional_proposal_diagnostics(payload: dict[str, Any]) -> list[str]:
+    """Remove prompt diagnostics that are not passage evidence.
+
+    The full ``lexical_only_withheld`` list stays on the run metadata. The
+    request may carry a count. Both are dropped before any passage is shortened.
+    """
+    dropped = [key for key in _OPTIONAL_PROPOSAL_DIAGNOSTICS if key in payload]
+    for key in dropped:
+        payload.pop(key, None)
+    if dropped:
+        omitted = dict(payload.get("omitted_diagnostics") or {})
+        already = [str(item) for item in (omitted.get("dropped_before_evidence") or [])]
+        for key in dropped:
+            if key not in already:
+                already.append(key)
+        omitted["dropped_before_evidence"] = already
+        payload["omitted_diagnostics"] = omitted
+    return dropped
+
+
+def _fit_proposal_request(payload: dict[str, Any], chunk: Sequence[Mapping[str, Any]], schema, request_budget: int) -> int:
+    """Fit one proposal request. Diagnostics go before passage evidence is shortened."""
+    messages = _messages("axial_proposal", payload)
+    estimate = request_input_tokens(messages, schema)
+    if estimate > int(request_budget):
+        _drop_optional_proposal_diagnostics(payload)
+        messages = _messages("axial_proposal", payload)
+        estimate = request_input_tokens(messages, schema)
+    trimmed = _trim_surplus_passages(payload, chunk, schema, request_budget)
+    return trimmed
+
+
 def _trim_surplus_passages(payload: dict[str, Any], chunk: Sequence[Mapping[str, Any]], schema, request_budget: int) -> int:
     """Drop passages that are not the last evidence for a category. Return the estimate."""
     messages = _messages("axial_proposal", payload)
@@ -3437,12 +3500,20 @@ def _propose_node(runtime: AxialRuntime):
                     lexical_only=lexical_only,
                 )
                 if lexical_only:
-                    payload["lexical_only_withheld"] = lexical_only
                     metadata["lexical_only_withheld"] = list(metadata.get("lexical_only_withheld") or []) + lexical_only
+                    payload["lexical_only_withheld_summary"] = {
+                        "count": len(lexical_only),
+                        "support_cap": 1,
+                        "lexical_only": True,
+                        "note": (
+                            "Passages that share fewer than two distinctive stems with either endpoint "
+                            "are withheld. They are not evidence. The full list is exported as lexical_only_withheld."
+                        ),
+                    }
                 if extras:
                     evidence = list(evidence) + extras
                     payload["passages"] = list(evidence)
-                estimate = _trim_surplus_passages(payload, window, AxialProposalBatch, token_budget)
+                estimate = _fit_proposal_request(payload, window, AxialProposalBatch, token_budget)
                 _sync_cross_case(payload)
                 over_request = estimate > token_budget
                 over_total = _allowance_refuses(runtime, estimate, estimated=estimated, max_tokens=max_tokens, stage="coding")

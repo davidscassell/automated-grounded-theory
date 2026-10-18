@@ -354,26 +354,50 @@ def _core_has_endpoint(core_id: str, relationships: Sequence[Mapping] | None) ->
     return False
 
 
+_QUIET_EXEMPT_REASONS = frozenset({"completed_pair"})
+
+
+def _quiet_direction_key(item: Mapping) -> str:
+    return str(item.get("direction_key") or item.get("question_key") or item.get("direction_id") or "")
+
+
+def _quiet_pair_exempt(item: Mapping, closed: set[str]) -> bool:
+    """A selected pair is exempt when it was already completed or the direction was closed."""
+    if str(item.get("reason") or "") in _QUIET_EXEMPT_REASONS:
+        return True
+    key = _quiet_direction_key(item)
+    return bool(key) and key in closed
+
+
 def _quiet_rounds_not_evaluable(rounds: Sequence[Mapping]) -> bool:
-    """True when a quiet reading would treat unsent selected pairs as silence.
+    """True when a quiet reading would treat an unfinished selection as silence.
 
     A round is evaluable when ``reread_unsent_pairs`` is present and every
-    pair left unsent for ``call_allowance`` is explicitly closed. A ledger
-    that does not record the field cannot be read as met.
+    selected pair was completed or explicitly exempted. A budget refusal
+    (``request_budget``, ``token_allowance``), a parse failure, an unresolved
+    timeout, or any other unsent pair that was not exempted is not silence.
+    A ledger that does not record the field cannot be read as met.
     """
     for row in rounds:
         if not isinstance(row, Mapping) or "reread_unsent_pairs" not in row:
             return True
         closed = {str(item) for item in (row.get("closed_direction_keys") or []) if str(item)}
         for item in row.get("reread_unsent_pairs") or []:
-            if not isinstance(item, Mapping):
-                continue
-            if str(item.get("reason") or "") != "call_allowance":
-                continue
-            key = str(item.get("direction_key") or item.get("question_key") or item.get("direction_id") or "")
-            if key and key in closed:
-                continue
-            return True
+            if isinstance(item, Mapping) and not _quiet_pair_exempt(item, closed):
+                return True
+        for item in row.get("reread_failed_pairs") or []:
+            if isinstance(item, Mapping) and not _quiet_pair_exempt(item, closed):
+                return True
+        status = str(row.get("reread_status") or "")
+        stop = str(row.get("reread_stop") or "")
+        if status == "timeout" or stop == "timeout":
+            listed = [
+                item
+                for item in list(row.get("reread_unsent_pairs") or []) + list(row.get("reread_failed_pairs") or [])
+                if isinstance(item, Mapping)
+            ]
+            if not listed or any(not _quiet_pair_exempt(item, closed) for item in listed):
+                return True
     return False
 
 
@@ -468,9 +492,9 @@ def stopping_criteria_report(
     if quiet_status == "not_evaluable":
         quiet_row["reason"] = "selected_pairs_unsent_or_unrecorded"
         quiet_row["note"] = (
-            "Quiet rounds are not met while selected pairs remain unsent for call_allowance, "
-            "or when the ledger does not say whether those pairs were sent. "
-            "observed stays null."
+            "Quiet rounds are not met unless every selected pair was completed or explicitly exempted. "
+            "A budget refusal, a parse failure, an unresolved timeout, or an unsent pair that was not closed "
+            "leaves the criterion not evaluable. observed stays null."
         )
     criteria.append(quiet_row)
     chosen = str(core_id or "")

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.11
+
+- A proposal request no longer includes the full `lexical_only_withheld` list. The model receives a count. The complete list stays on the run metadata and in `axial_run.json`. Optional diagnostics are dropped before passage evidence is shortened.
+- Quiet rounds are `not_evaluable`, and `observed` is null, unless every selected pair was completed or explicitly exempted. A `request_budget` or `token_allowance` refusal, a parse failure, and an unresolved timeout are not silence. A completed pair and a closed direction stay exempt.
+- Pair evidence is classified from passage tokens, endpoint terms, and case memberships computed once, with an inverted index for lexical overlap. Classification is skipped when no proposal request is scheduled. The class assigned to each pair is unchanged.
+- A weak lexical overlap does not reserve a passage. A later pair in the same batch can still offer that passage when the overlap is strong enough. A passage is reserved only after it qualifies.
+- `pattern_min_cases` stays 2. The axial token ceiling stays 24000. The design is [docs/design-review-fixes-0911.md](docs/design-review-fixes-0911.md). `policy_version` is `0.9.11`.
+
 ## 0.9.10
 
 - Axial pair planning takes same-passage, same-respondent, and lexical cross-case pairs before the seeded fill, and reports how many pairs were examined against how many were plausible. `max_axial_review_calls` still defaults to 8, so a default series examines a small fraction of the pairs. A corpus where no pair can reach `pattern_min_cases` records a warning. The minimum stays 2 and the axial token ceiling stays 24000.

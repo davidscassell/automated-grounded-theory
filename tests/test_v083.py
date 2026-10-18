@@ -23,8 +23,8 @@ from tests.test_v082 import _RepairCoder, _install_estimates
 
 
 def test_version_is_083():
-    assert __version__ == "0.9.10"
-    assert POLICY_VERSION == "0.9.10"
+    assert __version__ == "0.9.11"
+    assert POLICY_VERSION == "0.9.11"
 
 
 def _plain(value):
