@@ -1316,9 +1316,58 @@ def parse_incidents(decision: Any, known_ids: set[str]) -> list[dict[str, str]]:
 
 
 _EVIDENCE_CLASS_ORDER = ("same_passage", "same_respondent", "lexical_cross_case")
+# Minimum slots reserved for later evidence classes. Same-passage keeps the rest.
+# A design choice. It does not raise the call allowance.
+DEFAULT_EXPLORATION_QUOTAS = {
+    "same_passage": 0,
+    "same_respondent": 1,
+    "lexical_cross_case": 1,
+}
+_UNEXAMINED_MATERIALIZE_LIMIT = 256
 
 
-def plan_relation_pairs(
+def _pair_identity(pair: Sequence[str] | Mapping[str, Any]) -> tuple[str, str]:
+    if isinstance(pair, Mapping):
+        left = str(pair.get("from_id") or "")
+        right = str(pair.get("to_id") or "")
+    else:
+        left, right = str(pair[0]), str(pair[1])
+    return tuple(sorted((left, right)))
+
+
+def _class_slots(
+    pending_counts: Mapping[str, int],
+    round_size: int,
+    quotas: Mapping[str, int],
+) -> dict[str, int]:
+    """Old class order, then move slots so each later class keeps its minimum."""
+    assigned = {name: 0 for name in _EVIDENCE_CLASS_ORDER}
+    remaining = round_size
+    for name in _EVIDENCE_CLASS_ORDER:
+        take = min(int(pending_counts.get(name) or 0), remaining)
+        assigned[name] = take
+        remaining -= take
+    for name in reversed(_EVIDENCE_CLASS_ORDER):
+        want = min(int(quotas.get(name) or 0), int(pending_counts.get(name) or 0))
+        short = want - assigned[name]
+        if short <= 0:
+            continue
+        for donor in _EVIDENCE_CLASS_ORDER:
+            if donor == name:
+                break
+            floor = min(int(quotas.get(donor) or 0), int(pending_counts.get(donor) or 0))
+            spare = assigned[donor] - floor
+            give = min(max(spare, 0), short)
+            if give:
+                assigned[donor] -= give
+                assigned[name] += give
+                short -= give
+            if short == 0:
+                break
+    return assigned
+
+
+def _plan_relation_pairs_0919(
     category_ids: Sequence[str],
     *,
     examined: Sequence[Sequence[str]] = (),
@@ -1426,6 +1475,157 @@ def plan_relation_pairs(
         ],
         "unexamined_pair_count": len(unexamined),
         "unexamined_pairs": [{"from_id": left, "to_id": right} for left, right in unexamined],
+        "allowance_note": "Call and token allowances are ceilings, not measured costs.",
+    }
+
+
+def plan_relation_pairs(
+    category_ids: Sequence[str],
+    *,
+    examined: Sequence[Sequence[str] | Mapping[str, Any]] = (),
+    round_size: int = 8,
+    obvious_share: float = 0.5,
+    seed: int = 0,
+    evidence_classes: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
+    exploration_quotas: Mapping[str, int] | None = None,
+) -> dict[str, Any]:
+    """Choose the next axial pairs and reserve slots across evidence classes.
+
+    The 0.9.19 selector filled the allowance from same-passage pairs before
+    later classes. Each later class now keeps a minimum number of slots when
+    it still has unexamined pairs. The default minimum is one same-respondent
+    slot and one lexical cross-case slot. Same-passage pairs take what remains.
+    The allowance is not raised. Seed 0 keeps the previous pair order inside a
+    class. Another seed rotates a class only when that class has more pending
+    pairs than slots, so a rerun can cover a different pair. Examined pairs
+    are skipped. The full unexamined list is stored only for a small pair
+    space. A larger space reports the count and ``selection_procedure``.
+    """
+    if round_size < 0:
+        raise ValueError("round_size must be zero or more.")
+    if not 0 <= obvious_share <= 1:
+        raise ValueError("obvious_share must be between 0 and 1.")
+    quotas = dict(DEFAULT_EXPLORATION_QUOTAS if exploration_quotas is None else exploration_quotas)
+    for name in _EVIDENCE_CLASS_ORDER:
+        quotas.setdefault(name, 0)
+    ids = [str(item) for item in category_ids]
+    seen_ids: list[str] = []
+    for item in ids:
+        if item not in seen_ids:
+            seen_ids.append(item)
+    pairs = [(left, right) for index, left in enumerate(seen_ids) for right in seen_ids[index + 1 :]]
+    oriented = {tuple(sorted(pair)): pair for pair in pairs}
+    position = {item: index for index, item in enumerate(seen_ids)}
+    obvious = [(left, right) for left, right in pairs if abs(position[left] - position[right]) == 1]
+    less = [(left, right) for left, right in pairs if abs(position[left] - position[right]) != 1]
+    rng = random.Random(int(seed))
+    less = list(less)
+    rng.shuffle(less)
+    examined_keys = {_pair_identity(pair) for pair in examined}
+
+    def pending(rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        return [pair for pair in rows if tuple(sorted(pair)) not in examined_keys]
+
+    by_class: dict[str, list[tuple[str, str]]] = {name: [] for name in _EVIDENCE_CLASS_ORDER}
+    seen_evidence: set[tuple[str, str]] = set()
+    available = {name: 0 for name in _EVIDENCE_CLASS_ORDER}
+    if evidence_classes:
+        for class_name in _EVIDENCE_CLASS_ORDER:
+            for item in evidence_classes.get(class_name) or []:
+                if not isinstance(item, Mapping):
+                    continue
+                key = tuple(sorted((str(item.get("from_id") or ""), str(item.get("to_id") or ""))))
+                if key not in oriented or not key[0] or not key[1] or key in seen_evidence:
+                    continue
+                seen_evidence.add(key)
+                available[class_name] += 1
+                if key in examined_keys:
+                    continue
+                by_class[class_name].append(oriented[key])
+    pending_counts = {name: len(rows) for name, rows in by_class.items()}
+    slots = _class_slots(pending_counts, round_size, quotas) if evidence_classes else {name: 0 for name in _EVIDENCE_CLASS_ORDER}
+    prioritized: list[tuple[str, tuple[str, str]]] = []
+    prioritized_keys: set[tuple[str, str]] = set()
+    for class_name in _EVIDENCE_CLASS_ORDER:
+        rows = list(by_class[class_name])
+        take = slots.get(class_name, 0)
+        if take < len(rows) and int(seed) % len(rows):
+            offset = int(seed) % len(rows)
+            rows = rows[offset:] + rows[:offset]
+        for pair in rows[:take]:
+            key = tuple(sorted(pair))
+            if key in prioritized_keys:
+                continue
+            prioritized.append((class_name, pair))
+            prioritized_keys.add(key)
+    fill_size = max(0, round_size - len(prioritized))
+    obvious_pending = [pair for pair in pending(obvious) if tuple(sorted(pair)) not in prioritized_keys]
+    less_pending = [pair for pair in pending(less) if tuple(sorted(pair)) not in prioritized_keys]
+    if obvious_pending:
+        offset = int(seed) % len(obvious_pending)
+        if offset:
+            obvious_pending = obvious_pending[offset:] + obvious_pending[:offset]
+    take_obvious = int(round(fill_size * obvious_share))
+    take_less = fill_size - take_obvious
+    chosen_obvious = obvious_pending[:take_obvious]
+    chosen_less = less_pending[:take_less]
+    short_obvious = take_obvious - len(chosen_obvious)
+    short_less = take_less - len(chosen_less)
+    if short_obvious > 0:
+        chosen_less = less_pending[: take_less + short_obvious]
+    if short_less > 0:
+        chosen_obvious = obvious_pending[: take_obvious + short_less]
+    chosen = list(prioritized) + [("obvious", pair) for pair in chosen_obvious] + [("less_obvious", pair) for pair in chosen_less]
+    chosen_keys = {tuple(sorted(pair)) for _band, pair in chosen}
+    covered = {key for key in examined_keys if key in oriented} | chosen_keys
+    unexamined_count = len(pairs) - len(covered)
+    materialize = len(pairs) <= _UNEXAMINED_MATERIALIZE_LIMIT
+    if materialize:
+        unexamined = [pair for pair in pairs if tuple(sorted(pair)) not in covered]
+        unexamined_pairs = [{"from_id": left, "to_id": right} for left, right in unexamined]
+    else:
+        unexamined_pairs = []
+    examined_count = len(covered)
+    prioritized_by_class = {name: 0 for name in _EVIDENCE_CLASS_ORDER}
+    for band, _pair in prioritized:
+        prioritized_by_class[band] = prioritized_by_class.get(band, 0) + 1
+    plausible_count = sum(available.values()) if evidence_classes is not None else None
+    examined_plausible = None
+    if evidence_classes is not None:
+        plausible_keys = set()
+        for class_name in _EVIDENCE_CLASS_ORDER:
+            for item in evidence_classes.get(class_name) or []:
+                if isinstance(item, Mapping):
+                    plausible_keys.add(tuple(sorted((str(item.get("from_id") or ""), str(item.get("to_id") or "")))))
+        examined_plausible = len(covered & plausible_keys)
+    return {
+        "pair_count": len(pairs),
+        "examined_count": examined_count,
+        "within_run_pair_count": len(chosen),
+        "unique_pairs_explored": examined_count,
+        "plausible_count": plausible_count,
+        "examined_plausible": examined_plausible,
+        "evidence_available": None if evidence_classes is None else dict(available),
+        "prioritized_by_class": prioritized_by_class,
+        "exploration_quotas": {name: int(quotas.get(name) or 0) for name in _EVIDENCE_CLASS_ORDER},
+        "class_slot_counts": slots,
+        "pair_coverage": None if not pairs else round(examined_count / len(pairs), 4),
+        "pair_coverage_statement": f"{examined_count} of {len(pairs)} unordered pairs examined",
+        "round": [
+            {"from_id": left, "to_id": right, "band": band}
+            for band, (left, right) in chosen
+        ],
+        "unexamined_pair_count": unexamined_count,
+        "unexamined_pairs": unexamined_pairs,
+        "unexamined_materialized": materialize,
+        "selection_procedure": {
+            "seed": int(seed),
+            "round_size": int(round_size),
+            "obvious_share": float(obvious_share),
+            "quotas": {name: int(quotas.get(name) or 0) for name in _EVIDENCE_CLASS_ORDER},
+            "category_ids": list(seen_ids),
+            "examined_pair_count": len(examined_keys),
+        },
         "allowance_note": "Call and token allowances are ceilings, not measured costs.",
     }
 

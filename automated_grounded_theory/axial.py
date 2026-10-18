@@ -655,10 +655,43 @@ def _evidence_source_hash(data: Mapping[str, Any]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _mapping_rows(data: Mapping[str, Any], key: str) -> list[Any]:
+    rows = []
+    for item in data.get(key) or []:
+        if isinstance(item, Mapping):
+            rows.append(json.loads(json.dumps(dict(item), ensure_ascii=False, sort_keys=True, default=str)))
+    rows.sort(key=lambda row: json.dumps(row, ensure_ascii=False, sort_keys=True, default=str))
+    return rows
+
+
+def _selective_source_hash(data: Mapping[str, Any]) -> str:
+    """Fingerprint the inputs selective coding consumes, plus the axial evidence hash.
+
+    Relationships include evidence, dispositions, and interpretation fields.
+    Memos, properties, and dimensions are included in full.
+    """
+    relationships = _mapping_rows(data, "relationships")
+    relationships.sort(key=lambda row: str(row.get("relationship_id") or ""))
+    payload = {
+        "evidence": _evidence_source_hash(data),
+        "relationships": relationships,
+        "memos": _mapping_rows(data, "memos"),
+        "properties": _mapping_rows(data, "properties"),
+        "dimensions": _mapping_rows(data, "dimensions"),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 _LEGACY_FINGERPRINT = (
     "procedure.source_fingerprint: this checkpoint was saved before code definitions, "
     "segment assignments, and case identity were fingerprinted. "
     "Resume cannot confirm the evidence. Start a new axial run."
+)
+_SELECTIVE_LEGACY_FINGERPRINT = (
+    "procedure.source_fingerprint: this selective checkpoint was saved before relationships, "
+    "memos, properties, and dimensions were fingerprinted. "
+    "Resume cannot confirm those inputs. Start a new selective run."
 )
 
 
@@ -1037,7 +1070,9 @@ def _saturation(state: Mapping[str, Any]) -> dict[str, Any]:
     accounting = metadata.get("pair_accounting") or {}
     remaining = int(accounting.get("remaining_count") or 0)
     unexamined = list(state.get("unexamined_pairs") or [])
-    partial = remaining > 0 or bool(unexamined)
+    coverage = metadata.get("pair_coverage") if isinstance(metadata.get("pair_coverage"), Mapping) else {}
+    unexamined_count = int(accounting.get("unexamined_pair_count") or coverage.get("unexamined_pair_count") or 0)
+    partial = remaining > 0 or bool(unexamined) or unexamined_count > 0
     for key in ("new_property_rate", "new_relationship_rate"):
         value = report.get(key)
         if not partial:
@@ -2546,6 +2581,13 @@ def _score_candidates(state: Mapping[str, Any]) -> list[dict[str, Any]]:
                     for row in proposed
                     if row.get("relationship_id")
                 },
+                "core_support_components": sorted(
+                    {
+                        str(row.get("core_support_component") or "")
+                        for row in supported
+                        if row.get("core_support_component")
+                    }
+                ),
                 "reach_documents": len(docs),
                 "property_count": len(properties),
                 "relationship_evidence": bool(proposed),
@@ -2825,13 +2867,29 @@ def _plan_node(state: AxialState) -> dict:
             "lexical_only_count": None,
             "by_class": None,
         }
+    examined_pairs = list(metadata.get("examined_pairs") or [])
+    quotas = metadata.get("exploration_quotas")
     plan = plan_relation_pairs(
         ids,
+        examined=examined_pairs,
         round_size=calls * batch,
         obvious_share=float(procedure.get("obvious_share") or 0.5),
         seed=int(procedure.get("seed") or 0),
         evidence_classes=evidence_classes,
+        exploration_quotas=quotas if isinstance(quotas, Mapping) else None,
     )
+    seen_examined = {_pair_key(pair) for pair in examined_pairs}
+    for pair in plan["round"]:
+        key = _pair_key(pair)
+        if not key[0] or not key[1] or key in seen_examined:
+            continue
+        seen_examined.add(key)
+        examined_pairs.append({"from_id": key[0], "to_id": key[1]})
+    metadata["examined_pairs"] = examined_pairs
+    metadata["examined_pair_count"] = len(examined_pairs)
+    metadata["within_run_examined"] = list(plan["round"])
+    metadata["unique_pairs_explored"] = plan.get("unique_pairs_explored")
+    metadata["exploration_quotas"] = plan.get("exploration_quotas")
     warnings = list(state.get("warnings") or [])
     # The warning is a result of classification. A skipped classification has
     # no observed reach, so it must not be read as zero.
@@ -2903,13 +2961,20 @@ def _plan_node(state: AxialState) -> dict:
         "examined_plausible": plan.get("examined_plausible"),
         "evidence_available": plan.get("evidence_available"),
         "prioritized_by_class": plan.get("prioritized_by_class"),
+        "unexamined_pair_count": plan.get("unexamined_pair_count"),
+        "unexamined_materialized": plan.get("unexamined_materialized"),
+        "within_run_pair_count": plan.get("within_run_pair_count"),
+        "unique_pairs_explored": plan.get("unique_pairs_explored"),
+        "exploration_quotas": plan.get("exploration_quotas"),
+        "selection_procedure": plan.get("selection_procedure"),
         "lexical_only_count": evidence.get("lexical_only_count"),
         "seed": effective_seed,
         "seed_source": metadata["seed_source"],
         "note": (
             "The same seed examines the same pairs. Coverage is examined pairs over the unordered pair count. "
             "Plausible pairs are those with same-passage, same-respondent, or lexical cross-case evidence. "
-            "Evidence classes are taken before the salience and random fill. "
+            "Evidence classes keep a minimum slot before same-passage pairs fill the rest. "
+            "Examined pairs are not selected again. unique_pairs_explored counts this run and the examined history. "
             "max_axial_review_calls defaults to 8, so a default series examines a small fraction of the pairs."
         ),
     }
@@ -6531,7 +6596,7 @@ def _mark_recursion_limit(state: dict, *, limit: int, exc: BaseException) -> dic
     return state
 
 
-async def _invoke(builder, saver, initial: AxialState | None, *, thread_id: str, resume: Any, resuming: bool, output_dir, raise_on_timeout: bool, allow_changes: bool, procedure: Mapping[str, Any], runtime: AxialRuntime | None = None, recursion_limit: int | None = None, durability: str = "async", legacy_source_hash: str = "") -> AxialResult:
+async def _invoke(builder, saver, initial: AxialState | None, *, thread_id: str, resume: Any, resuming: bool, output_dir, raise_on_timeout: bool, allow_changes: bool, procedure: Mapping[str, Any], runtime: AxialRuntime | None = None, recursion_limit: int | None = None, durability: str = "async", legacy_source_hash: str = "", legacy_evidence_hash: str = "", legacy_evidence_message: str = "") -> AxialResult:
     graph = builder.compile(checkpointer=saver)
     limit = _derived_recursion_limit(procedure, override=recursion_limit)
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": limit}
@@ -6549,6 +6614,8 @@ async def _invoke(builder, saver, initial: AxialState | None, *, thread_id: str,
             saved_procedure = saved_meta.get("procedure") or {}
             saved_hash = str(saved_procedure.get("source_hash") or "")
             current_hash = str(procedure.get("source_hash") or "")
+            if legacy_evidence_hash and saved_hash == legacy_evidence_hash and saved_hash != current_hash:
+                raise AxialCheckpointMismatch([legacy_evidence_message or _SELECTIVE_LEGACY_FINGERPRINT])
             if legacy_source_hash and saved_hash == legacy_source_hash and saved_hash != current_hash:
                 raise AxialCheckpointMismatch([_LEGACY_FINGERPRINT])
             _check_resume(saved_procedure, procedure, allow_changes=allow_changes)
@@ -6932,6 +6999,8 @@ async def aaxial_code(
     node_timeout: float | None = None,
     checkpoint_path: str | Path | None = None,
     durability: str = "async",
+    examined_pairs: Sequence[Mapping[str, Any]] | None = None,
+    exploration_quotas: Mapping[str, int] | None = None,
 ) -> AxialResult:
     """Propose paradigm relationships and saturation indicators.
 
@@ -6995,6 +7064,12 @@ async def aaxial_code(
         "saturation_judgment": None,
         "seed": procedure["seed"],
         "seed_source": procedure["seed_source"],
+        "examined_pairs": [
+            {"from_id": str(pair.get("from_id") or ""), "to_id": str(pair.get("to_id") or "")}
+            for pair in (examined_pairs or [])
+            if isinstance(pair, Mapping) and pair.get("from_id") and pair.get("to_id")
+        ],
+        "exploration_quotas": None if exploration_quotas is None else {str(key): int(value) for key, value in exploration_quotas.items()},
         "retry_policy": {
             "provider_max_attempts": int(provider_max_attempts),
             "graph_max_attempts": 1,
@@ -7175,7 +7250,7 @@ async def aselective_code(
         "include_storyline": bool(include_storyline),
         "axial_synthetic_counterexample": False,
         "decision_mode": decision_mode,
-        "source_hash": _evidence_source_hash(data),
+        "source_hash": _selective_source_hash(data),
         "max_axial_review_tokens": int(max_axial_review_tokens),
         "storyline_token_reserve": _storyline_token_reserve(
             int(max_axial_review_tokens), include_storyline=bool(include_storyline)
@@ -7267,6 +7342,8 @@ async def aselective_code(
             recursion_limit=recursion_limit,
             durability=mode,
             legacy_source_hash=_source_hash(data),
+            legacy_evidence_hash=_evidence_source_hash(data),
+            legacy_evidence_message=_SELECTIVE_LEGACY_FINGERPRINT,
         )
 
     if checkpoint_path is None:

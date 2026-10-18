@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.20
+
+- Tier 3 wording `participants attribute X to Y` requires a deterministic reading of the quote: affirmative polarity, no hedge, and the stated from-to direction, plus a relevant rival check. A keyword hit only nominates the quote. A topical explanation, a denial, a reversed direction, an undirected association, and a hedge stay below tier 3. The quote text, direction, polarity, hedging, and `validated_by` stay on the participant claim. Validation does not call a model.
+- A relationship keeps three claim components: the observed pattern, the participant explanation, and the analyst interpretation. The pattern supports downstream use and a core when co-occurrence is independently supported. The participant explanation does not support a core. The analyst component stays a hypothesis and no longer excludes the row. Claim flags are recomputed on every reassessment. The previous reading stays on `claim_revision_history`. A 0.9.19 row that stored the analyst flag as a row-level exclusion stays unsupported until reassessment, which records that exclusion and then uses the pattern.
+- Selective resume hashes relationships, memos, properties, and dimensions, along with the axial evidence fingerprint. A changed relationship, disposition, memo, property, or dimension raises `AxialCheckpointMismatch`. An unchanged source still resumes. A 0.9.19 selective checkpoint cannot resume. Axial resume is unchanged.
+- Axial planning reserves one same-respondent slot and one lexical cross-case slot when those classes still have unexamined pairs. The call allowance is not raised. Examined pairs are passed into the plan and stored on the result. A seed rotates which pairs a class contributes when that class has more pairs than slots. The unexamined pair list is stored only for a pair space of 256 or fewer. A larger space stores the count and the selection procedure.
+- `pattern_min_cases` stays 2. The axial token ceiling stays 24000. `batch_size` stays 1. Tier 4 stays human-only. The design is [docs/design-review-fixes-0920.md](docs/design-review-fixes-0920.md). `policy_version` is `0.9.20`.
+
 ## 0.9.19
 
 - Tier 3 wording `participants attribute X to Y` requires a participant quote that states the link and is anchored to the passages, plus a relevant rival check. An analyst memo no longer raises that tier. A memo that is explicitly an analyst interpretation, and that names both endpoints, stays tier 2 with wording `analyst interprets X as related to Y`. It is flagged `analyst_interpretation`, is not downstream eligible, and does not support a core. A model memo cannot authorize either claim. A shared token plus an explanatory word is not an interpretation.

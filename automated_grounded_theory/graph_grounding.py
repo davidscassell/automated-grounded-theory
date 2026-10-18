@@ -71,19 +71,28 @@ def _usable(row: Mapping[str, Any]) -> bool:
 
 
 def graph_supported(row: Mapping[str, Any]) -> bool:
-    """Tier 2 or higher, excluding a weak-stem hypothesis and an analyst reading.
+    """Tier 2 or higher, excluding a weak-stem hypothesis.
 
     ``downstream_eligible`` is not read. A row that was marked eligible and
-    also carries ``weak_stem_anchor`` does not support a core. An analyst
-    interpretation does not support a core either.
+    also carries ``weak_stem_anchor`` does not support a core. When the row
+    has claim components, only the pattern component supports a core. An
+    analyst interpretation does not. A 0.9.19 export that still stores the
+    analyst reading as a row flag, and has no ``claims``, stays unsupported
+    until it is reassessed.
     """
     tier = tier_of(row)
     if not (_usable(row) and tier is not None and tier >= 2):
         return False
+    if weak_stem_relationship(row):
+        return False
+    claims = row.get("claims") if isinstance(row.get("claims"), Mapping) else None
+    if claims is not None:
+        pattern = claims.get("pattern") if isinstance(claims.get("pattern"), Mapping) else {}
+        return bool(pattern.get("supports_core")) and str(row.get("core_support_component") or "") == "pattern"
     flags = {str(item) for item in (row.get("flags") or [])}
     if "analyst_interpretation" in flags or str(row.get("attribution_source") or "") == "analyst_interpretation":
         return False
-    return not weak_stem_relationship(row)
+    return True
 
 
 def contradicted(row: Mapping[str, Any]) -> bool:
@@ -119,6 +128,7 @@ def graph_snapshot(relationships: Sequence[Mapping[str, Any]]) -> dict[str, Any]
     """Relationship ids and tiers a stage actually saw."""
     ids: list[str] = []
     tiers: dict[str, int | None] = {}
+    support: dict[str, str] = {}
     for row in relationships:
         if not _usable(row):
             continue
@@ -127,10 +137,18 @@ def graph_snapshot(relationships: Sequence[Mapping[str, Any]]) -> dict[str, Any]
             continue
         ids.append(relationship_id)
         tiers[relationship_id] = tier_of(row)
+        component = str(row.get("core_support_component") or "")
+        if component:
+            support[relationship_id] = component
     return {
         "relationship_ids": ids,
         "tiers": tiers,
-        "note": "The relationship ids and tiers this stage read. Later edits do not rewrite it.",
+        "support_components": support,
+        "note": (
+            "The relationship ids and tiers this stage read. "
+            "support_components names the claim that supports a core, when one does. "
+            "Later edits do not rewrite it."
+        ),
     }
 
 

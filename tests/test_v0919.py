@@ -19,8 +19,8 @@ from tests.test_v080 import FakeAxialCoder, _corpus
 
 
 def test_version_is_0919():
-    assert __version__ == "0.9.19"
-    assert POLICY_VERSION == "0.9.19"
+    assert __version__ == "0.9.20"
+    assert POLICY_VERSION == "0.9.20"
 
 
 def _passages(*, attribution: bool) -> list[dict]:
@@ -162,6 +162,12 @@ def test_a_participant_quote_still_reaches_tier_3():
 
 
 def test_an_analyst_interpretation_is_labeled_and_not_downstream_eligible():
+    """0.9.20 keeps the analyst reading on its own component.
+
+    The row wording stays the co-occurrence pattern. The analyst component
+    uses analyst wording, stays a hypothesis, and does not support a core.
+    The pattern component stays downstream eligible.
+    """
     row = _row(
         _source(
             memo={
@@ -174,14 +180,22 @@ def test_an_analyst_interpretation_is_labeled_and_not_downstream_eligible():
             }
         )
     )
+    analyst = row["claims"]["analyst_interpretation"]
     assert row["evidence_tier"] == 2
-    assert row["allowed_wording"] == "analyst interprets X as related to Y"
-    assert row["attribution_source"] == "analyst_interpretation"
+    assert row["allowed_wording"] == "co-occurs in 2 respondents"
+    assert row["attribution_source"] is None
+    assert analyst["allowed_wording"] == "analyst interprets X as related to Y"
+    assert analyst["present"] is True
+    assert analyst["downstream_eligible"] is False
+    assert analyst["supports_core"] is False
+    assert analyst["evidence_use"] == "hypothesis_exploration"
     assert "participants attribute" not in row["allowed_wording"]
+    assert "participants attribute" not in analyst["allowed_wording"]
     assert "analyst_interpretation" in row["flags"]
     assert row["needs_review"] is True
-    assert row["downstream_eligible"] is False
-    assert row["evidence_use"] == "hypothesis_exploration"
+    assert row["downstream_eligible"] is True
+    assert row["evidence_use"] == "supported_evidence"
+    assert row["core_support_component"] == "pattern"
 
 
 def test_llm_mode_cannot_use_its_own_memo_as_participant_attribution():

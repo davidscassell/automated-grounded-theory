@@ -48,8 +48,8 @@ from tests.test_v084 import _one_relationship
 
 
 def test_version_is_0910():
-    assert __version__ == "0.9.19"
-    assert POLICY_VERSION == "0.9.19"
+    assert __version__ == "0.9.20"
+    assert POLICY_VERSION == "0.9.20"
     assert PATTERN_MIN_CASES == 2
     assert DEFAULT_AXIAL_TOKEN_BUDGET == 6000
     assert DEFAULT_SAMPLING_TOKEN_BUDGET == 6000
