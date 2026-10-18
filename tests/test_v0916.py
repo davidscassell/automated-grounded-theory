@@ -493,3 +493,104 @@ def test_mixed_batch_keeps_valid_relationships_and_logs_the_rest():
     assert int(repaired.metadata["proposal_diagnostics"].get("schema_repairs") or 0) == 1
     assert blank.call_count == 2
     assert repaired.relationships
+
+
+class _FailedRereadSpend(FakeSamplingCoder):
+    """One relevant reread and one failed parse, both with token usage."""
+
+    def with_structured_output(self, schema, **kwargs):
+        include_raw = bool(kwargs.get("include_raw"))
+
+        def _call(messages):
+            self.call_count += 1
+            name = getattr(schema, "__name__", "")
+            body = _payload(messages)
+            from langchain_core.messages import AIMessage
+            from langchain_core.runnables import RunnableLambda
+
+            del RunnableLambda
+            if name == "ModelSamplingSelection":
+                thin = ""
+                for row in body.get("directions") or []:
+                    if str(row.get("kind") or "") == "thin_category":
+                        thin = str(row.get("direction_id") or "")
+                parsed = schema(
+                    selections=[
+                        {"direction_id": thin, "passage_id": "p1"},
+                        {"direction_id": thin, "passage_id": "p-low"},
+                    ],
+                    rationale="Two passages are enough to price a failed reread.",
+                )
+                raw = AIMessage(content="{}", usage_metadata={"input_tokens": 3, "output_tokens": 1, "total_tokens": 4})
+                return {"raw": raw, "parsed": parsed, "parsing_error": None}
+            if name == "SamplingRereadNote" and str(body.get("passage_id") or "") == "p-low":
+                raw = AIMessage(
+                    content="not json",
+                    usage_metadata={"input_tokens": 9, "output_tokens": 2, "total_tokens": 11},
+                )
+                return {"raw": raw, "parsed": None, "parsing_error": ValueError("not json")}
+            if name == "SamplingRereadNote":
+                text = str(body.get("text") or "")
+                parsed = schema(
+                    passage_id=str(body.get("passage_id") or ""),
+                    judgment="relevant",
+                    note="This passage bears on the question.",
+                    quote=text[:24],
+                )
+                raw = AIMessage(content="{}", usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15})
+                return {"raw": raw, "parsed": parsed, "parsing_error": None}
+            if name == "ModelSaturationJudgment":
+                parsed = schema(assessment="not_saturated", rationale="A gap remains after these two notes.")
+                raw = AIMessage(content="{}", usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+                return {"raw": raw, "parsed": parsed, "parsing_error": None}
+            parsed = schema()
+            if not include_raw:
+                return parsed
+            raw = AIMessage(content="{}", usage_metadata={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+            return {"raw": raw, "parsed": parsed, "parsing_error": None}
+
+        from langchain_core.runnables import RunnableLambda
+
+        return RunnableLambda(_call)
+
+
+def test_reread_expenditure_includes_failed_parses_and_stays_null_without_relevant_notes():
+    """Total reread spend includes a failed parse. The relevant rate does not.
+
+    The denominator is the relevant count. It stays 0, and the rate stays
+    null, when no reread was relevant. A researcher-confirmed count is left
+    unset.
+    """
+    from tests.test_v090 import _kwargs
+
+    result = theoretical_sample(
+        _corpus(),
+        _FailedRereadSpend(),
+        decision_mode="llm",
+        pursuit="reread",
+        interrupt=False,
+        **_kwargs(max_sampling_review_calls=4, sampling_token_budget=200000, max_sampling_review_tokens=200000),
+    )
+    report = result.metadata["reread_interpretations"]
+    assert report["relevant"] == 1
+    assert report["relevant_reread_count"] == 1
+    assert report["relevant_reread_tokens"] == 15
+    assert report["tokens_per_relevant_reread"] == 15
+    assert report["failed"] >= 1
+    assert report["reread_expenditure_tokens"] == 15 + 11 + 11
+    assert report["expenditure_tokens_per_relevant_reread"] == 37
+    assert report["reread_expenditure_cost_usd"] is None
+    assert report["human_confirmed_useful_rereads"] is None
+    assert report["human_confirmed_useful_rereads_status"] == "not_computed"
+    quiet = theoretical_sample(
+        _corpus(),
+        _FailedRereadSpend(),
+        decision_mode="llm",
+        pursuit="brief_only",
+        interrupt=False,
+        **_kwargs(max_sampling_review_calls=2),
+    ).metadata["reread_interpretations"]
+    assert quiet["relevant_reread_count"] == 0
+    assert quiet["reread_expenditure_tokens"] == 0
+    assert quiet["expenditure_tokens_per_relevant_reread"] is None
+    assert quiet["human_confirmed_useful_rereads"] is None

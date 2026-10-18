@@ -3885,14 +3885,71 @@ def _relevant_reread_tokens(
     return empty
 
 
+def _counts_as_reread_spend(row: Mapping[str, Any]) -> bool:
+    """True for a reread request or a repair of ``SamplingRereadNote``.
+
+    A selection repair names ``ModelSamplingSelection`` and is not reread spend.
+    """
+    kind = str(row.get("kind") or "")
+    if kind == "sampling_reread":
+        return True
+    if kind != "schema_repair":
+        return False
+    try:
+        blob = json.dumps(row.get("messages") or [], ensure_ascii=False)
+    except TypeError:
+        blob = str(row.get("messages") or "")
+    return "SamplingRereadNote" in blob
+
+
+def _reread_expenditure(
+    notes: Sequence[Mapping[str, Any]],
+    prompt_log: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """All reread tokens and cost, divided by relevant rereads.
+
+    The numerator includes irrelevant responses, failed parses, and repairs.
+    The rate is null when there are no relevant rereads. The denominator is
+    still reported. Zero spend is 0. ``human_confirmed_useful_rereads`` is a
+    hook for a researcher count and is not filled from model judgments.
+    """
+    relevant = sum(1 for note in notes if isinstance(note, Mapping) and _note_bucket(note) == "relevant")
+    incoming = outgoing = total = 0
+    for row in prompt_log:
+        if not isinstance(row, Mapping) or not _counts_as_reread_spend(row):
+            continue
+        parts = _usage_parts(row.get("usage"))
+        if parts is None:
+            continue
+        incoming += parts[0]
+        outgoing += parts[1]
+        total += parts[2]
+    return {
+        "reread_expenditure_tokens": total,
+        "reread_expenditure_input_tokens": incoming,
+        "reread_expenditure_output_tokens": outgoing,
+        "relevant_reread_count": relevant,
+        "expenditure_tokens_per_relevant_reread": None if relevant <= 0 else round(total / relevant, 4),
+        "reread_expenditure_cost_usd": None,
+        "expenditure_cost_per_relevant_reread_usd": None,
+        "human_confirmed_useful_rereads": None,
+        "human_confirmed_useful_rereads_status": "not_computed",
+    }
+
+
 def reread_interpretation_report(state: Mapping[str, Any]) -> dict[str, Any]:
     """Classify reread notes. This does not change which passages are reread.
 
     Non-relevant notes are irrelevant, unjudged, unanchored, or failed.
     An unanchored quote is unanchored even when the judgment says relevant.
     A missing document or respondent id is not counted as new or known.
-    Token totals stay null when usage cannot be tied to every relevant note.
-    Cost stays null unless the run records both token prices.
+    Token totals for relevant rereads stay null when usage cannot be tied to
+    every relevant note. ``tokens_per_relevant_reread`` counts only those
+    attributable tokens. ``expenditure_tokens_per_relevant_reread`` divides
+    every reread token, including irrelevant responses, failed parses, and
+    repairs, by the relevant count. That rate is null when the count is zero,
+    and the count is still reported. Cost stays null unless the run records
+    both token prices. ``human_confirmed_useful_rereads`` is not computed.
     """
     metadata = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
     directions = [row for row in (state.get("directions") or []) if isinstance(row, Mapping)]
@@ -3948,17 +4005,22 @@ def reread_interpretation_report(state: Mapping[str, Any]) -> dict[str, Any]:
         if respondent:
             label = "new_respondent" if respondent not in coded_respondents else "known_respondent"
             by_respondent.setdefault(label, _empty_interpretation_counts())[item["bucket"]] += 1
-    tokens = _relevant_reread_tokens(notes, list(state.get("prompt_log") or []))
+    prompt_log = list(state.get("prompt_log") or [])
+    tokens = _relevant_reread_tokens(notes, prompt_log)
+    expenditure = _reread_expenditure(notes, prompt_log)
     prices = metadata.get("token_prices") if isinstance(metadata.get("token_prices"), Mapping) else {}
     in_rate = prices.get("input_usd_per_million")
     out_rate = prices.get("output_usd_per_million")
-    incoming = tokens.get("relevant_reread_input_tokens")
-    outgoing = tokens.get("relevant_reread_output_tokens")
-    if (
+    prices_set = (
         isinstance(in_rate, (int, float))
         and not isinstance(in_rate, bool)
         and isinstance(out_rate, (int, float))
         and not isinstance(out_rate, bool)
+    )
+    incoming = tokens.get("relevant_reread_input_tokens")
+    outgoing = tokens.get("relevant_reread_output_tokens")
+    if (
+        prices_set
         and isinstance(incoming, int)
         and isinstance(outgoing, int)
         and tokens.get("relevant_reread_tokens") is not None
@@ -3967,12 +4029,20 @@ def reread_interpretation_report(state: Mapping[str, Any]) -> dict[str, Any]:
         relevant_n = overall["relevant"]
         tokens["cost_per_relevant_reread_usd"] = None if relevant_n <= 0 else round(cost / relevant_n, 6)
         tokens["cost_status"] = "configured"
+    if prices_set:
+        spent = (expenditure["reread_expenditure_input_tokens"] / 1_000_000) * float(in_rate) + (
+            expenditure["reread_expenditure_output_tokens"] / 1_000_000
+        ) * float(out_rate)
+        expenditure["reread_expenditure_cost_usd"] = round(spent, 6)
+        relevant_n = int(expenditure["relevant_reread_count"])
+        expenditure["expenditure_cost_per_relevant_reread_usd"] = None if relevant_n <= 0 else round(spent / relevant_n, 6)
     return {
         **_interpretation_block(overall),
         "by_direction_type": {kind: _interpretation_block(counts) for kind, counts in sorted(by_kind.items())},
         "by_document_novelty": {label: _interpretation_block(counts) for label, counts in sorted(by_document.items())},
         "by_respondent_novelty": {label: _interpretation_block(counts) for label, counts in sorted(by_respondent.items())},
         **tokens,
+        **expenditure,
     }
 
 
