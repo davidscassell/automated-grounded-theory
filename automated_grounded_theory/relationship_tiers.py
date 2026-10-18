@@ -716,36 +716,102 @@ def assign_relationship_eligibility(row: dict) -> str:
     return use
 
 
+def effective_statement(row: Mapping[str, Any]) -> str:
+    """The statement validation reads now.
+
+    A researcher's sentence replaces the working statement. The model's
+    earlier sentence stays on ``model_statement`` and is not rechecked.
+    """
+    human = str(row.get("human_statement") or "").strip()
+    if human:
+        return human
+    return str(row.get("statement") or "").strip()
+
+
+def effective_paradigm_role(row: Mapping[str, Any]) -> str:
+    """The role validation, eligibility, and export read now.
+
+    A human role wins. Until a human sets one, a recorded reviewer role is
+    the working role. Otherwise the row's ``paradigm_role`` stands. Actor
+    fields stay on the row for provenance.
+    """
+    human = str(row.get("human_paradigm_role") or "").strip()
+    if human:
+        return human
+    reviewer = str(row.get("reviewer_paradigm_role") or "").strip()
+    if reviewer:
+        return reviewer
+    return str(row.get("paradigm_role") or "").strip()
+
+
+_VALIDATION_FLAGS = frozenset(
+    {
+        "wording_exceeds_tier",
+        "role_evidence_exceeds_tier",
+        "causal_wording_withheld",
+        "hypothesis_not_supported",
+        "cross_case",
+    }
+)
+
+
+def sync_validation_flags(row: dict) -> None:
+    """Replace current validation flags from the effective statement, role, and tier.
+
+    Flags this function does not own stay. When the owned set changes, the
+    previous flags and the statement and role they used are appended to
+    ``validation_revision_history``. A second call with the same inputs does
+    not append again. ``needs_review`` is set when the current row overreaches
+    and is not cleared here.
+    """
+    tier = row.get("evidence_tier")
+    if isinstance(tier, bool) or not isinstance(tier, int):
+        tier = None
+    statement = effective_statement(row)
+    role = effective_paradigm_role(row)
+    statement_over = statement_wording_overreach(statement, tier)
+    role_over = role_evidence_overreach(tier, role)
+    wanted: set[str] = set()
+    if tier == 1:
+        wanted.add("hypothesis_not_supported")
+        if row.get("cross_case"):
+            wanted.add("cross_case")
+    if statement_over:
+        wanted.add("wording_exceeds_tier")
+    if role_over:
+        wanted.add("role_evidence_exceeds_tier")
+    if (statement_over or role_over) and isinstance(tier, int) and tier < 3:
+        wanted.add("causal_wording_withheld")
+    current = [str(item) for item in (row.get("flags") or [])]
+    previous = [item for item in current if item in _VALIDATION_FLAGS]
+    basis = row.get("validation_basis") if isinstance(row.get("validation_basis"), Mapping) else None
+    if set(previous) != wanted:
+        if previous or basis is not None:
+            history = [dict(item) for item in (row.get("validation_revision_history") or []) if isinstance(item, Mapping)]
+            history.append(
+                {
+                    "flags": previous,
+                    "statement": None if basis is None else basis.get("statement"),
+                    "role": None if basis is None else basis.get("role"),
+                }
+            )
+            row["validation_revision_history"] = history
+        row["validation_basis"] = {"statement": statement, "role": role}
+    elif basis is None:
+        row["validation_basis"] = {"statement": statement, "role": role}
+    if statement_over or role_over:
+        row["needs_review"] = True
+    row["flags"] = [item for item in current if item not in _VALIDATION_FLAGS] + [
+        item for item in ("cross_case", "hypothesis_not_supported", "wording_exceeds_tier", "role_evidence_exceeds_tier", "causal_wording_withheld") if item in wanted
+    ]
+
+
 def apply_evidence_tier(relationship: dict, **kwargs: Any) -> dict[str, Any]:
     """Write the assessment onto the row. Does not decide disposition or tier 4."""
     fields = assess_relationship(relationship, **kwargs)
     relationship.update(fields)
-    flags = list(relationship.get("flags") or [])
+    sync_validation_flags(relationship)
     tier = fields.get("evidence_tier")
-    if tier == 1 and fields.get("cross_case") and "cross_case" not in flags:
-        flags.append("cross_case")
-    if tier == 1 and "hypothesis_not_supported" not in flags:
-        flags.append("hypothesis_not_supported")
-    statement = " ".join(
-        str(relationship.get(key) or "") for key in ("statement", "human_statement", "model_statement")
-    )
-    role = str(
-        relationship.get("human_paradigm_role") or relationship.get("paradigm_role") or relationship.get("model_paradigm_role") or ""
-    )
-    tier_for_wording = tier if isinstance(tier, int) else None
-    statement_over = statement_wording_overreach(statement, tier_for_wording)
-    role_over = role_evidence_overreach(tier_for_wording, role)
-    if statement_over and "wording_exceeds_tier" not in flags:
-        flags.append("wording_exceeds_tier")
-        relationship["needs_review"] = True
-    if role_over and "role_evidence_exceeds_tier" not in flags:
-        flags.append("role_evidence_exceeds_tier")
-        relationship["needs_review"] = True
-    if (statement_over or role_over) and isinstance(tier, int) and tier < 3:
-        relationship["needs_review"] = True
-        if "causal_wording_withheld" not in flags:
-            flags.append("causal_wording_withheld")
-    relationship["flags"] = flags
     disposition = str(relationship.get("disposition") or "")
     if disposition not in {"rejected", "merged"} and isinstance(tier, int):
         relationship["evidence_status"] = fields["evidence_label"]

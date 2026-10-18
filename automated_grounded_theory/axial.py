@@ -77,10 +77,13 @@ from automated_grounded_theory.relationship_tiers import (
     citation_qualifies,
     classify_pair_evidence,
     denies_causal_language,
+    effective_paradigm_role,
+    effective_statement,
     has_causal_wording,
     promote_verified,
     role_evidence_overreach,
     statement_wording_overreach,
+    sync_validation_flags,
     wording_overreach,
 )
 from automated_grounded_theory.validation import GENERIC_CONTENT_STEMS, anchor_quote, locate_quote, meaningful_tokens
@@ -1336,11 +1339,10 @@ _CAUSAL_ROLES = frozenset({"causal_condition", "consequence"})
 
 
 def _is_causal_claim(row: Mapping[str, Any], role: str = "") -> bool:
-    chosen = str(role or row.get("paradigm_role") or row.get("model_paradigm_role") or "")
+    chosen = str(role or effective_paradigm_role(row) or "")
     if chosen in _CAUSAL_ROLES:
         return True
-    text = " ".join(str(row.get(key) or "") for key in ("statement", "human_statement", "model_statement")).casefold()
-    return "leads to" in text
+    return "leads to" in effective_statement(row).casefold()
 
 
 _CAUSAL_WORD = (
@@ -2161,20 +2163,8 @@ def _tiered_accept(
         target["needs_review"] = True
     else:
         target["downstream_eligible"] = True
-    statement = " ".join(str(target.get(key) or "") for key in ("statement", "human_statement", "model_statement"))
-    role = str(target.get("human_paradigm_role") or target.get("paradigm_role") or target.get("model_paradigm_role") or role or "")
-    statement_over = statement_wording_overreach(statement, tier)
-    role_over = role_evidence_overreach(tier, role)
-    if statement_over or role_over:
-        flags = list(target.get("flags") or [])
-        if statement_over and "wording_exceeds_tier" not in flags:
-            flags.append("wording_exceeds_tier")
-        if role_over and "role_evidence_exceeds_tier" not in flags:
-            flags.append("role_evidence_exceeds_tier")
-        if tier < 3 and "causal_wording_withheld" not in flags:
-            flags.append("causal_wording_withheld")
-        target["flags"] = flags
-        target["needs_review"] = True
+    del role
+    sync_validation_flags(target)
     _keep_qualification(target)
     assign_relationship_eligibility(target)
 

@@ -8,7 +8,17 @@ from pathlib import Path
 
 import pytest
 
+from langchain_core.runnables import RunnableLambda
+from langgraph.checkpoint.memory import InMemorySaver
+
 from automated_grounded_theory import axial_code, theoretical_sample
+from automated_grounded_theory.axial import (
+    AxialCaseQuote,
+    AxialProposalBatch,
+    AxialRelationDecision,
+    AxialRelationDecisions,
+    AxialRelationshipDraft,
+)
 from automated_grounded_theory.backends import InstallationMismatch, installation_record
 from automated_grounded_theory.version import __version__
 from tests.test_v080 import FakeAxialCoder, _corpus
@@ -223,3 +233,126 @@ def test_default_recursion_limit_finishes_thirty_two_rereads():
     completed = {row["passage_id"] for row in result.reread_notes}
     assert completed == {row["passage_id"] for row in passages}
     assert len(result.reread_notes) == calls
+
+
+_SHARED = "The tools for the shift sit beside coworkers on the crew tonight"
+_CAUSAL = "The tools for the shift lead to coworkers on the crew."
+_ASSOCIATION = "The tools for the shift sit beside coworkers on the crew."
+
+
+def _tier2_corpus() -> dict:
+    return {
+        "codebook": {
+            "tools": {"code_id": "tools", "code": "tools for the shift", "definition": "tools for the shift"},
+            "crew": {"code_id": "crew", "code": "coworkers on the crew", "definition": "coworkers on the crew"},
+        },
+        "passages": [
+            {"passage_id": "p1", "doc_id": "d1", "respondent_id": "r1", "text": _SHARED},
+            {"passage_id": "p2", "doc_id": "d2", "respondent_id": "r2", "text": _SHARED},
+        ],
+        "segments": [
+            {"segment_id": "s1", "code_id": "tools", "passage_id": "p1", "quote": "tools for the shift sit"},
+            {"segment_id": "s2", "code_id": "crew", "passage_id": "p1", "quote": "coworkers on the crew tonight"},
+        ],
+        "properties": [],
+        "dimensions": [],
+        "memos": [],
+        "relationships": [],
+    }
+
+
+def _case_quotes() -> list[AxialCaseQuote]:
+    return [
+        AxialCaseQuote(passage_id="p1", quote="tools for the shift sit", endpoint="from"),
+        AxialCaseQuote(passage_id="p1", quote="coworkers on the crew tonight", endpoint="to"),
+        AxialCaseQuote(passage_id="p2", quote="tools for the shift sit", endpoint="from"),
+        AxialCaseQuote(passage_id="p2", quote="coworkers on the crew tonight", endpoint="to"),
+    ]
+
+
+class _Tier2Coder(FakeAxialCoder):
+    """One anchored tier-2 proposal. ``review_role`` is what the reviewer returns."""
+
+    proposal_role: str = "consequence"
+    proposal_statement: str = _CAUSAL
+    review_role: str = "context"
+
+    def proposals(self, body: dict) -> AxialProposalBatch:
+        del body
+        return AxialProposalBatch(
+            relationships=[
+                AxialRelationshipDraft(
+                    from_id="tools",
+                    to_id="crew",
+                    paradigm_role=self.proposal_role,  # type: ignore[arg-type]
+                    statement=self.proposal_statement,
+                    passage_id="p1",
+                    quote="tools for the shift sit",
+                    quote_from="tools for the shift sit",
+                    quote_to="coworkers on the crew tonight",
+                    case_quotes=_case_quotes(),
+                )
+            ]
+        )
+
+    def relation_review(self, body: dict):
+        return AxialRelationDecisions(
+            relationships=[
+                AxialRelationDecision(
+                    relationship_id=str(row.get("relationship_id") or ""),
+                    disposition="accepted",
+                    paradigm_role=self.review_role,  # type: ignore[arg-type]
+                    rationale="The two cases support this role.",
+                )
+                for row in body.get("relationships") or []
+            ]
+        )
+
+
+def test_human_correction_clears_causal_withholding():
+    """A human can clear role and wording flags that the proposal earned.
+
+    The model sentence stays on the row. Validation reads the corrected
+    sentence and the corrected role, and keeps the old flags in the history.
+    """
+    saver = InMemorySaver()
+    common = _axial(interrupt=True)
+    paused = axial_code(_tier2_corpus(), _Tier2Coder(), checkpointer=saver, thread_id="clear-role", **common)
+    proposed = paused.relationships[0]
+    assert proposed["evidence_tier"] == 2
+    assert proposed["model_statement"] == _CAUSAL
+    for flag in ("wording_exceeds_tier", "role_evidence_exceeds_tier", "causal_wording_withheld"):
+        assert flag in proposed["flags"]
+    assert proposed["downstream_eligible"] is False
+
+    done = axial_code(
+        _tier2_corpus(),
+        _Tier2Coder(),
+        checkpointer=saver,
+        thread_id="clear-role",
+        resuming=True,
+        resume={
+            "relationships": [
+                {
+                    "relationship_id": proposed["relationship_id"],
+                    "action": "accept",
+                    "paradigm_role": "unspecified",
+                    "statement": _ASSOCIATION,
+                }
+            ]
+        },
+        **_axial(interrupt=False),
+    )
+    corrected = done.relationships[0]
+    assert corrected["human_paradigm_role"] == "unspecified"
+    assert corrected["human_statement"] == _ASSOCIATION
+    assert corrected["model_statement"] == _CAUSAL
+    assert corrected["evidence_tier"] == 2
+    for flag in ("wording_exceeds_tier", "role_evidence_exceeds_tier", "causal_wording_withheld"):
+        assert flag not in corrected["flags"]
+    assert corrected["downstream_eligible"] is True
+    history = corrected["validation_revision_history"]
+    assert history
+    assert set(history[0]["flags"]) >= {"role_evidence_exceeds_tier", "causal_wording_withheld"}
+    assert history[0]["role"] == "consequence"
+    assert "lead to" in str(history[0]["statement"])
