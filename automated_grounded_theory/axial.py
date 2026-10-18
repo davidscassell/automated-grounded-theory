@@ -1865,8 +1865,8 @@ def _flag_reviewer_causal_claim(target: dict, rationale: str) -> None:
     """A reviewer's denial of causal language is checked against the detector."""
     if not denies_causal_language(rationale):
         return
-    statement = " ".join(str(target.get(key) or "") for key in ("statement", "human_statement", "model_statement"))
-    role = str(target.get("model_paradigm_role") or target.get("paradigm_role") or target.get("human_paradigm_role") or "")
+    statement = effective_statement(target)
+    role = effective_paradigm_role(target)
     if not has_causal_wording(statement) and not has_causal_wording(role) and str(role).casefold() not in {"consequence", "cause", "causal_condition"}:
         return
     flags = list(target.get("flags") or [])
@@ -2305,7 +2305,11 @@ def validated_relation_decision(relationships: Sequence[Mapping[str, Any]], *, a
             {
                 "relationship_id": str(row.get("relationship_id") or ""),
                 "disposition": str(row.get(field) or row.get("disposition") or ""),
-                "paradigm_role": str(row.get("paradigm_role") or ""),
+                "paradigm_role": effective_paradigm_role(row),
+                "proposal_paradigm_role": row.get("proposal_paradigm_role"),
+                "model_paradigm_role": row.get("model_paradigm_role"),
+                "reviewer_paradigm_role": row.get("reviewer_paradigm_role"),
+                "human_paradigm_role": row.get("human_paradigm_role"),
                 "needs_review": bool(row.get("needs_review")),
             }
         )
@@ -2337,8 +2341,14 @@ def _apply_model_relations(
         if row is None:
             continue
         requested = str(decision.get("disposition") or "")
+        if "proposal_paradigm_role" not in row:
+            row["proposal_paradigm_role"] = row.get("paradigm_role")
+        reviewer_role = decision.get("paradigm_role")
         row["model_disposition"] = requested
-        row["model_paradigm_role"] = decision.get("paradigm_role")
+        row["model_paradigm_role"] = reviewer_role
+        row["reviewer_paradigm_role"] = reviewer_role
+        if not str(row.get("human_paradigm_role") or "").strip() and str(reviewer_role or "").strip():
+            row["paradigm_role"] = str(reviewer_role)
         row["model_rationale"] = decision.get("rationale")
         _flag_same_passage_claim(row, str(decision.get("rationale") or ""), flag="reviewer_same_passage_mismatch")
         _flag_reviewer_causal_claim(row, str(decision.get("rationale") or ""))

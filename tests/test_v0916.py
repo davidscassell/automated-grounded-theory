@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-from langchain_core.runnables import RunnableLambda
 from langgraph.checkpoint.memory import InMemorySaver
 
 from automated_grounded_theory import axial_code, theoretical_sample
@@ -356,3 +355,35 @@ def test_human_correction_clears_causal_withholding():
     assert set(history[0]["flags"]) >= {"role_evidence_exceeds_tier", "causal_wording_withheld"}
     assert history[0]["role"] == "consequence"
     assert "lead to" in str(history[0]["statement"])
+
+
+def test_reviewer_role_overrides_until_a_human_sets_one():
+    """An LLM reviewer's role is the working role. It is not only a proposal.
+
+    Actor fields keep the original proposal, the reviewer, and the human.
+    Validation, eligibility, and validated_decision read the working role.
+    A human role still wins once it is set.
+    """
+    reviewed = axial_code(
+        _tier2_corpus(),
+        _Tier2Coder(proposal_role="unspecified", proposal_statement=_ASSOCIATION, review_role="consequence"),
+        decision_mode="llm",
+        max_decision_calls=2,
+        **_axial(),
+    )
+    row = reviewed.relationships[0]
+    assert row["evidence_tier"] == 2
+    assert row["proposal_paradigm_role"] == "unspecified"
+    assert row["model_paradigm_role"] == "consequence"
+    assert row["reviewer_paradigm_role"] == "consequence"
+    assert row["human_paradigm_role"] is None
+    assert row["paradigm_role"] == "consequence"
+    assert "role_evidence_exceeds_tier" in row["flags"]
+    assert "causal_wording_withheld" in row["flags"]
+    assert "wording_exceeds_tier" not in row["flags"]
+    assert row["downstream_eligible"] is False
+    recorded = reviewed.metadata["validated_decision"]["relationships"][0]
+    assert recorded["paradigm_role"] == "consequence"
+    assert recorded["proposal_paradigm_role"] == "unspecified"
+    assert recorded["reviewer_paradigm_role"] == "consequence"
+    assert recorded["human_paradigm_role"] is None
