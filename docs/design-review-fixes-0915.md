@@ -40,6 +40,26 @@ A stalled initial axial call is cut off by `axial_request_timeout`. The partial 
 
 Cancellation is cooperative. The provider timeout, the graph-node timeout, and process isolation are different boundaries. The default node watchdog is the elapsed run timeout times the sequential calls in the step, plus two seconds, so a stalled provider hits the provider timeout first. `node_timeout` replaces that watchdog when the caller sets it. The default is unchanged. Abandoning the provider await, or cancelling the node, does not stop a blocking synchronous call such as `time.sleep`. `node_timeout_stops_remote_request` is false. `CallLimiter(process_isolation=True)` can terminate a picklable provider in a child process. Axial, focused, and sampling graphs leave process isolation off.
 
+## Replay
+
+A human resume sends `Command(resume=...)` on the same thread. The interrupted node starts again from its first line. Work before `interrupt()` is recomputed from the checkpointed input: stage notes, allowance copies, and candidate lists are derived again rather than appended. `interrupt()` is not wrapped in `except Exception`. The pause order is the graph order: axial relationships, then thematic saturation.
+
+A node that raises before it returns is not an interrupt. The next invoke on that thread with `resume=None` retries the node from the last checkpoint. A timeout resume stays that same `None` invoke when the thread has no interrupt.
+
+Human and model relation reviews both write `metadata.validated_decision`. The relationship rows share `relationship_id`, `disposition`, `paradigm_role`, and `needs_review`. `provenance.actor` is `human` or `llm`, and `provenance.channel` is `interrupt` or `model`.
+
+## Persistence
+
+`metadata.persistence` names the checkpointer and the durability mode. The default checkpointer is `InMemorySaver`. It drops every checkpoint when the process exits. `checkpoint_path` opens a SQLite saver. That file is still readable after the process exits, and a later process can resume the same thread without repeating a proposal that was already checkpointed. `durability` defaults to `async`, which is LangGraph's own default. `sync` and `exit` are available. This does not change the default.
+
+## Pair records
+
+`metadata.pair_records` holds one record per direction and passage. The record stores the question key, the direction id, the passage id, the current status, the result, and the attempt history. `reread_completed_pairs`, `reread_failed_pairs`, `reread_unsent_pairs`, `reread_status`, `reread_stop`, and `reread_stage_summary` are derived from those records. A completed pair is not also failed. Ledger `completed_pairs` stay question key plus passage id. The metadata list stays direction id plus passage id. This does not change which passages are reread.
+
+## LangGraph floor
+
+Node timeouts and `RetryPolicy` are passed into `add_node` on the axial, focused, and sampling graphs. Those arguments need LangGraph 1.2 or newer. The dependency floor is `langgraph>=1.2,<2`. The previous floor was `>=1.0,<2`. This is a declared raise, not a silent one. Schema validity, evidence eligibility, and token accounting stay application rules.
+
 ## Sampling report
 
 This does not change which passages are reread or how a judgment is stored. `reread_interpretations` breaks non-relevant notes into `irrelevant`, `unjudged`, `unanchored`, and `failed`. An unanchored quote is `unanchored` even when `judgment` is `relevant`. `relevance` is null when nothing was classified. The same counts are grouped by direction kind and by document and respondent novelty. A missing id is not treated as new or known. `tokens_per_relevant_reread` is null unless every relevant note has attributable usage. `cost_per_relevant_reread_usd` is null unless `token_prices` records both per-million rates.

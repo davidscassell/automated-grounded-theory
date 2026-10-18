@@ -1179,3 +1179,282 @@ def test_timeout_boundaries_stay_independent():
     assert sampled.metadata["timeout_policy"]["idle_timeout_seconds"] == 6
     assert sampled.metadata["timeout_policy"]["idle_timeout_enforced"] is False
     assert sampled.metadata["timeout_policy"]["process_isolation"] is False
+
+
+class _FailOnce(FakeAxialCoder):
+    def with_structured_output(self, schema, **kwargs):
+        parent = FakeAxialCoder.with_structured_output(self, schema, **kwargs)
+
+        def _call(messages):
+            if getattr(schema, "__name__", "") == "AxialProposalBatch" and self.call_count == 0:
+                self.call_count += 1
+                raise RuntimeError("node failed before checkpoint")
+            return parent.invoke(messages)
+
+        return RunnableLambda(_call)
+
+
+def _decision_shape(record: dict) -> dict:
+    return {
+        "record": sorted(record),
+        "provenance": sorted(record["provenance"]),
+        "row": sorted(record["relationships"][0]),
+    }
+
+
+def test_resume_restarts_the_node_and_decisions_share_a_shape():
+    """Command(resume=...) continues the same thread. None retries a failed node.
+
+    Human and model reviews write one validated decision shape. Provenance differs.
+    """
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.types import Command
+
+    paused_saver = InMemorySaver()
+    thread = "replay-order"
+    first = axial_code(
+        _corpus(),
+        FakeAxialCoder(),
+        checkpointer=paused_saver,
+        thread_id=thread,
+        interrupt=True,
+        max_axial_review_calls=1,
+        axial_share_propose=1,
+        axial_share_counterexample=0,
+        batch_size=1,
+        seed=3,
+    )
+    assert first.interrupted is True
+    assert first.interrupt_payload["kind"] == "axial_relations"
+    resume = {"accept": True}
+    assert Command(resume=resume).resume == {"accept": True}
+    second = axial_code(
+        _corpus(),
+        FakeAxialCoder(),
+        checkpointer=paused_saver,
+        thread_id=thread,
+        resuming=True,
+        resume=resume,
+        interrupt=True,
+        max_axial_review_calls=1,
+        axial_share_propose=1,
+        axial_share_counterexample=0,
+        batch_size=1,
+        seed=3,
+    )
+    assert second.interrupted is True
+    assert second.interrupt_payload["kind"] == "thematic_saturation"
+    human = second.metadata["validated_decision"]
+    assert human["actor"] == "human"
+    assert human["provenance"] == {"actor": "human", "channel": "interrupt"}
+    assert human["relationships"]
+
+    model = axial_code(
+        _corpus(),
+        FakeAxialCoder(),
+        decision_mode="llm",
+        interrupt=False,
+        max_axial_review_calls=1,
+        max_decision_calls=2,
+        axial_share_propose=1,
+        axial_share_counterexample=0,
+        batch_size=1,
+        seed=3,
+    )
+    learned = model.metadata["validated_decision"]
+    assert learned["actor"] == "llm"
+    assert learned["provenance"] == {"actor": "llm", "channel": "model"}
+    assert _decision_shape(human) == _decision_shape(learned)
+
+    saver = InMemorySaver()
+    coder = _FailOnce()
+    with pytest.raises(RuntimeError, match="node failed before checkpoint"):
+        axial_code(
+            _corpus(),
+            coder,
+            checkpointer=saver,
+            thread_id="replay-error",
+            **_COMMON,
+        )
+    recovered = axial_code(
+        _corpus(),
+        coder,
+        checkpointer=saver,
+        thread_id="replay-error",
+        resuming=True,
+        resume=None,
+        **_COMMON,
+    )
+    assert recovered.relationships
+    assert coder.call_count >= 2
+
+
+def test_sqlite_checkpoint_survives_a_process_restart(tmp_path: Path):
+    """InMemorySaver is process-local. SQLite is readable after the process exits.
+
+    The second process resumes the same thread and does not repeat the proposal.
+    """
+    import subprocess
+    import sys
+
+    memory = axial_code(
+        _corpus(),
+        FakeAxialCoder(),
+        interrupt=False,
+        seed=3,
+        max_axial_review_calls=1,
+        axial_share_propose=1,
+        axial_share_counterexample=0,
+        batch_size=1,
+    )
+    assert memory.metadata["persistence"] == {
+        "checkpointer": "memory",
+        "durability": "async",
+        "durability_default": "async",
+        "note": "InMemorySaver drops every checkpoint when this process exits.",
+    }
+    with pytest.raises(AxialError, match="durability"):
+        axial_code(_corpus(), FakeAxialCoder(), durability="sometimes", interrupt=False, seed=1)
+
+    script = r"""
+import sys
+from automated_grounded_theory import axial_code
+from tests.test_v080 import FakeAxialCoder, _corpus
+
+phase, path = sys.argv[1], sys.argv[2]
+coder = FakeAxialCoder()
+common = dict(
+    seed=3,
+    max_axial_review_calls=1,
+    axial_share_propose=1,
+    axial_share_counterexample=0,
+    batch_size=1,
+    checkpoint_path=path,
+    thread_id="expensive-run",
+    durability="async",
+    interrupt=True,
+)
+if phase == "start":
+    result = axial_code(_corpus(), coder, **common)
+    assert result.interrupted, result.metadata.get("stop")
+    assert result.interrupt_payload["kind"] == "axial_relations"
+    assert result.metadata["persistence"]["checkpointer"] == "sqlite"
+    assert coder.call_count >= 1
+    raise SystemExit(0)
+result = axial_code(_corpus(), coder, resuming=True, resume={"accept": True}, **common)
+assert coder.call_count == 0, coder.call_count
+assert result.prompt_log
+assert result.metadata["persistence"]["durability"] == "async"
+"""
+    db = tmp_path / "axial.sqlite"
+    first = subprocess.run(
+        [sys.executable, "-c", script, "start", str(db)],
+        cwd="/workspace",
+        capture_output=True,
+        text=True,
+    )
+    assert first.returncode == 0, first.stderr
+    second = subprocess.run(
+        [sys.executable, "-c", script, "resume", str(db)],
+        cwd="/workspace",
+        capture_output=True,
+        text=True,
+    )
+    assert second.returncode == 0, second.stderr
+
+
+def _pair_views_agree(metadata: dict) -> None:
+    from automated_grounded_theory.sampling import derive_reread_views
+
+    derived = derive_reread_views(metadata["pair_records"])
+    for name in ("reread_completed_pairs", "reread_failed_pairs", "reread_unsent_pairs"):
+        if name in metadata:
+            assert metadata[name] == derived[name]
+    summary = metadata["reread_stage_summary"]
+    assert summary["completed"] == len(metadata.get("reread_completed_pairs") or [])
+    assert summary["failed"] == len(metadata.get("reread_failed_pairs") or [])
+    assert summary["unsent"] == len(metadata.get("reread_unsent_pairs") or [])
+    assert summary["reread_status"] == metadata.get("reread_status")
+    assert summary["reread_stop"] == (metadata.get("reread_stop") or "")
+    records = metadata["pair_records"]["pairs"]
+    seen = set()
+    for row in metadata.get("reread_completed_pairs") or []:
+        key = f"{row['direction_id']}\x1f{row['passage_id']}"
+        assert records[key]["status"] == "completed"
+        assert "direction_id" in row and "passage_id" in row
+        seen.add(key)
+    for row in metadata.get("reread_failed_pairs") or []:
+        key = f"{row['direction_id']}\x1f{row['passage_id']}"
+        assert records[key]["status"] == "failed"
+        assert key not in seen
+    for row in metadata.get("sampling_ledger") or []:
+        for pair in row.get("completed_pairs") or []:
+            assert set(pair) >= {"question_key", "passage_id"}
+            assert "direction_id" not in pair
+
+
+def test_pair_records_agree_with_derived_views_after_recovery():
+    """Derived reread lists match the canonical records, including after a timeout resume."""
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from automated_grounded_theory import theoretical_sample
+    from tests.test_v090 import _kwargs
+    from tests.test_v095 import _SecondRereadTimeout
+
+    saver = InMemorySaver()
+    coder = _SecondRereadTimeout()
+    common = _kwargs(pursuit="reread", max_sampling_review_calls=4)
+    paused = theoretical_sample(_corpus(), coder, checkpointer=saver, thread_id="pair-records", **common)
+    ids = [str(row["direction_id"]) for row in paused.directions[:3]]
+    assigned = {
+        "directions": [
+            {"direction_id": direction_id, "action": "accept", "sampled_passage_ids": ["p-low"]}
+            for direction_id in ids
+        ]
+    }
+    partial = theoretical_sample(
+        _corpus(),
+        coder,
+        checkpointer=saver,
+        thread_id="pair-records",
+        resuming=True,
+        resume=assigned,
+        **common,
+    )
+    _pair_views_agree(partial.metadata)
+    assert partial.metadata["pair_records"]["pairs"]
+    resumed = theoretical_sample(
+        _corpus(),
+        coder,
+        checkpointer=saver,
+        thread_id="pair-records",
+        resuming=True,
+        resume={"continue": True},
+        **common,
+    )
+    _pair_views_agree(resumed.metadata)
+    completed = {
+        f"{row['direction_id']}\x1f{row['passage_id']}" for row in resumed.metadata["reread_completed_pairs"]
+    }
+    assert len(completed) == 3
+    failed_ids = {
+        f"{row['direction_id']}\x1f{row['passage_id']}"
+        for row in resumed.metadata.get("reread_failed_pairs") or []
+    }
+    assert not failed_ids & completed
+
+
+def test_langgraph_floor_is_the_version_that_provides_node_timeout():
+    """Node timeout and error_handler are 1.2 features. The declared floor matches."""
+    import inspect
+    from importlib.metadata import version
+
+    from langgraph.graph import StateGraph
+
+    declared = Path("pyproject.toml").read_text(encoding="utf-8")
+    assert 'langgraph>=1.2,<2' in declared
+    installed = tuple(int(part) for part in version("langgraph").split(".")[:2])
+    assert installed >= (1, 2)
+    parameters = inspect.signature(StateGraph.add_node).parameters
+    assert "timeout" in parameters
+    assert "error_handler" in parameters

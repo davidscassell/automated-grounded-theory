@@ -8,6 +8,10 @@
 - Axial export records an attrition funnel and install provenance: commit, module path, module and distribution versions, model, and generation parameters. Temperature is unset unless the caller configured it. A distribution that does not match the imported checkout raises `InstallationMismatch`.
 - Sampling reports split non-relevant rereads into irrelevant, unjudged, unanchored, and failed, with relevance by direction type and by document or respondent novelty, and tokens per relevant reread. Cost stays null unless prices were configured. `SamplingResult.completed_pairs` repeats `metadata.reread_completed_pairs`.
 - `timeout_policy` records the elapsed provider limit apart from `idle_timeout`. The inactivity limit is stored and is not enforced. A node timeout does not stop a blocking provider call. Process isolation is the boundary that can, and the stage graphs leave it off.
+- A human resume restarts the interrupted node with `Command(resume=...)`. An execution error retries that node when the same thread is invoked with `resume=None`. Human and model relation reviews write the same `validated_decision` shape with different provenance.
+- `metadata.persistence` names the checkpointer and `durability`. The default saver is in-memory and is lost at process exit. `checkpoint_path` keeps a SQLite file. `durability` stays `async`.
+- Sampling keeps one `pair_records` entry per direction and passage. Completed, failed, and unsent lists, plus `reread_status` and `reread_stop`, are derived from those records.
+- The LangGraph floor is `>=1.2,<2`. Node timeout and retry policy need that release.
 - `pattern_min_cases` stays 2. The axial token ceiling stays 24000. The design is [docs/design-review-fixes-0915.md](docs/design-review-fixes-0915.md). `policy_version` is `0.9.15`.
 
 ## 0.9.14
