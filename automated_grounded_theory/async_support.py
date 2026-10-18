@@ -26,6 +26,126 @@ from typing import Any, Callable, Mapping, Sequence
 
 logger = logging.getLogger("automated_grounded_theory")
 
+DURABILITY_MODES = ("sync", "async", "exit")
+DEFAULT_DURABILITY = "async"
+
+
+def check_durability(value: str) -> str:
+    """``async`` is LangGraph's default. This package keeps that default."""
+    mode = str(value or "")
+    if mode not in DURABILITY_MODES:
+        raise ValueError("durability must be 'sync', 'async', or 'exit'.")
+    return mode
+
+
+def persistence_record(*, checkpointer: Any, checkpoint_path: Any, durability: str) -> dict[str, Any]:
+    """Name the saver and the durability mode stored with the run.
+
+    ``InMemorySaver`` is the default when the caller passes neither a
+    checkpointer nor a checkpoint file. That saver is gone when the process
+    exits. A SQLite file remains on disk.
+    """
+    mode = check_durability(durability)
+    if checkpoint_path is not None:
+        kind = "sqlite"
+        note = "The SQLite file keeps checkpoints after this process exits."
+    elif checkpointer is None:
+        kind = "memory"
+        note = "InMemorySaver drops every checkpoint when this process exits."
+    else:
+        kind = "caller"
+        note = "The caller supplied the checkpointer. An in-memory saver is lost at process exit."
+    return {
+        "checkpointer": kind,
+        "durability": mode,
+        "durability_default": DEFAULT_DURABILITY,
+        "note": note,
+    }
+
+
+def node_watchdog(run_timeout: float, calls: int, override: float | None = None) -> float:
+    """Elapsed limit for one graph node.
+
+    The default is the provider run timeout times the sequential calls in the
+    step, plus two seconds. That is longer than one provider call, so a stalled
+    model call hits the provider timeout first. ``override`` replaces the
+    formula and does not change the provider limit. Zero means no node watchdog.
+    """
+    if override is not None:
+        value = float(override)
+        if value < 0:
+            raise ValueError("node_timeout must be zero or more.")
+        return value
+    timeout = float(run_timeout or 0)
+    if timeout <= 0:
+        return 0.0
+    return timeout * max(1, int(calls)) + 2.0
+
+
+def timeout_policy(
+    *,
+    run_timeout_seconds: float,
+    idle_timeout_seconds: float | None = None,
+    node_timeout_seconds: float = 0.0,
+    node_timeout_default: bool = True,
+    process_isolation: bool = False,
+) -> dict[str, Any]:
+    """Elapsed run limit and inactivity limit, recorded separately.
+
+    ``run_timeout_seconds`` is the elapsed wall clock for one provider call.
+    The public names stay ``axial_request_timeout``, ``focused_request_timeout``,
+    and ``sampling_request_timeout``.
+
+    ``idle_timeout_seconds`` is an inactivity limit. Structured calls do not
+    report progress, so the value is stored and ``idle_timeout_enforced`` is
+    false. This package does not start a second timer that resets on tokens
+    or bytes.
+
+    Graph-node cancellation and the wait around a provider call are
+    cooperative. Neither is proof that a remote request stopped. A blocking
+    synchronous call keeps running after that wait is abandoned.
+    ``process_isolation`` can terminate that call, and only for a picklable
+    provider. The stage graphs leave it off.
+    """
+    run = float(run_timeout_seconds)
+    if run < 0:
+        raise ValueError("run timeout must be zero or more.")
+    if idle_timeout_seconds is None:
+        idle = None
+    else:
+        idle = float(idle_timeout_seconds)
+        if idle < 0:
+            raise ValueError("idle_timeout must be zero or more.")
+    node = float(node_timeout_seconds)
+    if node < 0:
+        raise ValueError("node_timeout must be zero or more.")
+    return {
+        "run_timeout_seconds": run,
+        "run_timeout_kind": "elapsed",
+        "idle_timeout_seconds": idle,
+        "idle_timeout_kind": "inactivity",
+        "idle_timeout_enforced": False,
+        "node_timeout_seconds": node,
+        "node_timeout_default": bool(node_timeout_default),
+        "node_timeout_stops_remote_request": False,
+        "cancellation": "cooperative",
+        "process_isolation": bool(process_isolation),
+        "process_isolation_can_stop_blocked_call": bool(process_isolation),
+        "note": (
+            "run_timeout_seconds is the elapsed limit on one provider call "
+            "(axial_request_timeout, focused_request_timeout, or sampling_request_timeout). "
+            "idle_timeout_seconds is an inactivity limit. Structured calls do not report "
+            "progress, so idle_timeout is recorded and is not enforced. "
+            "The default node watchdog is that elapsed limit times the sequential calls "
+            "in the step, plus two seconds, and is longer than one provider call. "
+            "Cancelling the node or abandoning the provider await does not stop a blocking "
+            "synchronous call. process_isolation is the boundary that can terminate that "
+            "call, and these graphs leave it off. A node timeout is not proof that the "
+            "remote request stopped."
+        ),
+    }
+
+
 class ProviderAllowance:
     """Shared estimated-token ceiling and separate per-stage call ceilings.
 
@@ -311,6 +431,7 @@ class CallLimiter:
         concurrency: int = 2,
         *,
         max_retries: int = 4,
+        max_attempts: int | None = None,
         backoff: float = 0.5,
         max_backoff: float = 8.0,
         tokens_per_minute: float = 0,
@@ -326,7 +447,16 @@ class CallLimiter:
         self.concurrency = max(1, int(concurrency))
         self.max_concurrency = self.concurrency
         self.limit = self.concurrency
+        # max_attempts counts the initial call. max_retries is the extra tries.
+        # Passing max_attempts replaces max_retries. The default remains 4 retries
+        # (5 attempts) when neither is used to change that count.
+        if max_attempts is not None:
+            attempts = int(max_attempts)
+            if attempts < 1:
+                raise ValueError("max_attempts includes the initial attempt and must be at least 1.")
+            max_retries = attempts - 1
         self.max_retries = max(0, int(max_retries))
+        self.max_attempts = self.max_retries + 1
         self.backoff = max(0.0, float(backoff))
         self.max_backoff = max(self.backoff, float(max_backoff))
         self.tokens_per_minute = max(0.0, float(tokens_per_minute))

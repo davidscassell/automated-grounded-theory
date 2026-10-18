@@ -102,8 +102,12 @@ from automated_grounded_theory.async_support import (
     CallLimiter,
     ProviderAllowance,
     ainvoke_structured,
+    check_durability,
     combine_usage,
+    node_watchdog,
+    persistence_record,
     run_sync,
+    timeout_policy,
 )
 from automated_grounded_theory.batching import (
     calibrated_token_estimate,
@@ -347,6 +351,7 @@ class FocusedState(TypedDict, total=False):
     dimensions: list
     prompt_log: list
     proposal_buffer: Annotated[dict, proposal_buffer_reducer]
+    focused_call_holds: Annotated[dict, _merge_call_holds]
     committed_ids: list
     counters: dict
     highlight_ids: dict
@@ -3299,6 +3304,7 @@ def _researcher_node(state: FocusedState, *, model_decision: dict | None = None)
         source = "proposal"
         changed = False
     else:
+        # Resume restarts this node. Selection was checkpointed by the previous node.
         decision = interrupt(_checkpoint_payload(state))
         raised, changed = apply_selection_override(known, proposed, decision)
         source = "researcher" if changed else "proposal"
@@ -4500,6 +4506,7 @@ def _worker(runtime: FocusedRuntime):
                 token_budget=runtime.token_budget,
                 preserve_failed=True,
                 send_repair_overflow=False,
+                attempt_repair=False,
                 allowance_kind="focused_recode",
                 call_audits=audits,
             ))
@@ -4518,6 +4525,24 @@ def _worker(runtime: FocusedRuntime):
             sent = messages
         calls = 1 + sum(1 for row in audits if row.get("kind") == "schema_repair" and row.get("status") == "validated")
         interpreted_retry = False
+        proposal_id = str(job.get("proposal_id") or "")
+        if parsed.get("needs_repair"):
+            runtime.limiter.step_deadline = None
+            return {
+                "focused_call_holds": {
+                    proposal_id: _focused_hold(
+                        phase="schema_repair",
+                        job=job,
+                        schema_name=getattr(schema, "__name__", "FocusedRecodeBatch"),
+                        messages=sent,
+                        usage=usage,
+                        raw_response=str(parsed.get("raw_response") or ""),
+                        error=str(parsed.get("error") or ""),
+                        audits=audits,
+                        parsed=parsed,
+                    )
+                }
+            }
         if parsed.get("_agt_unparsed"):
             runtime.limiter.step_deadline = None
             return {
@@ -4548,58 +4573,28 @@ def _worker(runtime: FocusedRuntime):
                             ],
                         }
                     ]
+                },
+                "focused_call_holds": {"__clear__": [proposal_id]},
+            }
+        if job.get("allow_label_retry") and _probe_labels(parsed, passages, book, runtime):
+            runtime.limiter.step_deadline = None
+            return {
+                "focused_call_holds": {
+                    proposal_id: _focused_hold(
+                        phase="label_retry",
+                        job=job,
+                        schema_name=getattr(schema, "__name__", "FocusedRecodeBatch"),
+                        messages=sent,
+                        usage=usage,
+                        raw_response="\n".join(part for part in raw_parts if part),
+                        error="",
+                        audits=audits,
+                        parsed=parsed,
+                        original_usage=usage,
+                        original_raw_response="\n".join(part for part in raw_parts if part),
+                    )
                 }
             }
-        if job.get("allow_label_retry"):
-            probe = _probe_labels(parsed, passages, book, runtime)
-            if probe:
-                feedback = "LABEL RETRY\n" + validation_feedback(probe)
-                retry_messages, retry_schema = _recode_request(
-                    passages,
-                    raised,
-                    other=other,
-                    purposes=purposes,
-                    initial_codes=initial_codes,
-                    claims=claims,
-                    feedback=feedback,
-                )
-                kept = parsed
-                kept_sent = sent
-                try:
-                    if call_limit > 0:
-                        runtime.limiter.step_deadline = time.monotonic() + call_limit
-                    (retried, retry_usage), retry_sent = await _bounded(ainvoke_structured(
-                        runtime.coder,
-                        retry_schema,
-                        retry_messages,
-                        runtime.limiter,
-                        use_cache=False,
-                        raw_out=raw_parts,
-                        token_budget=runtime.token_budget,
-                        preserve_failed=True,
-                        send_repair_overflow=False,
-                        allowance_kind="focused_label_retry",
-                        call_audits=audits,
-                    ))
-                except TimeoutError:
-                    runtime.limiter.step_deadline = None
-                    raise
-                except AllowanceExhausted:
-                    retried = kept
-                    retry_usage = {}
-                    retry_sent = kept_sent
-                    interpreted_retry = False
-                else:
-                    if retried.get("_agt_unparsed"):
-                        retried = kept
-                        retry_sent = kept_sent
-                        interpreted_retry = False
-                    else:
-                        interpreted_retry = True
-                        calls = 2
-                usage = combine_usage(usage, retry_usage)
-                parsed = retried
-                sent = retry_sent
         proposal = {
             "proposal_id": job.get("proposal_id"),
             "snapshot_id": job.get("snapshot_id"),
@@ -4621,9 +4616,323 @@ def _worker(runtime: FocusedRuntime):
             ],
         }
         runtime.limiter.step_deadline = None
-        return {"proposal_buffer": {"items": [proposal]}}
+        return {
+            "proposal_buffer": {"items": [proposal]},
+            "focused_call_holds": {"__clear__": [proposal_id]},
+        }
 
     return recode_worker
+
+
+def _focused_message_rows(messages: Sequence[Any]) -> list[dict[str, str]]:
+    rows = []
+    for message in messages or []:
+        if isinstance(message, Mapping):
+            role = str(message.get("role") or message.get("type") or "human")
+            content = message.get("content", "")
+        else:
+            role = str(getattr(message, "type", "human"))
+            content = getattr(message, "content", "")
+        rows.append({"role": role, "content": content if isinstance(content, str) else str(content)})
+    return rows
+
+
+def _focused_messages(rows: Sequence[Mapping[str, Any]]) -> list:
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+    restored = []
+    for row in rows or []:
+        role = str(row.get("role") or "human")
+        content = str(row.get("content") or "")
+        if role == "system":
+            restored.append(SystemMessage(content=content))
+        elif role in {"ai", "assistant"}:
+            restored.append(AIMessage(content=content))
+        else:
+            restored.append(HumanMessage(content=content))
+    return restored
+
+
+def _json_audits(audits: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    safe = []
+    for audit in audits or []:
+        if not isinstance(audit, Mapping):
+            continue
+        safe.append(
+            {
+                "kind": audit.get("kind"),
+                "status": audit.get("status"),
+                "reason": audit.get("reason") or "",
+                "usage": dict(audit.get("usage") or {}),
+                "raw_response": audit.get("raw_response") or "",
+                "estimated_input_tokens": audit.get("estimated_input_tokens"),
+                "messages": _focused_message_rows(audit.get("messages") or []),
+                "parsed": audit.get("parsed") if isinstance(audit.get("parsed"), Mapping) else {},
+            }
+        )
+    return safe
+
+
+def _focused_hold(
+    *,
+    phase: str,
+    job: Mapping[str, Any],
+    schema_name: str,
+    messages: Sequence[Any],
+    usage: Mapping[str, Any] | None,
+    raw_response: str,
+    error: str,
+    audits: Sequence[Mapping[str, Any]],
+    parsed: Mapping[str, Any] | None = None,
+    original_usage: Mapping[str, Any] | None = None,
+    original_raw_response: str = "",
+) -> dict[str, Any]:
+    """One preserved provider call. The next node performs the follow-up."""
+    return {
+        "phase": phase,
+        "schema": schema_name,
+        "messages": _focused_message_rows(messages),
+        "usage": dict(usage or {}),
+        "raw_response": raw_response,
+        "error": error,
+        "audits": _json_audits(audits),
+        "job": dict(job),
+        "kind": "focused_label_retry" if phase == "label_retry" else "focused_recode",
+        "parsed": dict(parsed or {}),
+        "original_usage": dict(original_usage or usage or {}),
+        "original_raw_response": original_raw_response or raw_response,
+    }
+
+
+_FOCUSED_SCHEMAS = {
+    "FocusedRecodeBatch": FocusedRecodeBatch,
+    "FocusedCompeteBatch": FocusedCompeteBatch,
+    "FocusedClaimTest": FocusedClaimTest,
+}
+
+
+def _followup(runtime: FocusedRuntime):
+    """One repair or one label retry. The original response is already checkpointed."""
+
+    async def recode_followup(state: FocusedState) -> dict:
+        holds = dict(state.get("focused_call_holds") or {})
+        chosen = next(
+            ((str(key), dict(value)) for key, value in holds.items() if isinstance(value, Mapping) and value.get("phase")),
+            None,
+        )
+        if chosen is None:
+            return {}
+        proposal_id, hold = chosen
+        job = dict(hold.get("job") or {})
+        book = state.get("codebook") or {}
+        raised_ids = set(state.get("raised_code_ids") or [])
+        raised, other = _split_codebook(book, raised_ids)
+        passages = list(job.get("passages") or [])
+        purposes = dict(job.get("purposes") or {})
+        initial_codes = dict(job.get("initial_codes") or {})
+        claims = dict(job.get("claims") or {})
+        audits = [dict(item) for item in (hold.get("audits") or []) if isinstance(item, Mapping)]
+        raw_parts = [str(hold.get("raw_response") or "")]
+        call_limit = float(runtime.limiter.request_timeout or 0)
+
+        async def _bounded(coro):
+            if call_limit <= 0:
+                return await coro
+            return await asyncio.wait_for(coro, timeout=call_limit + 1.0)
+
+        phase = str(hold.get("phase") or "")
+        parsed = dict(hold.get("parsed") or {})
+        usage = dict(hold.get("usage") or {})
+        sent_rows = list(hold.get("messages") or [])
+        interpreted_retry = False
+        calls = 1 + sum(1 for row in audits if row.get("kind") == "schema_repair" and row.get("status") == "validated")
+        try:
+            if phase == "schema_repair":
+                schema = _FOCUSED_SCHEMAS.get(str(hold.get("schema") or ""), FocusedRecodeBatch)
+                messages = _focused_messages(sent_rows)
+                messages.append(
+                    HumanMessage(
+                        content=(
+                            "REPAIR THIS OUTPUT\n"
+                            f"The previous output was not valid {getattr(schema, '__name__', 'the schema')}: "
+                            f"{hold.get('error') or 'the output did not match the schema'}\n"
+                            "Return only the structured object."
+                        )
+                    )
+                )
+                if call_limit > 0:
+                    runtime.limiter.step_deadline = time.monotonic() + call_limit
+                try:
+                    (repaired, repair_usage), repair_sent = await _bounded(ainvoke_structured(
+                        runtime.coder,
+                        schema,
+                        messages,
+                        runtime.limiter,
+                        use_cache=False,
+                        raw_out=raw_parts,
+                        token_budget=runtime.token_budget,
+                        preserve_failed=True,
+                        send_repair_overflow=False,
+                        attempt_repair=False,
+                        allowance_kind="schema_repair",
+                        call_audits=audits,
+                    ))
+                except AllowanceExhausted as exc:
+                    audits.append(
+                        {
+                            "kind": "schema_repair",
+                            "status": "refused",
+                            "reason": exc.reason,
+                            "usage": {},
+                            "raw_response": "",
+                            "messages": _focused_message_rows(messages),
+                            "parsed": {},
+                            "received": False,
+                        }
+                    )
+                    parsed = {
+                        "_agt_unparsed": True,
+                        "needs_review": True,
+                        "flagged": True,
+                        "reason": "schema_unparsed",
+                        "error": str(exc),
+                        "raw_response": str(hold.get("raw_response") or ""),
+                    }
+                    usage = dict(hold.get("original_usage") or hold.get("usage") or {})
+                else:
+                    usage = combine_usage(hold.get("original_usage") or hold.get("usage"), repair_usage)
+                    if repaired.get("needs_repair") or repaired.get("_agt_unparsed"):
+                        parsed = {
+                            "_agt_unparsed": True,
+                            "needs_review": True,
+                            "flagged": True,
+                            "reason": "schema_unparsed",
+                            "error": str(repaired.get("error") or ""),
+                            "raw_response": str(hold.get("raw_response") or ""),
+                            "repair_raw_response": str(repaired.get("raw_response") or ""),
+                        }
+                        sent_rows = _focused_message_rows(repair_sent)
+                    else:
+                        parsed = repaired
+                        sent_rows = _focused_message_rows(repair_sent)
+                        calls += 1
+                        if job.get("allow_label_retry") and _probe_labels(parsed, passages, book, runtime):
+                            runtime.limiter.step_deadline = None
+                            return {
+                                "focused_call_holds": {
+                                    proposal_id: _focused_hold(
+                                        phase="label_retry",
+                                        job=job,
+                                        schema_name=getattr(schema, "__name__", "FocusedRecodeBatch"),
+                                        messages=repair_sent,
+                                        usage=usage,
+                                        raw_response=str(hold.get("raw_response") or ""),
+                                        error="",
+                                        audits=audits,
+                                        parsed=parsed,
+                                        original_usage=hold.get("original_usage") or hold.get("usage"),
+                                        original_raw_response=str(
+                                            hold.get("original_raw_response") or hold.get("raw_response") or ""
+                                        ),
+                                    )
+                                }
+                            }
+            if phase == "label_retry" or (not parsed.get("_agt_unparsed") and job.get("allow_label_retry")):
+                probe = _probe_labels(parsed, passages, book, runtime)
+                if probe:
+                    feedback = "LABEL RETRY\n" + validation_feedback(probe)
+                    retry_messages, retry_schema = _recode_request(
+                        passages,
+                        raised,
+                        other=other,
+                        purposes=purposes,
+                        initial_codes=initial_codes,
+                        claims=claims,
+                        feedback=feedback,
+                    )
+                    kept = parsed
+                    if call_limit > 0:
+                        runtime.limiter.step_deadline = time.monotonic() + call_limit
+                    try:
+                        (retried, retry_usage), retry_sent = await _bounded(ainvoke_structured(
+                            runtime.coder,
+                            retry_schema,
+                            retry_messages,
+                            runtime.limiter,
+                            use_cache=False,
+                            raw_out=raw_parts,
+                            token_budget=runtime.token_budget,
+                            preserve_failed=True,
+                            send_repair_overflow=False,
+                            attempt_repair=False,
+                            allowance_kind="focused_label_retry",
+                            call_audits=audits,
+                        ))
+                    except AllowanceExhausted:
+                        retried = kept
+                        retry_usage = {}
+                        retry_sent = _focused_messages(sent_rows)
+                    if retried.get("_agt_unparsed") or retried.get("needs_repair"):
+                        retried = kept
+                        retry_sent = _focused_messages(sent_rows)
+                    else:
+                        interpreted_retry = True
+                        calls += 1
+                        parsed = retried
+                        sent_rows = _focused_message_rows(retry_sent)
+                    usage = combine_usage(usage, retry_usage)
+        except TimeoutError:
+            runtime.limiter.step_deadline = None
+            raise
+        proposal = {
+            "proposal_id": job.get("proposal_id"),
+            "snapshot_id": job.get("snapshot_id"),
+            "passage_index": 0,
+            "coding": parsed,
+            "passage_ids": list(job.get("passage_ids") or []),
+            "purposes": purposes,
+            "claim_pairs": list(job.get("claim_pairs") or _claim_pairs(claims)),
+            "claim_sources": dict(job.get("claim_sources") or {}),
+            "calls": calls,
+            "usage": usage,
+            "label_retry": interpreted_retry,
+            "response": parsed,
+            "provider_audits": audits,
+            "raw_response": str(hold.get("original_raw_response") or hold.get("raw_response") or ""),
+            "original_usage": dict(hold.get("original_usage") or hold.get("usage") or {}),
+            "messages": sent_rows,
+        }
+        if parsed.get("_agt_unparsed"):
+            proposal.update(
+                schema_unparsed=True,
+                schema_reason=parsed.get("reason"),
+                needs_review=True,
+                flagged=True,
+            )
+        runtime.limiter.step_deadline = None
+        return {
+            "proposal_buffer": {"items": [proposal]},
+            "focused_call_holds": {"__clear__": [proposal_id]},
+        }
+
+    return recode_followup
+
+
+def _merge_call_holds(left: Any, right: Any) -> dict:
+    merged = {
+        str(key): value
+        for key, value in dict(left or {}).items()
+        if not str(key).startswith("__")
+    }
+    if not isinstance(right, Mapping):
+        return merged
+    for key in right.get("__clear__") or []:
+        merged.pop(str(key), None)
+    for key, value in right.items():
+        if str(key).startswith("__"):
+            continue
+        merged[str(key)] = value
+    return merged
 
 
 def _probe_labels(parsed: Mapping[str, Any], passages: Sequence[Mapping], book: Mapping, runtime: FocusedRuntime) -> list:
@@ -5415,6 +5724,7 @@ def _claim_node(state: FocusedState) -> dict:
     dimensions = list(state.get("dimensions") or [])
     if not state.get("interrupt_enabled", True):
         return {}
+    # Resume restarts this node. Claims were checkpointed before this pause.
     decision = interrupt(_claim_payload(state))
     try:
         reviewed = apply_claim_review(properties, dimensions, decision)
@@ -5762,7 +6072,10 @@ def _watched_node_kwargs(seconds: float) -> dict[str, Any]:
 
     ``NodeTimeoutError`` is retryable under LangGraph's default policy. Leaving
     the policy unset is what the graph does today. Setting ``max_attempts`` to 1
-    keeps a stuck step from running the watchdog twice. Human checkpoints pass
+    keeps a stuck step from running the watchdog twice and keeps the graph from
+    multiplying the limiter's provider attempts. Those attempts include the
+    initial call (``focused_request_retries`` extra tries; the default 4 is 5
+    attempts) and each one spends the call allowance. Human checkpoints pass
     0 and stay unwrapped, so ``interrupt()`` is unchanged.
     """
     timeout = _positive_timeout(seconds)
@@ -5782,12 +6095,24 @@ def _positive_timeout(seconds: float) -> float | None:
     return value
 
 
+def _route_recode_followup(state: FocusedState) -> str:
+    holds = state.get("focused_call_holds") or {}
+    if any(isinstance(value, Mapping) and value.get("phase") for value in holds.values()):
+        return "recode_followup"
+    return "commit_focused"
+
+
 def build_focused_graph(runtime: FocusedRuntime | None = None):
     """Uncompiled focused-coding graph.
 
     ``load_open_coding`` → ``select_candidates`` → ``researcher_checkpoint`` →
-    ``prepare_recode`` → ``recode_worker`` → ``commit_focused`` →
-    ``review_recode`` → ``claim_checkpoint`` → ``export_focused``.
+    ``prepare_recode`` → ``recode_worker`` → ``recode_followup`` or
+    ``commit_focused`` → ``review_recode`` → ``claim_checkpoint`` →
+    ``export_focused``.
+
+    A schema repair or label retry is ``recode_followup``, after the original
+    response has been checkpointed. A response that needs neither goes straight
+    to ``commit_focused``.
 
     ``researcher_checkpoint`` and ``claim_checkpoint`` call
     :func:`langgraph.types.interrupt` when interrupts are enabled.
@@ -5812,6 +6137,11 @@ def build_focused_graph(runtime: FocusedRuntime | None = None):
         input_schema=_WorkerInput,
         **_watched_node_kwargs(runtime.step_timeout),
     )
+    builder.add_node(
+        "recode_followup",
+        _followup(runtime),
+        **_watched_node_kwargs(runtime.step_timeout),
+    )
     builder.add_node("commit_focused", _commit_node(runtime))
     builder.add_node("review_recode", _review_node)
     builder.add_node(
@@ -5830,7 +6160,16 @@ def build_focused_graph(runtime: FocusedRuntime | None = None):
         _route_prepare,
         ["recode_worker", "review_recode"],
     )
-    builder.add_edge("recode_worker", "commit_focused")
+    builder.add_conditional_edges(
+        "recode_worker",
+        _route_recode_followup,
+        ["recode_followup", "commit_focused"],
+    )
+    builder.add_conditional_edges(
+        "recode_followup",
+        _route_recode_followup,
+        ["recode_followup", "commit_focused"],
+    )
     builder.add_conditional_edges(
         "commit_focused",
         _route_commit,
@@ -5882,6 +6221,7 @@ def _initial_state(source: OpenCodeResult, metadata: dict, *, interrupt_enabled:
         "dimensions": [],
         "prompt_log": [],
         "proposal_buffer": {"items": [], "duplicates": 0, "conflicts": []},
+        "focused_call_holds": {},
         "committed_ids": [],
         "counters": restore_id_counters(source.segments, source.memos),
         "highlight_ids": {},
@@ -5902,6 +6242,22 @@ def _result_from_state(
     checkpointer: Any,
 ) -> FocusedResult:
     metadata = dict(state.get("metadata") or {})
+    holds = state.get("focused_call_holds") or {}
+    preserved = {
+        str(key): {
+            "phase": value.get("phase"),
+            "kind": value.get("kind"),
+            "usage": dict(value.get("usage") or {}),
+            "raw_response": value.get("raw_response") or "",
+            "error": value.get("error") or "",
+            "original_usage": dict(value.get("original_usage") or value.get("usage") or {}),
+            "original_raw_response": value.get("original_raw_response") or value.get("raw_response") or "",
+        }
+        for key, value in holds.items()
+        if isinstance(value, Mapping) and value.get("phase")
+    }
+    if preserved:
+        metadata["focused_call_holds"] = preserved
     if not interrupted:
         metadata.update(_status_fields(state))
     else:
@@ -6114,6 +6470,9 @@ async def afocused_code(
     continuation: bool = False,
     recursion_limit: int | None = None,
     raise_on_timeout: bool = False,
+    idle_timeout: float | None = None,
+    node_timeout: float | None = None,
+    durability: str = "async",
 ) -> FocusedResult:
     """Run focused coding over a finished open-coding result.
 
@@ -6229,6 +6588,11 @@ async def afocused_code(
         "model": manifest["model"],
         "saturation_judgment": None,
         "decision_mode": decision_mode,
+        "retry_policy": {
+            "provider_max_attempts": int(procedure["focused_request_retries"]) + 1,
+            "graph_max_attempts": 1,
+            "counts_initial_attempt": True,
+        },
     }
     limit = recursion_limit if recursion_limit is not None else max(250, 8 * max(1, len(source.passages)) + 40)
     runtime = FocusedRuntime(
@@ -6242,7 +6606,7 @@ async def afocused_code(
         token_budget=performance["token_budget"],
         limiter=CallLimiter(
             performance["concurrency"],
-            max_retries=int(procedure["focused_request_retries"]),
+            max_attempts=int(procedure["focused_request_retries"]) + 1,
             request_timeout=float(procedure["focused_request_timeout"]),
             wall_timeout=float(procedure["focused_request_timeout"]),
             provider_allowance=ProviderAllowance(
@@ -6253,12 +6617,33 @@ async def afocused_code(
         ),
         validation_retries=validation_retries,
         duplicate_similarity=float(procedure["focused_duplicate_similarity"]),
-        step_timeout=_step_watchdog(float(procedure["focused_request_timeout"]), calls=2),
+        step_timeout=node_watchdog(float(procedure["focused_request_timeout"]), 2, node_timeout),
         decision_step_timeout=(
-            _step_watchdog(float(procedure["focused_request_timeout"]), calls=max(1, int(max_decision_calls)))
+            node_watchdog(
+                float(procedure["focused_request_timeout"]),
+                max(1, int(max_decision_calls)),
+                node_timeout,
+            )
             if decision_mode == "llm"
             else 0.0
         ),
+    )
+    metadata["timeout_policy"] = timeout_policy(
+        run_timeout_seconds=float(procedure["focused_request_timeout"]),
+        idle_timeout_seconds=idle_timeout,
+        node_timeout_seconds=runtime.step_timeout,
+        node_timeout_default=node_timeout is None,
+    )
+    try:
+        mode = check_durability(durability)
+    except ValueError as exc:
+        raise FocusedError(str(exc)) from exc
+    if checkpoint_path is not None and checkpointer is not None:
+        raise FocusedError("Pass checkpointer or checkpoint_path, not both.")
+    metadata["persistence"] = persistence_record(
+        checkpointer=checkpointer,
+        checkpoint_path=checkpoint_path,
+        durability=mode,
     )
     metadata.update(determinism)
 
@@ -6286,6 +6671,7 @@ async def afocused_code(
                 recursion_limit=limit,
                 output_dir=output_dir,
                 raise_on_timeout=raise_on_timeout,
+                durability=mode,
             )
     saver = checkpointer if checkpointer is not None else _memory_saver()
     if thread_id is None:
@@ -6303,6 +6689,7 @@ async def afocused_code(
         recursion_limit=limit,
         output_dir=output_dir,
         raise_on_timeout=raise_on_timeout,
+        durability=mode,
     )
 
 
@@ -6508,6 +6895,7 @@ async def _invoke(
     recursion_limit: int,
     output_dir: str | Path | None,
     raise_on_timeout: bool = False,
+    durability: str = "async",
 ) -> FocusedResult:
     graph = build_focused_graph(runtime).compile(checkpointer=saver)
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": recursion_limit}
@@ -6537,8 +6925,16 @@ async def _invoke(
                 metadata["continuations"] = list(saved_meta.get("continuations") or []) + continuation
                 await graph.aupdate_state(config, {"metadata": {**saved_meta, **metadata}})
             await graph.aupdate_state(config, {"interrupt_enabled": interrupt_enabled})
-            await graph.ainvoke(Command(resume=({"automated_review": True}
-                if runtime.decision_mode == "llm" else resume)), config)
+            if getattr(snapshot, "interrupts", ()):
+                await graph.ainvoke(
+                    Command(resume=({"automated_review": True} if runtime.decision_mode == "llm" else resume)),
+                    config,
+                    durability=durability,
+                )
+            else:
+                # An execution error left the node unfinished. Retry from the
+                # last checkpoint. Command(resume=...) is only for interrupt().
+                await graph.ainvoke(None, config, durability=durability)
         else:
             if has_state:
                 raise FocusedError(
@@ -6548,6 +6944,7 @@ async def _invoke(
             await graph.ainvoke(
                 _initial_state(source, metadata, interrupt_enabled=interrupt_enabled),
                 config,
+                durability=durability,
             )
     except Exception as exc:
         if isinstance(exc, GraphRecursionError):

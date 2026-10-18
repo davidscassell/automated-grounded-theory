@@ -48,8 +48,8 @@ from tests.test_v084 import _one_relationship
 
 
 def test_version_is_0910():
-    assert __version__ == "0.9.14"
-    assert POLICY_VERSION == "0.9.14"
+    assert __version__ == "0.9.15"
+    assert POLICY_VERSION == "0.9.15"
     assert PATTERN_MIN_CASES == 2
     assert DEFAULT_AXIAL_TOKEN_BUDGET == 6000
     assert DEFAULT_SAMPLING_TOKEN_BUDGET == 6000
@@ -93,46 +93,19 @@ def test_prompt_allows_a_tier1_hypothesis_and_counts_blank_rows_apart_from_empty
     assert "one respondent" in prompt
     assert "nothing_to_propose" in prompt
     assert "unrelated passages" in prompt
+    assert "nonempty statement" in prompt
     empty = AxialProposalBatch(nothing_to_propose=True, relationships=[])
     assert empty.nothing_to_propose is True
     assert empty.relationships == []
-    assert AxialRelationshipDraft().statement is None
+    with pytest.raises(Exception):
+        AxialRelationshipDraft()
+    with pytest.raises(Exception):
+        AxialRelationshipDraft(statement="   ")
 
     class _None(FakeAxialCoder):
         def proposals(self, body):
             del body
             return AxialProposalBatch(relationships=[], nothing_to_propose=True)
-
-    class _Blank(FakeAxialCoder):
-        def proposals(self, body):
-            pair = (body.get("pairs") or [{}])[0]
-            return AxialProposalBatch(
-                relationships=[
-                    AxialRelationshipDraft(
-                        from_id=str(pair.get("from_id") or ""),
-                        to_id=str(pair.get("to_id") or ""),
-                        statement="",
-                        quote="",
-                        quote_from="",
-                        quote_to="",
-                    )
-                ]
-            )
-
-    class _Statementless(FakeAxialCoder):
-        def proposals(self, body):
-            pair = (body.get("pairs") or [{}])[0]
-            return AxialProposalBatch(
-                relationships=[
-                    AxialRelationshipDraft(
-                        from_id=str(pair.get("from_id") or ""),
-                        to_id=str(pair.get("to_id") or ""),
-                        statement="",
-                        passage_id="p1",
-                        quote="Packing the suitcase took all night",
-                    )
-                ]
-            )
 
     class _Stitched(FakeAxialCoder):
         def proposals(self, body):
@@ -176,14 +149,8 @@ def test_prompt_allows_a_tier1_hypothesis_and_counts_blank_rows_apart_from_empty
     none = axial_code(_corpus(), _None(), **common)
     assert none.metadata["proposal_diagnostics"]["explicit_none"] == 1
     assert none.metadata["proposal_diagnostics"]["blank_rows"] == 0
+    assert none.metadata["proposal_diagnostics"]["rejection_reasons"] == {}
     assert none.relationships == []
-    blank = axial_code(_corpus(), _Blank(), **common)
-    assert blank.metadata["proposal_diagnostics"]["blank_rows"] == 1
-    assert blank.metadata["proposal_diagnostics"]["empty_statements"] == 0
-    assert blank.relationships == []
-    statementless = axial_code(_corpus(), _Statementless(), **common)
-    assert statementless.metadata["proposal_diagnostics"]["empty_statements"] == 1
-    assert statementless.metadata["proposal_diagnostics"]["blank_rows"] == 0
     stitched = axial_code(_corpus(), _Stitched(), **common)
     assert stitched.metadata["proposal_diagnostics"]["rejection_reasons"]["stitched_unrelated_passages"] == 1
     assert stitched.relationships == []

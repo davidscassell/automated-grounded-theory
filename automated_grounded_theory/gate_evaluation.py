@@ -21,6 +21,7 @@ _VERDICTS = frozenset({"supported", "unsupported"})
 _FLAG_RULES = {
     "weak_stem_anchor": "stem_only",
     "wording_exceeds_tier": "consequence_wording",
+    "role_evidence_exceeds_tier": "role_evidence",
     "reviewer_causal_claim_mismatch": "consequence_wording",
     "memo_wording_exceeds_tier": "consequence_wording",
     "storyline_wording_exceeds_tier": "consequence_wording",

@@ -588,15 +588,39 @@ def denies_causal_language(text: str) -> bool:
     )
 
 
+_ROLE_EVIDENCE_ROLES = frozenset({"consequence", "cause", "causal_condition"})
+
+
+def _role_key(role: str) -> str:
+    return str(role or "").strip().casefold().replace(" ", "_")
+
+
+def statement_wording_overreach(text: str, tier: int | None) -> bool:
+    """True when the sentence itself needs a higher tier. The role is ignored."""
+    return wording_overreach(text, tier, role="")
+
+
+def role_evidence_overreach(tier: int | None, role: str = "") -> bool:
+    """True when a causal role is used below tier 3.
+
+    An association can stay ``unspecified``. The role is a separate check from
+    the sentence. A missing tier is not an overreach.
+    """
+    if tier is None:
+        return False
+    return tier < 3 and _role_key(role) in _ROLE_EVIDENCE_ROLES
+
+
 def wording_overreach(text: str, tier: int | None, *, role: str = "") -> bool:
     """True when ``text`` or ``role`` uses wording a higher tier would be needed to license.
 
     A missing tier is undefined and is not an overreach. Role ``consequence``
     or ``cause`` at tier 1 or 2 is causal wording even when the sentence is mild.
+    ``causal_condition`` is reported by :func:`role_evidence_overreach`.
     """
     if tier is None:
         return False
-    chosen = str(role or "").strip().casefold().replace(" ", "_")
+    chosen = _role_key(role)
     if tier < 3 and chosen in _CAUSAL_ROLES:
         return True
     if not str(text or "").strip():
@@ -620,6 +644,78 @@ def _causal(folded: str) -> bool:
     return bool(stems & _CAUSAL_WORD)
 
 
+_WEAK_STEM_REASONS = frozenset({"stem_only", "generic_stem_only"})
+HYPOTHESIS_EXPLORATION = "hypothesis_exploration"
+SUPPORTED_EVIDENCE = "supported_evidence"
+WITHHELD_EVIDENCE = "withheld"
+
+
+def weak_stem_relationship(row: Mapping[str, Any]) -> bool:
+    """True when an endpoint is only a single stem or a generic stem.
+
+    Quote containment does not clear this. ``same_passage_stem_only`` and
+    ``weak_stem_anchor`` are the flags the axial annotator writes.
+    """
+    if not isinstance(row, Mapping):
+        return False
+    if str(row.get("evidence_scope") or "") == "same_passage_stem_only":
+        return True
+    flags = {str(item) for item in (row.get("flags") or [])}
+    if "weak_stem_anchor" in flags:
+        return True
+    for endpoint in row.get("endpoint_anchoring") or []:
+        if isinstance(endpoint, Mapping) and str(endpoint.get("reason") or "") in _WEAK_STEM_REASONS:
+            return True
+    return False
+
+
+def relationship_evidence_use(row: Mapping[str, Any]) -> str:
+    """Classify a relationship for later stages.
+
+    ``supported_evidence`` is the only class that may set ``downstream_eligible``.
+    A tier-1 proposal and a weak-stem anchor are ``hypothesis_exploration``.
+    Rejected, empty, synthetic, unanchored, disputed, and causal-wording rows
+    are ``withheld``. A missing tier is not supported evidence.
+    """
+    if not isinstance(row, Mapping) or row.get("synthetic"):
+        return WITHHELD_EVIDENCE
+    if str(row.get("passage_id") or "") == "synthetic-counterexample":
+        return WITHHELD_EVIDENCE
+    if not str(row.get("statement") or "").strip():
+        return WITHHELD_EVIDENCE
+    disposition = str(row.get("human_disposition") or row.get("disposition") or "").strip().casefold()
+    if disposition in {"rejected", "merged"}:
+        return WITHHELD_EVIDENCE
+    if str(row.get("evidence_condition") or "") in {"unanchored", "disputed"}:
+        return WITHHELD_EVIDENCE
+    flags = {str(item) for item in (row.get("flags") or [])}
+    if "causal_wording_withheld" in flags or "role_evidence_exceeds_tier" in flags:
+        return WITHHELD_EVIDENCE
+    tier = row.get("evidence_tier")
+    try:
+        tier_n = int(tier) if tier is not None and not isinstance(tier, bool) else None
+    except (TypeError, ValueError):
+        tier_n = None
+    if isinstance(tier_n, int) and tier_n < 3 and "wording_exceeds_tier" in flags:
+        return WITHHELD_EVIDENCE
+    if "acceptance_withheld" in flags or str(row.get("evidence_status") or "") == "cross_respondent_pattern":
+        return HYPOTHESIS_EXPLORATION
+    if weak_stem_relationship(row) or tier_n is None or tier_n < 2:
+        return HYPOTHESIS_EXPLORATION
+    ends = [item for item in (row.get("endpoint_anchoring") or []) if isinstance(item, Mapping)]
+    if ends and any(not item.get("anchored") for item in ends):
+        return HYPOTHESIS_EXPLORATION
+    return SUPPORTED_EVIDENCE
+
+
+def assign_relationship_eligibility(row: dict) -> str:
+    """Write ``evidence_use`` and ``downstream_eligible`` from one rule."""
+    use = relationship_evidence_use(row)
+    row["evidence_use"] = use
+    row["downstream_eligible"] = use == SUPPORTED_EVIDENCE
+    return use
+
+
 def apply_evidence_tier(relationship: dict, **kwargs: Any) -> dict[str, Any]:
     """Write the assessment onto the row. Does not decide disposition or tier 4."""
     fields = assess_relationship(relationship, **kwargs)
@@ -636,11 +732,16 @@ def apply_evidence_tier(relationship: dict, **kwargs: Any) -> dict[str, Any]:
     role = str(
         relationship.get("human_paradigm_role") or relationship.get("paradigm_role") or relationship.get("model_paradigm_role") or ""
     )
-    if wording_overreach(statement, tier if isinstance(tier, int) else None, role=role) and "wording_exceeds_tier" not in flags:
+    tier_for_wording = tier if isinstance(tier, int) else None
+    statement_over = statement_wording_overreach(statement, tier_for_wording)
+    role_over = role_evidence_overreach(tier_for_wording, role)
+    if statement_over and "wording_exceeds_tier" not in flags:
         flags.append("wording_exceeds_tier")
         relationship["needs_review"] = True
-    if "wording_exceeds_tier" in flags and isinstance(tier, int) and tier < 3:
-        relationship["downstream_eligible"] = False
+    if role_over and "role_evidence_exceeds_tier" not in flags:
+        flags.append("role_evidence_exceeds_tier")
+        relationship["needs_review"] = True
+    if (statement_over or role_over) and isinstance(tier, int) and tier < 3:
         relationship["needs_review"] = True
         if "causal_wording_withheld" not in flags:
             flags.append("causal_wording_withheld")
@@ -648,6 +749,7 @@ def apply_evidence_tier(relationship: dict, **kwargs: Any) -> dict[str, Any]:
     disposition = str(relationship.get("disposition") or "")
     if disposition not in {"rejected", "merged"} and isinstance(tier, int):
         relationship["evidence_status"] = fields["evidence_label"]
+    assign_relationship_eligibility(relationship)
     return fields
 
 
@@ -691,8 +793,7 @@ def promote_verified(relationship: dict, *, actor: str, scope: str) -> str:
     if "verified" not in flags:
         flags.append("verified")
     relationship["flags"] = flags
-    if str(relationship.get("evidence_condition") or "") != "disputed":
-        relationship["downstream_eligible"] = True
+    assign_relationship_eligibility(relationship)
     return "verified"
 
 

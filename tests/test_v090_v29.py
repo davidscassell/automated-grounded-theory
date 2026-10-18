@@ -393,6 +393,14 @@ def test_core_chooser_prefers_a_relationship_endpoint_and_stability_stays_undefi
 
 
 def test_blank_rows_are_counted_separately_from_unknown_passages():
+    """A blank statement is not a parsed row. Other discards stay per reason."""
+    from pydantic import ValidationError
+
+    import pytest
+
+    with pytest.raises(ValidationError):
+        AxialRelationshipDraft(from_id="c-prep", to_id="c-return", statement=" ")
+
     class Mixed(FakeAxialCoder):
         def proposals(self, body):
             pair = (body.get("pairs") or [{}])[0]
@@ -401,9 +409,9 @@ def test_blank_rows_are_counted_separately_from_unknown_passages():
                     AxialRelationshipDraft(
                         from_id=str(pair.get("from_id") or ""),
                         to_id=str(pair.get("to_id") or ""),
-                        statement="",
-                        passage_id="",
-                        quote="",
+                        statement=QUOTE,
+                        passage_id="p1",
+                        quote=QUOTE,
                     ),
                     AxialRelationshipDraft(
                         from_id=str(pair.get("from_id") or ""),
@@ -417,8 +425,9 @@ def test_blank_rows_are_counted_separately_from_unknown_passages():
 
     result = axial_code(_corpus(), Mixed(), seed=3, max_axial_review_calls=2, interrupt=False)
     diagnostics = result.metadata["proposal_diagnostics"]
-    assert diagnostics["blank_rows"] == 1
-    assert diagnostics["rejection_reasons"]["blank_proposal"] == 1
+    assert diagnostics["blank_rows"] == 0
+    assert diagnostics["empty_statements"] == 0
+    assert diagnostics["rejection_reasons"]["verbatim_quote_statement"] == 1
     assert diagnostics["rejection_reasons"]["unknown_passage"] == 1
     assert result.relationships == []
     counts = _coverage(

@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import importlib.metadata
+import subprocess
 import weakref
-from typing import Any
+from pathlib import Path
+from typing import Any, Mapping
 
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -24,6 +27,10 @@ DEFAULT_REQUEST_TIMEOUT = 120.0
 
 class BackendError(TypeError):
     """Raised when a model or embeddings argument cannot be resolved."""
+
+
+class InstallationMismatch(RuntimeError):
+    """The imported package does not match the installed distribution."""
 
 
 def describe_model(model: BaseChatModel | str) -> str:
@@ -145,6 +152,79 @@ def _clean_setting(name: str, value: Any) -> Any:
     return _MISSING
 
 
+def _git_commit(root: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    commit = completed.stdout.strip()
+    return commit or None
+
+
+def installation_record() -> dict[str, Any]:
+    """Commit, import path, and versions. Raise when they disagree.
+
+    An editable install whose metadata names another checkout, or a
+    distribution version that is not the imported module version, is a
+    mismatch. A missing git commit stays null.
+    """
+    import automated_grounded_theory as package
+
+    imported = Path(package.__file__).resolve()
+    module_version = str(package.__version__)
+    try:
+        dist = importlib.metadata.distribution("automated_grounded_theory")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise InstallationMismatch("automated_grounded_theory is imported but not installed.") from exc
+    dist_version = str(dist.version)
+    dist_root = Path(dist.locate_file("")).resolve()
+    expected = (dist_root / "automated_grounded_theory" / "__init__.py").resolve()
+    if imported != expected:
+        raise InstallationMismatch(
+            f"Imported {imported} but the distribution is at {dist_root}."
+        )
+    if dist_version != module_version:
+        raise InstallationMismatch(
+            f"Imported version {module_version} from {imported} but the distribution version is {dist_version}."
+        )
+    return {
+        "commit": _git_commit(dist_root),
+        "module_path": str(imported),
+        "module_version": module_version,
+        "distribution_version": dist_version,
+        "distribution_path": str(dist_root),
+    }
+
+
+def generation_parameters(model: BaseChatModel | str | None, *, before: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Parameters the caller configured. Temperature is unset unless they set it.
+
+    An automatic temperature of 0, applied so a later call has a value, is not
+    reported as a configured temperature.
+    """
+    settings = dict(before if before is not None else chat_model_settings(model))
+    explicit = settings.get("temperature")
+    configured = isinstance(explicit, (int, float)) and not isinstance(explicit, bool)
+    parameters = dict(settings)
+    parameters["temperature"] = explicit if configured else None
+    parameters["temperature_status"] = "configured" if configured else "unset"
+    model_id = settings.get("model") or settings.get("class") or None
+    return {
+        "model": model_id,
+        "temperature": explicit if configured else None,
+        "temperature_status": "configured" if configured else "unset",
+        "parameters": parameters,
+    }
+
+
 def record_model_determinism(
     model: BaseChatModel | str | None,
     *,
@@ -156,7 +236,10 @@ def record_model_determinism(
     temperature and assignment fails, ``model_determinism`` is ``unset``.
     A seed is written only when the instance already exposes ``seed`` and it
     is empty. Temperature 0 does not guarantee identical completions.
+    The generation report still says temperature is unset unless the caller
+    configured it before this function ran.
     """
+    configured = generation_parameters(model)
     seed_status = "unsupported"
     if model is not None and not isinstance(model, str):
         current = _declared_setting(model, "temperature")
@@ -183,6 +266,7 @@ def record_model_determinism(
         "model_temperature": temperature if temperature is not None else None,
         "model_seed": settings.get("seed"),
         "model_seed_status": seed_status,
+        "generation_parameters": configured,
         "model_determinism": "recorded" if temperature is not None else "unset",
         "model_determinism_note": (
             "temperature 0 does not guarantee identical completions. "

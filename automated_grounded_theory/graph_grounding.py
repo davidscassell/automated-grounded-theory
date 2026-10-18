@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
-from automated_grounded_theory.relationship_tiers import case_id_of
+from automated_grounded_theory.relationship_tiers import case_id_of, weak_stem_relationship
 
 CORE_STABILITY_MIN_N = 2
 CORE_STABILITY_MIN_N_NOTE = (
@@ -71,8 +71,15 @@ def _usable(row: Mapping[str, Any]) -> bool:
 
 
 def graph_supported(row: Mapping[str, Any]) -> bool:
+    """Tier 2 or higher, excluding a weak-stem hypothesis.
+
+    ``downstream_eligible`` is not read. A row that was marked eligible and
+    also carries ``weak_stem_anchor`` does not support a core.
+    """
     tier = tier_of(row)
-    return bool(_usable(row) and tier is not None and tier >= 2)
+    if not (_usable(row) and tier is not None and tier >= 2):
+        return False
+    return not weak_stem_relationship(row)
 
 
 def contradicted(row: Mapping[str, Any]) -> bool:

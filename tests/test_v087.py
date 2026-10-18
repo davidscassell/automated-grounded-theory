@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
 from automated_grounded_theory import __version__, axial_code, focused_code, selective_code
 from automated_grounded_theory.async_support import ProviderAllowance
 from automated_grounded_theory.axial import (
+    AxialRelationshipDraft,
     _apply_model_relations,
     _coverage,
     _endpoint_anchoring,
@@ -25,8 +27,8 @@ from tests.test_v080 import QUOTE, FakeAxialCoder, _corpus
 
 
 def test_version_is_087():
-    assert __version__ == "0.9.14"
-    assert POLICY_VERSION == "0.9.14"
+    assert __version__ == "0.9.15"
+    assert POLICY_VERSION == "0.9.15"
 
 
 def test_generic_stem_does_not_anchor_and_disagreement_is_reported():
@@ -174,41 +176,34 @@ def test_empty_statement_is_not_a_relationship_and_blank_rows_are_counted():
     assert coverage["relationships"] == 1
     assert coverage["empty_statements"] == 1
 
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        AxialRelationshipDraft(statement="", passage_id="p1", quote=QUOTE)
+
     class BlankCoder(FakeAxialCoder):
         def proposals(self, body):
             from automated_grounded_theory.axial import AxialProposalBatch, AxialRelationshipDraft
 
             pair = (body.get("pairs") or [{}])[0]
-            rows = [
-                AxialRelationshipDraft(
-                    from_id=str(pair.get("from_id") or ""),
-                    to_id=str(pair.get("to_id") or ""),
-                    statement="",
-                    passage_id="p1",
-                    quote="",
-                ),
-                AxialRelationshipDraft(
-                    from_id=str(pair.get("from_id") or ""),
-                    to_id=str(pair.get("to_id") or ""),
-                    statement="",
-                    passage_id="p1",
-                    quote=QUOTE,
-                ),
-                AxialRelationshipDraft(
-                    from_id=str(pair.get("from_id") or ""),
-                    to_id=str(pair.get("to_id") or ""),
-                    paradigm_role="context",
-                    statement="Packing the suitcase before departure shapes the return to work.",
-                    passage_id="p1",
-                    quote=QUOTE,
-                ),
-            ]
-            return AxialProposalBatch(relationships=rows)
+            return AxialProposalBatch(
+                relationships=[
+                    AxialRelationshipDraft(
+                        from_id=str(pair.get("from_id") or ""),
+                        to_id=str(pair.get("to_id") or ""),
+                        paradigm_role="context",
+                        statement="Packing the suitcase before departure shapes the return to work.",
+                        passage_id="p1",
+                        quote=QUOTE,
+                    )
+                ]
+            )
 
     result = axial_code(_corpus(), BlankCoder(), seed=3, max_axial_review_calls=2, interrupt=False)
     diagnostics = result.metadata["proposal_diagnostics"]
-    assert diagnostics["blank_rows"] == 1
-    assert diagnostics["empty_statements"] == 1
+    assert diagnostics["blank_rows"] == 0
+    assert diagnostics["empty_statements"] == 0
+    assert diagnostics["rejection_reasons"] == {}
     assert len(result.relationships) == 1
     assert result.relationships[0]["statement"]
 

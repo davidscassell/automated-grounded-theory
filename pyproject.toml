@@ -1,6 +1,6 @@
 [project]
 name = "automated_grounded_theory"
-version = "0.9.14"
+version = "0.9.15"
 description = "Automated initial open coding, a theme report, and optional focused, axial, selective, and within-corpus sampling stages, with any LangChain chat model."
 readme = "README.md"
 license = "MIT"
@@ -8,7 +8,7 @@ requires-python = ">=3.11"
 dependencies = [
     "langchain>=1.0,<2",
     "langchain-core>=0.3",
-    "langgraph>=1.0,<2",
+    "langgraph>=1.2,<2",
     "pydantic>=2",
 ]
 

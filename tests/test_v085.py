@@ -30,8 +30,8 @@ from tests.test_v080 import QUOTE, FakeAxialCoder, _corpus
 
 
 def test_version_is_085():
-    assert __version__ == "0.9.14"
-    assert POLICY_VERSION == "0.9.14"
+    assert __version__ == "0.9.15"
+    assert POLICY_VERSION == "0.9.15"
 
 
 def test_endpoint_anchoring_is_not_a_single_quote():
