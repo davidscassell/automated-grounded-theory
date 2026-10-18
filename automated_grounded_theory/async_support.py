@@ -26,6 +26,42 @@ from typing import Any, Callable, Mapping, Sequence
 
 logger = logging.getLogger("automated_grounded_theory")
 
+DURABILITY_MODES = ("sync", "async", "exit")
+DEFAULT_DURABILITY = "async"
+
+
+def check_durability(value: str) -> str:
+    """``async`` is LangGraph's default. This package keeps that default."""
+    mode = str(value or "")
+    if mode not in DURABILITY_MODES:
+        raise ValueError("durability must be 'sync', 'async', or 'exit'.")
+    return mode
+
+
+def persistence_record(*, checkpointer: Any, checkpoint_path: Any, durability: str) -> dict[str, Any]:
+    """Name the saver and the durability mode stored with the run.
+
+    ``InMemorySaver`` is the default when the caller passes neither a
+    checkpointer nor a checkpoint file. That saver is gone when the process
+    exits. A SQLite file remains on disk.
+    """
+    mode = check_durability(durability)
+    if checkpoint_path is not None:
+        kind = "sqlite"
+        note = "The SQLite file keeps checkpoints after this process exits."
+    elif checkpointer is None:
+        kind = "memory"
+        note = "InMemorySaver drops every checkpoint when this process exits."
+    else:
+        kind = "caller"
+        note = "The caller supplied the checkpointer. An in-memory saver is lost at process exit."
+    return {
+        "checkpointer": kind,
+        "durability": mode,
+        "durability_default": DEFAULT_DURABILITY,
+        "note": note,
+    }
+
 
 def node_watchdog(run_timeout: float, calls: int, override: float | None = None) -> float:
     """Elapsed limit for one graph node.

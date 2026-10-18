@@ -102,8 +102,10 @@ from automated_grounded_theory.async_support import (
     CallLimiter,
     ProviderAllowance,
     ainvoke_structured,
+    check_durability,
     combine_usage,
     node_watchdog,
+    persistence_record,
     run_sync,
     timeout_policy,
 )
@@ -3302,6 +3304,7 @@ def _researcher_node(state: FocusedState, *, model_decision: dict | None = None)
         source = "proposal"
         changed = False
     else:
+        # Resume restarts this node. Selection was checkpointed by the previous node.
         decision = interrupt(_checkpoint_payload(state))
         raised, changed = apply_selection_override(known, proposed, decision)
         source = "researcher" if changed else "proposal"
@@ -5695,6 +5698,7 @@ def _claim_node(state: FocusedState) -> dict:
     dimensions = list(state.get("dimensions") or [])
     if not state.get("interrupt_enabled", True):
         return {}
+    # Resume restarts this node. Claims were checkpointed before this pause.
     decision = interrupt(_claim_payload(state))
     try:
         reviewed = apply_claim_review(properties, dimensions, decision)
@@ -6442,6 +6446,7 @@ async def afocused_code(
     raise_on_timeout: bool = False,
     idle_timeout: float | None = None,
     node_timeout: float | None = None,
+    durability: str = "async",
 ) -> FocusedResult:
     """Run focused coding over a finished open-coding result.
 
@@ -6603,6 +6608,17 @@ async def afocused_code(
         node_timeout_seconds=runtime.step_timeout,
         node_timeout_default=node_timeout is None,
     )
+    try:
+        mode = check_durability(durability)
+    except ValueError as exc:
+        raise FocusedError(str(exc)) from exc
+    if checkpoint_path is not None and checkpointer is not None:
+        raise FocusedError("Pass checkpointer or checkpoint_path, not both.")
+    metadata["persistence"] = persistence_record(
+        checkpointer=checkpointer,
+        checkpoint_path=checkpoint_path,
+        durability=mode,
+    )
     metadata.update(determinism)
 
     own_saver = checkpointer is None and checkpoint_path is None
@@ -6629,6 +6645,7 @@ async def afocused_code(
                 recursion_limit=limit,
                 output_dir=output_dir,
                 raise_on_timeout=raise_on_timeout,
+                durability=mode,
             )
     saver = checkpointer if checkpointer is not None else _memory_saver()
     if thread_id is None:
@@ -6646,6 +6663,7 @@ async def afocused_code(
         recursion_limit=limit,
         output_dir=output_dir,
         raise_on_timeout=raise_on_timeout,
+        durability=mode,
     )
 
 
@@ -6851,6 +6869,7 @@ async def _invoke(
     recursion_limit: int,
     output_dir: str | Path | None,
     raise_on_timeout: bool = False,
+    durability: str = "async",
 ) -> FocusedResult:
     graph = build_focused_graph(runtime).compile(checkpointer=saver)
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": recursion_limit}
@@ -6880,8 +6899,16 @@ async def _invoke(
                 metadata["continuations"] = list(saved_meta.get("continuations") or []) + continuation
                 await graph.aupdate_state(config, {"metadata": {**saved_meta, **metadata}})
             await graph.aupdate_state(config, {"interrupt_enabled": interrupt_enabled})
-            await graph.ainvoke(Command(resume=({"automated_review": True}
-                if runtime.decision_mode == "llm" else resume)), config)
+            if getattr(snapshot, "interrupts", ()):
+                await graph.ainvoke(
+                    Command(resume=({"automated_review": True} if runtime.decision_mode == "llm" else resume)),
+                    config,
+                    durability=durability,
+                )
+            else:
+                # An execution error left the node unfinished. Retry from the
+                # last checkpoint. Command(resume=...) is only for interrupt().
+                await graph.ainvoke(None, config, durability=durability)
         else:
             if has_state:
                 raise FocusedError(
@@ -6891,6 +6918,7 @@ async def _invoke(
             await graph.ainvoke(
                 _initial_state(source, metadata, interrupt_enabled=interrupt_enabled),
                 config,
+                durability=durability,
             )
     except Exception as exc:
         if isinstance(exc, GraphRecursionError):

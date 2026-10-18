@@ -29,8 +29,10 @@ from automated_grounded_theory.async_support import (
     CallLimiter,
     ProviderAllowance,
     ainvoke_structured,
+    check_durability,
     node_watchdog,
     parse_structured,
+    persistence_record,
     run_sync,
     structured_runnable,
     timeout_policy,
@@ -2295,6 +2297,39 @@ def _apply_human_relations(
     return relationships
 
 
+def validated_relation_decision(relationships: Sequence[Mapping[str, Any]], *, actor: str) -> dict[str, Any]:
+    """One decision shape for a researcher interrupt and a model review.
+
+    Provenance is the only field that differs. The relationship rows use the
+    disposition stored for that actor after the same validation rules.
+    """
+    field = "human_disposition" if actor == "human" else "model_disposition"
+    rows = []
+    for row in relationships:
+        if not isinstance(row, Mapping):
+            continue
+        if not row.get(field) and row.get("review_actor") != actor and row.get("verification_actor") != actor:
+            continue
+        rows.append(
+            {
+                "relationship_id": str(row.get("relationship_id") or ""),
+                "disposition": str(row.get(field) or row.get("disposition") or ""),
+                "paradigm_role": str(row.get("paradigm_role") or ""),
+                "needs_review": bool(row.get("needs_review")),
+            }
+        )
+    rows.sort(key=lambda item: item["relationship_id"])
+    return {
+        "kind": "axial_relations",
+        "actor": actor,
+        "provenance": {
+            "actor": actor,
+            "channel": "interrupt" if actor == "human" else "model",
+        },
+        "relationships": rows,
+    }
+
+
 def _apply_model_relations(
     relationships: list[dict],
     parsed: Mapping[str, Any],
@@ -4145,10 +4180,13 @@ def _relation_checkpoint(runtime: AxialRuntime):
                     memos=state.get("memos") or [],
                     pattern_min_cases=_pattern_minimum(metadata.get("procedure") or {}),
                 )
+                metadata["validated_decision"] = validated_relation_decision(relationships, actor="llm")
             return {"relationships": relationships, "metadata": metadata, "prompt_log": logs}
         _note_stage(metadata, "decision_review", required=False, status="skipped")
         if not state.get("interrupt_enabled", True):
             return {"relationships": relationships}
+        # Resume restarts this node. The stage note above is local until the
+        # node returns, and _note_stage is safe to apply again.
         decision = interrupt(
             {
                 "kind": "axial_relations",
@@ -4177,6 +4215,7 @@ def _relation_checkpoint(runtime: AxialRuntime):
             pattern_min_cases=_pattern_minimum((state.get("metadata") or {}).get("procedure") or {}),
         )
         metadata["researcher_relation_decision"] = decision
+        metadata["validated_decision"] = validated_relation_decision(relationships, actor="human")
         return {"relationships": relationships, "metadata": metadata}
 
     return relation_checkpoint
@@ -4727,6 +4766,8 @@ def _saturation_checkpoint(runtime: AxialRuntime):
         _note_stage(metadata, "decision_review", required=False, status="skipped")
         if not state.get("interrupt_enabled", True):
             return {"saturation": report, "metadata": metadata}
+        # Resume restarts this node from its start. The report is rebuilt from
+        # the checkpointed input, so the pause does not append a second copy.
         decision = interrupt(
             {
                 "kind": "thematic_saturation",
@@ -4996,6 +5037,7 @@ def _core_checkpoint(runtime: AxialRuntime):
             **dict(metadata.get("graph_snapshots") or {}),
             "selective_core": graph_snapshot(state.get("relationships") or []),
         }
+        # Resume restarts this node. The candidate list is derived again.
         decision = interrupt(
             {
                 "kind": "selective_core",
@@ -6202,7 +6244,7 @@ def _mark_recursion_limit(state: dict, *, limit: int, exc: BaseException) -> dic
     return state
 
 
-async def _invoke(builder, saver, initial: AxialState | None, *, thread_id: str, resume: Any, resuming: bool, output_dir, raise_on_timeout: bool, allow_changes: bool, procedure: Mapping[str, Any], runtime: AxialRuntime | None = None, recursion_limit: int | None = None) -> AxialResult:
+async def _invoke(builder, saver, initial: AxialState | None, *, thread_id: str, resume: Any, resuming: bool, output_dir, raise_on_timeout: bool, allow_changes: bool, procedure: Mapping[str, Any], runtime: AxialRuntime | None = None, recursion_limit: int | None = None, durability: str = "async") -> AxialResult:
     graph = builder.compile(checkpointer=saver)
     limit = _derived_recursion_limit(procedure, override=recursion_limit)
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": limit}
@@ -6220,11 +6262,16 @@ async def _invoke(builder, saver, initial: AxialState | None, *, thread_id: str,
             _check_resume(saved_meta.get("procedure") or {}, procedure, allow_changes=allow_changes)
             if runtime is not None:
                 _restore_runtime_budget(runtime, saved_meta)
-            await graph.ainvoke(Command(resume=resume), config)
+            if getattr(snapshot, "interrupts", ()):
+                await graph.ainvoke(Command(resume=resume), config, durability=durability)
+            else:
+                # The node failed before it returned. Retry it from the last
+                # checkpoint. Command(resume=...) is only for interrupt().
+                await graph.ainvoke(None, config, durability=durability)
         else:
             if has_state:
                 raise AxialError(f"Thread {thread_id!r} already has a run. Pass resuming=True or a new thread_id.")
-            await graph.ainvoke(initial, config)
+            await graph.ainvoke(initial, config, durability=durability)
     except Exception as exc:
         if isinstance(exc, AxialError):
             raise
@@ -6589,6 +6636,8 @@ async def aaxial_code(
     retry_backoff: float = 0.5,
     idle_timeout: float | None = None,
     node_timeout: float | None = None,
+    checkpoint_path: str | Path | None = None,
+    durability: str = "async",
 ) -> AxialResult:
     """Propose paradigm relationships and saturation indicators.
 
@@ -6687,50 +6736,75 @@ async def aaxial_code(
         )
     except ValueError as exc:
         raise AxialError(str(exc)) from exc
+    try:
+        mode = check_durability(durability)
+    except ValueError as exc:
+        raise AxialError(str(exc)) from exc
+    if checkpoint_path is not None and checkpointer is not None:
+        raise AxialError("Pass checkpointer or checkpoint_path, not both.")
+    metadata["persistence"] = persistence_record(
+        checkpointer=checkpointer,
+        checkpoint_path=checkpoint_path,
+        durability=mode,
+    )
     from langgraph.checkpoint.memory import InMemorySaver
 
-    saver = checkpointer if checkpointer is not None else InMemorySaver()
     thread = thread_id or uuid.uuid4().hex
     if decision_mode == "llm" and resuming:
         resume = {"automated_review": True}
-    result = await _invoke(
-        build_axial_graph(runtime, output_dir=output_dir),
-        saver,
-        None if resuming else _initial(data, metadata, interrupt_enabled=interrupt),
-        thread_id=thread,
-        resume=resume if decision_mode == "human" else {"automated_review": True},
-        resuming=resuming,
-        output_dir=output_dir,
-        raise_on_timeout=raise_on_timeout,
-        allow_changes=allow_changes,
-        procedure=procedure,
-        runtime=runtime,
-        recursion_limit=recursion_limit,
-    )
-    if also_selective and not result.interrupted and result.metadata.get("stop") != "timeout":
-        return await aselective_code(
-            result,
-            model,
-            seed=seed,
-            include_memos=include_memos,
-            include_storyline=include_storyline,
-            max_selective_review_calls=max_selective_review_calls,
-            decision_mode=decision_mode,
-            decision_model=decision_model,
-            max_decision_calls=max_decision_calls,
-            max_axial_review_tokens=max_axial_review_tokens,
-            axial_token_budget=axial_token_budget,
-            batch_size=batch_size,
-            axial_request_timeout=axial_request_timeout,
-            idle_timeout=idle_timeout,
-            node_timeout=node_timeout,
-            interrupt=interrupt,
-            checkpointer=saver,
-            thread_id=f"{thread}:selective",
+
+    async def _run(saver):
+        result = await _invoke(
+            build_axial_graph(runtime, output_dir=output_dir),
+            saver,
+            None if resuming else _initial(data, metadata, interrupt_enabled=interrupt),
+            thread_id=thread,
+            resume=resume if decision_mode == "human" else {"automated_review": True},
+            resuming=resuming,
             output_dir=output_dir,
             raise_on_timeout=raise_on_timeout,
+            allow_changes=allow_changes,
+            procedure=procedure,
+            runtime=runtime,
+            recursion_limit=recursion_limit,
+            durability=mode,
         )
-    return result
+        if also_selective and not result.interrupted and result.metadata.get("stop") != "timeout":
+            return await aselective_code(
+                result,
+                model,
+                seed=seed,
+                include_memos=include_memos,
+                include_storyline=include_storyline,
+                max_selective_review_calls=max_selective_review_calls,
+                decision_mode=decision_mode,
+                decision_model=decision_model,
+                max_decision_calls=max_decision_calls,
+                max_axial_review_tokens=max_axial_review_tokens,
+                axial_token_budget=axial_token_budget,
+                batch_size=batch_size,
+                axial_request_timeout=axial_request_timeout,
+                idle_timeout=idle_timeout,
+                node_timeout=node_timeout,
+                interrupt=interrupt,
+                checkpointer=saver,
+                thread_id=f"{thread}:selective",
+                output_dir=output_dir,
+                raise_on_timeout=raise_on_timeout,
+                durability=mode,
+            )
+        return result
+
+    if checkpoint_path is None:
+        return await _run(checkpointer if checkpointer is not None else InMemorySaver())
+    try:
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+    except ImportError as exc:
+        raise AxialError(
+            "checkpoint_path requires the sqlite checkpointer. Install the checkpoint extra."
+        ) from exc
+    async with AsyncSqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
+        return await _run(saver)
 
 
 async def aselective_code(
@@ -6759,6 +6833,8 @@ async def aselective_code(
     recursion_limit: int | None = None,
     idle_timeout: float | None = None,
     node_timeout: float | None = None,
+    checkpoint_path: str | Path | None = None,
+    durability: str = "async",
 ) -> AxialResult:
     """Score core candidates. Memos and the storyline run only when asked."""
     if decision_mode not in {"human", "llm"}:
@@ -6862,25 +6938,49 @@ async def aselective_code(
         )
     except ValueError as exc:
         raise AxialError(str(exc)) from exc
+    try:
+        mode = check_durability(durability)
+    except ValueError as exc:
+        raise AxialError(str(exc)) from exc
+    if checkpoint_path is not None and checkpointer is not None:
+        raise AxialError("Pass checkpointer or checkpoint_path, not both.")
+    metadata["persistence"] = persistence_record(
+        checkpointer=checkpointer,
+        checkpoint_path=checkpoint_path,
+        durability=mode,
+    )
     _carry_budget(runtime.limiter.provider_allowance, metadata.get("provider_budget"))
     from langgraph.checkpoint.memory import InMemorySaver
 
-    saver = checkpointer if checkpointer is not None else InMemorySaver()
     thread = thread_id or uuid.uuid4().hex
-    return await _invoke(
-        build_selective_graph(runtime, output_dir=output_dir),
-        saver,
-        None if resuming else _initial(data, metadata, interrupt_enabled=interrupt, keep_audit=True),
-        thread_id=thread,
-        resume=resume if decision_mode == "human" else {"automated_review": True},
-        resuming=resuming,
-        output_dir=output_dir,
-        raise_on_timeout=raise_on_timeout,
-        allow_changes=allow_changes,
-        procedure=procedure,
-        runtime=runtime,
-        recursion_limit=recursion_limit,
-    )
+
+    async def _run(saver):
+        return await _invoke(
+            build_selective_graph(runtime, output_dir=output_dir),
+            saver,
+            None if resuming else _initial(data, metadata, interrupt_enabled=interrupt, keep_audit=True),
+            thread_id=thread,
+            resume=resume if decision_mode == "human" else {"automated_review": True},
+            resuming=resuming,
+            output_dir=output_dir,
+            raise_on_timeout=raise_on_timeout,
+            allow_changes=allow_changes,
+            procedure=procedure,
+            runtime=runtime,
+            recursion_limit=recursion_limit,
+            durability=mode,
+        )
+
+    if checkpoint_path is None:
+        return await _run(checkpointer if checkpointer is not None else InMemorySaver())
+    try:
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+    except ImportError as exc:
+        raise AxialError(
+            "checkpoint_path requires the sqlite checkpointer. Install the checkpoint extra."
+        ) from exc
+    async with AsyncSqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
+        return await _run(saver)
 
 
 def _bridge_timeout(request_timeout: float, calls: int) -> float | None:
