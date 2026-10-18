@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.19
+
+- Tier 3 wording `participants attribute X to Y` requires a participant quote that states the link and is anchored to the passages, plus a relevant rival check. An analyst memo no longer raises that tier. A memo that is explicitly an analyst interpretation, and that names both endpoints, stays tier 2 with wording `analyst interprets X as related to Y`. It is flagged `analyst_interpretation`, is not downstream eligible, and does not support a core. A model memo cannot authorize either claim. A shared token plus an explanatory word is not an interpretation.
+- Axial and selective resume hash code definitions, segment assignments, and case identity, following the focused-coding fingerprint and adding the respondent fields the tier count uses. A changed definition, a removed assignment, or a changed case id raises `AxialCheckpointMismatch`. An unchanged source still resumes. A 0.9.18 checkpoint, whose hash covered only passage text and code ids, cannot resume: the error says the evidence fingerprint is missing and a new run is required. The default seed still uses the passage-and-code-id hash. Sampling's `source_hash` is unchanged.
+- `pattern_min_cases` stays 2. The axial token ceiling stays 24000. Tier 4 stays human-only. The design is [docs/design-review-fixes-0919.md](docs/design-review-fixes-0919.md). `policy_version` is `0.9.19`.
+
 ## 0.9.18
 
 - A timed-out reread keeps its operation. An initial reread is logged as `sampling_reread`. A reread repair is logged as `schema_repair` with schema `SamplingRereadNote`. Both count as sent calls with unknown usage. `reread_expenditure_complete` stays false, coverage counts the attempt, and the full expenditure rates and cost stay null. The known token sum excludes that attempt. Selection and saturation timeouts stay kind `provider`. Axial and focused timeout rows are unchanged. The provider budget call count is still the limiter's `calls_used`.

@@ -1,6 +1,6 @@
 # Theoretical sampling and a saturation decision (0.9.0)
 
-`policy_version` was `0.9.0` for the first sampling graph. Package `policy_version` is `0.9.18`. The sections below record what each version added. The current sampling behavior is the whole file. The index is [README.md](README.md). This note is the design for the sampling graph. It does not replace [design-axial-0800.md](design-axial-0800.md). Axial coding and selective coding were already experimental graphs in 0.8.x. 0.9.0 does not rebuild them.
+`policy_version` was `0.9.0` for the first sampling graph. Package `policy_version` is `0.9.19`. The sections below record what each version added. The current sampling behavior is the whole file. The index is [README.md](README.md). This note is the design for the sampling graph. It does not replace [design-axial-0800.md](design-axial-0800.md). Axial coding and selective coding were already experimental graphs in 0.8.x. 0.9.0 does not rebuild them.
 
 The README sentence this release retires said: "The package does not do theoretical sampling, axial coding, selective coding, or a saturation decision." That sentence was stale. The audit below is what was already true on 0.8.7 (`158bae3`), and what 0.9.0 adds.
 

@@ -25,8 +25,8 @@ from automated_grounded_theory.version import __version__
 def test_documented_defaults_match_the_code():
     readme = Path("README.md").read_text(encoding="utf-8")
     index = Path("docs/README.md").read_text(encoding="utf-8")
-    assert __version__ == "0.9.18"
-    assert POLICY_VERSION == "0.9.18"
+    assert __version__ == "0.9.19"
+    assert POLICY_VERSION == "0.9.19"
     assert f"`policy_version` is `{POLICY_VERSION}`" in readme
     assert f"Package `policy_version` is `{POLICY_VERSION}`" in index
     assert f"`pattern_min_cases` {PATTERN_MIN_CASES}" in readme
