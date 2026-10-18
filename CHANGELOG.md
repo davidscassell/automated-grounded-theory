@@ -12,6 +12,7 @@
 - `metadata.persistence` names the checkpointer and `durability`. The default saver is in-memory and is lost at process exit. `checkpoint_path` keeps a SQLite file. `durability` stays `async`.
 - Sampling keeps one `pair_records` entry per direction and passage. Completed, failed, and unsent lists, plus `reread_status` and `reread_stop`, are derived from those records.
 - The LangGraph floor is `>=1.2,<2`. Node timeout and retry policy need that release.
+- A repair that is still over the request budget is `not_sent` and does not reuse the original usage. A repair the call allowance refuses stays `schema_unparsed` and `incomplete`. The original response remains.
 - `pattern_min_cases` stays 2. The axial token ceiling stays 24000. The design is [docs/design-review-fixes-0915.md](docs/design-review-fixes-0915.md). `policy_version` is `0.9.15`.
 
 ## 0.9.14

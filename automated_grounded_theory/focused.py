@@ -4762,55 +4762,81 @@ def _followup(runtime: FocusedRuntime):
                 )
                 if call_limit > 0:
                     runtime.limiter.step_deadline = time.monotonic() + call_limit
-                (repaired, repair_usage), repair_sent = await _bounded(ainvoke_structured(
-                    runtime.coder,
-                    schema,
-                    messages,
-                    runtime.limiter,
-                    use_cache=False,
-                    raw_out=raw_parts,
-                    token_budget=runtime.token_budget,
-                    preserve_failed=True,
-                    send_repair_overflow=False,
-                    attempt_repair=False,
-                    allowance_kind="schema_repair",
-                    call_audits=audits,
-                ))
-                usage = combine_usage(hold.get("original_usage") or hold.get("usage"), repair_usage)
-                if repaired.get("needs_repair") or repaired.get("_agt_unparsed"):
+                try:
+                    (repaired, repair_usage), repair_sent = await _bounded(ainvoke_structured(
+                        runtime.coder,
+                        schema,
+                        messages,
+                        runtime.limiter,
+                        use_cache=False,
+                        raw_out=raw_parts,
+                        token_budget=runtime.token_budget,
+                        preserve_failed=True,
+                        send_repair_overflow=False,
+                        attempt_repair=False,
+                        allowance_kind="schema_repair",
+                        call_audits=audits,
+                    ))
+                except AllowanceExhausted as exc:
+                    audits.append(
+                        {
+                            "kind": "schema_repair",
+                            "status": "refused",
+                            "reason": exc.reason,
+                            "usage": {},
+                            "raw_response": "",
+                            "messages": _focused_message_rows(messages),
+                            "parsed": {},
+                            "received": False,
+                        }
+                    )
                     parsed = {
                         "_agt_unparsed": True,
                         "needs_review": True,
                         "flagged": True,
                         "reason": "schema_unparsed",
-                        "error": str(repaired.get("error") or ""),
+                        "error": str(exc),
                         "raw_response": str(hold.get("raw_response") or ""),
-                        "repair_raw_response": str(repaired.get("raw_response") or ""),
                     }
-                    sent_rows = _focused_message_rows(repair_sent)
+                    usage = dict(hold.get("original_usage") or hold.get("usage") or {})
                 else:
-                    parsed = repaired
-                    sent_rows = _focused_message_rows(repair_sent)
-                    calls += 1
-                    if job.get("allow_label_retry") and _probe_labels(parsed, passages, book, runtime):
-                        runtime.limiter.step_deadline = None
-                        return {
-                            "focused_call_holds": {
-                                proposal_id: _focused_hold(
-                                    phase="label_retry",
-                                    job=job,
-                                    schema_name=getattr(schema, "__name__", "FocusedRecodeBatch"),
-                                    messages=repair_sent,
-                                    usage=usage,
-                                    raw_response=str(hold.get("raw_response") or ""),
-                                    error="",
-                                    audits=audits,
-                                    parsed=parsed,
-                                    original_usage=hold.get("original_usage") or hold.get("usage"),
-                                    original_raw_response=str(hold.get("original_raw_response") or hold.get("raw_response") or ""),
-                                )
-                            }
+                    usage = combine_usage(hold.get("original_usage") or hold.get("usage"), repair_usage)
+                    if repaired.get("needs_repair") or repaired.get("_agt_unparsed"):
+                        parsed = {
+                            "_agt_unparsed": True,
+                            "needs_review": True,
+                            "flagged": True,
+                            "reason": "schema_unparsed",
+                            "error": str(repaired.get("error") or ""),
+                            "raw_response": str(hold.get("raw_response") or ""),
+                            "repair_raw_response": str(repaired.get("raw_response") or ""),
                         }
+                        sent_rows = _focused_message_rows(repair_sent)
+                    else:
+                        parsed = repaired
+                        sent_rows = _focused_message_rows(repair_sent)
+                        calls += 1
+                        if job.get("allow_label_retry") and _probe_labels(parsed, passages, book, runtime):
+                            runtime.limiter.step_deadline = None
+                            return {
+                                "focused_call_holds": {
+                                    proposal_id: _focused_hold(
+                                        phase="label_retry",
+                                        job=job,
+                                        schema_name=getattr(schema, "__name__", "FocusedRecodeBatch"),
+                                        messages=repair_sent,
+                                        usage=usage,
+                                        raw_response=str(hold.get("raw_response") or ""),
+                                        error="",
+                                        audits=audits,
+                                        parsed=parsed,
+                                        original_usage=hold.get("original_usage") or hold.get("usage"),
+                                        original_raw_response=str(
+                                            hold.get("original_raw_response") or hold.get("raw_response") or ""
+                                        ),
+                                    )
+                                }
+                            }
             if phase == "label_retry" or (not parsed.get("_agt_unparsed") and job.get("allow_label_retry")):
                 probe = _probe_labels(parsed, passages, book, runtime)
                 if probe:

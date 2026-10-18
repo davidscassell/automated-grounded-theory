@@ -32,6 +32,7 @@ from automated_grounded_theory.async_support import (
     check_durability,
     node_watchdog,
     parse_structured,
+    oversized_request_message,
     persistence_record,
     run_sync,
     structured_runnable,
@@ -45,7 +46,7 @@ from automated_grounded_theory.backends import (
     installation_record,
     record_model_determinism,
 )
-from automated_grounded_theory.batching import request_input_tokens
+from automated_grounded_theory.batching import request_input_tokens, shrink_repair_messages
 from automated_grounded_theory.category_state import plan_relation_pairs, property_stability
 from automated_grounded_theory.focused import _rationale_indicates_irrelevance
 from automated_grounded_theory.retrieval import cosine
@@ -3317,6 +3318,127 @@ def _close_failed_repair(
     return closed
 
 
+def _repair_audit(
+    messages: Sequence[Any],
+    *,
+    status: str,
+    reason: str,
+    estimate: int,
+) -> dict[str, Any]:
+    """A repair row that was not sent. It carries no provider usage."""
+    return {
+        "kind": "schema_repair",
+        "messages": list(messages),
+        "estimated_input_tokens": int(estimate),
+        "usage": {},
+        "status": status,
+        "reason": reason,
+        "parsed": {"_agt_unparsed": True, "reason": "schema_unparsed"},
+        "received": False,
+    }
+
+
+def _kept_parse_failure(
+    result: Mapping[str, Any],
+    *,
+    messages: Sequence[Any],
+    original_raw: str,
+    estimate: int = 0,
+    audit_status: str = "refused",
+    audit_reason: str = "",
+) -> dict[str, Any]:
+    """The original response stays the failure. A withheld repair is not a budget stop."""
+    closed = dict(result)
+    closed["refused"] = False
+    closed["unparsed"] = True
+    closed["repair_pending"] = False
+    closed["reason"] = "schema_unparsed"
+    closed["usage"] = {}
+    parsed = dict(closed.get("parsed") or {})
+    parsed["_agt_unparsed"] = True
+    parsed["needs_review"] = True
+    parsed["flagged"] = True
+    parsed["reason"] = "schema_unparsed"
+    if original_raw:
+        parsed["raw_response"] = original_raw
+    closed["parsed"] = parsed
+    audits = [dict(row) for row in (closed.get("audits") or []) if isinstance(row, Mapping)]
+    if not any(str(row.get("kind") or "") == "schema_repair" for row in audits):
+        audits.append(
+            _repair_audit(
+                messages,
+                status=audit_status,
+                reason=audit_reason or str(result.get("reason") or "call_allowance"),
+                estimate=estimate,
+            )
+        )
+    closed["audits"] = audits
+    return closed
+
+
+def _repair_over_request_budget(
+    metadata: dict[str, Any],
+    schema,
+    messages: list,
+    *,
+    original_raw: str,
+) -> tuple[list, dict[str, Any] | None]:
+    """Shrink a repair, then keep it local when it is still over the request budget.
+
+    The warning matches the in-call path: the overflow is flagged and the
+    request was not sent. That is not evidence the provider stopped.
+    """
+    token_budget = _request_token_budget(metadata)
+    fitted = list(messages)
+    if token_budget > 0:
+        fitted = shrink_repair_messages(fitted, schema, max(1, token_budget))
+    estimate = request_input_tokens(fitted, schema)
+    if token_budget <= 0 or estimate <= token_budget:
+        return fitted, None
+    logger.warning("%s", oversized_request_message("schema_repair", estimate, token_budget, sent=False))
+    metadata["axial_stop"] = "schema_unparsed"
+    return fitted, _kept_parse_failure(
+        {"reason": "request_budget", "parsed": {}, "audits": []},
+        messages=fitted,
+        original_raw=original_raw,
+        estimate=estimate,
+        audit_status="not_sent",
+        audit_reason="request_budget",
+    )
+
+
+async def _repair_visit(
+    runtime: AxialRuntime,
+    metadata: dict[str, Any],
+    schema,
+    messages: list,
+    *,
+    stage: str,
+    original_raw: str,
+) -> dict[str, Any]:
+    """One repair visit. An over-budget or refused repair does not call the model."""
+    fitted, local = _repair_over_request_budget(metadata, schema, messages, original_raw=original_raw)
+    if local is not None:
+        return local
+    result = _close_failed_repair(
+        metadata,
+        await _structured_call(
+            runtime,
+            schema,
+            fitted,
+            kind="schema_repair",
+            metadata=metadata,
+            stage=stage,
+            attempt_repair=False,
+        ),
+        original_raw=original_raw,
+    )
+    if result.get("refused"):
+        metadata["axial_stop"] = "schema_unparsed"
+        return _kept_parse_failure(result, messages=fitted, original_raw=original_raw)
+    return result
+
+
 def _pack_window(
     pending: Sequence[Any],
     batch: int,
@@ -3792,16 +3914,14 @@ def _propose_node(runtime: AxialRuntime):
                 messages = _repair_messages(proposal_hold)
                 original_raw = str(proposal_hold.get("raw_response") or "")
                 proposal_hold = None
-                result = await _structured_call(
+                result = await _repair_visit(
                     runtime,
+                    metadata,
                     AxialProposalBatch,
                     messages,
-                    kind="schema_repair",
-                    metadata=metadata,
                     stage="coding",
-                    attempt_repair=False,
+                    original_raw=original_raw,
                 )
-                result = _close_failed_repair(metadata, result, original_raw=original_raw)
             else:
                 window = list(pending[:batch])
                 pending = list(pending[batch:])
@@ -4321,17 +4441,12 @@ def _counterexample_node(runtime: AxialRuntime):
                 messages = _repair_messages(counter_hold)
                 original_raw = str(counter_hold.get("raw_response") or "")
                 counter_hold = None
-                result = _close_failed_repair(
+                result = await _repair_visit(
+                    runtime,
                     metadata,
-                    await _structured_call(
-                        runtime,
-                        AxialCounterexampleBatch,
-                        messages,
-                        kind="schema_repair",
-                        metadata=metadata,
-                        stage="coding",
-                        attempt_repair=False,
-                    ),
+                    AxialCounterexampleBatch,
+                    messages,
+                    stage="coding",
                     original_raw=original_raw,
                 )
             else:
@@ -5284,17 +5399,12 @@ def _memo_node(runtime: AxialRuntime):
                 messages = _repair_messages(memo_hold)
                 original_raw = str(memo_hold.get("raw_response") or "")
                 memo_hold = None
-                result = _close_failed_repair(
+                result = await _repair_visit(
+                    runtime,
                     metadata,
-                    await _structured_call(
-                        runtime,
-                        TheoreticalMemoBatch,
-                        messages,
-                        kind="schema_repair",
-                        metadata=metadata,
-                        stage="selective",
-                        attempt_repair=False,
-                    ),
+                    TheoreticalMemoBatch,
+                    messages,
+                    stage="selective",
                     original_raw=original_raw,
                 )
             else:
@@ -5693,17 +5803,12 @@ def _story_node(runtime: AxialRuntime):
             messages = _repair_messages(story_hold)
             logs = list(state.get("prompt_log") or [])
             original_raw = str(story_hold.get("raw_response") or "")
-            result = _close_failed_repair(
+            result = await _repair_visit(
+                runtime,
                 metadata,
-                await _structured_call(
-                    runtime,
-                    StorylineBatch,
-                    messages,
-                    kind="schema_repair",
-                    metadata=metadata,
-                    stage="selective",
-                    attempt_repair=False,
-                ),
+                StorylineBatch,
+                messages,
+                stage="selective",
                 original_raw=original_raw,
             )
             emphasis = bool(metadata.get("storyline_core_emphasis"))

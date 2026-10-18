@@ -32,6 +32,10 @@ The proposal prompt allows `unspecified` when the passages support only an assoc
 
 `metadata.provenance` records the commit, the imported module path, and the module and distribution versions. A missing git commit is null. `InstallationMismatch` is raised when the imported `automated_grounded_theory/__init__.py` is not the distribution's package, or when the distribution version differs from `__version__`. `generation_parameters.temperature` is null and `temperature_status` is `unset` unless the caller set a numeric temperature before the automatic determinism record. The model instance can still receive temperature 0 for resume checkpoints. That automatic value is not reported as the configured temperature.
 
+## Repair visits
+
+A paid axial or focused call returns before its repair, so the original response and its usage are already checkpointed. The repair is the next visit. A repair that is still over the request budget after the repair note is shortened is `schema_repair` with status `not_sent`, `received` false, and empty usage. The warning says the request was not sent. A repair the call allowance refuses is status `refused`, and the stage stays `incomplete` with reason `schema_unparsed`. The pair counts as attempted. It is not reclassified as `budget_limited`. Neither path calls the model again or copies the original usage onto the repair row.
+
 ## Timeouts
 
 A stalled initial axial call is cut off by `axial_request_timeout`. The partial result is `incomplete`, `stop` is `timeout`, and `axial_run.json` is written when an output directory was set. Resume with `resume={"accept": True}` on the same checkpoint can finish, and the timeout row stays in the prompt log. A stalled repair keeps the failed parse on the call audit and raises `TimeoutError`. A later call with the stall cleared can return a statement.
