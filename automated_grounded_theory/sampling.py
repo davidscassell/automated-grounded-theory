@@ -4183,19 +4183,24 @@ def _restore(runtime: SamplingRuntime, metadata: Mapping[str, Any]) -> None:
 
 
 def _sampling_recursion_limit(procedure: Mapping[str, Any], *, override: int | None = None) -> int:
-    """Steps for the sampling graph, plus the planned calls as headroom.
+    """LangGraph steps for one sampling run, counted from the graph edges.
 
-    Each reread records its pair, then sends it, and a reread repair is one
-    extra visit. Those visits sit inside the call ceilings plus the overhead.
-    The overhead is not a new analytic setting.
+    Preparation is load, rank, retrieve, the selection checkpoint, and the
+    ledger. The checkpoint can loop once when the selection needs a repair.
+    Each coding call can arm a pair, send the request, and repair it. One
+    later visit withholds every pair still pending after that ceiling. The
+    run then updates the ledger, decides saturation, and exports. Decision
+    repairs stay inside the saturation node, so they are not extra steps.
     """
     if override is not None:
         return max(1, int(override))
-    calls = int(procedure.get("max_sampling_review_calls") or 0) + int(procedure.get("max_decision_calls") or 0)
-    return calls + _GRAPH_NODE_OVERHEAD
-
-
-_GRAPH_NODE_OVERHEAD = 24
+    calls = max(0, int(procedure.get("max_sampling_review_calls") or 0))
+    preparation = 5
+    selection_repair = 1
+    per_call = 3
+    withhold = 1
+    finalization = 3
+    return preparation + selection_repair + (calls * per_call) + withhold + finalization
 
 
 async def _invoke(builder, saver, initial, *, thread_id: str, resume, resuming: bool, output_dir, raise_on_timeout: bool, allow_changes: bool, procedure: Mapping[str, Any], runtime: SamplingRuntime, recursion_limit: int | None = None, durability: str = "async") -> SamplingResult:

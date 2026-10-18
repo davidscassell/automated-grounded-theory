@@ -8,10 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from automated_grounded_theory import axial_code
+from automated_grounded_theory import axial_code, theoretical_sample
 from automated_grounded_theory.backends import InstallationMismatch, installation_record
 from automated_grounded_theory.version import __version__
 from tests.test_v080 import FakeAxialCoder, _corpus
+from tests.test_v090 import FakeSamplingCoder, _payload
 
 
 def _axial(**overrides):
@@ -94,3 +95,131 @@ def test_editable_install_is_checked_before_a_model_call(tmp_path: Path, monkeyp
     with pytest.raises(InstallationMismatch, match="9.9.9"):
         axial_code(_corpus(), mismatch, **_axial())
     assert mismatch.call_count == 0
+
+
+def _sampling_visit_allowance(calls: int) -> int:
+    """The same transitions ``_sampling_recursion_limit`` counts."""
+    return 5 + 1 + (calls * 3) + 1 + 3
+
+
+class _EveryPassage(FakeSamplingCoder):
+    """Select every proposal on the thin category, then reread each one."""
+
+    def with_structured_output(self, schema, **kwargs):
+        include_raw = bool(kwargs.get("include_raw"))
+
+        def _call(messages):
+            self.call_count += 1
+            name = getattr(schema, "__name__", "")
+            body = _payload(messages)
+            if name == "ModelSamplingSelection":
+                selections = []
+                for row in body.get("directions") or []:
+                    if str(row.get("kind") or "") != "thin_category":
+                        continue
+                    direction_id = str(row.get("direction_id") or "")
+                    for group in body.get("passage_proposals") or []:
+                        if str(group.get("direction_id") or "") != direction_id:
+                            continue
+                        for proposal in group.get("proposals") or []:
+                            selections.append(
+                                {
+                                    "direction_id": direction_id,
+                                    "passage_id": str(proposal.get("passage_id") or ""),
+                                }
+                            )
+                parsed = schema(
+                    selections=selections,
+                    rationale="Every retrieved passage for the thin category is reread.",
+                )
+            elif name == "SamplingRereadNote":
+                passage_id = str(body.get("passage_id") or "")
+                text = str(body.get("text") or "")
+                parsed = schema(
+                    passage_id=passage_id,
+                    judgment="relevant",
+                    note="This passage bears on the thin category.",
+                    quote=text[:48],
+                )
+            elif name == "ModelSaturationJudgment":
+                parsed = schema(
+                    assessment="not_saturated",
+                    rationale="The window is interpretable and a sampling gap is still open.",
+                )
+            else:
+                parsed = schema()
+            if not include_raw:
+                return parsed
+            from langchain_core.messages import AIMessage
+
+            raw = AIMessage(
+                content="{}",
+                usage_metadata={"input_tokens": 11, "output_tokens": 4, "total_tokens": 15},
+            )
+            return {"raw": raw, "parsed": parsed, "parsing_error": None}
+
+        from langchain_core.runnables import RunnableLambda
+
+        return RunnableLambda(_call)
+
+
+def test_default_recursion_limit_finishes_thirty_two_rereads():
+    """Thirty-two rereads need a visit to arm each pair and a visit to send it.
+
+    A limit of the call ceiling plus a fixed overhead stops before the last
+    requests. The default limit is the graph's own transitions.
+    """
+    stem = "zephyrcrate"
+    passages = [
+        {
+            "passage_id": f"extra-{index:02d}",
+            "doc_id": f"d-{index:02d}",
+            "respondent_id": f"r-{index:02d}",
+            "text": f"Another {stem} account that was not coded yet.",
+        }
+        for index in range(32)
+    ]
+    corpus = {
+        "codebook": {
+            "c-pack": {
+                "code_id": "c-pack",
+                "code": stem,
+                "definition": f"A {stem} that still needs another document.",
+            }
+        },
+        "passages": [
+            {
+                "passage_id": "coded",
+                "doc_id": "d-coded",
+                "respondent_id": "r-coded",
+                "text": f"The coded {stem} is already evidence.",
+            },
+            *passages,
+        ],
+        "segments": [{"segment_id": "s-coded", "code_id": "c-pack", "passage_id": "coded"}],
+        "properties": [],
+        "dimensions": [],
+        "relationships": [],
+        "memos": [],
+    }
+    calls = 32
+    result = theoretical_sample(
+        corpus,
+        _EveryPassage(),
+        decision_mode="llm",
+        pursuit="reread",
+        interrupt=False,
+        seed=3,
+        evidence_limit=32,
+        category_documents=2,
+        max_sampling_review_calls=calls,
+        max_decision_calls=4,
+        sampling_token_budget=200000,
+        max_sampling_review_tokens=200000,
+        sampling_request_timeout=30,
+    )
+    assert result.metadata.get("stop") != "recursion_limit"
+    assert result.metadata["performance"]["recursion_limit"] >= _sampling_visit_allowance(calls)
+    completed = {row["passage_id"] for row in result.reread_notes}
+    assert completed == {row["passage_id"] for row in passages}
+    assert len(result.reread_notes) == calls
