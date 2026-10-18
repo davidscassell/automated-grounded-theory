@@ -1,6 +1,6 @@
 # Design notes
 
-Package `policy_version` is `0.9.17`. This index says which notes describe the package now and which notes are the record of an earlier version. A historical note can disagree with the code. The code, the README, and the current notes below win.
+Package `policy_version` is `0.9.18`. This index says which notes describe the package now and which notes are the record of an earlier version. A historical note can disagree with the code. The code, the README, and the current notes below win.
 
 Axial coding, selective coding, and theoretical sampling are experimental. No human adjudication file is included. Live evaluation runs through v31, on package 0.9.9, did not measure analytic accuracy.
 
@@ -10,17 +10,17 @@ Axial coding, selective coding, and theoretical sampling are experimental. No hu
 | --- | --- |
 | [../README.md](../README.md) | The pipeline, the defaults, the evidence tiers, quiet rounds, timeouts, and gate scoring. |
 | [methodology.md](methodology.md) | How the open-coding default maps onto the sources already named there. |
-| [design.md](design.md) | The open-coding engineering design, plus a version log through `0.9.17`. The early sections are the 0.6 run. |
+| [design.md](design.md) | The open-coding engineering design, plus a version log through `0.9.18`. The early sections are the 0.6 run. |
 | [design-relationship-tiers.md](design-relationship-tiers.md) | Evidence tiers. `pattern_min_cases` is 2. Tier labels are `category_evidence`, `hypothesis`, `pattern_supported`, `attribution`, and `verified`. |
 | [design-negative-cases-092.md](design-negative-cases-092.md) | Negative-case search at respondent level, and a core that needs tier 2. Later search corrections are in the 0.9.3 review note. |
 | [design-gate-evaluation.md](design-gate-evaluation.md) | `export_gate_relationships`, `load_adjudications`, and `score_gate_adjudications`, including `downstream_precision` and `downstream_withheld_supported_recall`. |
-| [design-sampling-0900.md](design-sampling-0900.md) | The sampling graph. Later sections through 0.9.17 are part of the current behavior. |
+| [design-sampling-0900.md](design-sampling-0900.md) | The sampling graph. Later sections through 0.9.18 are part of the current behavior. |
 | [focused-evaluation.md](focused-evaluation.md) | The offline focused comparison and its live-cost estimate. It does not call an API. |
-| [design-review-fixes-0917.md](design-review-fixes-0917.md) | The 0.9.17 oversized-reread visit, mixed-batch salvage, reread expenditure coverage, and validation basis. This is the latest review note. |
+| [design-review-fixes-0918.md](design-review-fixes-0918.md) | The 0.9.18 timeout rows in reread expenditure coverage. This is the latest review note. |
 
 ## Historical
 
-These notes stay so a reader can see what a version changed. They are not the current contract. `design-review-fixes-*` through 0.9.16 are in this list. `design-review-fixes-0917.md` is the latest review note, listed above.
+These notes stay so a reader can see what a version changed. They are not the current contract. `design-review-fixes-*` through 0.9.17 are in this list. `design-review-fixes-0918.md` is the latest review note, listed above.
 
 | Note | Version it records |
 | --- | --- |
@@ -40,8 +40,9 @@ These notes stay so a reader can see what a version changed. They are not the cu
 | [design-review-fixes-0914.md](design-review-fixes-0914.md) | 0.9.14. The coverage split and `min_documents` check still stand. |
 | [design-review-fixes-0915.md](design-review-fixes-0915.md) | 0.9.15. The statement contract, eligibility rule, and reread report still stand. 0.9.16 changes the editable-install check, mixed batches, and the sampling step limit. |
 | [design-review-fixes-0916.md](design-review-fixes-0916.md) | 0.9.16. The editable-install check, reviewer role, and timeout wording still stand. 0.9.17 changes oversized rereads, mixed-batch salvage, expenditure coverage, and the validation basis. |
+| [design-review-fixes-0917.md](design-review-fixes-0917.md) | 0.9.17. The oversized-reread visit, mixed-batch salvage, and validation basis still stand. 0.9.18 counts a timed-out reread or reread repair as unknown usage. |
 
-`design-review-fixes-0917.md` is current for the 0.9.17 fixes and is not only history.
+`design-review-fixes-0918.md` is current for the 0.9.18 fixes and is not only history.
 
 ## Defaults the tests check
 

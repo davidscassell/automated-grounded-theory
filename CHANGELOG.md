@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.18
+
+- A timed-out reread keeps its operation. An initial reread is logged as `sampling_reread`. A reread repair is logged as `schema_repair` with schema `SamplingRereadNote`. Both count as sent calls with unknown usage. `reread_expenditure_complete` stays false, coverage counts the attempt, and the full expenditure rates and cost stay null. The known token sum excludes that attempt. Selection and saturation timeouts stay kind `provider`. Axial and focused timeout rows are unchanged. The provider budget call count is still the limiter's `calls_used`.
+- `pattern_min_cases` stays 2. The axial token ceiling stays 24000. The design is [docs/design-review-fixes-0918.md](docs/design-review-fixes-0918.md). `policy_version` is `0.9.18`.
+
 ## 0.9.17
 
 - Reread requests that do not fit the per-request budget or the remaining token allowance are withheld in one visit. They are not provider calls, so they do not spend the recursion limit one passage at a time. A human assignment of 32 oversized passages, with the default four-call allowance, ends with every passage unsent and stop `request_budget`. The visit limit stays the 0.9.16 count. A model selection is still cut to the call allowance before that loop.

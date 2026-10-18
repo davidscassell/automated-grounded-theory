@@ -611,7 +611,7 @@ def test_stalled_initial_and_repair_calls_stay_inside_the_timeout(tmp_path: Path
         resume={"accept": True},
     )
     assert recovered.relationships
-    assert any(row.get("status") == "timeout" for row in recovered.prompt_log)
+    assert any(row.get("status") == "timeout" and row.get("kind") == "provider" for row in recovered.prompt_log)
 
     repair = _StallCoder(stall="repair", delay=1.5)
     limiter = CallLimiter(2, max_retries=0, request_timeout=timeout, wall_timeout=timeout)
