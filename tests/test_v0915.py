@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from langchain_core.runnables import RunnableLambda
 from pydantic import ValidationError
 
 from automated_grounded_theory import axial_code, selective_code
+from automated_grounded_theory.async_support import CallLimiter, ainvoke_structured, run_sync
 from automated_grounded_theory.axial import AxialProposalBatch, AxialRelationshipDraft, export_axial_state
 from automated_grounded_theory.graph_grounding import graph_supported
 from tests.test_v080 import QUOTE, FakeAxialCoder, _corpus, _payload
@@ -525,3 +527,114 @@ def test_axial_export_records_attrition_and_refuses_a_version_mismatch(tmp_path:
         installation_record()
     with pytest.raises(InstallationMismatch):
         export_axial_state({"relationships": [], "metadata": {}, "codebook": {}}, tmp_path / "mismatch")
+
+class _StallCoder(FakeAxialCoder):
+    """Sleep on the initial call, the repair call, or neither."""
+
+    stall: str = ""
+    delay: float = 1.5
+
+    def with_structured_output(self, schema, **kwargs):
+        parent = FakeAxialCoder.with_structured_output(self, schema, **kwargs)
+
+        def _call(messages):
+            name = getattr(schema, "__name__", "")
+            repair = "REPAIR THIS OUTPUT" in _texts(messages)
+            if name == "AxialProposalBatch" and self.stall == "initial" and not repair and self.call_count == 0:
+                self.call_count += 1
+                time.sleep(self.delay)
+            if name == "AxialProposalBatch" and self.stall == "repair" and not repair:
+                self.call_count += 1
+                raw = AIMessage(content=json.dumps({"relationships": [{"statement": "   "}]}))
+                return {"raw": raw, "parsed": None, "parsing_error": ValueError("blank statement")}
+            if name == "AxialProposalBatch" and self.stall == "repair" and repair:
+                self.call_count += 1
+                time.sleep(self.delay)
+            return parent.invoke(messages)
+
+        return RunnableLambda(_call)
+
+
+def test_stalled_initial_and_repair_calls_stay_inside_the_timeout(tmp_path: Path):
+    """A stalled provider call is cut off. The failed initial response is kept.
+
+    Resume after the initial timeout uses the same checkpoint and can finish.
+    A stalled repair keeps the failed parse and a later call can succeed.
+    """
+    from langchain_core.messages import HumanMessage
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    timeout = 0.35
+    initial = _StallCoder(stall="initial", delay=1.5)
+    saver = InMemorySaver()
+    started = time.perf_counter()
+    partial = axial_code(
+        _corpus(),
+        initial,
+        seed=3,
+        max_axial_review_calls=2,
+        axial_share_propose=1,
+        axial_share_counterexample=0,
+        batch_size=1,
+        axial_request_timeout=timeout,
+        interrupt=False,
+        checkpointer=saver,
+        thread_id="stall-initial",
+        output_dir=tmp_path / "initial",
+    )
+    assert time.perf_counter() - started < timeout + 0.9
+    assert partial.metadata["stop"] == "timeout"
+    assert partial.metadata["status"] == "incomplete"
+    assert (tmp_path / "initial" / "axial_run.json").exists()
+    assert "timed out after 0.35" in partial.metadata["timeout_error"]
+
+    initial.stall = ""
+    recovered = axial_code(
+        _corpus(),
+        initial,
+        seed=3,
+        max_axial_review_calls=2,
+        axial_share_propose=1,
+        axial_share_counterexample=0,
+        batch_size=1,
+        axial_request_timeout=timeout,
+        interrupt=False,
+        checkpointer=saver,
+        thread_id="stall-initial",
+        resuming=True,
+        resume={"accept": True},
+    )
+    assert recovered.relationships
+    assert any(row.get("status") == "timeout" for row in recovered.prompt_log)
+
+    repair = _StallCoder(stall="repair", delay=1.5)
+    limiter = CallLimiter(2, max_retries=0, request_timeout=timeout, wall_timeout=timeout)
+    audits: list[dict] = []
+    started = time.perf_counter()
+    with pytest.raises(TimeoutError, match=r"0\.35"):
+        run_sync(
+            ainvoke_structured(
+                repair,
+                AxialProposalBatch,
+                [HumanMessage(content='{"pairs":[{"from_id":"c-prep","to_id":"c-return"}]}')],
+                limiter,
+                preserve_failed=True,
+                call_audits=audits,
+            )
+        )
+    assert time.perf_counter() - started < timeout + 0.9
+    assert audits[0]["status"] == "parse_failed"
+    assert audits[0]["raw_response"]
+
+    repair.stall = ""
+    (recovered_payload, _usage), _messages = run_sync(
+        ainvoke_structured(
+            repair,
+            AxialProposalBatch,
+            [HumanMessage(content='{"pairs":[{"from_id":"c-prep","to_id":"c-return"}]}')],
+            CallLimiter(2, max_retries=0, request_timeout=timeout, wall_timeout=timeout),
+            preserve_failed=True,
+        )
+    )
+    assert recovered_payload["relationships"]
+    assert recovered_payload["relationships"][0]["statement"]
