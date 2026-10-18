@@ -773,7 +773,8 @@ def test_reread_reporting_splits_non_relevant_and_exposes_completed_pairs(tmp_pa
     assert report["cost_status"] == "unset"
     assert report["relevant_reread_count"] == 2
     assert report["reread_expenditure_tokens"] == 210
-    assert report["expenditure_tokens_per_relevant_reread"] == 105
+    assert report["reread_expenditure_complete"] is False
+    assert report["expenditure_tokens_per_relevant_reread"] is None
     assert report["reread_expenditure_cost_usd"] is None
     assert report["expenditure_cost_per_relevant_reread_usd"] is None
     assert report["human_confirmed_useful_rereads"] is None

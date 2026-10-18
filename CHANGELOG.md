@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.17
+
+- Reread requests that do not fit the per-request budget or the remaining token allowance are withheld in one visit. They are not provider calls, so they do not spend the recursion limit one passage at a time. A human assignment of 32 oversized passages, with the default four-call allowance, ends with every passage unsent and stop `request_budget`. The visit limit stays the 0.9.16 count. A model selection is still cut to the call allowance before that loop.
+- A proposal batch is recovered from JSON text, from tool-call arguments, and from the repair response. Valid rows are kept. A batch with nothing valid still uses one repair. Grounding checks still run after salvage.
+- `reread_expenditure_tokens` is the known sum. `reread_expenditure_calls`, `reread_expenditure_calls_with_usage`, and `reread_expenditure_usage_coverage` separate no calls from calls with missing usage. `reread_expenditure_complete` is false when a sent call did not report usage. Full expenditure rates and cost stay null in that case. A missing provider report stored as zeros is not a known spend of zero. `tokens_per_relevant_reread` is unchanged. Prices are read from source `metadata.token_prices`.
+- `validation_basis` is refreshed on every validation. History is still written only when the owned flags change, and it archives the previous basis. A human accept validates the statement before it applies a role, so a sentence edit that does not change flags is the statement a later role change archives.
+- `pattern_min_cases` stays 2. The axial token ceiling stays 24000. The design is [docs/design-review-fixes-0917.md](docs/design-review-fixes-0917.md). `policy_version` is `0.9.17`.
+
 ## 0.9.16
 
 - An editable install is consistent when `direct_url.json` or an editable finder names the imported checkout. A distribution version that differs from the imported module still raises `InstallationMismatch`, and axial and selective coding check that before a model call.

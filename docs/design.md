@@ -1,7 +1,7 @@
 # automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, 0.6.14, 0.6.15, and 0.6.16, focused coding in 0.7.0, fixes in 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, 0.7.6, 0.7.7, 0.7.8, and 0.7.9, axial coding and saturation indicators in 0.8.0, fixes in 0.8.1)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
-Status: this file is the open-coding design, beginning with steps 1 and 2 of the v0.6 plan. Focused coding is in 0.7.0 and the 0.7.1 through 0.7.9 fixes. Axial coding, saturation indicators, and selective coding are separate experimental graphs from 0.8.0. Within-corpus theoretical sampling and a saturation decision that leaves `judgment` null are in 0.9.0 and later. Package `policy_version` is `0.9.16`. The current index is [README.md](README.md). The 0.8 axial slice is [design-axial-0800.md](design-axial-0800.md). 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
+Status: this file is the open-coding design, beginning with steps 1 and 2 of the v0.6 plan. Focused coding is in 0.7.0 and the 0.7.1 through 0.7.9 fixes. Axial coding, saturation indicators, and selective coding are separate experimental graphs from 0.8.0. Within-corpus theoretical sampling and a saturation decision that leaves `judgment` null are in 0.9.0 and later. Package `policy_version` is `0.9.17`. The current index is [README.md](README.md). The 0.8 axial slice is [design-axial-0800.md](design-axial-0800.md). 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
 
 The default procedure is Charmaz-informed automated analysis: initial coding against a frozen snapshot, constant comparison with distinct operations, and `build_themes` as a descriptive reporting view. It is not an axial-coding template.
 
@@ -447,7 +447,11 @@ Package 0.9.15 requires a nonempty relationship statement and keeps `nothing_to_
 
 Package 0.9.16 accepts an editable install whose metadata names the imported checkout, and still raises `InstallationMismatch` for a version mismatch before axial or selective work calls a model. The sampling recursion limit is counted from graph visits, so a 32-call reread is not stopped early. Validation flags are recomputed from the effective statement and role, and the previous flags stay on the revision history. Until a human sets a role, a reviewer's role is the working role. A mixed proposal batch keeps the valid relationships and logs each invalid row. A batch with nothing valid still uses one repair. `expenditure_tokens_per_relevant_reread` divides all reread tokens by the relevant count and is null when that count is zero. `idle_timeout` stays recorded and unenforced. A returned timeout does not prove the provider request stopped. `pattern_min_cases` stays 2 and the axial ceiling stays 24000. The design is [design-review-fixes-0916.md](design-review-fixes-0916.md).
 
-`policy_version` is `0.9.16`.
+`policy_version` was `0.9.16`.
+
+Package 0.9.17 withholds every reread that does not fit the per-request budget in the same visit, so a human assignment of oversized passages is not stopped by the recursion limit. A mixed proposal batch is recovered from tool-call arguments and from the repair response, and a batch with nothing valid still uses one repair. Reread expenditure reports the known sum, how many sent calls had usage, and whether that sum is complete. Full expenditure rates stay null when usage is missing. Validation refreshes `validation_basis` on every check, and a human accept validates the statement before the role. `pattern_min_cases` stays 2 and the axial ceiling stays 24000. The design is [design-review-fixes-0917.md](design-review-fixes-0917.md).
+
+`policy_version` is `0.9.17`.
 
 ## 26. Out of scope
 

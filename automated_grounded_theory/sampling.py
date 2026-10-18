@@ -3136,9 +3136,29 @@ async def _reread(runtime: SamplingRuntime, state: SamplingState) -> dict:
         return _reread_return(notes, metadata, logs, warnings)
     messages = _messages("sampling_reread", _reread_payload(state, pair["passage_id"], passage, direction))
     if not armed:
-        estimate, reason = _sampling_fit(metadata, messages, SamplingRereadNote, runtime)
-        if reason:
-            logs.append(_prompt_row("sampling_reread", messages, {}, extra_status=reason))
+        # A pair that does not fit is not a provider call. Withhold every such
+        # pair in this visit and arm the first one that does fit. Counting one
+        # visit per oversized pair exhausts the recursion limit while the call
+        # allowance is still unused.
+        chosen: dict[str, Any] | None = None
+        for item in pending:
+            item_direction = _direction_row(state, item["direction_id"])
+            stamped = _annotate_pairs([item], [item_direction] if item_direction else [])
+            if stamped:
+                item = stamped[0]
+            item_passage = passages.get(item["passage_id"])
+            if item_passage is None:
+                _withhold_reread(metadata, unsent, item, reason="missing_passage")
+                continue
+            item_messages = _messages(
+                "sampling_reread",
+                _reread_payload(state, item["passage_id"], item_passage, item_direction),
+            )
+            estimate, reason = _sampling_fit(metadata, item_messages, SamplingRereadNote, runtime)
+            if not reason:
+                chosen = item
+                break
+            logs.append(_prompt_row("sampling_reread", item_messages, {}, extra_status=reason))
             logs[-1]["status"] = "omitted"
             logs[-1]["reason"] = reason
             logs[-1]["estimated_input_tokens"] = estimate
@@ -3157,17 +3177,16 @@ async def _reread(runtime: SamplingRuntime, state: SamplingState) -> dict:
                 },
             )
             metadata["sampling_stop"] = reason
-            metadata["reread_active_pair"] = None
-            _withhold_reread(metadata, unsent, pair, reason=reason)
-            if len(pending) > 1:
-                metadata.pop("reread_status", None)
-            else:
-                _finish_reread(metadata, notes, wanted, unsent)
-            metadata["reread_notes_do_not_change_saturation_indicators"] = True
-            _sync_allowance(metadata, runtime)
-            return _reread_return(notes, metadata, logs, warnings)
-        metadata["reread_active_pair"] = {"direction_id": pair["direction_id"], "passage_id": pair["passage_id"]}
-        metadata.pop("reread_status", None)
+            _withhold_reread(metadata, unsent, item, reason=reason)
+        metadata["reread_active_pair"] = (
+            None
+            if chosen is None
+            else {"direction_id": chosen["direction_id"], "passage_id": chosen["passage_id"]}
+        )
+        if chosen is None:
+            _finish_reread(metadata, notes, wanted, unsent)
+        else:
+            metadata.pop("reread_status", None)
         metadata["reread_notes_do_not_change_saturation_indicators"] = True
         _sync_allowance(metadata, runtime)
         return _reread_return(notes, metadata, logs, warnings)
@@ -3902,34 +3921,91 @@ def _counts_as_reread_spend(row: Mapping[str, Any]) -> bool:
     return "SamplingRereadNote" in blob
 
 
+def _sent_reread_call(row: Mapping[str, Any]) -> bool:
+    """A reread or reread repair that was sent. An omitted request is not unknown usage."""
+    if not _counts_as_reread_spend(row):
+        return False
+    if row.get("received") is False:
+        return False
+    status = str(row.get("status") or "")
+    return status not in {"omitted", "not_sent", "deferred"}
+
+
+def _reported_usage(usage: Any) -> tuple[int, int, int] | None:
+    """Input, output, and total when the call reported a non-zero token count.
+
+    ``usage_from_message`` stores a missing provider report as zeros. That
+    record is unknown, not a known spend of zero. A total with no input and
+    no output is also unknown. A missing total is input plus output.
+    """
+    if not isinstance(usage, Mapping):
+        return None
+    if "input_tokens" not in usage or "output_tokens" not in usage:
+        return None
+    try:
+        incoming = int(usage.get("input_tokens"))
+        outgoing = int(usage.get("output_tokens"))
+    except (TypeError, ValueError):
+        return None
+    if incoming < 0 or outgoing < 0:
+        return None
+    total = incoming + outgoing
+    if "total_tokens" in usage and usage.get("total_tokens") is not None:
+        try:
+            reported = int(usage.get("total_tokens"))
+        except (TypeError, ValueError):
+            return None
+        if reported < 0:
+            return None
+        if reported > 0:
+            total = reported
+    if incoming == 0 and outgoing == 0:
+        return None
+    return incoming, outgoing, total
+
+
 def _reread_expenditure(
     notes: Sequence[Mapping[str, Any]],
     prompt_log: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """All reread tokens and cost, divided by relevant rereads.
+    """Known reread tokens, and whether that sum is the whole spend.
 
-    The numerator includes irrelevant responses, failed parses, and repairs.
-    The rate is null when there are no relevant rereads. The denominator is
-    still reported. Zero spend is 0. ``human_confirmed_useful_rereads`` is a
-    hook for a researcher count and is not filled from model judgments.
+    The known sum includes irrelevant responses, failed parses, and repairs
+    that reported input and output tokens. A sent call with missing or
+    all-zero usage is a call without usage. No sent reread calls is complete
+    with a known sum of 0. Rates that divide by relevant rereads stay null
+    when usage is incomplete or when that count is zero.
+    ``human_confirmed_useful_rereads`` is a hook for a researcher count and
+    is not filled from model judgments.
     """
     relevant = sum(1 for note in notes if isinstance(note, Mapping) and _note_bucket(note) == "relevant")
+    calls = 0
+    with_usage = 0
     incoming = outgoing = total = 0
     for row in prompt_log:
-        if not isinstance(row, Mapping) or not _counts_as_reread_spend(row):
+        if not isinstance(row, Mapping) or not _sent_reread_call(row):
             continue
-        parts = _usage_parts(row.get("usage"))
+        calls += 1
+        parts = _reported_usage(row.get("usage"))
         if parts is None:
             continue
+        with_usage += 1
         incoming += parts[0]
         outgoing += parts[1]
         total += parts[2]
+    complete = with_usage == calls
+    coverage = None if calls <= 0 else round(with_usage / calls, 4)
+    rate = None if not complete or relevant <= 0 else round(total / relevant, 4)
     return {
         "reread_expenditure_tokens": total,
         "reread_expenditure_input_tokens": incoming,
         "reread_expenditure_output_tokens": outgoing,
+        "reread_expenditure_calls": calls,
+        "reread_expenditure_calls_with_usage": with_usage,
+        "reread_expenditure_usage_coverage": coverage,
+        "reread_expenditure_complete": complete,
         "relevant_reread_count": relevant,
-        "expenditure_tokens_per_relevant_reread": None if relevant <= 0 else round(total / relevant, 4),
+        "expenditure_tokens_per_relevant_reread": rate,
         "reread_expenditure_cost_usd": None,
         "expenditure_cost_per_relevant_reread_usd": None,
         "human_confirmed_useful_rereads": None,
@@ -3945,11 +4021,14 @@ def reread_interpretation_report(state: Mapping[str, Any]) -> dict[str, Any]:
     A missing document or respondent id is not counted as new or known.
     Token totals for relevant rereads stay null when usage cannot be tied to
     every relevant note. ``tokens_per_relevant_reread`` counts only those
-    attributable tokens. ``expenditure_tokens_per_relevant_reread`` divides
-    every reread token, including irrelevant responses, failed parses, and
-    repairs, by the relevant count. That rate is null when the count is zero,
-    and the count is still reported. Cost stays null unless the run records
-    both token prices. ``human_confirmed_useful_rereads`` is not computed.
+    attributable tokens. ``reread_expenditure_tokens`` is the known sum.
+    ``reread_expenditure_complete`` is true only when every sent reread call
+    reported usage, including when no reread was sent. Coverage is null when
+    there were no reread calls. ``expenditure_tokens_per_relevant_reread``
+    and the expenditure cost rate stay null when usage is incomplete or when
+    the relevant count is zero. Cost stays null unless the run records both
+    token prices and the usage is complete. ``human_confirmed_useful_rereads``
+    is not computed.
     """
     metadata = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
     directions = [row for row in (state.get("directions") or []) if isinstance(row, Mapping)]
@@ -4029,7 +4108,7 @@ def reread_interpretation_report(state: Mapping[str, Any]) -> dict[str, Any]:
         relevant_n = overall["relevant"]
         tokens["cost_per_relevant_reread_usd"] = None if relevant_n <= 0 else round(cost / relevant_n, 6)
         tokens["cost_status"] = "configured"
-    if prices_set:
+    if prices_set and expenditure.get("reread_expenditure_complete"):
         spent = (expenditure["reread_expenditure_input_tokens"] / 1_000_000) * float(in_rate) + (
             expenditure["reread_expenditure_output_tokens"] / 1_000_000
         ) * float(out_rate)
@@ -4257,10 +4336,13 @@ def _sampling_recursion_limit(procedure: Mapping[str, Any], *, override: int | N
 
     Preparation is load, rank, retrieve, the selection checkpoint, and the
     ledger. The checkpoint can loop once when the selection needs a repair.
-    Each coding call can arm a pair, send the request, and repair it. One
-    later visit withholds every pair still pending after that ceiling. The
-    run then updates the ledger, decides saturation, and exports. Decision
-    repairs stay inside the saturation node, so they are not extra steps.
+    Each coding call can arm a pair, send the request, and repair it. Pairs
+    that do not fit the per-request budget or the remaining token allowance
+    are withheld in that same arming visit: they do not use a provider call,
+    so they do not add a visit of their own. One later visit withholds every
+    pair still pending after the call ceiling. The run then updates the
+    ledger, decides saturation, and exports. Decision repairs stay inside
+    the saturation node, so they are not extra steps.
     """
     if override is not None:
         return max(1, int(override))
@@ -4468,6 +4550,8 @@ async def atheoretical_sample(
         "previous_saturation_decision": upstream.get("saturation_decision"),
         **record_model_determinism(coder, seed=int(procedure["seed"])),
     }
+    if isinstance(upstream.get("token_prices"), Mapping):
+        metadata["token_prices"] = dict(upstream["token_prices"])
     reviewer = decision_model or coder if decision_mode == "llm" else None
     calls = max(1, int(max_sampling_review_calls))
     try:

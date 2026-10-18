@@ -758,11 +758,13 @@ _VALIDATION_FLAGS = frozenset(
 def sync_validation_flags(row: dict) -> None:
     """Replace current validation flags from the effective statement, role, and tier.
 
-    Flags this function does not own stay. When the owned set changes, the
-    previous flags and the statement and role they used are appended to
-    ``validation_revision_history``. A second call with the same inputs does
-    not append again. ``needs_review`` is set when the current row overreaches
-    and is not cleared here.
+    Flags this function does not own stay. ``validation_basis`` is the
+    statement and role this call just used, including when the owned flags
+    did not change. When the owned set changes, the previous flags and the
+    basis they used are appended to ``validation_revision_history``. A
+    statement edit that leaves the flags the same does not append. A second
+    call with the same inputs does not append again. ``needs_review`` is set
+    when the current row overreaches and is not cleared here.
     """
     tier = row.get("evidence_tier")
     if isinstance(tier, bool) or not isinstance(tier, int):
@@ -796,9 +798,7 @@ def sync_validation_flags(row: dict) -> None:
                 }
             )
             row["validation_revision_history"] = history
-        row["validation_basis"] = {"statement": statement, "role": role}
-    elif basis is None:
-        row["validation_basis"] = {"statement": statement, "role": role}
+    row["validation_basis"] = {"statement": statement, "role": role}
     if statement_over or role_over:
         row["needs_review"] = True
     row["flags"] = [item for item in current if item not in _VALIDATION_FLAGS] + [
