@@ -71,13 +71,17 @@ def _usable(row: Mapping[str, Any]) -> bool:
 
 
 def graph_supported(row: Mapping[str, Any]) -> bool:
-    """Tier 2 or higher, excluding a weak-stem hypothesis.
+    """Tier 2 or higher, excluding a weak-stem hypothesis and an analyst reading.
 
     ``downstream_eligible`` is not read. A row that was marked eligible and
-    also carries ``weak_stem_anchor`` does not support a core.
+    also carries ``weak_stem_anchor`` does not support a core. An analyst
+    interpretation does not support a core either.
     """
     tier = tier_of(row)
     if not (_usable(row) and tier is not None and tier >= 2):
+        return False
+    flags = {str(item) for item in (row.get("flags") or [])}
+    if "analyst_interpretation" in flags or str(row.get("attribution_source") or "") == "analyst_interpretation":
         return False
     return not weak_stem_relationship(row)
 

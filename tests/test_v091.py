@@ -91,8 +91,8 @@ def _both_cases(row: dict) -> dict:
 
 
 def test_version_is_091():
-    assert __version__ == "0.9.18"
-    assert POLICY_VERSION == "0.9.18"
+    assert __version__ == "0.9.19"
+    assert POLICY_VERSION == "0.9.19"
 
 
 def test_tier_zero_is_category_evidence_and_a_label_is_not_a_quote():
@@ -343,8 +343,9 @@ def test_attribution_needs_a_rival_check_and_only_then_allows_a_cause():
         codebook=book,
         memos=[{"relationship_id": "rel-0001", "text": "The tools for the shift quote shows why coworkers on the crew changed."}],
     )
-    assert memo_only["attribution_source"] == "analyst_memo"
+    assert memo_only["attribution_source"] is None
     assert memo_only["evidence_tier"] == 2
+    assert memo_only["allowed_wording"] == "co-occurs in 2 respondents"
     flags = _memo_flags("tools for the shift lead to coworkers on the crew.", {**row, "evidence_tier": 2, "quote": quote})
     assert "memo_wording_exceeds_tier" in flags
     quiet = _memo_flags("The evidence on this side is partial.", {"quote": QUOTE, "endpoint_anchoring": [{"anchored": True}, {"anchored": False}]})

@@ -56,8 +56,14 @@ _ATTRIBUTION = (
     "attributed to",
 )
 _GROUNDED_STEMS = 2
-_WHY = ("because", "due to", "the reason", "why ")
 _RELEVANT = frozenset({"supports", "contradicts", "qualifies"})
+_ANALYST_LABELS = (
+    "analyst interprets",
+    "analyst interpretation",
+    "i interpret",
+    "my interpretation",
+)
+ANALYST_WORDING = "analyst interprets X as related to Y"
 
 
 def allowed_wording(tier: int | None, n: int | None = None) -> str | None:
@@ -440,29 +446,43 @@ def _participant_attribution(
     return False
 
 
-def _analyst_attribution(
+def _model_memo(memo: Mapping[str, Any]) -> bool:
+    """A memo this package stored from the model, not from an analyst."""
+    actor = str(memo.get("actor") or "").strip().casefold()
+    kind = str(memo.get("kind") or "").strip().casefold()
+    return actor == "model" or kind == "model_memo"
+
+
+def _analyst_interpretation(
     relationship: Mapping[str, Any],
-    cases: Sequence[Mapping[str, Any]],
+    from_terms: set[str],
+    to_terms: set[str],
     memos: Sequence[Mapping[str, Any]] | None,
 ) -> bool:
+    """An explicitly labeled analyst reading that names both endpoints.
+
+    A shared token plus an explanatory word is not that reading. A memo the
+    model wrote cannot stand in for the analyst, and it cannot become
+    participant attribution.
+    """
+    if not from_terms or not to_terms:
+        return False
     relationship_id = str(relationship.get("relationship_id") or "")
-    quote_tokens: set[str] = set()
-    for case in cases:
-        for item in case.get("quotes") or []:
-            quote_tokens |= meaningful_tokens(str(item.get("quote") or ""))
-    quote_tokens |= meaningful_tokens(str(relationship.get("quote") or ""))
-    if not quote_tokens:
+    if not relationship_id:
         return False
     for memo in memos or []:
         if not isinstance(memo, Mapping):
             continue
         if str(memo.get("relationship_id") or "") != relationship_id:
             continue
+        if _model_memo(memo):
+            continue
         text = str(memo.get("text") or "")
         folded = f" {_norm(text)} "
-        if not any(marker in folded for marker in _WHY):
+        if not any(label in folded for label in _ANALYST_LABELS):
             continue
-        if meaningful_tokens(text) & quote_tokens:
+        tokens = _distinctive(text)
+        if tokens & from_terms and tokens & to_terms:
             return True
     return False
 
@@ -503,7 +523,12 @@ def assess_relationship(
     memos: Sequence[Mapping[str, Any]] | None = None,
     pattern_min_cases: int = PATTERN_MIN_CASES,
 ) -> dict[str, Any]:
-    """Score a relationship up to tier 3. Tier 4 is left to ``promote_verified``."""
+    """Score a relationship up to tier 3. Tier 4 is left to ``promote_verified``.
+
+    Tier 3 is a participant quote that states the link. An analyst memo does
+    not raise the tier. A labeled analyst reading stays tier 2 and uses
+    analyst wording.
+    """
     minimum = max(1, int(pattern_min_cases or PATTERN_MIN_CASES))
     if passages is None:
         return _undefined_fields(minimum)
@@ -530,21 +555,24 @@ def assess_relationship(
     variation = _search_report(relationship, kind="variation")
     from_terms = _endpoint_terms(str(relationship.get("from_id") or ""), codebook, segments)
     to_terms = _endpoint_terms(str(relationship.get("to_id") or ""), codebook, segments)
-    attribution = None
-    if _participant_attribution(relationship, cases, usable, from_terms, to_terms):
-        attribution = "participant"
-    elif _analyst_attribution(relationship, both_cases or cases, memos):
-        attribution = "analyst_memo"
+    participant = _participant_attribution(relationship, cases, usable, from_terms, to_terms)
+    analyst = False if participant else _analyst_interpretation(relationship, from_terms, to_terms, memos)
+    attribution = "participant" if participant else ("analyst_interpretation" if analyst else None)
     if not from_cases or not to_cases:
         tier = 0
     elif len(both_cases) >= minimum:
-        tier = 3 if attribution and rival == "reported" else 2
+        # Only a participant quote raises tier 3. An analyst reading stays a pattern.
+        tier = 3 if participant and rival == "reported" else 2
     else:
         tier = 1
+    if analyst and tier == 2:
+        wording = ANALYST_WORDING
+    else:
+        wording = allowed_wording(tier, len(both_cases) if tier >= 2 else None)
     return {
         "evidence_tier": tier,
         "evidence_label": TIER_LABELS[tier],
-        "allowed_wording": allowed_wording(tier, len(both_cases) if tier >= 2 else None),
+        "allowed_wording": wording,
         "cross_case": cross_case if tier == 1 else False,
         "within_case_strength": strength,
         "supporting_cases": cases,
@@ -673,9 +701,10 @@ def relationship_evidence_use(row: Mapping[str, Any]) -> str:
     """Classify a relationship for later stages.
 
     ``supported_evidence`` is the only class that may set ``downstream_eligible``.
-    A tier-1 proposal and a weak-stem anchor are ``hypothesis_exploration``.
-    Rejected, empty, synthetic, unanchored, disputed, and causal-wording rows
-    are ``withheld``. A missing tier is not supported evidence.
+    A tier-1 proposal, a weak-stem anchor, and an analyst interpretation are
+    ``hypothesis_exploration``. Rejected, empty, synthetic, unanchored,
+    disputed, and causal-wording rows are ``withheld``. A missing tier is not
+    supported evidence.
     """
     if not isinstance(row, Mapping) or row.get("synthetic"):
         return WITHHELD_EVIDENCE
@@ -699,6 +728,8 @@ def relationship_evidence_use(row: Mapping[str, Any]) -> str:
     if isinstance(tier_n, int) and tier_n < 3 and "wording_exceeds_tier" in flags:
         return WITHHELD_EVIDENCE
     if "acceptance_withheld" in flags or str(row.get("evidence_status") or "") == "cross_respondent_pattern":
+        return HYPOTHESIS_EXPLORATION
+    if "analyst_interpretation" in flags or str(row.get("attribution_source") or "") == "analyst_interpretation":
         return HYPOTHESIS_EXPLORATION
     if weak_stem_relationship(row) or tier_n is None or tier_n < 2:
         return HYPOTHESIS_EXPLORATION
@@ -810,6 +841,12 @@ def apply_evidence_tier(relationship: dict, **kwargs: Any) -> dict[str, Any]:
     """Write the assessment onto the row. Does not decide disposition or tier 4."""
     fields = assess_relationship(relationship, **kwargs)
     relationship.update(fields)
+    if fields.get("attribution_source") == "analyst_interpretation":
+        flags = [str(item) for item in (relationship.get("flags") or [])]
+        if "analyst_interpretation" not in flags:
+            flags.append("analyst_interpretation")
+        relationship["flags"] = flags
+        relationship["needs_review"] = True
     sync_validation_flags(relationship)
     tier = fields.get("evidence_tier")
     disposition = str(relationship.get("disposition") or "")
