@@ -1346,17 +1346,20 @@ assert coder.call_count == 0, coder.call_count
 assert result.prompt_log
 assert result.metadata["persistence"]["durability"] == "async"
 """
+    root = Path(__file__).resolve().parents[1]
+    assert (root / "automated_grounded_theory").is_dir()
+    assert (root / "tests" / "test_v080.py").is_file()
     db = tmp_path / "axial.sqlite"
     first = subprocess.run(
         [sys.executable, "-c", script, "start", str(db)],
-        cwd="/workspace",
+        cwd=root,
         capture_output=True,
         text=True,
     )
     assert first.returncode == 0, first.stderr
     second = subprocess.run(
         [sys.executable, "-c", script, "resume", str(db)],
-        cwd="/workspace",
+        cwd=root,
         capture_output=True,
         text=True,
     )
