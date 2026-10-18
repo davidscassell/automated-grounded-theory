@@ -68,6 +68,8 @@ from automated_grounded_theory.relationship_tiers import (
     denies_causal_language,
     has_causal_wording,
     promote_verified,
+    role_evidence_overreach,
+    statement_wording_overreach,
     wording_overreach,
 )
 from automated_grounded_theory.validation import GENERIC_CONTENT_STEMS, anchor_quote, locate_quote, meaningful_tokens
@@ -359,7 +361,9 @@ _KIND_PROMPTS = {
         "Every relationship you return must include a nonempty statement. "
         "A function word, or a generic stem such as work, job, or team, is not evidence by itself. "
         "When paradigm_roles lists roles, choose the role the passages support. "
-        "unspecified is not the default when those roles are supplied. "
+        "Use unspecified when the passages support only an association. "
+        "unspecified is a valid role for that association, not a missing value. "
+        "Do not assign consequence or causal_condition unless the passages support that role. "
         "Do not decide saturation and do not set human claim support."
     ),
     "axial_counterexample": (
@@ -1767,8 +1771,6 @@ def _new_relationship(
     flags = []
     if not anchored:
         flags.append("unanchored_quote")
-    if lens == "paradigm" and role == "unspecified":
-        flags.append("paradigm_role_unspecified")
     row = {
         "relationship_id": f"rel-{index:04d}",
         "from_id": str(draft.get("from_id") or ""),
@@ -1795,7 +1797,7 @@ def _new_relationship(
         "negative_cases": [],
         "counterexamples": [],
         "flags": flags,
-        "needs_review": not anchored or "paradigm_role_unspecified" in flags,
+        "needs_review": not anchored,
         "downstream_eligible": anchored,
         "tentative_few_documents": False,
         "negative_case_search": False,
@@ -2144,14 +2146,16 @@ def _tiered_accept(
         target["downstream_eligible"] = True
     statement = " ".join(str(target.get(key) or "") for key in ("statement", "human_statement", "model_statement"))
     role = str(target.get("human_paradigm_role") or target.get("paradigm_role") or target.get("model_paradigm_role") or role or "")
-    if wording_overreach(statement, tier, role=role):
+    statement_over = statement_wording_overreach(statement, tier)
+    role_over = role_evidence_overreach(tier, role)
+    if statement_over or role_over:
         flags = list(target.get("flags") or [])
-        if "wording_exceeds_tier" not in flags:
+        if statement_over and "wording_exceeds_tier" not in flags:
             flags.append("wording_exceeds_tier")
-        if tier < 3:
-            target["downstream_eligible"] = False
-            if "causal_wording_withheld" not in flags:
-                flags.append("causal_wording_withheld")
+        if role_over and "role_evidence_exceeds_tier" not in flags:
+            flags.append("role_evidence_exceeds_tier")
+        if tier < 3 and "causal_wording_withheld" not in flags:
+            flags.append("causal_wording_withheld")
         target["flags"] = flags
         target["needs_review"] = True
     _keep_qualification(target)

@@ -588,15 +588,39 @@ def denies_causal_language(text: str) -> bool:
     )
 
 
+_ROLE_EVIDENCE_ROLES = frozenset({"consequence", "cause", "causal_condition"})
+
+
+def _role_key(role: str) -> str:
+    return str(role or "").strip().casefold().replace(" ", "_")
+
+
+def statement_wording_overreach(text: str, tier: int | None) -> bool:
+    """True when the sentence itself needs a higher tier. The role is ignored."""
+    return wording_overreach(text, tier, role="")
+
+
+def role_evidence_overreach(tier: int | None, role: str = "") -> bool:
+    """True when a causal role is used below tier 3.
+
+    An association can stay ``unspecified``. The role is a separate check from
+    the sentence. A missing tier is not an overreach.
+    """
+    if tier is None:
+        return False
+    return tier < 3 and _role_key(role) in _ROLE_EVIDENCE_ROLES
+
+
 def wording_overreach(text: str, tier: int | None, *, role: str = "") -> bool:
     """True when ``text`` or ``role`` uses wording a higher tier would be needed to license.
 
     A missing tier is undefined and is not an overreach. Role ``consequence``
     or ``cause`` at tier 1 or 2 is causal wording even when the sentence is mild.
+    ``causal_condition`` is reported by :func:`role_evidence_overreach`.
     """
     if tier is None:
         return False
-    chosen = str(role or "").strip().casefold().replace(" ", "_")
+    chosen = _role_key(role)
     if tier < 3 and chosen in _CAUSAL_ROLES:
         return True
     if not str(text or "").strip():
@@ -708,11 +732,16 @@ def apply_evidence_tier(relationship: dict, **kwargs: Any) -> dict[str, Any]:
     role = str(
         relationship.get("human_paradigm_role") or relationship.get("paradigm_role") or relationship.get("model_paradigm_role") or ""
     )
-    if wording_overreach(statement, tier if isinstance(tier, int) else None, role=role) and "wording_exceeds_tier" not in flags:
+    tier_for_wording = tier if isinstance(tier, int) else None
+    statement_over = statement_wording_overreach(statement, tier_for_wording)
+    role_over = role_evidence_overreach(tier_for_wording, role)
+    if statement_over and "wording_exceeds_tier" not in flags:
         flags.append("wording_exceeds_tier")
         relationship["needs_review"] = True
-    if "wording_exceeds_tier" in flags and isinstance(tier, int) and tier < 3:
-        relationship["downstream_eligible"] = False
+    if role_over and "role_evidence_exceeds_tier" not in flags:
+        flags.append("role_evidence_exceeds_tier")
+        relationship["needs_review"] = True
+    if (statement_over or role_over) and isinstance(tier, int) and tier < 3:
         relationship["needs_review"] = True
         if "causal_wording_withheld" not in flags:
             flags.append("causal_wording_withheld")

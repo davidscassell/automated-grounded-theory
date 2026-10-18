@@ -342,3 +342,102 @@ def test_weak_stem_cannot_reach_supported_evidence_consumers(tmp_path: Path):
     assert by_id["rel-strong"]["downstream_eligible"] is True
     assert by_id["rel-causal"]["evidence_use"] == "withheld"
     assert by_id["rel-causal"]["downstream_eligible"] is False
+
+
+def test_association_may_stay_unspecified_and_role_evidence_is_not_statement_wording():
+    """A causal role below tier 3 is still withheld. The sentence is a separate flag.
+
+    unspecified is allowed when the statement is only an association.
+    """
+    from automated_grounded_theory.axial import _KIND_PROMPTS
+    from automated_grounded_theory.gate_evaluation import export_gate_relationships
+    from automated_grounded_theory.relationship_tiers import role_evidence_overreach, wording_overreach
+
+    prompt = _KIND_PROMPTS["axial_proposal"]
+    assert "only an association" in prompt
+    assert "unspecified is not the default" not in prompt
+    assert wording_overreach("The teams met weekly.", 2, role="consequence") is True
+    assert wording_overreach("leads to", 2) is True
+    assert role_evidence_overreach(2, "consequence") is True
+    assert role_evidence_overreach(3, "consequence") is False
+
+    text = "The tools for the shift sit beside coworkers on the crew tonight"
+    corpus = {
+        "codebook": {
+            "tools": {"code_id": "tools", "code": "tools for the shift", "definition": "tools for the shift"},
+            "crew": {"code_id": "crew", "code": "coworkers on the crew", "definition": "coworkers on the crew"},
+        },
+        "passages": [{"passage_id": "p1", "doc_id": "d1", "respondent_id": "r1", "text": text}],
+        "segments": [
+            {"segment_id": "s1", "code_id": "tools", "passage_id": "p1"},
+            {"segment_id": "s2", "code_id": "crew", "passage_id": "p1"},
+        ],
+    }
+
+    class _Roles(FakeAxialCoder):
+        def proposals(self, body):
+            pair = (body.get("pairs") or [{}])[0]
+            from_id = str(pair.get("from_id") or "tools")
+            to_id = str(pair.get("to_id") or "crew")
+            shared = dict(
+                from_id=from_id,
+                to_id=to_id,
+                passage_id="p1",
+                quote_from="tools for the shift sit",
+                quote_to="coworkers on the crew tonight",
+            )
+            return AxialProposalBatch(
+                relationships=[
+                    AxialRelationshipDraft(
+                        paradigm_role="unspecified",
+                        statement="The tools may be related to the crew.",
+                        **shared,
+                    ),
+                    AxialRelationshipDraft(
+                        paradigm_role="consequence",
+                        statement="The teams met weekly.",
+                        **shared,
+                    ),
+                    AxialRelationshipDraft(
+                        paradigm_role="context",
+                        statement="The tools lead to the crew.",
+                        **shared,
+                    ),
+                ]
+            )
+
+    result = axial_code(
+        corpus,
+        _Roles(),
+        seed=3,
+        max_axial_review_calls=1,
+        axial_share_propose=1,
+        axial_share_counterexample=0,
+        batch_size=1,
+        interrupt=False,
+    )
+    by_statement = {row["statement"]: row for row in result.relationships}
+    association = by_statement["The tools may be related to the crew."]
+    assert association["paradigm_role"] == "unspecified"
+    assert "paradigm_role_unspecified" not in association["flags"]
+    assert "role_evidence_exceeds_tier" not in association["flags"]
+    assert "wording_exceeds_tier" not in association["flags"]
+    mild = by_statement["The teams met weekly."]
+    assert "role_evidence_exceeds_tier" in mild["flags"]
+    assert "wording_exceeds_tier" not in mild["flags"]
+    assert "causal_wording_withheld" in mild["flags"]
+    assert mild["downstream_eligible"] is False
+    causal = by_statement["The tools lead to the crew."]
+    assert "wording_exceeds_tier" in causal["flags"]
+    assert "role_evidence_exceeds_tier" not in causal["flags"]
+    assert "causal_wording_withheld" in causal["flags"]
+    gate = export_gate_relationships(result.relationships)
+    rules = {
+        item["relationship_id"]: set(item.get("rules") or [])
+        for bucket in ("accepted", "withheld", "proposed")
+        for item in gate[bucket]
+    }
+    assert "role_evidence" in rules[mild["relationship_id"]]
+    assert "consequence_wording" not in rules[mild["relationship_id"]]
+    assert "consequence_wording" in rules[causal["relationship_id"]]
+    assert "role_evidence" not in rules[causal["relationship_id"]]
