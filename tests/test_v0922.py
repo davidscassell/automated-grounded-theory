@@ -212,14 +212,15 @@ def _gold(adjudication_id, passage_id, **extra):
     return row
 
 
-def _freeze(adjudications):
-    return freeze_discovery_set(
-        {
-            "label": "Synthetic example data only. Not a study result.",
-            "note": "Synthetic example data only. Not a study result.",
-            "adjudications": adjudications,
-        }
-    )
+def _freeze(adjudications, claim_reviews=None):
+    payload = {
+        "label": "Synthetic example data only. Not a study result.",
+        "note": "Synthetic example data only. Not a study result.",
+        "adjudications": adjudications,
+    }
+    if claim_reviews is not None:
+        payload["claim_reviews"] = claim_reviews
+    return freeze_discovery_set(payload)
 
 
 def test_discovery_recall_is_invariant_to_ids_and_order():
@@ -455,16 +456,7 @@ def test_duplicate_system_relationship_ids_are_rejected_or_flagged():
 
 def test_a_denying_statement_does_not_change_structural_recall():
     statement = "c-a does not cause c-b"
-    gold = _gold(
-        "g-deny",
-        "p-1",
-        claim_judgment={
-            "verdict": "incorrect",
-            "direction": "the statement reverses the gold direction",
-            "qualification": "denied",
-            "support": "the quote does not say this",
-        },
-    )
+    gold = _gold("g-deny", "p-1")
     proposal = {
         "relationship_id": "r-deny",
         "from_id": "c-a",
@@ -474,7 +466,17 @@ def test_a_denying_statement_does_not_change_structural_recall():
         "statement": statement,
         "downstream_eligible": True,
     }
-    judged = score_discovery([proposal], _freeze([gold]))
+    review = {
+        "review_id": "rev-deny",
+        "run_id": "run-deny",
+        "relationship_id": "r-deny",
+        "statement": statement,
+        "direction": "from_to",
+        "qualification": "denied",
+        "support": "the quote does not say this",
+        "verdict": "incorrect",
+    }
+    judged = score_discovery([proposal], _freeze([gold], [review]), run_id="run-deny")
     assert judged["discovery_recall"] == 1.0
     assert judged["discovery_precision"] == 1.0
     assert judged["discovery_distortion_rate"] == 0.0
@@ -482,6 +484,7 @@ def test_a_denying_statement_does_not_change_structural_recall():
     assert judged["claim_correct_denominator"] == 1
     assert judged["claim_correct_coverage"] == 1.0
     assert judged["claim_matched_count"] == 1
+    assert judged["claim_stale_count"] == 0
     unjudged_gold = _gold("g-deny", "p-1")
     unjudged = score_discovery([proposal], _freeze([unjudged_gold]))
     assert unjudged["discovery_recall"] == 1.0
@@ -489,17 +492,19 @@ def test_a_denying_statement_does_not_change_structural_recall():
     assert unjudged["claim_correct_denominator"] == 0
     assert unjudged["claim_correct_coverage"] == 0.0
     assert unjudged["claim_matched_count"] == 1
+    assert unjudged["claim_stale_count"] == 0
 
 
 def test_discovery_eval_1_still_verifies_and_freeze_rewrites_the_hash():
-    assert DISCOVERY_SCHEMA_VERSION == "discovery-eval-2"
+    assert DISCOVERY_SCHEMA_VERSION == "discovery-eval-3"
     loaded = load_discovery_file(_EXAMPLE)
-    assert loaded["schema_version"] == "discovery-eval-2"
+    assert loaded["schema_version"] == "discovery-eval-3"
     assert loaded["source_schema_version"] == "discovery-eval-1"
     assert loaded["frozen_hash_status"] == "verified"
     assert all(row["claim_judgment"]["verdict"] == "not_judged" for row in loaded["adjudications"])
     rewritten = freeze_discovery_set(loaded)
-    assert rewritten["schema_version"] == "discovery-eval-2"
+    assert rewritten["schema_version"] == "discovery-eval-3"
+    assert rewritten["source_schema_version"] == "discovery-eval-3"
     assert rewritten["frozen_hash"] != loaded["frozen_hash"]
     assert rewritten["frozen_hash_status"] == "verified"
     scored = score_discovery([], loaded)
@@ -507,5 +512,5 @@ def test_discovery_eval_1_still_verifies_and_freeze_rewrites_the_hash():
     assert scored["source_schema_version"] == "discovery-eval-1"
     tainted = json.loads(_EXAMPLE.read_text(encoding="utf-8"))
     tainted["adjudications"][0]["claim_judgment"] = {"verdict": "correct"}
-    with pytest.raises(DiscoveryEvaluationError, match="discovery-eval-2"):
+    with pytest.raises(DiscoveryEvaluationError, match="discovery-eval-3"):
         load_discovery_file(tainted)

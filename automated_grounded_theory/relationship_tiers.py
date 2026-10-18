@@ -75,6 +75,7 @@ _CLAIM_FLAGS = frozenset(
         "participant_link_contested",
         "participant_link_hypothetical",
         "participant_link_ambiguous",
+        "participant_link_unsupported",
     }
 )
 # Longer phrases are listed with the short ones. Matching keeps the longest
@@ -116,6 +117,21 @@ _DENIAL_RE = re.compile(
 )
 _HYPOTHETICAL_RE = re.compile(
     r"\b(?:if|would|someone said|they said|i heard|suppose|supposing|what if|had said)\b"
+)
+# Epistemic and existential-negation markers. A hit in the clause text before
+# the first connector is unsupported. This is not a list of the only sentences
+# that can fail: any of these markers fails closed. ``doubt`` also matches
+# inside ``no doubt``. No affirmative exception is recognized for that phrase.
+_EPISTEMIC_NEGATION_RE = re.compile(
+    r"\b(?:no evidence|not clear|unclear|doubt(?:ful)?|unknown|not known|"
+    r"nothing to suggest|nothing indicates|nothing to indicate|nothing that|"
+    r"i don't know|i do not know|i dont know|"
+    r"no sign|no indication|no proof|no reason to|"
+    r"not established|not obvious|cannot tell|can't tell|"
+    r"no data|no support|not sure whether|unsure whether|"
+    r"there is no|there are no|there's no|there isn't|there aren't|"
+    r"no doubt|without evidence|absent evidence|lack of evidence|"
+    r"not certain|uncertain|questionable whether|hard to say whether)\b"
 )
 _CLAUSE_SPLIT_RE = re.compile(
     r"[.!?]+|\s+(?:but|although|though|however|while|whereas)\s+|;\s*"
@@ -615,15 +631,47 @@ def _claim_clause(folded: str, from_terms: set[str], to_terms: set[str]) -> str:
     return folded
 
 
+def _recognized_affirmative_prefix(prefix: str) -> bool:
+    """No affirmative exception is recognized for an epistemic or negation marker.
+
+    ``there is no doubt that`` and ``I have no doubt`` stay unsupported.
+    The argument is unused on purpose so a later exception would be a visible
+    change here rather than a silent pass.
+    """
+    del prefix
+    return False
+
+
+def _unsupported_before_connector(clause: str) -> bool:
+    """True when a negation or epistemic marker sits before the first connector.
+
+    The marker may occur anywhere in that prefix, not only at the start.
+    A marker that appears only after the connector does not by itself fail
+    the clause. A clause with no connector is left to the denial rules.
+    """
+    connectors = _connectors(clause)
+    if not connectors:
+        return False
+    pos = min(item[0] for item in connectors)
+    prefix = clause[:pos]
+    if not _EPISTEMIC_NEGATION_RE.search(prefix):
+        return False
+    if _recognized_affirmative_prefix(prefix):
+        return False
+    return True
+
+
 def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dict[str, Any] | None:
     """Read one candidate quote. A keyword hit is not itself a tier-3 authorization.
 
     The rule is deterministic. It does not call a model. Tier 3 requires one
     clause, one recognized connector, affirmative polarity, no hedge, and the
     from-to direction. Passive voice reverses ``caused by`` and ``led to by``.
-    Negation that governs the connector denies the link. ``if``, ``would``,
-    and ``someone said`` are hypothetical. Anything else that is not one clear
-    pattern stays unvalidated. This is not a general reading of the sentence.
+    Negation that governs the connector denies the link. An epistemic or
+    existential-negation marker before that connector is unsupported and does
+    not authorize tier 3. ``if``, ``would``, and ``someone said`` are
+    hypothetical. Anything else that is not one clear pattern stays
+    unvalidated. This is not a general reading of the sentence.
     """
     folded = _norm(text)
     if not folded:
@@ -644,7 +692,12 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
         polarity = "negative"
     hedging = "hedged" if _HEDGE_RE.search(clause_padded) else "none"
     hypothetical = bool(_HYPOTHETICAL_RE.search(clause_padded))
-    if direction == "ambiguous":
+    unsupported = _unsupported_before_connector(clause)
+    if unsupported:
+        status = "unsupported"
+        if direction == "ambiguous":
+            direction = None
+    elif direction == "ambiguous":
         status = "ambiguous"
         direction = None
     elif hypothetical:
@@ -680,6 +733,8 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
         qualifications.append("participant_link_hypothetical")
     elif status == "ambiguous":
         qualifications.append("participant_link_ambiguous")
+    elif status == "unsupported":
+        qualifications.append("participant_link_unsupported")
     return {
         "link_text": str(text).strip(),
         "stated_direction": direction,
@@ -760,6 +815,7 @@ def _participant_link(
             "ambiguous",
             "direction_unspecified",
             "not_a_link",
+            "unsupported",
             "unvalidated",
         )
         chosen = sorted(readings, key=lambda item: order.index(item["status"]) if item["status"] in order else len(order))[0]
@@ -1208,6 +1264,8 @@ def _claim_flags(claims: Mapping[str, Any]) -> list[str]:
         flags.append("participant_link_hypothetical")
     if status == "ambiguous":
         flags.append("participant_link_ambiguous")
+    if status == "unsupported":
+        flags.append("participant_link_unsupported")
     analyst = claims.get("analyst_interpretation") if isinstance(claims.get("analyst_interpretation"), Mapping) else {}
     if analyst.get("present"):
         flags.append("analyst_interpretation")
@@ -1587,4 +1645,124 @@ def classify_pair_evidence(
         "pairs_reaching_pattern_min_cases": reaching,
         "pattern_min_cases": minimum,
         "code_count": len(ids),
+    }
+
+
+def _attribution_probe(quote: str) -> dict[str, Any]:
+    """Score one synthetic tools/crew quote with the public tier function.
+
+    The corpus is the same shape the regression tests use: two respondents,
+    a rival passage, and endpoint labels. It is not study data.
+    """
+    text = f"The tools for the shift sit beside coworkers on the crew tonight {quote}"
+    passages = {
+        "p1": {"passage_id": "p1", "doc_id": "d1", "respondent_id": "r1", "text": text},
+        "p2": {"passage_id": "p2", "doc_id": "d2", "respondent_id": "r2", "text": text},
+        "p3": {
+            "passage_id": "p3",
+            "doc_id": "d3",
+            "respondent_id": "r3",
+            "text": "The schedule changed and nobody mentioned either side.",
+        },
+    }
+    codebook = {
+        "tools": {"code_id": "tools", "code": "tools for the shift", "definition": "tools for the shift"},
+        "crew": {"code_id": "crew", "code": "coworkers on the crew", "definition": "coworkers on the crew"},
+    }
+    segments = [
+        {"segment_id": "s1", "code_id": "tools", "passage_id": "p1", "quote": "tools for the shift sit"},
+        {"segment_id": "s2", "code_id": "crew", "passage_id": "p1", "quote": "coworkers on the crew tonight"},
+        {"segment_id": "s3", "code_id": "tools", "passage_id": "p2", "quote": "tools for the shift sit"},
+        {"segment_id": "s4", "code_id": "crew", "passage_id": "p2", "quote": "coworkers on the crew tonight"},
+    ]
+    row = {
+        "relationship_id": "rel-probe",
+        "from_id": "tools",
+        "to_id": "crew",
+        "passage_id": "p1",
+        "quote": "",
+        "quote_from": "tools for the shift sit",
+        "quote_to": "coworkers on the crew tonight",
+        "statement": "tools for the shift may be related to coworkers on the crew",
+        "disposition": "proposed",
+        "flags": [],
+        "evidence_condition": "anchored",
+        "paradigm_role": "unspecified",
+        "counterexamples": [
+            {
+                "passage_id": "p3",
+                "judgment": "contradicts",
+                "valid_test": True,
+                "synthetic": False,
+                "quote": "The schedule changed",
+            }
+        ],
+        "case_quotes": [
+            {"passage_id": "p1", "quote": quote, "endpoint": "both"},
+            {"passage_id": "p2", "quote": quote, "endpoint": "both"},
+            {"passage_id": "p1", "quote": "tools for the shift sit", "endpoint": "from"},
+            {"passage_id": "p1", "quote": "coworkers on the crew tonight", "endpoint": "to"},
+            {"passage_id": "p2", "quote": "tools for the shift sit", "endpoint": "from"},
+            {"passage_id": "p2", "quote": "coworkers on the crew tonight", "endpoint": "to"},
+        ],
+    }
+    apply_evidence_tier(row, passages=passages, codebook=codebook, segments=segments, memos=[])
+    return row
+
+
+def score_attribution_accuracy(cases: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+    """Score the deterministic attribution rule on quotes a caller supplies.
+
+    ``None`` or an empty list leaves ``accuracy`` null and ``correct_count``
+    null. This function does not load the packaged adversarial fixtures.
+    Those fixtures are regression coverage, not this metric. No model is called.
+    Each case needs ``quote`` and ``expected_status``. ``authorizes_tier_3``
+    is checked when the case includes it.
+    """
+    empty = {
+        "accuracy": None,
+        "denominator": 0,
+        "correct_count": None,
+        "model_judgments_used": False,
+        "note": (
+            "No external quotes were supplied. "
+            "The packaged attribution fixtures are regression coverage, not this metric."
+        ),
+    }
+    if not cases:
+        return empty
+    correct = 0
+    rows: list[dict[str, Any]] = []
+    for case in cases:
+        if not isinstance(case, Mapping):
+            raise ValueError("An attribution accuracy case must be an object.")
+        quote = str(case.get("quote") or "")
+        expected = case.get("expected_status", case.get("status"))
+        expected_status = None if expected is None else str(expected)
+        assessed = _attribution_probe(quote)
+        link = assessed.get("participant_link") if isinstance(assessed.get("participant_link"), Mapping) else {}
+        status_ok = expected_status is not None and link.get("status") == expected_status
+        auth_ok = True
+        if "authorizes_tier_3" in case:
+            auth_ok = link.get("authorizes_tier_3") is case.get("authorizes_tier_3")
+        ok = status_ok and auth_ok
+        correct += int(ok)
+        rows.append(
+            {
+                "quote": quote,
+                "expected_status": expected_status,
+                "status": link.get("status"),
+                "authorizes_tier_3": link.get("authorizes_tier_3"),
+                "evidence_tier": assessed.get("evidence_tier"),
+                "correct": ok,
+            }
+        )
+    total = len(rows)
+    return {
+        "accuracy": round(correct / total, 4) if total else None,
+        "denominator": total,
+        "correct_count": correct,
+        "model_judgments_used": False,
+        "note": "Scored only the quotes passed in. The packaged fixtures were not loaded.",
+        "cases": rows,
     }

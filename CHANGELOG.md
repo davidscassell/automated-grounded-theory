@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.23
+
+- A `system_proposal` review no longer removes its proposal from independent discovery matching. The same proposal can be recovered for structural recall and linked for the review. Structural recall and precision do not change when proposal reviews are added or removed. The gate false-negative population is still per adjudication, so a review can change that rate.
+- Discovery assignment gives every gold item an unmatched option. The objective is lexicographic: full-agreement recoveries, then structural matches, then canonical content order that does not use ids. One full recovery beats any number of distorted matches. Matching runs on candidate-connected components, one solve each.
+- Claim reviews are stored apart from independent gold. Each review is bound to a run id, a relationship id, and `claim_statement_hash` of the statement, direction, and qualification. A changed statement, a changed direction, or a missing or different run is stale and unjudged, not correct. `claim_correct_rate` counts fresh reviews on independent matches and on id-bound proposals, once per relationship, and is null when nothing was judged. `claim_stale_count` is separate.
+- The schema is `discovery-eval-3`. `discovery-eval-1` and `discovery-eval-2` files still verify under their old hashes. An unbound claim judgment loads as stale or unjudged and is never scored correct. Freezing rewrites the file to `discovery-eval-3` and a new hash.
+- An epistemic or existential-negation marker before a connector, including "there is no evidence that", does not authorize tier 3. `there is no doubt` fails closed. The synthetic fixture is `tests/fixtures/attribution_adversarial_2.json`. Passing it is regression coverage, not general semantic accuracy. `score_attribution_accuracy` scores only quotes the caller supplies and is null when none are supplied.
+- The axial planner still builds the full pair space in memory. That limit is open. `pattern_min_cases` stays 2. The axial token ceiling stays 24000. `batch_size` stays 1. Tier 4 stays human-only. The review note is [docs/design-review-fixes-0923.md](docs/design-review-fixes-0923.md). `policy_version` is `0.9.23`.
+
 ## 0.9.22
 
 - Axial `examined_pairs` records completed examinations only, including a valid empty `nothing_to_propose` response. Planned, attempted, and completed counts are separate. `unique_pairs_explored` counts completed pairs. A failed, timed-out, or unsent pair stays retryable. A 0.9.20 or 0.9.21 `examined_pairs` list was written at planning time and cannot be split; passing it still excludes every pair in it.
