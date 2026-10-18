@@ -40,8 +40,8 @@ from tests.test_v090 import FakeSamplingCoder, _kwargs
 
 
 def test_version_is_097():
-    assert __version__ == "0.9.11"
-    assert POLICY_VERSION == "0.9.11"
+    assert __version__ == "0.9.12"
+    assert POLICY_VERSION == "0.9.12"
 
 
 def test_consequence_wording_fails_the_tier_gate_and_the_reviewer_is_checked():
@@ -320,7 +320,14 @@ def test_selection_above_the_call_allowance_stops_for_that_allowance():
         {"direction_id": "dir-1-0002", "passage_id": "p2"},
         {"direction_id": "dir-1-0003", "passage_id": "p3"},
     ]
-    assert metadata["scheduled_reread_pairs"] == [{"direction_id": "dir-1-0001", "passage_id": "p1"}]
+    assert metadata["scheduled_reread_pairs"] == [
+        {
+            "direction_id": "dir-1-0001",
+            "passage_id": "p1",
+            "question_key": "thin_category:c-prep",
+            "direction_key": "thin_category:c-prep",
+        }
+    ]
     assert len(metadata["sampling_selection_unsent_pairs"]) == 2
     assert {row["reason"] for row in metadata["sampling_selection_unsent_pairs"]} == {"call_allowance"}
 

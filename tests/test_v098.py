@@ -33,8 +33,8 @@ from tests.test_v090 import FakeSamplingCoder, _kwargs, _payload
 
 
 def test_version_is_098():
-    assert __version__ == "0.9.11"
-    assert POLICY_VERSION == "0.9.11"
+    assert __version__ == "0.9.12"
+    assert POLICY_VERSION == "0.9.12"
 
 
 def _prep_group(groups, directions):
@@ -180,7 +180,13 @@ def test_brief_only_keeps_the_selection_when_no_reread_is_requested():
     assert reread["sampling_stop"] == "call_allowance"
     assert reread["model_sampling_status"] == "budget_limited"
     assert reread["reread_unsent_pairs"] == [
-        {"direction_id": "dir-1-0001", "passage_id": "p1", "reason": "call_allowance"}
+        {
+            "direction_id": "dir-1-0001",
+            "passage_id": "p1",
+            "reason": "call_allowance",
+            "question_key": "thin_category:c-prep",
+            "direction_key": "thin_category:c-prep",
+        }
     ]
 
     sent = theoretical_sample(

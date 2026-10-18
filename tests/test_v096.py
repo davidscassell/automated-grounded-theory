@@ -16,8 +16,8 @@ from tests.test_v090 import FakeSamplingCoder, _kwargs, _payload
 
 
 def test_version_is_096():
-    assert __version__ == "0.9.11"
-    assert POLICY_VERSION == "0.9.11"
+    assert __version__ == "0.9.12"
+    assert POLICY_VERSION == "0.9.12"
 
 
 class _RereadRepairTimeout(FakeSamplingCoder):
@@ -176,10 +176,17 @@ def test_a_withheld_pair_is_not_labeled_as_the_timeout():
     assert coder.rereads == 1
     assert partial.metadata["stop"] == "timeout"
     assert partial.metadata["status"] == "incomplete"
-    assert partial.metadata["reread_failed_pairs"] == [{"direction_id": second, "passage_id": "p-low"}]
+    failed = partial.metadata["reread_failed_pairs"]
+    assert [(row["direction_id"], row["passage_id"]) for row in failed] == [(second, "p-low")]
+    second_direction = next(row for row in paused.directions if row["direction_id"] == second)
+    assert failed[0]["question_key"] == f"{second_direction['kind']}:{second_direction['target_id']}"
     assert partial.metadata["reread_active_pair"] == {"direction_id": second, "passage_id": "p-low"}
     withheld = partial.metadata["reread_unsent_pairs"]
-    assert {"direction_id": first, "passage_id": "p-huge", "reason": "request_budget"} in withheld
+    first_direction = next(row for row in paused.directions if row["direction_id"] == first)
+    withheld_row = next(row for row in withheld if row["passage_id"] == "p-huge")
+    assert withheld_row["direction_id"] == first
+    assert withheld_row["reason"] == "request_budget"
+    assert withheld_row["question_key"] == f"{first_direction['kind']}:{first_direction['target_id']}"
     assert all(row.get("passage_id") != "p-huge" for row in partial.metadata["reread_failed_pairs"])
     assert all(row.get("passage_id") != "p-huge" for row in partial.metadata.get("reread_unattempted_pairs") or [])
     assert partial.metadata["provider_budget"]["calls_used"] == 1
