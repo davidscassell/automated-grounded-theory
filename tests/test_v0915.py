@@ -921,3 +921,106 @@ def test_focused_repair_stall_keeps_the_original_response(tmp_path: Path):
     preserved = next(iter(holds.values()))
     assert preserved["usage"]["total_tokens"] == 18
     assert "focused-original" in preserved["raw_response"]
+
+
+class _RateCoder(FakeAxialCoder):
+    def with_structured_output(self, schema, **kwargs):
+        def _call(messages):
+            self.call_count += 1
+            error = RuntimeError("rate limit")
+            error.status_code = 429
+            raise error
+
+        return RunnableLambda(_call)
+
+
+class _BoomCoder(FakeAxialCoder):
+    def with_structured_output(self, schema, **kwargs):
+        def _call(messages):
+            raise RuntimeError("provider exploded")
+
+        return RunnableLambda(_call)
+
+
+class _NullStatementCoder(FakeAxialCoder):
+    seen: str = ""
+
+    def with_structured_output(self, schema, **kwargs):
+        parent = FakeAxialCoder.with_structured_output(self, schema, **kwargs)
+
+        def _call(messages):
+            text = _texts(messages)
+            if getattr(schema, "__name__", "") == "AxialProposalBatch" and "REPAIR THIS OUTPUT" not in text:
+                self.call_count += 1
+                raw = AIMessage(content='{"relationships":[{"from_id":"c-prep","to_id":"c-return","statement":null}]}')
+                return {"raw": raw, "parsed": None, "parsing_error": ValueError("statement is null")}
+            self.seen = text
+            return parent.invoke(messages)
+
+        return RunnableLambda(_call)
+
+
+def test_failure_routes_stay_separate():
+    """Retries, repair, analytic outcomes, interrupts, and crashes stay apart.
+
+    provider_max_attempts counts the initial call. The graph does not multiply
+    it. The stage call allowance stops the retries first. A null statement is
+    repair feedback. Missing category evidence is recorded, not raised. A
+    missing researcher decision pauses with interrupt(). An unexpected error
+    propagates.
+    """
+    limited = _RateCoder()
+    stopped = axial_code(
+        _corpus(),
+        limited,
+        seed=3,
+        provider_max_attempts=4,
+        retry_backoff=0,
+        max_axial_review_calls=2,
+        axial_share_propose=1,
+        axial_share_counterexample=0,
+        batch_size=1,
+        interrupt=False,
+    )
+    assert limited.call_count == 2
+    assert stopped.metadata["axial_stop"] == "call_allowance"
+    assert stopped.metadata["retry_policy"] == {
+        "provider_max_attempts": 4,
+        "graph_max_attempts": 1,
+        "counts_initial_attempt": True,
+    }
+
+    with pytest.raises(RuntimeError, match="provider exploded"):
+        axial_code(_corpus(), _BoomCoder(), **_COMMON)
+
+    repaired = _NullStatementCoder()
+    axial_code(_corpus(), repaired, **_COMMON)
+    assert "REPAIR THIS OUTPUT" in repaired.seen
+    assert "statement" in repaired.seen.casefold()
+
+    source = _corpus()
+    source["segments"] = []
+    deferred = axial_code(
+        source,
+        FakeAxialCoder(),
+        seed=3,
+        axial_token_budget=1,
+        max_axial_review_calls=2,
+        batch_size=1,
+        interrupt=False,
+    )
+    assert deferred.metadata["missing_category_evidence"]
+    assert any(row.get("reason") == "missing_category_evidence" and row.get("status") == "deferred" for row in deferred.prompt_log)
+
+    paused = axial_code(
+        _corpus(),
+        FakeAxialCoder(),
+        seed=3,
+        max_axial_review_calls=1,
+        axial_share_propose=1,
+        axial_share_counterexample=0,
+        batch_size=1,
+        interrupt=True,
+    )
+    assert paused.interrupted is True
+    assert paused.interrupt_payload["kind"] == "axial_relations"

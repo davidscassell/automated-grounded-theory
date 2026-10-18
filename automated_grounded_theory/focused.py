@@ -6040,7 +6040,10 @@ def _watched_node_kwargs(seconds: float) -> dict[str, Any]:
 
     ``NodeTimeoutError`` is retryable under LangGraph's default policy. Leaving
     the policy unset is what the graph does today. Setting ``max_attempts`` to 1
-    keeps a stuck step from running the watchdog twice. Human checkpoints pass
+    keeps a stuck step from running the watchdog twice and keeps the graph from
+    multiplying the limiter's provider attempts. Those attempts include the
+    initial call (``focused_request_retries`` extra tries; the default 4 is 5
+    attempts) and each one spends the call allowance. Human checkpoints pass
     0 and stay unwrapped, so ``interrupt()`` is unchanged.
     """
     timeout = _positive_timeout(seconds)
@@ -6550,6 +6553,11 @@ async def afocused_code(
         "model": manifest["model"],
         "saturation_judgment": None,
         "decision_mode": decision_mode,
+        "retry_policy": {
+            "provider_max_attempts": int(procedure["focused_request_retries"]) + 1,
+            "graph_max_attempts": 1,
+            "counts_initial_attempt": True,
+        },
     }
     limit = recursion_limit if recursion_limit is not None else max(250, 8 * max(1, len(source.passages)) + 40)
     runtime = FocusedRuntime(
@@ -6563,7 +6571,7 @@ async def afocused_code(
         token_budget=performance["token_budget"],
         limiter=CallLimiter(
             performance["concurrency"],
-            max_retries=int(procedure["focused_request_retries"]),
+            max_attempts=int(procedure["focused_request_retries"]) + 1,
             request_timeout=float(procedure["focused_request_timeout"]),
             wall_timeout=float(procedure["focused_request_timeout"]),
             provider_allowance=ProviderAllowance(

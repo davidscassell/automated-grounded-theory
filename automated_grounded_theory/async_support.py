@@ -311,6 +311,7 @@ class CallLimiter:
         concurrency: int = 2,
         *,
         max_retries: int = 4,
+        max_attempts: int | None = None,
         backoff: float = 0.5,
         max_backoff: float = 8.0,
         tokens_per_minute: float = 0,
@@ -326,7 +327,16 @@ class CallLimiter:
         self.concurrency = max(1, int(concurrency))
         self.max_concurrency = self.concurrency
         self.limit = self.concurrency
+        # max_attempts counts the initial call. max_retries is the extra tries.
+        # Passing max_attempts replaces max_retries. The default remains 4 retries
+        # (5 attempts) when neither is used to change that count.
+        if max_attempts is not None:
+            attempts = int(max_attempts)
+            if attempts < 1:
+                raise ValueError("max_attempts includes the initial attempt and must be at least 1.")
+            max_retries = attempts - 1
         self.max_retries = max(0, int(max_retries))
+        self.max_attempts = self.max_retries + 1
         self.backoff = max(0.0, float(backoff))
         self.max_backoff = max(self.backoff, float(max_backoff))
         self.tokens_per_minute = max(0.0, float(tokens_per_minute))

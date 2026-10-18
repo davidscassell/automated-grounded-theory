@@ -335,13 +335,19 @@ class AxialRuntime:
     step_timeout: float = 0.0
     decision_step_timeout: float = 0.0
     selective_step_timeout: float = 0.0
+    provider_max_attempts: int = 1
+    retry_backoff: float = 0.5
     limiter: CallLimiter = field(init=False)
 
     def __post_init__(self) -> None:
         timeout = float(self.request_timeout or 0)
+        attempts = int(self.provider_max_attempts)
+        if attempts < 1:
+            raise AxialError("provider_max_attempts includes the initial attempt and must be at least 1.")
         self.limiter = CallLimiter(
             1,
-            max_retries=0,
+            max_attempts=attempts,
+            backoff=float(self.retry_backoff),
             request_timeout=timeout,
             wall_timeout=timeout if timeout > 0 else None,
         )
@@ -2613,6 +2619,13 @@ def _positive_timeout(seconds: float) -> float | None:
 
 
 def _watched(seconds: float) -> dict[str, Any]:
+    """One graph attempt. Provider retries live on the limiter, not here.
+
+    LangGraph's default policy would run a timed-out node again. ``max_attempts``
+    of 1 keeps that from multiplying the limiter's ``provider_max_attempts``.
+    Each limiter attempt spends the stage allowance, so the call budget is the
+    ceiling for the combined tries.
+    """
     timeout = _positive_timeout(seconds)
     if timeout is None:
         return {}
@@ -6479,6 +6492,8 @@ def _runtime(
     selective_call_ceiling: int | None = None,
     tokens_already: int = 0,
     token_reserve: int = 0,
+    provider_max_attempts: int = 1,
+    retry_backoff: float = 0.5,
 ) -> AxialRuntime:
     reviewer = None
     if decision_mode == "llm" and int(decision_calls) > 0:
@@ -6502,6 +6517,8 @@ def _runtime(
         step_timeout=_step_watchdog(request_timeout, calls),
         decision_step_timeout=decision_watch,
         selective_step_timeout=_step_watchdog(request_timeout, max(1, selective_calls)),
+        provider_max_attempts=int(provider_max_attempts),
+        retry_backoff=float(retry_backoff),
     )
     stages: dict[str, int] = {}
     if coding_calls is not None:
@@ -6562,6 +6579,8 @@ async def aaxial_code(
     output_dir: str | Path | None = None,
     raise_on_timeout: bool = False,
     recursion_limit: int | None = None,
+    provider_max_attempts: int = 1,
+    retry_backoff: float = 0.5,
 ) -> AxialResult:
     """Propose paradigm relationships and saturation indicators.
 
@@ -6582,6 +6601,8 @@ async def aaxial_code(
         raise AxialError("axial_token_budget must be zero or more.")
     if int(pattern_min_cases) < 1:
         raise AxialError("pattern_min_cases must be at least 1.")
+    if int(provider_max_attempts) < 1:
+        raise AxialError("provider_max_attempts includes the initial attempt and must be at least 1.")
     if abs((axial_share_propose + axial_share_counterexample) - 1) > 1e-9:
         raise AxialError("axial shares must sum to 1.")
     data = _source_mapping(source)
@@ -6622,6 +6643,11 @@ async def aaxial_code(
         "saturation_judgment": None,
         "seed": procedure["seed"],
         "seed_source": procedure["seed_source"],
+        "retry_policy": {
+            "provider_max_attempts": int(provider_max_attempts),
+            "graph_max_attempts": 1,
+            "counts_initial_attempt": True,
+        },
         **record_model_determinism(model, seed=int(procedure["seed"])),
     }
     runtime = _runtime(
@@ -6640,6 +6666,8 @@ async def aaxial_code(
         coding_calls=int(procedure["max_axial_review_calls"]),
         review_calls=int(max_decision_calls) if decision_mode == "llm" else 0,
         token_reserve=int(procedure.get("storyline_token_reserve") or 0),
+        provider_max_attempts=int(provider_max_attempts),
+        retry_backoff=float(retry_backoff),
     )
     from langgraph.checkpoint.memory import InMemorySaver
 
