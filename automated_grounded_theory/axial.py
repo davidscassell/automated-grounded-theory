@@ -29,9 +29,11 @@ from automated_grounded_theory.async_support import (
     CallLimiter,
     ProviderAllowance,
     ainvoke_structured,
+    node_watchdog,
     parse_structured,
     run_sync,
     structured_runnable,
+    timeout_policy,
     usage_from_result,
 )
 from automated_grounded_theory.backends import (
@@ -6494,6 +6496,7 @@ def _runtime(
     token_reserve: int = 0,
     provider_max_attempts: int = 1,
     retry_backoff: float = 0.5,
+    node_timeout: float | None = None,
 ) -> AxialRuntime:
     reviewer = None
     if decision_mode == "llm" and int(decision_calls) > 0:
@@ -6506,7 +6509,6 @@ def _runtime(
             token_budget=token_budget,
         )
     calls = max(propose_calls, counter_calls, 1)
-    decision_watch = _step_watchdog(request_timeout, int(decision_calls)) if decision_mode == "llm" and int(decision_calls) > 0 else 0.0
     runtime = AxialRuntime(
         coder=model,
         reviewer=reviewer,
@@ -6514,9 +6516,13 @@ def _runtime(
         request_timeout=request_timeout,
         include_memos=include_memos,
         include_storyline=include_storyline,
-        step_timeout=_step_watchdog(request_timeout, calls),
-        decision_step_timeout=decision_watch,
-        selective_step_timeout=_step_watchdog(request_timeout, max(1, selective_calls)),
+        step_timeout=node_watchdog(request_timeout, calls, node_timeout),
+        decision_step_timeout=(
+            node_watchdog(request_timeout, int(decision_calls), node_timeout)
+            if decision_mode == "llm" and int(decision_calls) > 0
+            else 0.0
+        ),
+        selective_step_timeout=node_watchdog(request_timeout, max(1, selective_calls), node_timeout),
         provider_max_attempts=int(provider_max_attempts),
         retry_backoff=float(retry_backoff),
     )
@@ -6581,6 +6587,8 @@ async def aaxial_code(
     recursion_limit: int | None = None,
     provider_max_attempts: int = 1,
     retry_backoff: float = 0.5,
+    idle_timeout: float | None = None,
+    node_timeout: float | None = None,
 ) -> AxialResult:
     """Propose paradigm relationships and saturation indicators.
 
@@ -6650,25 +6658,35 @@ async def aaxial_code(
         },
         **record_model_determinism(model, seed=int(procedure["seed"])),
     }
-    runtime = _runtime(
-        model,
-        decision_mode=decision_mode,
-        decision_model=decision_model,
-        request_timeout=float(axial_request_timeout),
-        include_memos=False,
-        include_storyline=False,
-        propose_calls=int(procedure["propose_calls"]),
-        counter_calls=int(procedure["counterexample_calls"]),
-        selective_calls=max_selective_review_calls,
-        decision_calls=max_decision_calls,
-        max_review_tokens=max_axial_review_tokens,
-        token_budget=axial_token_budget,
-        coding_calls=int(procedure["max_axial_review_calls"]),
-        review_calls=int(max_decision_calls) if decision_mode == "llm" else 0,
-        token_reserve=int(procedure.get("storyline_token_reserve") or 0),
-        provider_max_attempts=int(provider_max_attempts),
-        retry_backoff=float(retry_backoff),
-    )
+    try:
+        runtime = _runtime(
+            model,
+            decision_mode=decision_mode,
+            decision_model=decision_model,
+            request_timeout=float(axial_request_timeout),
+            include_memos=False,
+            include_storyline=False,
+            propose_calls=int(procedure["propose_calls"]),
+            counter_calls=int(procedure["counterexample_calls"]),
+            selective_calls=max_selective_review_calls,
+            decision_calls=max_decision_calls,
+            max_review_tokens=max_axial_review_tokens,
+            token_budget=axial_token_budget,
+            coding_calls=int(procedure["max_axial_review_calls"]),
+            review_calls=int(max_decision_calls) if decision_mode == "llm" else 0,
+            token_reserve=int(procedure.get("storyline_token_reserve") or 0),
+            provider_max_attempts=int(provider_max_attempts),
+            retry_backoff=float(retry_backoff),
+            node_timeout=node_timeout,
+        )
+        metadata["timeout_policy"] = timeout_policy(
+            run_timeout_seconds=float(axial_request_timeout),
+            idle_timeout_seconds=idle_timeout,
+            node_timeout_seconds=runtime.step_timeout,
+            node_timeout_default=node_timeout is None,
+        )
+    except ValueError as exc:
+        raise AxialError(str(exc)) from exc
     from langgraph.checkpoint.memory import InMemorySaver
 
     saver = checkpointer if checkpointer is not None else InMemorySaver()
@@ -6704,6 +6722,8 @@ async def aaxial_code(
             axial_token_budget=axial_token_budget,
             batch_size=batch_size,
             axial_request_timeout=axial_request_timeout,
+            idle_timeout=idle_timeout,
+            node_timeout=node_timeout,
             interrupt=interrupt,
             checkpointer=saver,
             thread_id=f"{thread}:selective",
@@ -6737,6 +6757,8 @@ async def aselective_code(
     output_dir: str | Path | None = None,
     raise_on_timeout: bool = False,
     recursion_limit: int | None = None,
+    idle_timeout: float | None = None,
+    node_timeout: float | None = None,
 ) -> AxialResult:
     """Score core candidates. Memos and the storyline run only when asked."""
     if decision_mode not in {"human", "llm"}:
@@ -6812,24 +6834,34 @@ async def aselective_code(
     metadata["seed_source"] = seed_source
     metadata.update(record_model_determinism(model, seed=resolved_seed))
     metadata.setdefault("researcher_core_id", "")
-    runtime = _runtime(
-        model,
-        decision_mode=decision_mode,
-        decision_model=decision_model,
-        request_timeout=float(axial_request_timeout),
-        include_memos=include_memos,
-        include_storyline=include_storyline,
-        propose_calls=1,
-        counter_calls=1,
-        selective_calls=max_selective_review_calls if (include_memos or include_storyline) else 1,
-        decision_calls=max_decision_calls,
-        max_review_tokens=max_axial_review_tokens,
-        token_budget=axial_token_budget,
-        selective_call_ceiling=int(max_selective_review_calls if (include_memos or include_storyline) else 0),
-        review_calls=int(max_decision_calls) if decision_mode == "llm" else 0,
-        tokens_already=int(metadata.get("axial_tokens_estimated") or 0),
-        token_reserve=int(procedure.get("storyline_token_reserve") or 0),
-    )
+    try:
+        runtime = _runtime(
+            model,
+            decision_mode=decision_mode,
+            decision_model=decision_model,
+            request_timeout=float(axial_request_timeout),
+            include_memos=include_memos,
+            include_storyline=include_storyline,
+            propose_calls=1,
+            counter_calls=1,
+            selective_calls=max_selective_review_calls if (include_memos or include_storyline) else 1,
+            decision_calls=max_decision_calls,
+            max_review_tokens=max_axial_review_tokens,
+            token_budget=axial_token_budget,
+            selective_call_ceiling=int(max_selective_review_calls if (include_memos or include_storyline) else 0),
+            review_calls=int(max_decision_calls) if decision_mode == "llm" else 0,
+            tokens_already=int(metadata.get("axial_tokens_estimated") or 0),
+            token_reserve=int(procedure.get("storyline_token_reserve") or 0),
+            node_timeout=node_timeout,
+        )
+        metadata["timeout_policy"] = timeout_policy(
+            run_timeout_seconds=float(axial_request_timeout),
+            idle_timeout_seconds=idle_timeout,
+            node_timeout_seconds=runtime.selective_step_timeout,
+            node_timeout_default=node_timeout is None,
+        )
+    except ValueError as exc:
+        raise AxialError(str(exc)) from exc
     _carry_budget(runtime.limiter.provider_allowance, metadata.get("provider_budget"))
     from langgraph.checkpoint.memory import InMemorySaver
 

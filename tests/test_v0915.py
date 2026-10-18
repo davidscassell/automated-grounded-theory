@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -13,6 +15,7 @@ from pydantic import Field, ValidationError
 
 from automated_grounded_theory import axial_code, selective_code
 from automated_grounded_theory.async_support import CallLimiter, ainvoke_structured, run_sync
+from automated_grounded_theory.axial import AxialError
 from automated_grounded_theory.axial import AxialProposalBatch, AxialRelationshipDraft, export_axial_state
 from automated_grounded_theory.graph_grounding import graph_supported
 from tests.fake_focused import FakeFocusedCoder
@@ -1024,3 +1027,155 @@ def test_failure_routes_stay_separate():
     )
     assert paused.interrupted is True
     assert paused.interrupt_payload["kind"] == "axial_relations"
+
+
+class _TimeoutHold:
+    """One stalled provider. ``block`` is a synchronous sleep; ``async`` yields."""
+
+    def __init__(self, done: threading.Event, *, delay: float, block: bool):
+        self.done = done
+        self.delay = delay
+        self.block = block
+
+    async def ainvoke(self, payload):
+        if self.block:
+            time.sleep(self.delay)
+        else:
+            await asyncio.sleep(self.delay)
+        self.done.set()
+        raw = AIMessage(content="{}")
+        return {"raw": raw, "parsed": None, "parsing_error": ValueError("stall")}
+
+
+class _TimeoutCoder(FakeAxialCoder):
+    def __init__(self, done: threading.Event, *, delay: float, block: bool):
+        super().__init__()
+        object.__setattr__(self, "_hold", _TimeoutHold(done, delay=delay, block=block))
+
+    def with_structured_output(self, schema, **kwargs):
+        return object.__getattribute__(self, "_hold")
+
+
+class _PicklableSleeper:
+    def __init__(self, seconds: float):
+        self.seconds = seconds
+
+    async def ainvoke(self, payload):
+        time.sleep(self.seconds)
+        return "late"
+
+
+def test_timeout_boundaries_stay_independent():
+    """Elapsed, node, and process-isolation limits are different boundaries.
+
+    idle_timeout is recorded and is not enforced. A blocking sleep continues
+    after the provider await is abandoned and after the node is cancelled.
+    Process isolation is the boundary that can stop that sleep.
+    """
+    from automated_grounded_theory import focused_code, theoretical_sample
+    from tests.test_v070 import _entry, _passages, _source
+    from tests.test_v090 import _kwargs
+
+    recorded = axial_code(
+        _corpus(),
+        FakeAxialCoder(),
+        axial_request_timeout=2,
+        idle_timeout=9,
+        **_COMMON,
+    )
+    policy = recorded.metadata["timeout_policy"]
+    assert policy["run_timeout_seconds"] == 2
+    assert policy["run_timeout_kind"] == "elapsed"
+    assert policy["idle_timeout_seconds"] == 9
+    assert policy["idle_timeout_kind"] == "inactivity"
+    assert policy["idle_timeout_enforced"] is False
+    assert policy["node_timeout_default"] is True
+    assert policy["node_timeout_seconds"] > policy["run_timeout_seconds"]
+    assert policy["node_timeout_stops_remote_request"] is False
+    assert policy["cancellation"] == "cooperative"
+    assert policy["process_isolation"] is False
+    with pytest.raises(AxialError, match="idle_timeout"):
+        axial_code(_corpus(), FakeAxialCoder(), idle_timeout=-1, **_COMMON)
+
+    provider_done = threading.Event()
+    started = time.perf_counter()
+    provider = axial_code(
+        _corpus(),
+        _TimeoutCoder(provider_done, delay=1.2, block=False),
+        axial_request_timeout=0.35,
+        idle_timeout=30,
+        **_COMMON,
+    )
+    assert time.perf_counter() - started < 1.0
+    assert provider.metadata["stop"] == "timeout"
+    assert provider.metadata["timeout_policy"]["idle_timeout_enforced"] is False
+    assert provider_done.wait(0.4) is False
+
+    blocked_done = threading.Event()
+    started = time.perf_counter()
+    blocked = axial_code(
+        _corpus(),
+        _TimeoutCoder(blocked_done, delay=1.2, block=True),
+        axial_request_timeout=0.35,
+        **_COMMON,
+    )
+    assert time.perf_counter() - started < 1.0
+    assert blocked.metadata["stop"] == "timeout"
+    assert blocked_done.is_set() is False
+    assert blocked.metadata["timeout_policy"]["node_timeout_stops_remote_request"] is False
+    assert blocked_done.wait(2)
+
+    node_done = threading.Event()
+    started = time.perf_counter()
+    cancelled = axial_code(
+        _corpus(),
+        _TimeoutCoder(node_done, delay=1.2, block=True),
+        axial_request_timeout=3,
+        node_timeout=0.3,
+        **_COMMON,
+    )
+    assert time.perf_counter() - started < 1.0
+    assert cancelled.metadata["stop"] == "timeout"
+    node_policy = cancelled.metadata["timeout_policy"]
+    assert node_policy["node_timeout_seconds"] == 0.3
+    assert node_policy["node_timeout_default"] is False
+    assert node_policy["run_timeout_seconds"] == 3
+    assert node_policy["node_timeout_stops_remote_request"] is False
+    assert node_done.is_set() is False
+    assert node_done.wait(2)
+
+    isolated = CallLimiter(1, max_attempts=1, request_timeout=0.4, wall_timeout=0.4, process_isolation=True)
+    started = time.perf_counter()
+    with pytest.raises(TimeoutError):
+        run_sync(isolated.ainvoke(_PicklableSleeper(2), {}, use_cache=False), timeout=10)
+    assert time.perf_counter() - started < 1.5
+
+    focused = focused_code(
+        _source(
+            passages=_passages()[:1],
+            codes=[_entry("c-freq", "packing bags", 1, ["d1"])],
+            segments=[],
+        ),
+        model=FakeFocusedCoder(),
+        seed=1,
+        max_focused_review_calls=0,
+        interrupt=False,
+        idle_timeout=4,
+        focused_request_timeout=2,
+    )
+    assert focused.metadata["timeout_policy"]["run_timeout_seconds"] == 2
+    assert focused.metadata["timeout_policy"]["idle_timeout_seconds"] == 4
+    assert focused.metadata["timeout_policy"]["idle_timeout_enforced"] is False
+    assert focused.metadata["timeout_policy"]["node_timeout_stops_remote_request"] is False
+
+    sampled = theoretical_sample(
+        _corpus(),
+        FakeSamplingCoder(),
+        interrupt=False,
+        idle_timeout=6,
+        **_kwargs(max_sampling_review_calls=0, max_decision_calls=0, sampling_request_timeout=2),
+    )
+    assert sampled.metadata["timeout_policy"]["run_timeout_seconds"] == 2
+    assert sampled.metadata["timeout_policy"]["idle_timeout_seconds"] == 6
+    assert sampled.metadata["timeout_policy"]["idle_timeout_enforced"] is False
+    assert sampled.metadata["timeout_policy"]["process_isolation"] is False

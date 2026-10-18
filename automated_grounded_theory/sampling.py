@@ -30,7 +30,9 @@ from automated_grounded_theory.async_support import (
     CallLimiter,
     ProviderAllowance,
     ainvoke_structured,
+    node_watchdog,
     run_sync,
+    timeout_policy,
 )
 from automated_grounded_theory.axial import (
     PARADIGM_ROLES,
@@ -4183,6 +4185,8 @@ async def atheoretical_sample(
     output_dir: str | Path | None = None,
     raise_on_timeout: bool = False,
     recursion_limit: int | None = None,
+    idle_timeout: float | None = None,
+    node_timeout: float | None = None,
 ) -> SamplingResult:
     """Rank sampling directions and record a saturation decision.
 
@@ -4243,14 +4247,23 @@ async def atheoretical_sample(
     }
     reviewer = decision_model or coder if decision_mode == "llm" else None
     calls = max(1, int(max_sampling_review_calls))
-    runtime = SamplingRuntime(
-        coder=coder,
-        reviewer=reviewer,
-        decision_mode=decision_mode,
-        request_timeout=float(sampling_request_timeout),
-        step_timeout=_step_watchdog(float(sampling_request_timeout), calls),
-        pursuit=pursuit,
-    )
+    try:
+        runtime = SamplingRuntime(
+            coder=coder,
+            reviewer=reviewer,
+            decision_mode=decision_mode,
+            request_timeout=float(sampling_request_timeout),
+            step_timeout=node_watchdog(float(sampling_request_timeout), calls, node_timeout),
+            pursuit=pursuit,
+        )
+        metadata["timeout_policy"] = timeout_policy(
+            run_timeout_seconds=float(sampling_request_timeout),
+            idle_timeout_seconds=idle_timeout,
+            node_timeout_seconds=runtime.step_timeout,
+            node_timeout_default=node_timeout is None,
+        )
+    except ValueError as exc:
+        raise SamplingError(str(exc)) from exc
     runtime.limiter.provider_allowance = ProviderAllowance(
         max_tokens=max(0, int(max_sampling_review_tokens)),
         stages={

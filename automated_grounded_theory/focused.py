@@ -103,7 +103,9 @@ from automated_grounded_theory.async_support import (
     ProviderAllowance,
     ainvoke_structured,
     combine_usage,
+    node_watchdog,
     run_sync,
+    timeout_policy,
 )
 from automated_grounded_theory.batching import (
     calibrated_token_estimate,
@@ -6438,6 +6440,8 @@ async def afocused_code(
     continuation: bool = False,
     recursion_limit: int | None = None,
     raise_on_timeout: bool = False,
+    idle_timeout: float | None = None,
+    node_timeout: float | None = None,
 ) -> FocusedResult:
     """Run focused coding over a finished open-coding result.
 
@@ -6582,12 +6586,22 @@ async def afocused_code(
         ),
         validation_retries=validation_retries,
         duplicate_similarity=float(procedure["focused_duplicate_similarity"]),
-        step_timeout=_step_watchdog(float(procedure["focused_request_timeout"]), calls=2),
+        step_timeout=node_watchdog(float(procedure["focused_request_timeout"]), 2, node_timeout),
         decision_step_timeout=(
-            _step_watchdog(float(procedure["focused_request_timeout"]), calls=max(1, int(max_decision_calls)))
+            node_watchdog(
+                float(procedure["focused_request_timeout"]),
+                max(1, int(max_decision_calls)),
+                node_timeout,
+            )
             if decision_mode == "llm"
             else 0.0
         ),
+    )
+    metadata["timeout_policy"] = timeout_policy(
+        run_timeout_seconds=float(procedure["focused_request_timeout"]),
+        idle_timeout_seconds=idle_timeout,
+        node_timeout_seconds=runtime.step_timeout,
+        node_timeout_default=node_timeout is None,
     )
     metadata.update(determinism)
 
