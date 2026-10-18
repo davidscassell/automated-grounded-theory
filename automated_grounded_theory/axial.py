@@ -2235,7 +2235,12 @@ def _apply_human_relations(
             assign_relationship_eligibility(target)
             continue
         if action in {"accept", "verify"}:
-            _apply_quote(target, action_row, passages or {})
+            # Validate the statement before the role. A sentence edit that
+            # does not change flags still refreshes the basis, so a role
+            # change in this same resume archives that sentence.
+            role = str(action_row.get("paradigm_role") or "")
+            text_action = {key: value for key, value in action_row.items() if key != "paradigm_role"}
+            _apply_quote(target, text_action, passages or {})
             _annotate_endpoints(target, codebook, segments, passages)
             _flag_same_passage_claim(target, str(action_row.get("rationale") or target.get("statement") or ""), flag="reviewer_same_passage_mismatch")
             _refresh_evidence(
@@ -2246,6 +2251,9 @@ def _apply_human_relations(
                 memos=memos,
                 pattern_min_cases=pattern_min_cases,
             )
+            if role:
+                target["human_paradigm_role"] = role
+                target["paradigm_role"] = role
             if action == "verify":
                 scope = str(action_row.get("scope") or "").strip()
                 if not scope:
@@ -3292,6 +3300,29 @@ def _salvage_proposal_batch(raw: str) -> tuple[list[dict], list[dict]] | None:
     return kept, dropped
 
 
+def _recovered_proposal_batch(result: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Keep valid rows from a batch that failed as a whole.
+
+    Returns None when the text is not a relationship list or every row is
+    invalid. The caller then keeps the single repair. A repair response uses
+    the same recovery before the failure is closed.
+    """
+    if not result.get("repair_pending"):
+        return None
+    salvaged = _salvage_proposal_batch(str((result.get("parsed") or {}).get("raw_response") or ""))
+    if salvaged is None or not salvaged[0]:
+        return None
+    kept, dropped = salvaged
+    recovered = dict(result)
+    recovered["repair_pending"] = False
+    recovered["unparsed"] = False
+    recovered["refused"] = False
+    recovered["reason"] = ""
+    recovered["parsed"] = {"relationships": kept, "nothing_to_propose": False}
+    recovered["recovered_drops"] = dropped
+    return recovered
+
+
 def _preserve_provider_call(
     metadata: dict[str, Any],
     result: Mapping[str, Any],
@@ -3463,17 +3494,22 @@ async def _repair_visit(
     fitted, local = _repair_over_request_budget(metadata, schema, messages, original_raw=original_raw)
     if local is not None:
         return local
+    result = await _structured_call(
+        runtime,
+        schema,
+        fitted,
+        kind="schema_repair",
+        metadata=metadata,
+        stage=stage,
+        attempt_repair=False,
+    )
+    if getattr(schema, "__name__", "") == "AxialProposalBatch":
+        recovered = _recovered_proposal_batch(result)
+        if recovered is not None:
+            return recovered
     result = _close_failed_repair(
         metadata,
-        await _structured_call(
-            runtime,
-            schema,
-            fitted,
-            kind="schema_repair",
-            metadata=metadata,
-            stage=stage,
-            attempt_repair=False,
-        ),
+        result,
         original_raw=original_raw,
     )
     if result.get("refused"):
@@ -4125,16 +4161,12 @@ def _propose_node(runtime: AxialRuntime):
             )
             _note_proposal_repairs(metadata, result["audits"])
             estimated = int(metadata.get("axial_tokens_estimated") or estimated)
-            recovered_drops: list[dict] = []
+            recovered_drops = [dict(item) for item in (result.get("recovered_drops") or []) if isinstance(item, Mapping)]
             if result.get("repair_pending"):
-                salvaged = _salvage_proposal_batch(str((result.get("parsed") or {}).get("raw_response") or ""))
-                if salvaged is not None and salvaged[0]:
-                    kept, recovered_drops = salvaged
-                    result = dict(result)
-                    result["repair_pending"] = False
-                    result["unparsed"] = False
-                    result["reason"] = ""
-                    result["parsed"] = {"relationships": kept, "nothing_to_propose": False}
+                salvaged_result = _recovered_proposal_batch(result)
+                if salvaged_result is not None:
+                    recovered_drops = [dict(item) for item in (salvaged_result.get("recovered_drops") or []) if isinstance(item, Mapping)]
+                    result = salvaged_result
                 else:
                     _preserve_provider_call(
                         metadata,

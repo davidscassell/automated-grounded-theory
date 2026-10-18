@@ -1320,9 +1320,7 @@ def structured_runnable(model, schema):
     return model.with_structured_output(schema)
 
 
-def _raw_text(raw: Any) -> str:
-    if raw is None:
-        return ""
+def _content_text(raw: Any) -> str:
     content = getattr(raw, "content", None)
     if isinstance(content, str):
         return content
@@ -1337,6 +1335,48 @@ def _raw_text(raw: Any) -> str:
     if isinstance(raw, str):
         return raw
     return ""
+
+
+def _tool_argument_text(raw: Any) -> str:
+    """JSON text from a structured tool call when the message content is empty."""
+    calls = list(getattr(raw, "tool_calls", None) or [])
+    extra = getattr(raw, "additional_kwargs", None) or {}
+    if isinstance(extra, Mapping):
+        calls.extend(list(extra.get("tool_calls") or []))
+    for call in calls:
+        if not isinstance(call, Mapping):
+            continue
+        args = call.get("args")
+        if isinstance(args, str) and args.strip():
+            return args
+        if isinstance(args, Mapping) and args:
+            return json.dumps(args, ensure_ascii=False)
+        function = call.get("function") if isinstance(call.get("function"), Mapping) else {}
+        arguments = function.get("arguments")
+        if isinstance(arguments, str) and arguments.strip():
+            return arguments
+        if isinstance(arguments, Mapping) and arguments:
+            return json.dumps(arguments, ensure_ascii=False)
+    return ""
+
+
+def _raw_text(raw: Any) -> str:
+    """Message text, or tool-call arguments when the content has no JSON object.
+
+    A structured response may put the payload in ``tool_calls`` and leave
+    ``content`` empty. Salvage and the text parser both read this string.
+    Content that already contains an object wins, so a JSON-text response is
+    not replaced by a second tool-call payload.
+    """
+    if raw is None:
+        return ""
+    text = _content_text(raw)
+    if "{" in text:
+        return text
+    arguments = _tool_argument_text(raw)
+    if arguments:
+        return arguments
+    return text
 
 
 def _model_from_text(text: str, schema):
