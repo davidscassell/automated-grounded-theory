@@ -23,8 +23,8 @@ from tests.test_v090 import FakeSamplingCoder, _kwargs
 
 
 def test_version_is_094():
-    assert __version__ == "0.9.20"
-    assert POLICY_VERSION == "0.9.20"
+    assert __version__ == "0.9.21"
+    assert POLICY_VERSION == "0.9.21"
 
 
 def _assigned_passage(paused):
