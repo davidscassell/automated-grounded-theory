@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.14
+
+- `downstream_withheld_supported_recall` and `downstream_precision` stay null unless every row in that rate's population has a boolean `downstream_eligible`. Unknown eligibility is not a lower bound stored as a point estimate. `downstream_withheld_supported_recall_known` and `downstream_precision_known` score the known rows and report the denominator and coverage. Per-rule results use the same split. A zero denominator stays null.
+- The sampling saturation check uses the configured `min_documents`. Below it, the model decision is `not_interpretable`, `minimum_documents` is that configured value, and the decision call is not spent. A human checkpoint still pauses and reports `window_ready`. The default remains 3.
+- `pattern_min_cases` stays 2. The axial token ceiling stays 24000. The design is [docs/design-review-fixes-0914.md](docs/design-review-fixes-0914.md). `policy_version` is `0.9.14`.
+
 ## 0.9.13
 
 - A reread pair that times out and then succeeds leaves `reread_failed_pairs` when that pair succeeds. The timeout is kept on `reread_recovered_timeouts` and in the sampling attempt log. A later pair withheld for `call_allowance` is the current `reread_stop`. A pair is not both completed and failed. An unresolved timeout still blocks.

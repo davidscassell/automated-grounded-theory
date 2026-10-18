@@ -26,8 +26,8 @@ from tests.test_v080 import FakeAxialCoder, _corpus
 
 
 def test_version_is_090():
-    assert __version__ == "0.9.13"
-    assert POLICY_VERSION == "0.9.13"
+    assert __version__ == "0.9.14"
+    assert POLICY_VERSION == "0.9.14"
 
 
 def _payload(messages) -> dict:
@@ -43,6 +43,7 @@ class FakeSamplingCoder(BaseChatModel):
 
     call_count: int = 0
     mode: str = "grounded"
+    judgment_assessment: str = "not_saturated"
 
     @property
     def _llm_type(self) -> str:
@@ -81,7 +82,7 @@ class FakeSamplingCoder(BaseChatModel):
                 parsed = schema(passage_id=str(body.get("passage_id") or ""), note="A note about this passage.", quote=quote)
             elif name == "ModelSaturationJudgment":
                 parsed = schema(
-                    assessment="not_saturated",
+                    assessment=self.judgment_assessment,
                     rationale="The window is interpretable and a sampling gap is still open.",
                 )
             else:

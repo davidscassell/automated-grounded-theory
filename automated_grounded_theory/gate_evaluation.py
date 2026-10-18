@@ -216,32 +216,49 @@ def _blank_counts() -> dict[str, Any]:
         "downstream_eligible_adjudicated": 0,
         "downstream_eligible_supported": 0,
         "downstream_withheld_supported": 0,
-        "_downstream_known": False,
+        "downstream_adjudicated": 0,
+        "downstream_eligibility_known_adjudicated": 0,
+        "downstream_supported_known": 0,
     }
+
+
+def _rate(numerator: int, denominator: int) -> float | None:
+    if denominator == 0:
+        return None
+    return round(numerator / denominator, 4)
 
 
 def _fill(counts: dict[str, Any]) -> dict[str, Any]:
     accepted = int(counts["accepted_adjudicated"])
     supported = int(counts["supported_adjudicated"])
     eligible = int(counts["downstream_eligible_adjudicated"])
-    counts["accept_precision"] = None if accepted == 0 else round(int(counts["accepted_supported"]) / accepted, 4)
-    counts["withheld_supported_recall"] = (
-        None if supported == 0 else round(int(counts["withheld_supported"]) / supported, 4)
+    adjudicated = int(counts["downstream_adjudicated"])
+    known_rows = int(counts["downstream_eligibility_known_adjudicated"])
+    supported_known = int(counts["downstream_supported_known"])
+    eligible_supported = int(counts["downstream_eligible_supported"])
+    withheld_supported = int(counts["downstream_withheld_supported"])
+    counts["accept_precision"] = _rate(int(counts["accepted_supported"]), accepted)
+    counts["withheld_supported_recall"] = _rate(int(counts["withheld_supported"]), supported)
+    # Full-population rates stay null unless every row in that population has a
+    # boolean downstream_eligible. A known-only rate is the same fraction on
+    # the rows whose eligibility is known, and it carries that denominator.
+    precision_identified = adjudicated > 0 and known_rows == adjudicated
+    counts["downstream_precision"] = _rate(eligible_supported, eligible) if precision_identified else None
+    counts["downstream_precision_known"] = _rate(eligible_supported, eligible)
+    counts["downstream_precision_known_denominator"] = eligible
+    counts["downstream_precision_coverage"] = _rate(known_rows, adjudicated)
+    recall_identified = supported > 0 and supported_known == supported
+    counts["downstream_withheld_supported_recall"] = (
+        _rate(withheld_supported, supported) if recall_identified else None
     )
-    counts["downstream_precision"] = (
-        None if eligible == 0 else round(int(counts["downstream_eligible_supported"]) / eligible, 4)
-    )
-    if not counts.get("_downstream_known") or supported == 0:
-        counts["downstream_withheld_supported_recall"] = None
-    else:
-        counts["downstream_withheld_supported_recall"] = round(int(counts["downstream_withheld_supported"]) / supported, 4)
+    counts["downstream_withheld_supported_recall_known"] = _rate(withheld_supported, supported_known)
+    counts["downstream_withheld_supported_recall_known_denominator"] = supported_known
+    counts["downstream_withheld_supported_recall_coverage"] = _rate(supported_known, supported)
     return counts
 
 
 def _public_counts(counts: dict[str, Any]) -> dict[str, Any]:
-    filled = _fill(counts)
-    filled.pop("_downstream_known", None)
-    return filled
+    return _fill(counts)
 
 
 def score_gate_adjudications(
@@ -254,15 +271,39 @@ def score_gate_adjudications(
     ``withheld_supported_recall`` is withheld-and-supported over every
     adjudicated supported relationship. Those two rates follow disposition.
 
-    ``downstream_precision`` is supported rows among adjudicated rows whose
-    export says ``downstream_eligible`` is true. ``downstream_withheld_supported_recall``
-    is supported rows whose export says ``downstream_eligible`` is false, over
-    every adjudicated supported relationship. An export that does not carry
-    ``downstream_eligible`` leaves both rates null. A missing field is not
-    treated as eligible. Either rate is null when its denominator is zero.
-    Per-rule figures use the same rule and stay null on the same condition.
-    A rule that fired on no exported row is omitted. Optional fields on an
-    adjudication are not the source of these rates.
+    ``downstream_precision`` and ``downstream_withheld_supported_recall`` are
+    full-population rates. Each stays null unless every row in its population
+    has a boolean ``downstream_eligible``. A missing field is unknown, not
+    eligible and not withheld. An unknown row in the denominator would make
+    the fraction a bound, so that unidentified rate is null rather than a
+    point estimate.
+
+    The precision population is every adjudicated row, because an unknown row
+    might be eligible. ``downstream_precision`` is supported rows among rows
+    whose export says ``downstream_eligible`` is true, and only when
+    eligibility is known for every adjudicated row. ``downstream_precision_known``
+    is that same fraction among rows already known to be eligible. Its
+    denominator is ``downstream_precision_known_denominator``.
+    ``downstream_precision_coverage`` is adjudicated rows with known
+    eligibility over adjudicated rows.
+
+    The recall population is adjudicated supported rows.
+    ``downstream_withheld_supported_recall`` is supported rows whose export
+    says ``downstream_eligible`` is false, over every adjudicated supported
+    row, and only when every one of those rows has known eligibility. An
+    unsupported row does not identify it.
+    ``downstream_withheld_supported_recall_known`` uses only the supported
+    rows whose eligibility is known. Its denominator is
+    ``downstream_withheld_supported_recall_known_denominator``.
+    ``downstream_withheld_supported_recall_coverage`` is those known supported
+    rows over every adjudicated supported row.
+
+    A zero denominator stays null, including a known-only rate with no known
+    rows. Coverage is null when its own denominator is zero. An export that
+    does not carry ``downstream_eligible`` leaves the rates null. Per-rule
+    figures use the same rule. A rule that fired on no exported row is
+    omitted. Optional fields on an adjudication are not the source of these
+    rates.
     """
     by_outcome: dict[str, dict[str, Any]] = {}
     for outcome in ("accepted", "withheld"):
@@ -306,10 +347,13 @@ def score_gate_adjudications(
         blocked = known and exported_row.get("downstream_eligible") is False
         buckets = [overall] + [_rule_bucket(per_rule, rule) for rule in rules]
         for bucket in buckets:
+            bucket["downstream_adjudicated"] += 1
             if known:
-                bucket["_downstream_known"] = True
+                bucket["downstream_eligibility_known_adjudicated"] += 1
             if supported:
                 bucket["supported_adjudicated"] += 1
+                if known:
+                    bucket["downstream_supported_known"] += 1
                 if blocked:
                     bucket["downstream_withheld_supported"] += 1
             if eligible:
