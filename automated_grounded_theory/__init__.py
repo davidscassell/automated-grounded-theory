@@ -1,13 +1,14 @@
-"""Automated initial (open) coding, then a theme report.
+"""Open coding, a theme report, and separate later graphs.
 
 Codes are produced passage by passage from the corpus. The research context
 sensitizes attention and is not a codebook. The theme report groups those
 codes afterwards for presentation. It does not reread the passages. Focused
 coding, axial coding, selective coding, and within-corpus theoretical sampling
-are separate graphs. They are not the theme report. Saturation indicators do
-not set ``judgment``. A saturation decision is a researcher record, or a
-model judgment stored apart from that record. The package does not collect
-new fieldwork data.
+are separate graphs. Axial coding, selective coding, and theoretical sampling
+are experimental. Each has a human checkpoint and an LLM-only decision mode.
+They are not the theme report. Saturation indicators do not set ``judgment``.
+A saturation decision is a researcher record, or a model judgment stored apart
+from that record. The package does not collect new fieldwork data.
 """
 
 from automated_grounded_theory.axial import (

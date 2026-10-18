@@ -1,8 +1,48 @@
 # automated_grounded_theory
 
-**Automated initial (open) coding**, plus a **theme report**, informed by the grounded theory tradition (Glaser and Strauss 1967; Glaser 1978, 1992; Strauss and Corbin 1990/1998; Charmaz 2006/2014). By default the model reads every document in a seeded order, and every passage of that document in reading order, comparing each incident with the codebook earned so far. Experimental axial coding, selective coding, indicator-based saturation, and theoretical sampling over the existing corpus are separate later graphs. The package does not collect new fieldwork data, and it does not automatically decide that a theory is saturated. A researcher records a saturation decision, or `decision_mode='llm'` stores a model judgment on `model_saturation_judgment`. That judgment does not set `judgment`. How each step maps onto those sources is in [docs/methodology.md](docs/methodology.md). The 0.6 design, including the 0.6.1 corrections, is in [docs/design.md](docs/design.md). A literature-grounded design for the stages after initial coding is in [docs/design-later-stages.md](docs/design-later-stages.md). The 0.9.0 sampling design is [docs/design-sampling-0900.md](docs/design-sampling-0900.md). Relationship evidence tiers are in [docs/design-relationship-tiers.md](docs/design-relationship-tiers.md). Focused coding, axial coding, selective coding, and within-corpus theoretical sampling are implemented as their own graphs. The conditional matrix, the full Glaser 1978 coding-family catalog, and collecting new data are not. A short notebook with the same citations and the Taguette import steps is [docs/open_coding.ipynb](docs/open_coding.ipynb). A full walkthrough on a fictional employee survey, including an offline mode that needs no API key, is [examples/demo.ipynb](examples/demo.ipynb). The notebook writes its outputs to a temporary directory.
+**Open coding**, a **theme report**, and separate later graphs for **focused coding**, **axial coding**, **selective coding**, and **within-corpus theoretical sampling** with an explicit saturation decision. The tradition behind the open-coding defaults is Glaser and Strauss 1967, Glaser 1978 and 1992, Strauss and Corbin 1990/1998, and Charmaz 2006/2014. By default `open_code` reads every document in a seeded order and every passage of that document in reading order, comparing each incident with the codebook earned so far. Axial coding, selective coding, and theoretical sampling are experimental. Each has a human path (`decision_mode='human'`, `interrupt()` inside the checkpoint, resumed with `Command(resume=...)`) and an LLM-only path (`decision_mode='llm'`) that writes model fields and does not write the researcher fields. The package does not collect new fieldwork data, and it does not automatically decide that a theory is saturated. A researcher records a saturation decision, or `decision_mode='llm'` stores a model judgment on `model_saturation_judgment`. That judgment does not set `judgment`. The stage map is [docs/README.md](docs/README.md). How the open-coding steps map onto those sources is in [docs/methodology.md](docs/methodology.md). The 0.6 design, including the 0.6.1 corrections, is in [docs/design.md](docs/design.md). A literature-grounded design for the stages after initial coding is in [docs/design-later-stages.md](docs/design-later-stages.md). The 0.9.0 sampling design is [docs/design-sampling-0900.md](docs/design-sampling-0900.md). Relationship evidence tiers are in [docs/design-relationship-tiers.md](docs/design-relationship-tiers.md). Focused coding, axial coding, selective coding, and within-corpus theoretical sampling are implemented as their own graphs. The conditional matrix, the full Glaser 1978 coding-family catalog, and collecting new data are not. A short notebook with the same citations and the Taguette import steps is [docs/open_coding.ipynb](docs/open_coding.ipynb). A full walkthrough on a fictional employee survey, including an offline mode that needs no API key, is [examples/demo.ipynb](examples/demo.ipynb). The notebook writes its outputs to a temporary directory.
 
 `build_themes` is a descriptive grouping of the open codes for reporting. It does not reread the passages and it does not mint codes. Focused coding is not that report.
+
+## Current package (0.9.13)
+
+`policy_version` is `0.9.13`. The default entry point is still `open_code`. The later graphs are called on their own. Axial coding, selective coding, and theoretical sampling are experimental. Focused coding is the reread between open coding and those graphs. No human adjudication file ships with the package. Live evaluation runs through v31, on package 0.9.9, did not measure analytic accuracy. The 0.5.4 comparison stored under [Evaluate](#evaluate) is the last open-coding comparison this README records. It is not a result for 0.9.13. The index of design notes is [docs/README.md](docs/README.md).
+
+| Stage | Entry | Status |
+| --- | --- | --- |
+| Open coding | `open_code` / `get_graph("open_code")` | Default run. Reads the corpus in seeded document order. |
+| Theme report | `build_themes` | Descriptive grouping. It does not reread passages. |
+| Focused coding | `focused_code` / `get_graph("focused")` | Rereads a proposed subset and records properties and dimensions. |
+| Axial coding | `axial_code` / `get_graph("axial")` | Experimental. Relationship proposals, evidence tiers, negative-case search. |
+| Selective coding | `selective_code` / `get_graph("selective")` | Experimental. Core candidates, optional memos, optional storyline. |
+| Theoretical sampling and saturation | `theoretical_sample` / `get_graph("sampling")` | Experimental. Directions over the corpus already in hand. `judgment` stays null. |
+
+Human checkpoints call `interrupt()`. Resume with the public `resume=` argument, which is `Command(resume=...)`. An empty object is not a resume value. `decision_mode='llm'` does not interrupt those checkpoints. A sampling timeout is not a human interrupt. After it, `resume={"continue": True}` sends the failed pair again. `raise_on_timeout=True` raises `TimeoutError` instead of returning the partial result.
+
+Relationship evidence uses `pattern_min_cases` 2. The labels are `category_evidence`, `hypothesis`, `pattern_supported`, `attribution`, and `verified`. Tier 4 is a human `verify` with a named scope. A model cannot set `verified`. One content stem is `stem_only` and does not count as both endpoints. `negative_case_search` defaults on. Causal wording below tier 3 sets `downstream_eligible` false and flags `causal_wording_withheld`. `disposition` can still be `accepted`. Those are separate fields.
+
+A sampling question keeps a stable `question_key`, such as `thin_category:c-prep`. `completed_pairs` records each question and passage that was reread, and that pair is not sent again. `quiet_rounds` defaults to 2. `sampling_rounds_without_new_directions` is `not_evaluable`, and `observed` is null, while a selected pair is unsent or failed and not explicitly exempted, or while a timeout is still unresolved. A pair that times out and then succeeds leaves `reread_failed_pairs`. The timeout stays on `reread_recovered_timeouts`. The current `reread_stop` is whatever is still unresolved, including `call_allowance`.
+
+Call and token ceilings, from the function defaults:
+
+| Setting | Default | What it bounds |
+| --- | --- | --- |
+| `batch_size` | 1 | Passages or pairs in one request. Performance, not the analytic rule. |
+| `token_budget` | 6000 | One open-coding request, and the same parameter name on focused coding. |
+| `max_focused_review_calls` | 8 | Focused reread calls. |
+| `max_focused_review_tokens` | 24000 | Focused token allowance. |
+| `max_axial_review_calls` | 8 | Axial proposal and counterexample calls. A default run examines a small fraction of the pairs. |
+| `max_axial_review_tokens` | 24000 | Axial token allowance. |
+| `axial_token_budget` | 6000 | One axial request. |
+| `max_selective_review_calls` | 4 | Selective memo and storyline calls. |
+| `max_sampling_review_calls` | 4 | Sampling reread calls when `pursuit` is `reread`. |
+| `max_sampling_review_tokens` | 24000 | Sampling token allowance. |
+| `sampling_token_budget` | 6000 | One sampling request. |
+| `sampling_request_timeout` | 120 | Seconds for one sampling call. |
+| `quiet_rounds` | 2 | Ledger rows in the quiet-round window. |
+| `max_decision_calls` | 8 on focused coding; 4 on axial and sampling | Reviewer calls in `decision_mode='llm'`. |
+
+`export_gate_relationships` copies each non-synthetic relationship into `accepted`, `withheld`, or `proposed`, with `disposition`, `rules`, `withholding_flags`, and `downstream_eligible` when that value is a boolean. `load_adjudications` reads a separate file of `supported` or `unsupported` verdicts. `score_gate_adjudications` returns `accept_precision` and `withheld_supported_recall` from disposition, and `downstream_precision` and `downstream_withheld_supported_recall` from `downstream_eligible`. A zero denominator stays null. An export that has no `downstream_eligible` field, including a 0.9.9 export, scores the downstream rates as null. The shape is [docs/design-gate-evaluation.md](docs/design-gate-evaluation.md). The JSON example there is not a finding.
 
 ## How it works
 
@@ -155,7 +195,7 @@ Weights are `focused_weight_frequency`, `focused_weight_documents`, and `focused
 
 ## Axial coding and saturation
 
-Axial coding is `get_graph("axial")`. Selective coding is `get_graph("selective")`. Neither graph is inserted into `open_code`, `themes`, or `focused`. The default run is still initial coding plus a theme report. `judgment` stays null. The design is [docs/design-axial-0800.md](docs/design-axial-0800.md).
+Axial coding is `get_graph("axial")`. Selective coding is `get_graph("selective")`. Neither graph is inserted into `open_code`, `themes`, or `focused`. Both are experimental. Calling `open_code` is still initial coding, and `build_themes` is still the theme report. `judgment` stays null. The 0.8 design is [docs/design-axial-0800.md](docs/design-axial-0800.md). The current index is [docs/README.md](docs/README.md).
 
 <!-- graph:axial:begin -->
 ```mermaid
@@ -285,7 +325,7 @@ The sampling ledger appends one round per run, including directions, new directi
 
 `saturation_decision` is the explicit decision step. It shows the indicators, the ledger, and a stopping-criteria report. That report marks each criterion met, unmet, or undefined: new codes, new properties, new relationships, code-frequency shift, sampling rounds without new directions, and core-category coverage, with the threshold on the row. It does not declare the theory saturated. Resume with `{"decision": "not_claimed|sufficient_for_this_question|not_saturated", "rationale": "..."}` or `{"leave_saturation": true}`. The stored decision has `actor` and a UTC timestamp. `judgment` stays null. `decision_mode="llm"` writes `model_saturation_judgment` only. Below 3 documents, or below 2 sampling rounds, the assessment is withheld as `not_interpretable` and is not filled in as `not_saturated`. A model judgment is never copied into `saturation_decision` or `researcher_saturation`.
 
-`batch_size` and `sampling_request_timeout` are performance settings. `pursuit`, `coding_family`, `quiet_rounds`, and the document minimum are procedure. `coding_family` may be `glaser` (a limited sensitizing list: the Six Cs, strategy, and means-goal), `paradigm`, `charmaz`, or one family name. Axial coding still accepts only `paradigm` and `charmaz`. Applying the 1978 catalog as axial roles is not implemented.
+`max_sampling_review_calls` defaults to 4. `max_sampling_review_tokens` defaults to 24000. `sampling_token_budget` defaults to 6000. `quiet_rounds` defaults to 2. `min_documents` defaults to 3. `sampling_request_timeout` defaults to 120 seconds. `max_decision_calls` on this graph defaults to 4. `batch_size` and `sampling_request_timeout` are performance settings. `pursuit`, `coding_family`, `quiet_rounds`, and the document minimum are procedure. `coding_family` may be `glaser` (a limited sensitizing list: the Six Cs, strategy, and means-goal), `paradigm`, `charmaz`, or one family name. Axial coding still accepts only `paradigm` and `charmaz`. Applying the 1978 catalog as axial roles is not implemented.
 
 ## Human-guided or LLM-driven review
 
@@ -559,7 +599,7 @@ On this fake coder, exact repeated labels collapse when they are committed, so n
 
 `benchmarks/run_benchmark.py` downloads the RAND Muse eval files and the BC Stats 2018 WES sample, runs `open_code` and `build_themes`, and asks the model to map each LLM code onto a human code. The report has per-code precision, recall, and F1, Cohen's kappa where the units line up, coverage of the human codes, novel LLM codes, and theme agreement for the BC Stats sample. Mapping rows carry a confidence and a rationale. Downloaded files go to `benchmarks/data/`, which is gitignored.
 
-Accuracy against human coding has not been measured live for 0.6.x. The last live numbers are from 0.5.4 (RAND Muse E2: precision 0.60, recall 0.19, F1 0.29). The speed table above is a simulated fake-coder benchmark and is not that measurement.
+Accuracy against human coding has not been measured live for 0.6.x. The last open-coding comparison stored here is from 0.5.4 (RAND Muse E2: precision 0.60, recall 0.19, F1 0.29). Live evaluation runs through v31, on package 0.9.9, did not measure analytic accuracy. No human adjudication of the accept and withhold gates is included. The speed table above is a simulated fake-coder benchmark and is not that measurement.
 
 ```bash
 python benchmarks/run_benchmark.py --download

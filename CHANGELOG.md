@@ -5,6 +5,7 @@
 - A reread pair that times out and then succeeds leaves `reread_failed_pairs` when that pair succeeds. The timeout is kept on `reread_recovered_timeouts` and in the sampling attempt log. A later pair withheld for `call_allowance` is the current `reread_stop`. A pair is not both completed and failed. An unresolved timeout still blocks.
 - Gate export copies `disposition` and `downstream_eligible` separately, plus withholding flags such as `causal_wording_withheld`. `downstream_precision` and `downstream_withheld_supported_recall` score that block. Disposition metrics keep their names. A rate with a zero denominator stays null. An export without `downstream_eligible` scores the new rates as null.
 - `pattern_min_cases` stays 2. The axial token ceiling stays 24000. The design is [docs/design-review-fixes-0913.md](docs/design-review-fixes-0913.md). `policy_version` is `0.9.13`.
+- The README and [docs/README.md](docs/README.md) describe the current graphs. Axial, selective, and sampling stay experimental. Older `design-review-fixes-*` notes stay as history.
 
 ## 0.9.12
 
