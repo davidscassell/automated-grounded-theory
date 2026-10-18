@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.errors import GraphRecursionError, NodeTimeoutError
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, RetryPolicy, interrupt
@@ -3094,8 +3094,14 @@ async def _structured_call(
     kind: str,
     metadata: dict[str, Any],
     stage: str,
+    attempt_repair: bool = True,
 ) -> dict[str, Any]:
-    """One structured provider call. A repair acquires the same stage again."""
+    """One structured provider call.
+
+    ``attempt_repair=False`` returns a parse failure as ``repair_pending``
+    and does not spend a second call. The caller checkpoints that response
+    before the repair visit.
+    """
     audits: list[dict[str, Any]] = []
     try:
         (parsed, usage), sent = await ainvoke_structured(
@@ -3107,6 +3113,7 @@ async def _structured_call(
             token_budget=_request_token_budget(metadata),
             preserve_failed=True,
             send_repair_overflow=False,
+            attempt_repair=attempt_repair,
             allowance_kind=kind,
             allowance_stage=stage,
             call_audits=audits,
@@ -3117,6 +3124,7 @@ async def _structured_call(
         return {
             "refused": True,
             "unparsed": False,
+            "repair_pending": False,
             "reason": exc.reason,
             "parsed": {},
             "usage": {},
@@ -3125,18 +3133,138 @@ async def _structured_call(
         }
     _sync_allowance(metadata, runtime)
     _account_responses(metadata, audits)
-    unparsed = bool(isinstance(parsed, Mapping) and parsed.get("_agt_unparsed"))
+    repair_pending = bool(isinstance(parsed, Mapping) and parsed.get("needs_repair"))
+    unparsed = bool(isinstance(parsed, Mapping) and parsed.get("_agt_unparsed")) and not repair_pending
     if unparsed:
         metadata["axial_stop"] = str(parsed.get("reason") or "schema_unparsed")
     return {
         "refused": False,
         "unparsed": unparsed,
-        "reason": str(parsed.get("reason") or "") if unparsed else "",
+        "repair_pending": repair_pending,
+        "reason": str(parsed.get("reason") or "") if unparsed or repair_pending else "",
         "parsed": parsed if isinstance(parsed, Mapping) else {},
         "usage": usage,
         "sent": sent,
         "audits": audits,
     }
+
+
+def _message_rows(messages: Sequence[Any]) -> list[dict[str, str]]:
+    rows = []
+    for message in messages or []:
+        if isinstance(message, Mapping):
+            role = str(message.get("role") or message.get("type") or "human")
+            content = message.get("content", "")
+        else:
+            role = str(getattr(message, "type", "human"))
+            content = getattr(message, "content", "")
+        rows.append({"role": role, "content": content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)})
+    return rows
+
+
+def _messages_from_rows(rows: Sequence[Mapping[str, Any]]) -> list:
+    restored = []
+    for row in rows or []:
+        role = str(row.get("role") or "human")
+        content = str(row.get("content") or "")
+        if role == "system":
+            restored.append(SystemMessage(content=content))
+        elif role in {"ai", "assistant"}:
+            restored.append(AIMessage(content=content))
+        else:
+            restored.append(HumanMessage(content=content))
+    return restored
+
+
+def _repair_messages(hold: Mapping[str, Any]) -> list:
+    """The original request plus one repair note. The original call is not resent."""
+    messages = _messages_from_rows(hold.get("messages") or [])
+    schema_name = str(hold.get("schema") or "the schema")
+    error = str(hold.get("error") or "the output did not match the schema")
+    messages.append(
+        HumanMessage(
+            content=(
+                "REPAIR THIS OUTPUT\n"
+                f"The previous output was not valid {schema_name}: {error}\n"
+                "Return only the structured object."
+            )
+        )
+    )
+    return messages
+
+
+def _hold_is(metadata: Mapping[str, Any], kind: str) -> bool:
+    hold = metadata.get("provider_call_hold")
+    return isinstance(hold, Mapping) and str(hold.get("kind") or "") == kind
+
+
+def _preserve_provider_call(
+    metadata: dict[str, Any],
+    result: Mapping[str, Any],
+    *,
+    kind: str,
+    schema_name: str,
+    messages: Sequence[Any],
+    context: Mapping[str, Any],
+) -> None:
+    """Keep the original response and usage before a repair call starts."""
+    parsed = result.get("parsed") if isinstance(result.get("parsed"), Mapping) else {}
+    if str(metadata.get("axial_stop") or "") in {"schema_unparsed", "parse_failed"}:
+        metadata.pop("axial_stop", None)
+    usage = dict(result.get("usage") or {})
+    raw = str(parsed.get("raw_response") or "")
+    metadata["provider_call_hold"] = {
+        "kind": kind,
+        "schema": schema_name,
+        "messages": _message_rows(result.get("sent") or messages),
+        "error": str(parsed.get("error") or result.get("reason") or ""),
+        "usage": usage,
+        "raw_response": raw,
+        "context": dict(context),
+    }
+
+
+def _take_provider_hold(metadata: dict[str, Any], kind: str) -> dict[str, Any] | None:
+    if not _hold_is(metadata, kind):
+        return None
+    hold = dict(metadata.pop("provider_call_hold"))
+    return hold
+
+
+def _close_failed_repair(
+    metadata: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    original_raw: str = "",
+) -> dict[str, Any]:
+    """A second parse failure is the bounded repair's outcome, not another call."""
+    if not result.get("repair_pending"):
+        return result
+    metadata["axial_stop"] = "schema_unparsed"
+    closed = dict(result)
+    closed["repair_pending"] = False
+    closed["unparsed"] = True
+    closed["reason"] = "schema_unparsed"
+    parsed = dict(closed.get("parsed") or {})
+    repair_raw = str(parsed.get("raw_response") or "")
+    if original_raw:
+        parsed["raw_response"] = original_raw
+    if repair_raw:
+        parsed["repair_raw_response"] = repair_raw
+    parsed["reason"] = "schema_unparsed"
+    closed["parsed"] = parsed
+    audits = []
+    for audit in result.get("audits") or []:
+        row = dict(audit)
+        if str(row.get("status") or "") == "parse_failed":
+            row["status"] = "schema_unparsed"
+            row["reason"] = "schema_unparsed"
+            row["parsed"] = dict(parsed)
+            if repair_raw:
+                row["repair_raw_response"] = repair_raw
+        audits.append(row)
+    closed["audits"] = audits
+    return closed
 
 
 def _pack_window(
@@ -3508,8 +3636,11 @@ def _proposals_continue(metadata: Mapping[str, Any], pending: Sequence[Any], use
 
     A recorded timeout does not discard the remaining round. The allowance
     restored from the checkpoint still refuses a request that does not fit,
-    including the attempt that timed out.
+    including the attempt that timed out. A preserved response that still
+    needs its one repair is its own visit, even when the round looks stopped.
     """
+    if _hold_is(metadata, "axial_proposal"):
+        return True
     if str(metadata.get("axial_stop") or "") in {"timeout", "schema_unparsed"}:
         return False
     procedure = metadata.get("procedure") or {}
@@ -3521,6 +3652,28 @@ def _route_proposals(state: AxialState) -> str:
     if _proposals_continue(metadata, state.get("relation_round") or [], int(state.get("axial_calls_used") or 0)):
         return "propose_relations"
     return "relation_checkpoint"
+
+
+def _route_counterexamples(state: AxialState) -> str:
+    metadata = state.get("metadata") or {}
+    progress = metadata.get("counterexample_progress")
+    if (isinstance(progress, Mapping) and progress.get("open")) or _hold_is(metadata, "axial_counterexample"):
+        return "counterexample_worker"
+    return "commit_relations"
+
+
+def _route_memos(state: AxialState) -> str:
+    metadata = state.get("metadata") or {}
+    progress = metadata.get("memo_progress")
+    if (isinstance(progress, Mapping) and progress.get("open")) or _hold_is(metadata, "theoretical_memo"):
+        return "draft_memos"
+    return "draft_storyline"
+
+
+def _route_storyline(state: AxialState) -> str:
+    if _hold_is(state.get("metadata") or {}, "storyline"):
+        return "draft_storyline"
+    return "export_selective"
 
 
 def _propose_node(runtime: AxialRuntime):
@@ -3575,14 +3728,35 @@ def _propose_node(runtime: AxialRuntime):
                 _remember_pairs(accounting["omitted"], unsupported)
                 pending = list(supported_pending)
             metadata["unsupported_pairs_reconciled"] = True
-        while pending and used < int(procedure.get("propose_calls") or 0):
-            window = list(pending[:batch])
-            pending = list(pending[batch:])
+        proposal_hold = _take_provider_hold(metadata, "axial_proposal")
+        while proposal_hold is not None or (pending and used < int(procedure.get("propose_calls") or 0)):
             sent_chunk: list = []
             payload: dict[str, Any] = {}
             messages: list = []
             estimate = 0
-            while window:
+            if proposal_hold is not None:
+                context = proposal_hold.get("context") if isinstance(proposal_hold.get("context"), Mapping) else {}
+                sent_chunk = [dict(item) for item in (context.get("sent_chunk") or []) if isinstance(item, Mapping)]
+                estimate = int(context.get("estimate") or 0)
+                payload = {"omitted_evidence": context.get("omitted_evidence")}
+                messages = _repair_messages(proposal_hold)
+                original_raw = str(proposal_hold.get("raw_response") or "")
+                proposal_hold = None
+                result = await _structured_call(
+                    runtime,
+                    AxialProposalBatch,
+                    messages,
+                    kind="schema_repair",
+                    metadata=metadata,
+                    stage="coding",
+                    attempt_repair=False,
+                )
+                result = _close_failed_repair(metadata, result, original_raw=original_raw)
+            else:
+                window = list(pending[:batch])
+                pending = list(pending[batch:])
+                result = None
+            while result is None and window:
                 evidence, omitted = _allocate_evidence(window, assigned, passages, limit)
                 payload = {
                     "pairs": window,
@@ -3721,14 +3895,16 @@ def _propose_node(runtime: AxialRuntime):
                 break
             if not sent_chunk:
                 break
-            result = await _structured_call(
-                runtime,
-                AxialProposalBatch,
-                messages,
-                kind="axial_proposal",
-                metadata=metadata,
-                stage="coding",
-            )
+            if result is None:
+                result = await _structured_call(
+                    runtime,
+                    AxialProposalBatch,
+                    messages,
+                    kind="axial_proposal",
+                    metadata=metadata,
+                    stage="coding",
+                    attempt_repair=False,
+                )
             _log_call_audits(
                 logs,
                 result["audits"],
@@ -3736,6 +3912,27 @@ def _propose_node(runtime: AxialRuntime):
             )
             _note_proposal_repairs(metadata, result["audits"])
             estimated = int(metadata.get("axial_tokens_estimated") or estimated)
+            if result.get("repair_pending"):
+                _preserve_provider_call(
+                    metadata,
+                    result,
+                    kind="axial_proposal",
+                    schema_name="AxialProposalBatch",
+                    messages=messages,
+                    context={
+                        "sent_chunk": [dict(pair) for pair in sent_chunk],
+                        "estimate": estimate,
+                        "omitted_evidence": payload.get("omitted_evidence"),
+                    },
+                )
+                return {
+                    "relationships": relationships,
+                    "prompt_log": logs,
+                    "axial_calls_used": used,
+                    "relation_round": pending,
+                    "unexamined_pairs": list(state.get("unexamined_pairs") or []),
+                    "metadata": metadata,
+                }
             if result["refused"] or result["unparsed"]:
                 if not result["audits"]:
                     logs.append(
@@ -4004,82 +4201,155 @@ def _counterexample_node(runtime: AxialRuntime):
         batch = max(1, int((metadata.get("performance") or {}).get("batch_size") or 1))
         slots = allowance * batch
         search_enabled = procedure.get("negative_case_search", True) is not False
-        queued, stats = _select_counterexamples(
-            relationships,
-            passages,
-            slots=slots,
-            synthetic=bool(procedure.get("axial_synthetic_counterexample")),
-            codebook=state.get("codebook") if isinstance(state.get("codebook"), Mapping) else {},
-            segments=state.get("segments") or [],
-            enabled=search_enabled,
-        )
         by_id = {str(row.get("relationship_id") or ""): row for row in relationships}
-        for note in stats["notes"]:
-            if note not in warnings:
-                warnings.append(note)
-        metadata["axial_counterexample_relevance"] = {key: value for key, value in stats.items() if key != "notes"}
         logs = list(state.get("prompt_log") or [])
         used = int(state.get("axial_calls_used") or 0)
         passage_by_id = {str(item.get("passage_id") or ""): item for item in passages}
-        pending = list(queued)
-        made = 0
-        attempted_keys: set[tuple[str, str]] = set()
+        progress = metadata.get("counterexample_progress")
+        if isinstance(progress, Mapping) and progress.get("open"):
+            queued = [dict(item) for item in (progress.get("queued") or []) if isinstance(item, Mapping)]
+            stats = dict(metadata.get("axial_counterexample_relevance") or {})
+            stats.setdefault("notes", [])
+            pending = [dict(item) for item in (progress.get("pending") or []) if isinstance(item, Mapping)]
+            made = int(progress.get("made") or 0)
+            attempted_keys = {
+                (str(item[0]), str(item[1]))
+                for item in (progress.get("attempted_keys") or [])
+                if isinstance(item, (list, tuple)) and len(item) == 2
+            }
+            allowance = int(progress.get("allowance") or allowance)
+        else:
+            queued, stats = _select_counterexamples(
+                relationships,
+                passages,
+                slots=slots,
+                synthetic=bool(procedure.get("axial_synthetic_counterexample")),
+                codebook=state.get("codebook") if isinstance(state.get("codebook"), Mapping) else {},
+                segments=state.get("segments") or [],
+                enabled=search_enabled,
+            )
+            for note in stats["notes"]:
+                if note not in warnings:
+                    warnings.append(note)
+            metadata["axial_counterexample_relevance"] = {key: value for key, value in stats.items() if key != "notes"}
+            pending = list(queued)
+            made = 0
+            attempted_keys = set()
         token_budget = _request_token_budget(metadata)
         max_tokens = int(procedure.get("max_axial_review_tokens") or 0)
         estimated = int(metadata.get("axial_tokens_estimated") or 0)
-        while pending and made < allowance:
-            def _render(window, _by_id=by_id, _passages=passage_by_id):
-                payload = {
-                    "counterexamples": [
-                        {
-                            "relationship": _model_facing_relationship(_by_id.get(item["relationship_id"])),
-                            "passage": _model_facing_passage(_passages.get(item["passage_id"])),
-                            "complementary_passages": [
-                                _model_facing_passage(_passages.get(str(passage_id)))
-                                for passage_id in (item.get("complementary_passage_ids") or [])
-                                if _passages.get(str(passage_id)) is not None
-                            ],
-                            "respondent_id": str(item.get("respondent_id") or ""),
-                            "source": _model_facing_source(str(item.get("source") or "")),
-                            "comparison": str(item.get("comparison") or ""),
-                        }
-                        for item in window
-                    ]
-                }
-                return _messages("axial_counterexample", payload)
+        counter_hold = _take_provider_hold(metadata, "axial_counterexample")
 
-            chunk, pending, messages, estimate, reason = _pack_window(
-                pending,
-                batch,
-                _render,
-                AxialCounterexampleBatch,
-                request_budget=token_budget,
-                fits_total=lambda estimate: not _allowance_refuses(
-                    runtime, estimate, estimated=estimated, max_tokens=max_tokens, stage="coding"
-                ),
-            )
-            if reason or not chunk:
-                metadata["axial_stop"] = reason or "request_budget"
-                if messages:
-                    logs.append(
-                        _prompt_row(
-                            "axial_counterexample",
-                            messages,
-                            {},
-                            extra={"status": "omitted", "reason": reason or "request_budget", "estimated_input_tokens": estimate},
+        def _counterexample_partial() -> dict:
+            metadata["counterexample_progress"] = {
+                "open": True,
+                "pending": [dict(item) for item in pending],
+                "made": made,
+                "attempted_keys": [list(item) for item in attempted_keys],
+                "queued": [dict(item) for item in queued],
+                "allowance": allowance,
+            }
+            return {
+                "relationships": relationships,
+                "passages": [item for item in passages if not item.get("synthetic")],
+                "counterexample_queue": queued,
+                "prompt_log": logs,
+                "warnings": warnings,
+                "metadata": metadata,
+                "axial_calls_used": used,
+            }
+
+        while counter_hold is not None or (pending and made < allowance):
+            if counter_hold is not None:
+                context = counter_hold.get("context") if isinstance(counter_hold.get("context"), Mapping) else {}
+                chunk = [dict(item) for item in (context.get("chunk") or []) if isinstance(item, Mapping)]
+                estimate = int(context.get("estimate") or 0)
+                messages = _repair_messages(counter_hold)
+                original_raw = str(counter_hold.get("raw_response") or "")
+                counter_hold = None
+                result = _close_failed_repair(
+                    metadata,
+                    await _structured_call(
+                        runtime,
+                        AxialCounterexampleBatch,
+                        messages,
+                        kind="schema_repair",
+                        metadata=metadata,
+                        stage="coding",
+                        attempt_repair=False,
+                    ),
+                    original_raw=original_raw,
+                )
+            else:
+                chunk = []
+                messages = []
+                estimate = 0
+                result = None
+            if result is None:
+                def _render(window, _by_id=by_id, _passages=passage_by_id):
+                    payload = {
+                        "counterexamples": [
+                            {
+                                "relationship": _model_facing_relationship(_by_id.get(item["relationship_id"])),
+                                "passage": _model_facing_passage(_passages.get(item["passage_id"])),
+                                "complementary_passages": [
+                                    _model_facing_passage(_passages.get(str(passage_id)))
+                                    for passage_id in (item.get("complementary_passage_ids") or [])
+                                    if _passages.get(str(passage_id)) is not None
+                                ],
+                                "respondent_id": str(item.get("respondent_id") or ""),
+                                "source": _model_facing_source(str(item.get("source") or "")),
+                                "comparison": str(item.get("comparison") or ""),
+                            }
+                            for item in window
+                        ]
+                    }
+                    return _messages("axial_counterexample", payload)
+
+                chunk, pending, messages, estimate, reason = _pack_window(
+                    pending,
+                    batch,
+                    _render,
+                    AxialCounterexampleBatch,
+                    request_budget=token_budget,
+                    fits_total=lambda estimate: not _allowance_refuses(
+                        runtime, estimate, estimated=estimated, max_tokens=max_tokens, stage="coding"
+                    ),
+                )
+                if reason or not chunk:
+                    metadata["axial_stop"] = reason or "request_budget"
+                    if messages:
+                        logs.append(
+                            _prompt_row(
+                                "axial_counterexample",
+                                messages,
+                                {},
+                                extra={"status": "omitted", "reason": reason or "request_budget", "estimated_input_tokens": estimate},
+                            )
                         )
+                    if reason == "token_allowance":
+                        break
+                    continue
+                result = await _structured_call(
+                    runtime,
+                    AxialCounterexampleBatch,
+                    messages,
+                    kind="axial_counterexample",
+                    metadata=metadata,
+                    stage="coding",
+                    attempt_repair=False,
+                )
+                if result.get("repair_pending"):
+                    _log_call_audits(logs, result["audits"])
+                    _preserve_provider_call(
+                        metadata,
+                        result,
+                        kind="axial_counterexample",
+                        schema_name="AxialCounterexampleBatch",
+                        messages=messages,
+                        context={"chunk": [dict(item) for item in chunk], "estimate": estimate},
                     )
-                if reason == "token_allowance":
-                    break
-                continue
-            result = await _structured_call(
-                runtime,
-                AxialCounterexampleBatch,
-                messages,
-                kind="axial_counterexample",
-                metadata=metadata,
-                stage="coding",
-            )
+                    return _counterexample_partial()
             estimated = int(metadata.get("axial_tokens_estimated") or estimated)
             _log_call_audits(logs, result["audits"])
             if not result["refused"]:
@@ -4155,6 +4425,17 @@ def _counterexample_node(runtime: AxialRuntime):
                     }
                     if SYNTHETIC_LIMITATION not in warnings:
                         warnings.append(SYNTHETIC_LIMITATION)
+            break
+        stop_now = str(metadata.get("axial_stop") or "")
+        if pending and made < allowance and stop_now not in {
+            "timeout",
+            "schema_unparsed",
+            "call_allowance",
+            "token_allowance",
+            "request_budget",
+        }:
+            return _counterexample_partial()
+        metadata.pop("counterexample_progress", None)
         if pending:
             note = (
                 f"{len(pending)} counterexample pairs were not sent. "
@@ -4568,7 +4849,11 @@ def build_axial_graph(runtime: AxialRuntime | None = None, *, output_dir: str | 
         ["propose_relations", "relation_checkpoint"],
     )
     builder.add_edge("relation_checkpoint", "counterexample_worker")
-    builder.add_edge("counterexample_worker", "commit_relations")
+    builder.add_conditional_edges(
+        "counterexample_worker",
+        _route_counterexamples,
+        ["counterexample_worker", "commit_relations"],
+    )
     builder.add_edge("commit_relations", "saturation_indicators")
     builder.add_edge("saturation_indicators", "saturation_checkpoint")
     builder.add_edge("saturation_checkpoint", "export_axial")
@@ -4893,7 +5178,22 @@ def _memo_node(runtime: AxialRuntime):
         metadata = metadata_early
         memo_calls, _storyline_calls = _selective_allowances(metadata.get("procedure") or {})
         batch = max(1, int(((state.get("metadata") or {}).get("performance") or {}).get("batch_size") or 1))
-        pending = [row for row in relationships if not _relationship_rejected(row)]
+        memo_progress = metadata.get("memo_progress")
+        if isinstance(memo_progress, Mapping) and memo_progress.get("open"):
+            preexisting_ids = {str(item) for item in (memo_progress.get("initial_memo_ids") or [])}
+            preexisting_count = int(memo_progress.get("preexisting_count") or preexisting_count)
+            by_relationship = {
+                str(row.get("relationship_id") or ""): row
+                for row in relationships
+                if str(row.get("relationship_id") or "")
+            }
+            pending = [
+                by_relationship[str(item)]
+                for item in (memo_progress.get("pending_ids") or [])
+                if str(item) in by_relationship
+            ]
+        else:
+            pending = [row for row in relationships if not _relationship_rejected(row)]
         metadata["memo_skipped_rejected_ids"] = [
             str(row.get("relationship_id") or "")
             for row in relationships
@@ -4902,44 +5202,94 @@ def _memo_node(runtime: AxialRuntime):
         token_budget = _request_token_budget(metadata)
         max_tokens = int(((metadata.get("procedure") or {}).get("max_axial_review_tokens") or 0))
         estimated = int(metadata.get("axial_tokens_estimated") or 0)
-        while pending and used < memo_calls:
-            chunk, pending, messages, estimate, reason = _pack_window(
-                pending,
-                batch,
-                lambda window: _messages("theoretical_memo", {"relationships": window}),
-                TheoreticalMemoBatch,
-                request_budget=token_budget,
-                fits_total=lambda estimate: not _allowance_refuses(
-                    runtime, estimate, estimated=estimated, max_tokens=max_tokens, stage="selective"
-                ),
-            )
-            if reason or not chunk:
-                metadata["axial_stop"] = reason or "request_budget"
-                if messages:
-                    logs.append(
-                        _prompt_row(
-                            "theoretical_memo",
-                            messages,
-                            {},
-                            extra={
-                                "status": "omitted",
-                                "reason": reason or "request_budget",
-                                "estimated_input_tokens": estimate,
-                                "relationship_ids": [str(row.get("relationship_id") or "") for row in []],
-                            },
+        memo_hold = _take_provider_hold(metadata, "theoretical_memo")
+
+        def _memo_partial() -> dict:
+            metadata["memo_progress"] = {
+                "open": True,
+                "pending_ids": [str(row.get("relationship_id") or "") for row in pending if str(row.get("relationship_id") or "")],
+                "initial_memo_ids": sorted(preexisting_ids),
+                "preexisting_count": preexisting_count,
+            }
+            return {
+                "memos": memos,
+                "prompt_log": logs,
+                "selective_calls_used": used,
+                "warnings": list(state.get("warnings") or []),
+                "metadata": metadata,
+            }
+
+        while memo_hold is not None or (pending and used < memo_calls):
+            if memo_hold is not None:
+                context = memo_hold.get("context") if isinstance(memo_hold.get("context"), Mapping) else {}
+                chunk = [dict(item) for item in (context.get("chunk") or []) if isinstance(item, Mapping)]
+                estimate = int(context.get("estimate") or 0)
+                messages = _repair_messages(memo_hold)
+                original_raw = str(memo_hold.get("raw_response") or "")
+                memo_hold = None
+                result = _close_failed_repair(
+                    metadata,
+                    await _structured_call(
+                        runtime,
+                        TheoreticalMemoBatch,
+                        messages,
+                        kind="schema_repair",
+                        metadata=metadata,
+                        stage="selective",
+                        attempt_repair=False,
+                    ),
+                    original_raw=original_raw,
+                )
+            else:
+                chunk, pending, messages, estimate, reason = _pack_window(
+                    pending,
+                    batch,
+                    lambda window: _messages("theoretical_memo", {"relationships": window}),
+                    TheoreticalMemoBatch,
+                    request_budget=token_budget,
+                    fits_total=lambda estimate: not _allowance_refuses(
+                        runtime, estimate, estimated=estimated, max_tokens=max_tokens, stage="selective"
+                    ),
+                )
+                if reason or not chunk:
+                    metadata["axial_stop"] = reason or "request_budget"
+                    if messages:
+                        logs.append(
+                            _prompt_row(
+                                "theoretical_memo",
+                                messages,
+                                {},
+                                extra={
+                                    "status": "omitted",
+                                    "reason": reason or "request_budget",
+                                    "estimated_input_tokens": estimate,
+                                    "relationship_ids": [str(row.get("relationship_id") or "") for row in []],
+                                },
+                            )
                         )
+                    if reason == "token_allowance":
+                        break
+                    continue
+                result = await _structured_call(
+                    runtime,
+                    TheoreticalMemoBatch,
+                    messages,
+                    kind="theoretical_memo",
+                    metadata=metadata,
+                    stage="selective",
+                    attempt_repair=False,
+                )
+                if result.get("repair_pending"):
+                    _log_call_audits(logs, result["audits"])
+                    _preserve_provider_call(
+                        metadata,
+                        result,
+                        kind="theoretical_memo",
+                        schema_name="TheoreticalMemoBatch",
+                        messages=messages,
+                        context={"chunk": [dict(item) for item in chunk], "estimate": estimate},
                     )
-                if reason == "token_allowance":
-                    break
-                continue
-            result = await _structured_call(
-                runtime,
-                TheoreticalMemoBatch,
-                messages,
-                kind="theoretical_memo",
-                metadata=metadata,
-                stage="selective",
-            )
+                    return _memo_partial()
             estimated = int(metadata.get("axial_tokens_estimated") or estimated)
             _log_call_audits(logs, result["audits"])
             if result["refused"] or result["unparsed"]:
@@ -4992,6 +5342,17 @@ def _memo_node(runtime: AxialRuntime):
                         "graph_snapshot": (metadata.get("graph_snapshots") or {}).get("memos") or {},
                     }
                 )
+            break
+        stop_now = str(metadata.get("axial_stop") or "")
+        if pending and used < memo_calls and stop_now not in {
+            "timeout",
+            "schema_unparsed",
+            "call_allowance",
+            "token_allowance",
+            "request_budget",
+        }:
+            return _memo_partial()
+        metadata.pop("memo_progress", None)
         warnings = list(state.get("warnings") or [])
         if pending:
             note = (
@@ -5256,74 +5617,122 @@ def _story_node(runtime: AxialRuntime):
         procedure = ((state.get("metadata") or {}).get("procedure") or {})
         allowance = int(procedure.get("max_selective_review_calls") or 0)
         _memo_calls, storyline_calls = _selective_allowances(procedure)
-        if storyline_calls <= 0 or used >= allowance:
+        metadata = dict(state.get("metadata") or {})
+        story_hold = _take_provider_hold(metadata, "storyline")
+        if story_hold is None and (storyline_calls <= 0 or used >= allowance):
             warnings = list(state.get("warnings") or [])
             note = "The storyline was not drafted. The selective call allowance is a ceiling."
             if note not in warnings:
                 warnings.append(note)
-            metadata = dict(state.get("metadata") or {})
             metadata["axial_stop"] = "call_allowance"
             _note_stage(metadata, "storyline", required=True, status="budget_limited", reason="call_allowance")
             return {"warnings": warnings, "metadata": metadata}
-        metadata = dict(state.get("metadata") or {})
-        core_id, provenance = _story_core(state)
-        emphasis = bool(core_id) and _core_has_relationship(state, core_id)
-        payload, messages, estimate, omitted = _pack_storyline(
-            state,
-            core_id=core_id,
-            provenance=provenance,
-            metadata=metadata,
-            runtime=runtime,
-            core_emphasis=emphasis,
-        )
-        metadata["storyline_omitted"] = omitted
-        metadata["storyline_core_id"] = core_id
-        metadata["storyline_core_provenance"] = provenance
-        metadata["storyline_core_emphasis"] = emphasis
-        metadata["graph_snapshots"] = {
-            **dict(metadata.get("graph_snapshots") or {}),
-            "storyline": graph_snapshot(state.get("relationships") or []),
-        }
-        token_budget = _request_token_budget(metadata)
-        max_tokens = int(((metadata.get("procedure") or {}).get("max_axial_review_tokens") or 0))
-        estimated = int(metadata.get("axial_tokens_estimated") or 0)
-        logs = list(state.get("prompt_log") or [])
-        over_total = _allowance_refuses(
-            runtime, estimate, estimated=estimated, max_tokens=max_tokens, stage="selective", apply_reserve=False
-        )
-        over_request = estimate > token_budget
-        if over_total or over_request:
-            reason = "token_allowance" if over_total else "request_budget"
-            metadata["axial_stop"] = reason
-            reserve = int(procedure.get("storyline_token_reserve") or 0)
-            logs.append(
-                _prompt_row(
-                    "storyline",
+        if story_hold is not None:
+            context = story_hold.get("context") if isinstance(story_hold.get("context"), Mapping) else {}
+            core_id = str(context.get("core_id") or metadata.get("storyline_core_id") or "")
+            provenance = str(context.get("provenance") or metadata.get("storyline_core_provenance") or "")
+            estimate = int(context.get("estimate") or 0)
+            payload = {"passages": [{"passage_id": item} for item in (context.get("passage_ids") or [])]}
+            messages = _repair_messages(story_hold)
+            logs = list(state.get("prompt_log") or [])
+            original_raw = str(story_hold.get("raw_response") or "")
+            result = _close_failed_repair(
+                metadata,
+                await _structured_call(
+                    runtime,
+                    StorylineBatch,
                     messages,
-                    {},
-                    extra={
-                        "status": "omitted",
-                        "reason": reason,
-                        "estimated_input_tokens": estimate,
+                    kind="schema_repair",
+                    metadata=metadata,
+                    stage="selective",
+                    attempt_repair=False,
+                ),
+                original_raw=original_raw,
+            )
+            emphasis = bool(metadata.get("storyline_core_emphasis"))
+        else:
+            core_id, provenance = _story_core(state)
+            emphasis = bool(core_id) and _core_has_relationship(state, core_id)
+            payload, messages, estimate, omitted = _pack_storyline(
+                state,
+                core_id=core_id,
+                provenance=provenance,
+                metadata=metadata,
+                runtime=runtime,
+                core_emphasis=emphasis,
+            )
+            metadata["storyline_omitted"] = omitted
+            metadata["storyline_core_id"] = core_id
+            metadata["storyline_core_provenance"] = provenance
+            metadata["storyline_core_emphasis"] = emphasis
+            metadata["graph_snapshots"] = {
+                **dict(metadata.get("graph_snapshots") or {}),
+                "storyline": graph_snapshot(state.get("relationships") or []),
+            }
+            token_budget = _request_token_budget(metadata)
+            max_tokens = int(((metadata.get("procedure") or {}).get("max_axial_review_tokens") or 0))
+            estimated = int(metadata.get("axial_tokens_estimated") or 0)
+            logs = list(state.get("prompt_log") or [])
+            over_total = _allowance_refuses(
+                runtime, estimate, estimated=estimated, max_tokens=max_tokens, stage="selective", apply_reserve=False
+            )
+            over_request = estimate > token_budget
+            if over_total or over_request:
+                reason = "token_allowance" if over_total else "request_budget"
+                metadata["axial_stop"] = reason
+                reserve = int(procedure.get("storyline_token_reserve") or 0)
+                logs.append(
+                    _prompt_row(
+                        "storyline",
+                        messages,
+                        {},
+                        extra={
+                            "status": "omitted",
+                            "reason": reason,
+                            "estimated_input_tokens": estimate,
+                            "core_id": core_id,
+                            "core_provenance": provenance,
+                            "storyline_token_reserve": reserve,
+                        },
+                    )
+                )
+                warnings = list(state.get("warnings") or [])
+                if reason == "token_allowance":
+                    note = (
+                        "The storyline was not drafted (budget_limited, token_allowance). "
+                        f"A token share of {reserve} was reserved for the storyline and the request still did not fit."
+                    )
+                else:
+                    note = f"The storyline was not drafted ({reason})."
+                if note not in warnings:
+                    warnings.append(note)
+                _note_stage(metadata, "storyline", required=True, status="budget_limited", reason=reason)
+                return {"warnings": warnings, "prompt_log": logs, "metadata": metadata}
+            result = await _structured_call(
+                runtime,
+                StorylineBatch,
+                messages,
+                kind="storyline",
+                metadata=metadata,
+                stage="selective",
+                attempt_repair=False,
+            )
+            if result.get("repair_pending"):
+                _log_call_audits(logs, result["audits"], extra={"core_id": core_id, "core_provenance": provenance})
+                _preserve_provider_call(
+                    metadata,
+                    result,
+                    kind="storyline",
+                    schema_name="StorylineBatch",
+                    messages=messages,
+                    context={
+                        "estimate": estimate,
+                        "passage_ids": [str(row.get("passage_id") or "") for row in (payload.get("passages") or []) if isinstance(row, dict)],
                         "core_id": core_id,
-                        "core_provenance": provenance,
-                        "storyline_token_reserve": reserve,
+                        "provenance": provenance,
                     },
                 )
-            )
-            warnings = list(state.get("warnings") or [])
-            if reason == "token_allowance":
-                note = (
-                    "The storyline was not drafted (budget_limited, token_allowance). "
-                    f"A token share of {reserve} was reserved for the storyline and the request still did not fit."
-                )
-            else:
-                note = f"The storyline was not drafted ({reason})."
-            if note not in warnings:
-                warnings.append(note)
-            _note_stage(metadata, "storyline", required=True, status="budget_limited", reason=reason)
-            return {"warnings": warnings, "prompt_log": logs, "metadata": metadata}
-        result = await _structured_call(runtime, StorylineBatch, messages, kind="storyline", metadata=metadata, stage="selective")
+                return {"warnings": list(state.get("warnings") or []), "prompt_log": logs, "metadata": metadata}
         _log_call_audits(logs, result["audits"], extra={"core_id": core_id, "core_provenance": provenance})
         if result["refused"] or result["unparsed"]:
             warnings = list(state.get("warnings") or [])
@@ -5502,8 +5911,16 @@ def build_selective_graph(runtime: AxialRuntime | None = None, *, output_dir: st
     builder.add_edge("load_category_development", "score_candidates")
     builder.add_edge("score_candidates", "core_checkpoint")
     builder.add_edge("core_checkpoint", "draft_memos")
-    builder.add_edge("draft_memos", "draft_storyline")
-    builder.add_edge("draft_storyline", "export_selective")
+    builder.add_conditional_edges(
+        "draft_memos",
+        _route_memos,
+        ["draft_memos", "draft_storyline"],
+    )
+    builder.add_conditional_edges(
+        "draft_storyline",
+        _route_storyline,
+        ["draft_storyline", "export_selective"],
+    )
     builder.add_edge("export_selective", END)
     return builder
 
@@ -5737,7 +6154,12 @@ def _derived_recursion_limit(procedure: Mapping[str, Any], *, override: int | No
         return max(1, int(override))
     propose = int(procedure.get("propose_calls") or 0)
     pairs = int(procedure.get("planned_pair_count") or 0)
-    return propose + pairs + _GRAPH_NODE_OVERHEAD
+    counter = int(procedure.get("counterexample_calls") or 0)
+    memo_calls, storyline_calls = _selective_allowances(procedure)
+    # Each paid call returns so it can be checkpointed, and a schema repair
+    # is a second return. Proposal requests were already counted once.
+    paid = counter + memo_calls + storyline_calls
+    return propose + pairs + paid + (propose + paid) + _GRAPH_NODE_OVERHEAD
 
 
 def _mark_recursion_limit(state: dict, *, limit: int, exc: BaseException) -> dict:

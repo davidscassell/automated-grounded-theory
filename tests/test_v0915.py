@@ -15,6 +15,7 @@ from automated_grounded_theory import axial_code, selective_code
 from automated_grounded_theory.async_support import CallLimiter, ainvoke_structured, run_sync
 from automated_grounded_theory.axial import AxialProposalBatch, AxialRelationshipDraft, export_axial_state
 from automated_grounded_theory.graph_grounding import graph_supported
+from tests.fake_focused import FakeFocusedCoder
 from tests.test_v080 import QUOTE, FakeAxialCoder, _corpus, _payload
 from tests.test_v090 import FakeSamplingCoder
 
@@ -776,3 +777,147 @@ def test_reread_reporting_splits_non_relevant_and_exposes_completed_pairs(tmp_pa
     assert untouched.metadata["reread_interpretations"]["relevance"] is None
     assert untouched.metadata["reread_interpretations"]["relevant_reread_tokens"] is None
     assert untouched.reread_notes == []
+
+
+class _PreservedRepairCoder(_StallCoder):
+    """Invalid first response carries usage. The repair stalls or crashes."""
+
+    crash: bool = False
+
+    def with_structured_output(self, schema, **kwargs):
+        inner = _StallCoder.with_structured_output(self, schema, **kwargs)
+
+        def _call(messages):
+            repair = "REPAIR THIS OUTPUT" in _texts(messages)
+            if repair and self.crash:
+                raise RuntimeError("repair crashed")
+            result = inner.invoke(messages)
+            if isinstance(result, dict) and result.get("parsed") is None and isinstance(result.get("raw"), AIMessage):
+                result["raw"].usage_metadata = {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18}
+                result["raw"].content = json.dumps({"relationships": [{"statement": "   "}], "preserved": "original"})
+            return result
+
+        return RunnableLambda(_call)
+
+
+def _original_usage(result) -> dict:
+    hold = (result.metadata.get("provider_call_hold") or {})
+    if hold.get("usage"):
+        return hold["usage"]
+    for row in result.prompt_log:
+        usage = row.get("usage") or {}
+        if usage.get("total_tokens") == 18:
+            return usage
+    return {}
+
+
+def test_repair_stall_keeps_the_original_response_and_usage(tmp_path: Path):
+    """A stall or crash during repair does not drop the first response."""
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    timeout = 0.35
+    stalled = _PreservedRepairCoder(stall="repair", delay=1.5)
+    saver = InMemorySaver()
+    started = time.perf_counter()
+    partial = axial_code(
+        _corpus(),
+        stalled,
+        axial_request_timeout=timeout,
+        checkpointer=saver,
+        thread_id="repair-stall",
+        output_dir=tmp_path / "stall",
+        **_COMMON,
+    )
+    assert time.perf_counter() - started < timeout + 0.9
+    assert partial.metadata["stop"] == "timeout"
+    hold = partial.metadata["provider_call_hold"]
+    assert hold["kind"] == "axial_proposal"
+    assert hold["usage"]["total_tokens"] == 18
+    assert "preserved" in hold["raw_response"]
+    assert _original_usage(partial)["input_tokens"] == 11
+    logged = [row for row in partial.prompt_log if (row.get("usage") or {}).get("total_tokens") == 18]
+    assert logged
+    assert "preserved" in str(logged[0].get("raw_response") or "")
+
+    crashed = _PreservedRepairCoder(stall="repair", crash=True)
+    crash_saver = InMemorySaver()
+    with pytest.raises(RuntimeError, match="repair crashed"):
+        axial_code(
+            _corpus(),
+            crashed,
+            axial_request_timeout=timeout,
+            checkpointer=crash_saver,
+            thread_id="repair-crash",
+            **_COMMON,
+        )
+    saved = crash_saver.get_tuple({"configurable": {"thread_id": "repair-crash"}})
+    values = saved.checkpoint["channel_values"]
+    crashed_hold = values["metadata"]["provider_call_hold"]
+    assert crashed_hold["usage"]["total_tokens"] == 18
+    assert "preserved" in crashed_hold["raw_response"]
+    assert any((row.get("usage") or {}).get("total_tokens") == 18 for row in values["prompt_log"])
+
+
+class _FocusedRepairStall(FakeFocusedCoder):
+    """The recode response is unparsed. The repair sleeps."""
+
+    delay: float = 1.5
+
+    def with_structured_output(self, schema, **kwargs):
+        def _call(messages):
+            self.call_count += 1
+            text = "\n".join(getattr(message, "content", "") if not isinstance(message, dict) else str(message.get("content") or "") for message in messages)
+            if "REPAIR THIS OUTPUT" in text:
+                time.sleep(self.delay)
+            raw = AIMessage(
+                content="not json focused-original",
+                usage_metadata={"input_tokens": 11, "output_tokens": 7, "total_tokens": 18},
+            )
+            return {"raw": raw, "parsed": None, "parsing_error": ValueError("not a recode")}
+
+        return RunnableLambda(_call)
+
+
+def test_focused_repair_stall_keeps_the_original_response(tmp_path: Path):
+    from automated_grounded_theory import focused_code
+    from tests.test_v070 import _entry, _passages, _source
+
+    timeout = 0.35
+    started = time.perf_counter()
+    partial = focused_code(
+        _source(
+            passages=_passages()[:1],
+            codes=[_entry("c-freq", "packing bags", 1, ["d1"])],
+            segments=[
+                {
+                    "segment_id": "s1",
+                    "code_id": "c-freq",
+                    "code": "packing bags",
+                    "passage_id": "p1",
+                    "doc_id": "d1",
+                    "quote": _passages()[0]["text"],
+                    "review_reasons": [],
+                }
+            ],
+        ),
+        model=_FocusedRepairStall(),
+        seed=1,
+        focused_min_score=0,
+        focused_neighbor_limit=0,
+        focused_outside_limit=0,
+        focused_negative_case_limit=0,
+        focused_share_develop=1,
+        focused_share_compete=0,
+        focused_share_outside=0,
+        focused_share_claim_compete=0,
+        focused_request_timeout=timeout,
+        max_focused_review_calls=2,
+        interrupt=False,
+        output_dir=tmp_path / "focused",
+    )
+    assert time.perf_counter() - started < timeout + 0.9
+    assert partial.metadata["stop"] == "timeout"
+    holds = partial.metadata["focused_call_holds"]
+    preserved = next(iter(holds.values()))
+    assert preserved["usage"]["total_tokens"] == 18
+    assert "focused-original" in preserved["raw_response"]
