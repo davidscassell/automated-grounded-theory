@@ -20,10 +20,11 @@ Each copied row has `relationship_id`, `disposition`, `rules`, and `withholding_
 | `generic_stem_only` | `endpoint_anchoring.reason` `generic_stem_only` |
 | `absence_reclassified` | a non-synthetic counterexample whose `reclassification_reason` or `reason` is `absence_is_not_contradiction` |
 | `consequence_wording` | flags `wording_exceeds_tier`, `reviewer_causal_claim_mismatch`, `memo_wording_exceeds_tier`, `storyline_wording_exceeds_tier` |
+| `role_evidence` | flag `role_evidence_exceeds_tier` |
 | `acceptance_withheld` | flag `acceptance_withheld` |
 | other | any other flag or anchor reason, under that flag or reason name |
 
-An accepted row can still list a rule. A wording flag does not by itself move the row to `withheld`.
+An accepted row can still list a rule. A wording flag does not by itself move the row to `withheld`. 0.9.15 adds `role_evidence` for the flag `role_evidence_exceeds_tier`. `consequence_wording` still reads the sentence flags. The causal gate is not turned off.
 
 ## Adjudication record
 

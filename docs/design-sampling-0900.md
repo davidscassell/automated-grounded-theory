@@ -1,6 +1,6 @@
 # Theoretical sampling and a saturation decision (0.9.0)
 
-`policy_version` was `0.9.0` for the first sampling graph. Package `policy_version` is `0.9.14`. The sections below record what each version added. The current sampling behavior is the whole file. The index is [README.md](README.md). This note is the design for the sampling graph. It does not replace [design-axial-0800.md](design-axial-0800.md). Axial coding and selective coding were already experimental graphs in 0.8.x. 0.9.0 does not rebuild them.
+`policy_version` was `0.9.0` for the first sampling graph. Package `policy_version` is `0.9.15`. The sections below record what each version added. The current sampling behavior is the whole file. The index is [README.md](README.md). This note is the design for the sampling graph. It does not replace [design-axial-0800.md](design-axial-0800.md). Axial coding and selective coding were already experimental graphs in 0.8.x. 0.9.0 does not rebuild them.
 
 The README sentence this release retires said: "The package does not do theoretical sampling, axial coding, selective coding, or a saturation decision." That sentence was stale. The audit below is what was already true on 0.8.7 (`158bae3`), and what 0.9.0 adds.
 
@@ -206,3 +206,11 @@ A recovered pair is removed from `reread_failed_pairs` when its note is stored. 
 ## Configured document minimum (0.9.14)
 
 `min_documents` (default 3) is the saturation window the readiness check uses. A model saturation call is withheld when `n_documents` is below that configured value, when fewer than 2 sampling rounds are on the ledger, or when `saturation_window` is `not_interpretable`. The withheld record stores `minimum_documents` as the configured value, `status` `not_interpretable`, and `assessment` null. The decision call is not spent. A human checkpoint still pauses. Its payload carries `minimum_documents`, `window_ready`, and `window_reason`. The stopping-criteria rate rows already used this same minimum, so a run can show those rows as `undefined` while the model call stays unsent. The indicator label `saturation_window` is still computed from the constant 3 when the run has no curve of its own. That label still withholds the model call. The note is [design-review-fixes-0914.md](design-review-fixes-0914.md).
+
+## Reread interpretation report (0.9.15)
+
+`SamplingResult.completed_pairs` is `metadata.reread_completed_pairs`. It stays null when that list was not recorded, including a `brief_only` run. The ledger's `completed_pairs` are unchanged, and a completed pair is still not sent again.
+
+`reread_interpretations` classifies notes after the run. It does not change which passages are selected or how a judgment is stored. A note is `unanchored` when `quote_unanchored` is set, including when `judgment` is `relevant`. Otherwise `relevant` and `irrelevant` follow the structured judgment, an empty or other judgment is `unjudged`, and a pair in `reread_failed_pairs` or an unsent pair with reason `schema_unparsed`, `timeout`, or `incomplete` is `failed` when it has no note. `call_allowance` is not a failed interpretation.
+
+`relevance` is relevant notes divided by every classified interpretation, and null when that denominator is zero. The same block is reported for each direction `kind`, for `new_document` and `known_document`, and for `new_respondent` and `known_respondent`. A missing document or respondent id is left out of those novelty blocks. `relevant_reread_tokens` and `tokens_per_relevant_reread` stay null unless every relevant note has usage that can be tied to its passage. `cost_per_relevant_reread_usd` stays null unless the run records `token_prices.input_usd_per_million` and `token_prices.output_usd_per_million`. The note is [design-review-fixes-0915.md](design-review-fixes-0915.md).

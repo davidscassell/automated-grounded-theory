@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.15
+
+- A returned axial relationship requires a nonempty statement. `nothing_to_propose` with an empty list remains the explicit empty batch. One repair is sent against the original evidence, and a statement that is only a quote is discarded. `proposal_diagnostics.rejection_reasons` counts discarded proposals by reason.
+- `downstream_eligible` is supported evidence only. A weak stem, a tier below 2, or a missing tier is `hypothesis_exploration`. Core graph support ignores a stale eligible flag on a weak stem. Memos and the storyline snapshot still receive that hypothesis row.
+- `unspecified` is a valid role when the evidence is only an association. A causal role below tier 3 is `role_evidence_exceeds_tier`, apart from `wording_exceeds_tier` on the sentence. The causal gate stays on.
+- Axial export records an attrition funnel and install provenance: commit, module path, module and distribution versions, model, and generation parameters. Temperature is unset unless the caller configured it. A distribution that does not match the imported checkout raises `InstallationMismatch`.
+- Sampling reports split non-relevant rereads into irrelevant, unjudged, unanchored, and failed, with relevance by direction type and by document or respondent novelty, and tokens per relevant reread. Cost stays null unless prices were configured. `SamplingResult.completed_pairs` repeats `metadata.reread_completed_pairs`.
+- `pattern_min_cases` stays 2. The axial token ceiling stays 24000. The design is [docs/design-review-fixes-0915.md](docs/design-review-fixes-0915.md). `policy_version` is `0.9.15`.
+
 ## 0.9.14
 
 - `downstream_withheld_supported_recall` and `downstream_precision` stay null unless every row in that rate's population has a boolean `downstream_eligible`. Unknown eligibility is not a lower bound stored as a point estimate. `downstream_withheld_supported_recall_known` and `downstream_precision_known` score the known rows and report the denominator and coverage. Per-rule results use the same split. A zero denominator stays null.
