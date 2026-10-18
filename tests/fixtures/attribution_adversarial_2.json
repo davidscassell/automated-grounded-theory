@@ -1,0 +1,285 @@
+{
+  "fixture_version": "attribution-adversarial-2",
+  "note": "Synthetic quotes for the deterministic attribution rule. Not study data. Passing this fixture is regression coverage for closed patterns. It is not a measure of general semantic accuracy.",
+  "cases": [
+    {
+      "id": "repro-no-evidence-that",
+      "quote": "There is no evidence that tools for the shift cause coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "not-clear-that",
+      "quote": "It is not clear that tools for the shift lead to coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "doubt-before-connector",
+      "quote": "I doubt tools for the shift cause coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "unclear-whether",
+      "quote": "It is unclear whether tools for the shift lead to coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "there-is-no-before-cause",
+      "quote": "There is no basis on which tools for the shift cause coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "nothing-to-suggest",
+      "quote": "Nothing to suggest tools for the shift lead to coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "i-dont-know-if",
+      "quote": "I don't know if tools for the shift cause coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "i-do-not-know-if",
+      "quote": "I do not know if tools for the shift lead to coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "no-sign-that",
+      "quote": "There is no sign that tools for the shift cause coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "no-indication-that",
+      "quote": "No indication that tools for the shift lead to coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "doubtful-whether",
+      "quote": "It remains doubtful whether tools for the shift lead to coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "not-known-whether",
+      "quote": "It is not known whether tools for the shift cause coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "unknown-whether",
+      "quote": "Unknown whether tools for the shift cause coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "no-proof-that",
+      "quote": "There is no proof that tools for the shift lead to coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "nothing-indicates",
+      "quote": "Nothing indicates tools for the shift cause coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "no-reason-to-think",
+      "quote": "No reason to think tools for the shift lead to coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "not-established-that",
+      "quote": "It is not established that tools for the shift cause coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "cannot-tell-whether",
+      "quote": "I cannot tell whether tools for the shift lead to coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "cant-tell-whether",
+      "quote": "I can't tell whether tools for the shift cause coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "no-data-that",
+      "quote": "There is no data that tools for the shift lead to coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "no-support-that",
+      "quote": "There is no support that tools for the shift cause coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "not-obvious-that",
+      "quote": "It is not obvious that tools for the shift lead to coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "no-doubt-fails-closed",
+      "quote": "There is no doubt that tools for the shift cause coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "i-have-no-doubt-fails-closed",
+      "quote": "I have no doubt tools for the shift cause coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "nothing-that-shows",
+      "quote": "I see nothing that shows tools for the shift cause coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "lack-of-evidence",
+      "quote": "For lack of evidence tools for the shift cause coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "without-evidence-that",
+      "quote": "Without evidence that tools for the shift lead to coworkers on the crew the night still ran",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "hard-to-say-whether",
+      "quote": "It is hard to say whether tools for the shift lead to coworkers on the crew",
+      "outcome": "unsupported",
+      "status": "unsupported",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "genuine-forward-still-validated",
+      "quote": "tools for the shift lead to coworkers on the crew because the night ran long",
+      "outcome": "validated_forward",
+      "status": "validated",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": true,
+      "evidence_tier": 3
+    },
+    {
+      "id": "marker-after-the-connector-stays-validated",
+      "quote": "tools for the shift lead to coworkers on the crew and later there is no evidence about the weather",
+      "outcome": "validated_forward",
+      "status": "validated",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": true,
+      "evidence_tier": 3
+    },
+    {
+      "id": "later-sentence-does-not-poison-the-claim",
+      "quote": "tools for the shift lead to coworkers on the crew. There is no evidence about the weather.",
+      "outcome": "validated_forward",
+      "status": "validated",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": true,
+      "evidence_tier": 3
+    }
+  ]
+}

@@ -33,9 +33,9 @@ _TEMPLATE = Path("examples/discovery_adjudication_template.csv")
 
 
 def test_package_version_is_0921():
-    assert __version__ == "0.9.22"
-    assert POLICY_VERSION == "0.9.22"
-    assert DISCOVERY_SCHEMA_VERSION == "discovery-eval-2"
+    assert __version__ == "0.9.23"
+    assert POLICY_VERSION == "0.9.23"
+    assert DISCOVERY_SCHEMA_VERSION == "discovery-eval-3"
 
 
 def _gold(adjudication_id, from_id, to_id, passage_id, **extra):
@@ -339,7 +339,7 @@ def test_template_is_headers_only_and_example_is_synthetic():
     assert "synthetic" in loaded["label"].casefold()
     assert "not a study result" in loaded["label"].casefold()
     assert loaded["frozen_hash_status"] == "verified"
-    assert loaded["schema_version"] == "discovery-eval-2"
+    assert loaded["schema_version"] == "discovery-eval-3"
     assert loaded["source_schema_version"] == "discovery-eval-1"
     assert loaded["disagreements"]
     report = score_discovery([], loaded)

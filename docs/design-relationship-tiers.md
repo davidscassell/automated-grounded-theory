@@ -49,3 +49,5 @@ Package 0.9.20 still uses those tier numbers. A keyword hit no longer authorizes
 Package 0.9.21 does not change these tier numbers. It adds a separate discovery scorer. That scorer does not read tier labels. The note is [design-discovery-evaluation.md](design-discovery-evaluation.md).
 
 Package 0.9.22 keeps the same tier numbers. Tier 3 still needs one clear clause and one recognized connector, affirmative and unhedged, in the from-to direction, plus a rival check. Passive `caused by` and `led to by` reverse direction. Negation, a second claim clause, and `if`, `would`, or `someone said` stay unvalidated. Anything outside those patterns stays unvalidated. This is not general semantic reliability. The note is [design-review-fixes-0922.md](design-review-fixes-0922.md).
+
+Package 0.9.23 does not change the tier numbers. An epistemic or existential-negation marker before the connector, including absence-of-evidence wording, fails closed and does not authorize tier 3. Passing the synthetic fixture is regression coverage, not general semantic reliability. The note is [design-review-fixes-0923.md](design-review-fixes-0923.md).

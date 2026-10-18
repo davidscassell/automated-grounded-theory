@@ -39,8 +39,8 @@ from tests.fake_llm import FakeCoder
 
 
 def test_version_is_0_6_8():
-    assert __version__ == "0.9.22"
-    assert POLICY_VERSION == "0.9.22"
+    assert __version__ == "0.9.23"
+    assert POLICY_VERSION == "0.9.23"
 
 
 class _HeartbeatEmbeddings:

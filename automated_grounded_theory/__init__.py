@@ -44,6 +44,7 @@ from automated_grounded_theory.decision_review import (
 from automated_grounded_theory.discovery_evaluation import (
     DISCOVERY_SCHEMA_VERSION,
     DiscoveryEvaluationError,
+    claim_statement_hash,
     freeze_discovery_set,
     load_discovery_file,
     score_discovery,
@@ -78,6 +79,7 @@ from automated_grounded_theory.saturation import stopping_criteria_report, thema
 from automated_grounded_theory.segment import plan_coding
 from automated_grounded_theory.stability import StabilityReport
 from automated_grounded_theory.themes import ThemeError, ThemeResult, abuild_themes, build_themes
+from automated_grounded_theory.relationship_tiers import score_attribution_accuracy
 from automated_grounded_theory.version import __version__
 
 __all__ = [
@@ -116,12 +118,14 @@ __all__ = [
     "aopen_code",
     "build_themes",
     "chen_metrics",
+    "claim_statement_hash",
     "compare_runs",
     "evaluate_run",
     "export_gate_relationships",
     "freeze_discovery_set",
     "load_adjudications",
     "load_discovery_file",
+    "score_attribution_accuracy",
     "score_discovery",
     "score_gate_adjudications",
     "focused_code",
