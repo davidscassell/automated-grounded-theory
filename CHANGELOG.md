@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.16
+
+- An editable install is consistent when `direct_url.json` or an editable finder names the imported checkout. A distribution version that differs from the imported module still raises `InstallationMismatch`, and axial and selective coding check that before a model call.
+- The sampling recursion limit is the graph's visits: preparation, one selection repair, three visits per coding call, one withhold visit, and finalization. A 32-call reread is not stopped by a fixed overhead.
+- Validation flags are recomputed from the effective statement and role. A human correction removes flags whose conditions no longer apply. The previous flags stay on `validation_revision_history`.
+- Until a human sets a role, the reviewer's role is the working role for validation, eligibility, export, and `validated_decision`. The proposal, model, reviewer, and human roles stay on the row.
+- The restart test resolves its own repository root.
+- A proposal batch that mixes valid and invalid relationships keeps the valid rows and logs each dropped row with its index, reason, error, and draft. It does not spend a repair. A batch with nothing valid still uses one repair.
+- `tokens_per_relevant_reread` is unchanged. `expenditure_tokens_per_relevant_reread` divides all reread tokens, including irrelevant responses, failed parses, and repairs, by `relevant_reread_count`. The rate is null when that count is zero, and the count is reported. `human_confirmed_useful_rereads` is null and is not computed.
+- `idle_timeout` is recorded and is not enforced. Returning after a timeout does not prove the provider request stopped. Enforcing the idle limit is not feasible with the current structured calls.
+- `pattern_min_cases` stays 2. The axial token ceiling stays 24000. The design is [docs/design-review-fixes-0916.md](docs/design-review-fixes-0916.md). `policy_version` is `0.9.16`.
+
 ## 0.9.15
 
 - A returned axial relationship requires a nonempty statement. `nothing_to_propose` with an empty list remains the explicit empty batch. One repair is sent against the original evidence, and a statement that is only a quote is discarded. `proposal_diagnostics.rejection_reasons` counts discarded proposals by reason.

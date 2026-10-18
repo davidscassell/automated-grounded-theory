@@ -11,10 +11,13 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import importlib.metadata
+import json
 import subprocess
+import sys
 import weakref
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import unquote, urlparse
 
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -169,12 +172,72 @@ def _git_commit(root: Path) -> str | None:
     return commit or None
 
 
+def _path_contains(root: Path, file: Path) -> bool:
+    try:
+        file.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _direct_url_payload(dist: Any) -> dict[str, Any] | None:
+    read_text = getattr(dist, "read_text", None)
+    if not callable(read_text):
+        return None
+    try:
+        text = read_text("direct_url.json")
+    except (FileNotFoundError, OSError):
+        return None
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _editable_project_root(dist: Any) -> Path | None:
+    """Project root from PEP 660 ``direct_url.json``, when this install is editable."""
+    payload = _direct_url_payload(dist)
+    if payload is None:
+        return None
+    info = payload.get("dir_info")
+    if not isinstance(info, dict) or not info.get("editable"):
+        return None
+    url = str(payload.get("url") or "")
+    if not url.startswith("file:"):
+        return None
+    path = unquote(urlparse(url).path)
+    if not path:
+        return None
+    return Path(path).resolve()
+
+
+def _editable_finder_root(imported: Path) -> Path | None:
+    """Package directory from an editable finder whose mapping contains ``imported``."""
+    for finder in sys.meta_path:
+        mapping = getattr(finder, "MAPPING", None)
+        if not isinstance(mapping, dict):
+            continue
+        target = mapping.get("automated_grounded_theory")
+        if not isinstance(target, str) or not target:
+            continue
+        root = Path(target).resolve()
+        if _path_contains(root, imported):
+            return root
+    return None
+
+
 def installation_record() -> dict[str, Any]:
     """Commit, import path, and versions. Raise when they disagree.
 
-    An editable install whose metadata names another checkout, or a
-    distribution version that is not the imported module version, is a
-    mismatch. A missing git commit stays null.
+    A distribution version that is not the imported module version is a
+    mismatch. An editable install may keep metadata in site-packages while
+    importing code from the checkout. ``direct_url.json`` or an editable
+    finder names that checkout. Metadata that names a different tree is a
+    mismatch. A regular install must still sit beside its metadata. A missing
+    git commit stays null.
     """
     import automated_grounded_theory as package
 
@@ -185,22 +248,42 @@ def installation_record() -> dict[str, Any]:
     except importlib.metadata.PackageNotFoundError as exc:
         raise InstallationMismatch("automated_grounded_theory is imported but not installed.") from exc
     dist_version = str(dist.version)
-    dist_root = Path(dist.locate_file("")).resolve()
-    expected = (dist_root / "automated_grounded_theory" / "__init__.py").resolve()
-    if imported != expected:
-        raise InstallationMismatch(
-            f"Imported {imported} but the distribution is at {dist_root}."
-        )
     if dist_version != module_version:
         raise InstallationMismatch(
             f"Imported version {module_version} from {imported} but the distribution version is {dist_version}."
         )
+    dist_root = Path(dist.locate_file("")).resolve()
+    expected = (dist_root / "automated_grounded_theory" / "__init__.py").resolve()
+    editable_root = _editable_project_root(dist)
+    if imported == expected:
+        layout = "distribution"
+        source_root = dist_root
+        if editable_root is not None and _path_contains(editable_root, imported):
+            layout = "editable"
+            source_root = editable_root
+    elif editable_root is not None:
+        if not _path_contains(editable_root, imported):
+            raise InstallationMismatch(
+                f"Imported {imported} but the editable metadata names {editable_root}."
+            )
+        layout = "editable"
+        source_root = editable_root
+    else:
+        finder_root = _editable_finder_root(imported)
+        if finder_root is None:
+            raise InstallationMismatch(
+                f"Imported {imported} but the distribution is at {dist_root}."
+            )
+        layout = "editable"
+        source_root = finder_root
     return {
-        "commit": _git_commit(dist_root),
+        "commit": _git_commit(source_root),
         "module_path": str(imported),
         "module_version": module_version,
         "distribution_version": dist_version,
         "distribution_path": str(dist_root),
+        "layout": layout,
+        "source_root": str(source_root),
     }
 
 

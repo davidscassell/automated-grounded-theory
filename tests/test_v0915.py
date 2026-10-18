@@ -771,14 +771,27 @@ def test_reread_reporting_splits_non_relevant_and_exposes_completed_pairs(tmp_pa
     assert report["tokens_per_relevant_reread"] == 42
     assert report["cost_per_relevant_reread_usd"] is None
     assert report["cost_status"] == "unset"
+    assert report["relevant_reread_count"] == 2
+    assert report["reread_expenditure_tokens"] == 210
+    assert report["expenditure_tokens_per_relevant_reread"] == 105
+    assert report["reread_expenditure_cost_usd"] is None
+    assert report["expenditure_cost_per_relevant_reread_usd"] is None
+    assert report["human_confirmed_useful_rereads"] is None
+    assert report["human_confirmed_useful_rereads_status"] == "not_computed"
     saved = json.loads((tmp_path / "theoretical_sampling.json").read_text(encoding="utf-8"))
     assert saved["reread_interpretations"]["failed"] == 1
     assert saved["reread_completed_pairs"] == result.completed_pairs
 
     untouched = theoretical_sample(corpus, coder, decision_mode="llm", pursuit="brief_only", interrupt=False, **_kwargs(max_sampling_review_calls=2))
     assert untouched.completed_pairs is None
-    assert untouched.metadata["reread_interpretations"]["relevance"] is None
-    assert untouched.metadata["reread_interpretations"]["relevant_reread_tokens"] is None
+    quiet = untouched.metadata["reread_interpretations"]
+    assert quiet["relevance"] is None
+    assert quiet["relevant_reread_tokens"] is None
+    assert quiet["relevant_reread_count"] == 0
+    assert quiet["reread_expenditure_tokens"] == 0
+    assert quiet["expenditure_tokens_per_relevant_reread"] is None
+    assert quiet["reread_expenditure_cost_usd"] is None
+    assert quiet["human_confirmed_useful_rereads"] is None
     assert untouched.reread_notes == []
 
 
@@ -1089,6 +1102,10 @@ def test_timeout_boundaries_stay_independent():
     assert policy["idle_timeout_seconds"] == 9
     assert policy["idle_timeout_kind"] == "inactivity"
     assert policy["idle_timeout_enforced"] is False
+    assert policy["idle_timeout_enforcement"] == "not_feasible"
+    assert policy["timeout_return_stops_remote_request"] is False
+    assert "not enforced" in policy["note"]
+    assert "does not prove that the provider request stopped" in policy["note"]
     assert policy["node_timeout_default"] is True
     assert policy["node_timeout_seconds"] > policy["run_timeout_seconds"]
     assert policy["node_timeout_stops_remote_request"] is False
@@ -1346,17 +1363,20 @@ assert coder.call_count == 0, coder.call_count
 assert result.prompt_log
 assert result.metadata["persistence"]["durability"] == "async"
 """
+    root = Path(__file__).resolve().parents[1]
+    assert (root / "automated_grounded_theory").is_dir()
+    assert (root / "tests" / "test_v080.py").is_file()
     db = tmp_path / "axial.sqlite"
     first = subprocess.run(
         [sys.executable, "-c", script, "start", str(db)],
-        cwd="/workspace",
+        cwd=root,
         capture_output=True,
         text=True,
     )
     assert first.returncode == 0, first.stderr
     second = subprocess.run(
         [sys.executable, "-c", script, "resume", str(db)],
-        cwd="/workspace",
+        cwd=root,
         capture_output=True,
         text=True,
     )

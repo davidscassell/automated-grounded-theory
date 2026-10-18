@@ -21,7 +21,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.errors import GraphRecursionError, NodeTimeoutError
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, RetryPolicy, interrupt
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from typing_extensions import Literal, TypedDict
 
 from automated_grounded_theory.async_support import (
@@ -77,10 +77,13 @@ from automated_grounded_theory.relationship_tiers import (
     citation_qualifies,
     classify_pair_evidence,
     denies_causal_language,
+    effective_paradigm_role,
+    effective_statement,
     has_causal_wording,
     promote_verified,
     role_evidence_overreach,
     statement_wording_overreach,
+    sync_validation_flags,
     wording_overreach,
 )
 from automated_grounded_theory.validation import GENERIC_CONTENT_STEMS, anchor_quote, locate_quote, meaningful_tokens
@@ -1336,11 +1339,10 @@ _CAUSAL_ROLES = frozenset({"causal_condition", "consequence"})
 
 
 def _is_causal_claim(row: Mapping[str, Any], role: str = "") -> bool:
-    chosen = str(role or row.get("paradigm_role") or row.get("model_paradigm_role") or "")
+    chosen = str(role or effective_paradigm_role(row) or "")
     if chosen in _CAUSAL_ROLES:
         return True
-    text = " ".join(str(row.get(key) or "") for key in ("statement", "human_statement", "model_statement")).casefold()
-    return "leads to" in text
+    return "leads to" in effective_statement(row).casefold()
 
 
 _CAUSAL_WORD = (
@@ -1863,8 +1865,8 @@ def _flag_reviewer_causal_claim(target: dict, rationale: str) -> None:
     """A reviewer's denial of causal language is checked against the detector."""
     if not denies_causal_language(rationale):
         return
-    statement = " ".join(str(target.get(key) or "") for key in ("statement", "human_statement", "model_statement"))
-    role = str(target.get("model_paradigm_role") or target.get("paradigm_role") or target.get("human_paradigm_role") or "")
+    statement = effective_statement(target)
+    role = effective_paradigm_role(target)
     if not has_causal_wording(statement) and not has_causal_wording(role) and str(role).casefold() not in {"consequence", "cause", "causal_condition"}:
         return
     flags = list(target.get("flags") or [])
@@ -2161,20 +2163,8 @@ def _tiered_accept(
         target["needs_review"] = True
     else:
         target["downstream_eligible"] = True
-    statement = " ".join(str(target.get(key) or "") for key in ("statement", "human_statement", "model_statement"))
-    role = str(target.get("human_paradigm_role") or target.get("paradigm_role") or target.get("model_paradigm_role") or role or "")
-    statement_over = statement_wording_overreach(statement, tier)
-    role_over = role_evidence_overreach(tier, role)
-    if statement_over or role_over:
-        flags = list(target.get("flags") or [])
-        if statement_over and "wording_exceeds_tier" not in flags:
-            flags.append("wording_exceeds_tier")
-        if role_over and "role_evidence_exceeds_tier" not in flags:
-            flags.append("role_evidence_exceeds_tier")
-        if tier < 3 and "causal_wording_withheld" not in flags:
-            flags.append("causal_wording_withheld")
-        target["flags"] = flags
-        target["needs_review"] = True
+    del role
+    sync_validation_flags(target)
     _keep_qualification(target)
     assign_relationship_eligibility(target)
 
@@ -2315,7 +2305,11 @@ def validated_relation_decision(relationships: Sequence[Mapping[str, Any]], *, a
             {
                 "relationship_id": str(row.get("relationship_id") or ""),
                 "disposition": str(row.get(field) or row.get("disposition") or ""),
-                "paradigm_role": str(row.get("paradigm_role") or ""),
+                "paradigm_role": effective_paradigm_role(row),
+                "proposal_paradigm_role": row.get("proposal_paradigm_role"),
+                "model_paradigm_role": row.get("model_paradigm_role"),
+                "reviewer_paradigm_role": row.get("reviewer_paradigm_role"),
+                "human_paradigm_role": row.get("human_paradigm_role"),
                 "needs_review": bool(row.get("needs_review")),
             }
         )
@@ -2347,8 +2341,14 @@ def _apply_model_relations(
         if row is None:
             continue
         requested = str(decision.get("disposition") or "")
+        if "proposal_paradigm_role" not in row:
+            row["proposal_paradigm_role"] = row.get("paradigm_role")
+        reviewer_role = decision.get("paradigm_role")
         row["model_disposition"] = requested
-        row["model_paradigm_role"] = decision.get("paradigm_role")
+        row["model_paradigm_role"] = reviewer_role
+        row["reviewer_paradigm_role"] = reviewer_role
+        if not str(row.get("human_paradigm_role") or "").strip() and str(reviewer_role or "").strip():
+            row["paradigm_role"] = str(reviewer_role)
         row["model_rationale"] = decision.get("rationale")
         _flag_same_passage_claim(row, str(decision.get("rationale") or ""), flag="reviewer_same_passage_mismatch")
         _flag_reviewer_causal_claim(row, str(decision.get("rationale") or ""))
@@ -3249,6 +3249,49 @@ def _hold_is(metadata: Mapping[str, Any], kind: str) -> bool:
     return isinstance(hold, Mapping) and str(hold.get("kind") or "") == kind
 
 
+def _relationship_drop_reason(exc: Exception) -> str:
+    text = str(exc).casefold()
+    if "blank statement" in text or ("statement" in text and "field required" in text):
+        return "blank_statement"
+    return "invalid_relationship"
+
+
+def _salvage_proposal_batch(raw: str) -> tuple[list[dict], list[dict]] | None:
+    """Keep schema-valid relationships when one row invalidates the batch.
+
+    Returns None when the text is not a JSON object with a relationship list.
+    An empty kept list means the caller still sends the single repair. A
+    repaired response can replace rows that were already valid, so a batch
+    with at least one valid row is not repaired.
+    """
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    rows = payload.get("relationships")
+    if not isinstance(rows, list):
+        return None
+    kept: list[dict] = []
+    dropped: list[dict] = []
+    for index, item in enumerate(rows):
+        try:
+            draft = AxialRelationshipDraft.model_validate(item)
+        except ValidationError as exc:
+            dropped.append(
+                {
+                    "index": index,
+                    "reason": _relationship_drop_reason(exc),
+                    "error": str(exc),
+                    "draft": dict(item) if isinstance(item, Mapping) else {"value": item},
+                }
+            )
+            continue
+        kept.append(draft.model_dump())
+    return kept, dropped
+
+
 def _preserve_provider_call(
     metadata: dict[str, Any],
     result: Mapping[str, Any],
@@ -4082,27 +4125,37 @@ def _propose_node(runtime: AxialRuntime):
             )
             _note_proposal_repairs(metadata, result["audits"])
             estimated = int(metadata.get("axial_tokens_estimated") or estimated)
+            recovered_drops: list[dict] = []
             if result.get("repair_pending"):
-                _preserve_provider_call(
-                    metadata,
-                    result,
-                    kind="axial_proposal",
-                    schema_name="AxialProposalBatch",
-                    messages=messages,
-                    context={
-                        "sent_chunk": [dict(pair) for pair in sent_chunk],
-                        "estimate": estimate,
-                        "omitted_evidence": payload.get("omitted_evidence"),
-                    },
-                )
-                return {
-                    "relationships": relationships,
-                    "prompt_log": logs,
-                    "axial_calls_used": used,
-                    "relation_round": pending,
-                    "unexamined_pairs": list(state.get("unexamined_pairs") or []),
-                    "metadata": metadata,
-                }
+                salvaged = _salvage_proposal_batch(str((result.get("parsed") or {}).get("raw_response") or ""))
+                if salvaged is not None and salvaged[0]:
+                    kept, recovered_drops = salvaged
+                    result = dict(result)
+                    result["repair_pending"] = False
+                    result["unparsed"] = False
+                    result["reason"] = ""
+                    result["parsed"] = {"relationships": kept, "nothing_to_propose": False}
+                else:
+                    _preserve_provider_call(
+                        metadata,
+                        result,
+                        kind="axial_proposal",
+                        schema_name="AxialProposalBatch",
+                        messages=messages,
+                        context={
+                            "sent_chunk": [dict(pair) for pair in sent_chunk],
+                            "estimate": estimate,
+                            "omitted_evidence": payload.get("omitted_evidence"),
+                        },
+                    )
+                    return {
+                        "relationships": relationships,
+                        "prompt_log": logs,
+                        "axial_calls_used": used,
+                        "relation_round": pending,
+                        "unexamined_pairs": list(state.get("unexamined_pairs") or []),
+                        "metadata": metadata,
+                    }
             if result["refused"] or result["unparsed"]:
                 if not result["audits"]:
                     logs.append(
@@ -4142,6 +4195,16 @@ def _propose_node(runtime: AxialRuntime):
                 diagnostics["rejection_reasons"] = reasons
                 metadata["proposal_diagnostics"] = diagnostics
                 logs[-1].setdefault("rejections", []).append({"reason": reason, "draft": dict(draft)})
+
+            if recovered_drops:
+                diagnostics["partial_batch"] = True
+                recorded = list(diagnostics.get("dropped_relationships") or [])
+                for item in recovered_drops:
+                    draft = item.get("draft") if isinstance(item.get("draft"), Mapping) else {}
+                    _reject(str(item.get("reason") or "invalid_relationship"), draft)
+                    recorded.append(dict(item))
+                diagnostics["dropped_relationships"] = recorded
+                metadata["proposal_diagnostics"] = diagnostics
 
             returned = parsed.get("relationships")
             if parsed.get("nothing_to_propose") is True and not returned:
@@ -6767,6 +6830,7 @@ async def aaxial_code(
         raise AxialError("provider_max_attempts includes the initial attempt and must be at least 1.")
     if abs((axial_share_propose + axial_share_counterexample) - 1) > 1e-9:
         raise AxialError("axial shares must sum to 1.")
+    installation_record()
     data = _source_mapping(source)
     procedure = _procedure_from_kwargs(
         data,
@@ -6948,6 +7012,7 @@ async def aselective_code(
         raise AxialError("max_decision_calls must be zero or more. Zero disables reviewer calls.")
     if int(max_axial_review_tokens) < 0 or int(axial_token_budget) < 0:
         raise AxialError("Token allowances must be zero or more.")
+    installation_record()
     data = _source_mapping(source)
     upstream = dict(data.get("metadata") or {})
     axial_procedure = dict(upstream.get("procedure") or {})

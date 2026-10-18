@@ -16,8 +16,8 @@ from tests.test_v082 import _install_estimates
 
 
 def test_version_is_084():
-    assert __version__ == "0.9.15"
-    assert POLICY_VERSION == "0.9.15"
+    assert __version__ == "0.9.16"
+    assert POLICY_VERSION == "0.9.16"
 
 
 def _three_codes():
@@ -315,7 +315,9 @@ def test_missing_endpoint_evidence_defers_the_pair():
 
 
 def test_fresh_process_script_derives_the_checkout():
-    source = Path(__file__).resolve().parents[1].joinpath("tests", "test_v083.py").read_text(encoding="utf-8")
-    assert 'sys.path.insert(0, "/workspace")' not in source
-    assert 'cwd="/workspace"' not in source
-    assert "Path(__file__).resolve().parents[1]" in source
+    root = Path(__file__).resolve().parents[1]
+    for name in ("test_v083.py", "test_v0915.py"):
+        source = root.joinpath("tests", name).read_text(encoding="utf-8")
+        assert 'sys.path.insert(0, "/workspace")' not in source
+        assert 'cwd="/workspace"' not in source
+        assert "Path(__file__).resolve().parents[1]" in source

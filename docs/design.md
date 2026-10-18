@@ -1,7 +1,7 @@
 # automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, 0.6.14, 0.6.15, and 0.6.16, focused coding in 0.7.0, fixes in 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, 0.7.6, 0.7.7, 0.7.8, and 0.7.9, axial coding and saturation indicators in 0.8.0, fixes in 0.8.1)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
-Status: this file is the open-coding design, beginning with steps 1 and 2 of the v0.6 plan. Focused coding is in 0.7.0 and the 0.7.1 through 0.7.9 fixes. Axial coding, saturation indicators, and selective coding are separate experimental graphs from 0.8.0. Within-corpus theoretical sampling and a saturation decision that leaves `judgment` null are in 0.9.0 and later. Package `policy_version` is `0.9.15`. The current index is [README.md](README.md). The 0.8 axial slice is [design-axial-0800.md](design-axial-0800.md). 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
+Status: this file is the open-coding design, beginning with steps 1 and 2 of the v0.6 plan. Focused coding is in 0.7.0 and the 0.7.1 through 0.7.9 fixes. Axial coding, saturation indicators, and selective coding are separate experimental graphs from 0.8.0. Within-corpus theoretical sampling and a saturation decision that leaves `judgment` null are in 0.9.0 and later. Package `policy_version` is `0.9.16`. The current index is [README.md](README.md). The 0.8 axial slice is [design-axial-0800.md](design-axial-0800.md). 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
 
 The default procedure is Charmaz-informed automated analysis: initial coding against a frozen snapshot, constant comparison with distinct operations, and `build_themes` as a descriptive reporting view. It is not an axial-coding template.
 
@@ -443,7 +443,11 @@ Package 0.9.14 leaves a downstream full-population rate null unless every row in
 
 Package 0.9.15 requires a nonempty relationship statement and keeps `nothing_to_propose` as the explicit empty batch. One repair is checked against the original evidence, and a statement that is only a quote is not a relationship. `downstream_eligible` means supported evidence. A weak stem stays hypothesis exploration: the core graph does not treat it as support, and the export rewrites a stale eligible flag. Memos and the storyline snapshot still receive the hypothesis row. `unspecified` is a valid association role. A causal role below tier 3 is recorded apart from sentence wording, and the causal gate stays on. The axial export adds an attrition funnel and fails when the installed distribution does not match the imported checkout. Temperature is unset unless the caller configured it. Sampling reports the reread interpretation breakdown and copies completed pairs onto the result. `pattern_min_cases` stays 2 and the axial ceiling stays 24000. The design is [design-review-fixes-0915.md](design-review-fixes-0915.md).
 
-`policy_version` is `0.9.15`.
+`policy_version` was `0.9.15`.
+
+Package 0.9.16 accepts an editable install whose metadata names the imported checkout, and still raises `InstallationMismatch` for a version mismatch before axial or selective work calls a model. The sampling recursion limit is counted from graph visits, so a 32-call reread is not stopped early. Validation flags are recomputed from the effective statement and role, and the previous flags stay on the revision history. Until a human sets a role, a reviewer's role is the working role. A mixed proposal batch keeps the valid relationships and logs each invalid row. A batch with nothing valid still uses one repair. `expenditure_tokens_per_relevant_reread` divides all reread tokens by the relevant count and is null when that count is zero. `idle_timeout` stays recorded and unenforced. A returned timeout does not prove the provider request stopped. `pattern_min_cases` stays 2 and the axial ceiling stays 24000. The design is [design-review-fixes-0916.md](design-review-fixes-0916.md).
+
+`policy_version` is `0.9.16`.
 
 ## 26. Out of scope
 
