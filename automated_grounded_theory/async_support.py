@@ -131,17 +131,21 @@ def timeout_policy(
         "cancellation": "cooperative",
         "process_isolation": bool(process_isolation),
         "process_isolation_can_stop_blocked_call": bool(process_isolation),
+        "idle_timeout_enforcement": "not_feasible",
+        "timeout_return_stops_remote_request": False,
         "note": (
             "run_timeout_seconds is the elapsed limit on one provider call "
             "(axial_request_timeout, focused_request_timeout, or sampling_request_timeout). "
-            "idle_timeout_seconds is an inactivity limit. Structured calls do not report "
-            "progress, so idle_timeout is recorded and is not enforced. "
+            "idle_timeout_seconds is recorded and is not enforced. Enforcing it is not "
+            "feasible: a structured call does not report token or byte progress, so there "
+            "is no inactivity clock to reset. "
+            "Returning after a timeout means this process stopped waiting. It does not "
+            "prove that the provider request stopped. "
             "The default node watchdog is that elapsed limit times the sequential calls "
             "in the step, plus two seconds, and is longer than one provider call. "
             "Cancelling the node or abandoning the provider await does not stop a blocking "
             "synchronous call. process_isolation is the boundary that can terminate that "
-            "call, and these graphs leave it off. A node timeout is not proof that the "
-            "remote request stopped."
+            "call, and these graphs leave it off."
         ),
     }
 

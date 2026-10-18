@@ -506,9 +506,7 @@ class _FailedRereadSpend(FakeSamplingCoder):
             name = getattr(schema, "__name__", "")
             body = _payload(messages)
             from langchain_core.messages import AIMessage
-            from langchain_core.runnables import RunnableLambda
 
-            del RunnableLambda
             if name == "ModelSamplingSelection":
                 thin = ""
                 for row in body.get("directions") or []:

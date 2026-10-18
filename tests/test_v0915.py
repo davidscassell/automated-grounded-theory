@@ -1102,6 +1102,10 @@ def test_timeout_boundaries_stay_independent():
     assert policy["idle_timeout_seconds"] == 9
     assert policy["idle_timeout_kind"] == "inactivity"
     assert policy["idle_timeout_enforced"] is False
+    assert policy["idle_timeout_enforcement"] == "not_feasible"
+    assert policy["timeout_return_stops_remote_request"] is False
+    assert "not enforced" in policy["note"]
+    assert "does not prove that the provider request stopped" in policy["note"]
     assert policy["node_timeout_default"] is True
     assert policy["node_timeout_seconds"] > policy["run_timeout_seconds"]
     assert policy["node_timeout_stops_remote_request"] is False
