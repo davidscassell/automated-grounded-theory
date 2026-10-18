@@ -3149,10 +3149,22 @@ def _stamp_decision(ledger: Sequence[Mapping], metadata: Mapping[str, Any]) -> l
     return rows
 
 
-def _window_ready(indicators: Mapping[str, Any], ledger: Sequence[Mapping], *, min_rounds: int) -> tuple[bool, str]:
+def _configured_min_documents(metadata: Mapping[str, Any]) -> int:
+    """The run's saturation-window minimum. The default is three documents."""
+    return int((metadata.get("procedure") or {}).get("min_documents") or SATURATION_MIN_DOCUMENTS)
+
+
+def _window_ready(
+    indicators: Mapping[str, Any],
+    ledger: Sequence[Mapping],
+    *,
+    min_rounds: int,
+    min_documents: int,
+) -> tuple[bool, str]:
     n_documents = indicators.get("n_documents")
-    if n_documents is None or int(n_documents) < SATURATION_MIN_DOCUMENTS:
-        return False, f"n_documents is {n_documents}, below {SATURATION_MIN_DOCUMENTS}."
+    minimum = int(min_documents)
+    if n_documents is None or int(n_documents) < minimum:
+        return False, f"n_documents is {n_documents}, below {minimum}."
     if str(indicators.get("saturation_window") or "") == "not_interpretable":
         return False, "The saturation window is not interpretable."
     if len(list(ledger)) < int(min_rounds):
@@ -3160,7 +3172,14 @@ def _window_ready(indicators: Mapping[str, Any], ledger: Sequence[Mapping], *, m
     return True, ""
 
 
-def _withheld_judgment(indicators: Mapping[str, Any], ledger: Sequence, reason: str) -> dict:
+def _withheld_judgment(
+    indicators: Mapping[str, Any],
+    ledger: Sequence,
+    reason: str,
+    *,
+    min_documents: int,
+) -> dict:
+    minimum = int(min_documents)
     return {
         "status": "not_interpretable",
         "assessment": None,
@@ -3170,10 +3189,10 @@ def _withheld_judgment(indicators: Mapping[str, Any], ledger: Sequence, reason: 
         "does_not_set_judgment": True,
         "n_documents": indicators.get("n_documents"),
         "sampling_rounds": len(list(ledger)),
-        "minimum_documents": SATURATION_MIN_DOCUMENTS,
+        "minimum_documents": minimum,
         "minimum_sampling_rounds": SAMPLING_MIN_ROUNDS,
         "note": (
-            "A model judgment is withheld below 3 documents or below the minimum sampling rounds. "
+            f"A model judgment is withheld below {minimum} documents or below the minimum sampling rounds. "
             "The withheld assessment is undefined, not not_saturated. "
             "This is not a researcher decision and it does not set judgment."
         ),
@@ -3186,18 +3205,32 @@ def _saturation_decision(runtime: SamplingRuntime):
         indicators = _indicators(state)
         indicators["judgment"] = None
         ledger = list(state.get("sampling_ledger") or [])
+        minimum_documents = _configured_min_documents(metadata)
         criteria = state.get("stopping_criteria") or stopping_criteria_report(
             indicators,
             ledger,
             core_id=_core_id(state),
             relationships=state.get("relationships") or [],
             quiet_rounds=int((metadata.get("procedure") or {}).get("quiet_rounds") or STOPPING_QUIET_ROUNDS),
+            min_documents=minimum_documents,
         )
         logs = list(state.get("prompt_log") or [])
-        ready, reason = _window_ready(indicators, ledger, min_rounds=SAMPLING_MIN_ROUNDS)
+        ready, reason = _window_ready(
+            indicators,
+            ledger,
+            min_rounds=SAMPLING_MIN_ROUNDS,
+            min_documents=minimum_documents,
+        )
+        metadata["saturation_minimum_documents"] = minimum_documents
+        metadata["saturation_window_ready"] = ready
         if runtime.decision_mode == "llm":
             if not ready:
-                metadata["model_saturation_judgment"] = _withheld_judgment(indicators, ledger, reason)
+                metadata["model_saturation_judgment"] = _withheld_judgment(
+                    indicators,
+                    ledger,
+                    reason,
+                    min_documents=minimum_documents,
+                )
             else:
                 reviewer = runtime.reviewer
                 allowance = runtime.limiter.provider_allowance
@@ -3317,6 +3350,9 @@ def _saturation_decision(runtime: SamplingRuntime):
                 "saturation": indicators,
                 "sampling_ledger": ledger,
                 "stopping_criteria": criteria,
+                "minimum_documents": minimum_documents,
+                "window_ready": ready,
+                "window_reason": reason,
                 "instructions": (
                     "judgment stays null. The stopping-criteria report does not declare saturation. "
                     "Resume with {\"decision\": \"not_claimed|sufficient_for_this_question|not_saturated\", "
@@ -3346,6 +3382,8 @@ def _saturation_decision(runtime: SamplingRuntime):
             "actor": actor,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "n_documents": indicators.get("n_documents"),
+            "minimum_documents": minimum_documents,
+            "window_ready": ready,
             "sampling_rounds": len(ledger),
             "indicators_snapshot": {
                 "window_new_code_rate": indicators.get("window_new_code_rate"),

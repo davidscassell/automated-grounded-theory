@@ -25,3 +25,5 @@ Each exported row now keeps `disposition` and, when the source row stores a bool
 An export that does not carry `downstream_eligible`, including a 0.9.9 export, scores both new rates as null. A missing field is not treated as eligible. A non-boolean value is also unknown. Those choices are a decision. `load_adjudications` keeps an optional `downstream_eligible` or `withholding_flags` on an adjudication record. Scoring reads the export, not those optional notes. That source is a decision.
 
 The gate note is [design-gate-evaluation.md](design-gate-evaluation.md).
+
+0.9.14 keeps these export fields and replaces the recall denominator. A full-population downstream rate stays null when eligibility is unknown for any row in that rate's population. The known-only rates are in [design-review-fixes-0914.md](design-review-fixes-0914.md).
