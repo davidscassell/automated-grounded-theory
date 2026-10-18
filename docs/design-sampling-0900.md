@@ -1,6 +1,6 @@
 # Theoretical sampling and a saturation decision (0.9.0)
 
-`policy_version` is `0.9.0`. This note is the design for the sampling graph. It does not replace [design-axial-0800.md](design-axial-0800.md). Axial coding and selective coding were already experimental graphs in 0.8.x. 0.9.0 does not rebuild them.
+`policy_version` was `0.9.0` for the first sampling graph. Package `policy_version` is `0.9.13`. The sections below record what each version added. The current sampling behavior is the whole file. The index is [README.md](README.md). This note is the design for the sampling graph. It does not replace [design-axial-0800.md](design-axial-0800.md). Axial coding and selective coding were already experimental graphs in 0.8.x. 0.9.0 does not rebuild them.
 
 The README sentence this release retires said: "The package does not do theoretical sampling, axial coding, selective coding, or a saturation decision." That sentence was stale. The audit below is what was already true on 0.8.7 (`158bae3`), and what 0.9.0 adds.
 
@@ -198,3 +198,7 @@ Any other unsent or failed reason leaves the criterion `not_evaluable` and `obse
 A reread that times out and then completes sets `reread_status` to `complete` and clears `reread_stop`. The timeout is appended to `reread_recovered_timeouts` and to `sampling_attempts` with status `recovered`. Those records are history. They are not the active failure the quiet criterion reads. An unresolved timeout, where `reread_status` or `reread_stop` is still `timeout`, stays `not_evaluable`.
 
 `reread_unsent_pairs`, `reread_failed_pairs`, `reread_unattempted_pairs`, `sampling_selection_unsent_pairs`, and `scheduled_reread_pairs` store `question_key` and `direction_key` as the stable question, for example `thin_category:c-prep`. `direction_id` stays the round id, such as `dir-1-0001`. The exemption compares `question_key` first, then `direction_key`, then `direction_id`. `completed_pairs` already stored `question_key`. `model_sampling_pairs` and `selected_sampling_pairs` stay the model's direction and passage ids. `reread_active_pair` stays the in-flight direction id and passage id; the failed-pair copy made from it receives the question key. The note is [design-review-fixes-0912.md](design-review-fixes-0912.md).
+
+## Per-pair timeout recovery (0.9.13)
+
+A recovered pair is removed from `reread_failed_pairs` when its note is stored. That does not wait for the rest of the batch. The pair is appended to `reread_recovered_timeouts` and to `sampling_attempts` with status `recovered` and reason `timeout`. Pairs that still have no note stay failed. When no timeout failure remains, `reread_stop` is the next unresolved reason, such as `call_allowance`, rather than the recovered timeout. A pair is not both completed and failed. A batch in which every timed-out pair then succeeds still clears `reread_stop` and can meet the quiet-round criterion, as in 0.9.12. An unresolved timeout still leaves that criterion `not_evaluable`. The note is [design-review-fixes-0913.md](design-review-fixes-0913.md).

@@ -2683,6 +2683,70 @@ def _reread_partition(state: Mapping[str, Any], *, failed: int) -> tuple[list[di
     return [_identified(pair) for pair in completed], [_identified(pair) for pair in failed_rows], [_identified(pair) for pair in unattempted]
 
 
+def _recover_completed_failures(metadata: dict[str, Any], notes: Sequence[Mapping[str, Any]]) -> None:
+    """Drop a pair from the failure list once a note for it is stored.
+
+    A timeout retired by that note is history. It is appended to
+    ``reread_recovered_timeouts`` and to ``sampling_attempts``. Pairs that
+    still have no note stay in ``reread_failed_pairs``. The active timeout
+    stop is cleared only when none of those pairs remain, so a later
+    allowance refusal can become the current blocker.
+    """
+    done = {_reread_pair_key(row) for row in notes if isinstance(row, Mapping)}
+    failed = [dict(item) for item in (metadata.get("reread_failed_pairs") or []) if isinstance(item, Mapping)]
+    recovered = [item for item in failed if _reread_pair_key(item) in done]
+    if not recovered:
+        return
+    was_timeout = str(metadata.get("stop") or "") == "timeout" or str(metadata.get("reread_stop") or "") == "timeout"
+    metadata["reread_failed_pairs"] = [item for item in failed if _reread_pair_key(item) not in done]
+    if not was_timeout:
+        return
+    stage = str(metadata.get("reread_status") or "")
+    history = [dict(item) for item in (metadata.get("reread_recovered_timeouts") or []) if isinstance(item, Mapping)]
+    history.append(
+        {
+            "recovered": True,
+            "prior_reread_stop": "timeout",
+            "reread_status": stage if stage in {"complete", "skipped", "budget_limited"} else "recovered",
+            "pairs": recovered,
+        }
+    )
+    metadata["reread_recovered_timeouts"] = history
+    metadata["timeout_recovered"] = True
+    _remember_attempt(
+        metadata,
+        {
+            "kind": "sampling_reread",
+            "status": "recovered",
+            "reason": "timeout",
+            "recovered": True,
+            "pairs": recovered,
+        },
+    )
+    if metadata.get("reread_failed_pairs"):
+        return
+    if str(metadata.get("reread_stop") or "") == "timeout":
+        metadata["reread_stop"] = ""
+    if str(metadata.get("stop") or "") == "timeout":
+        metadata["stop"] = ""
+    if str(metadata.get("sampling_stop") or "") == "timeout":
+        metadata["sampling_stop"] = ""
+
+
+def _clear_recovered_timeout_markers(metadata: dict[str, Any]) -> None:
+    """Clear a timeout stop that no remaining failed pair still explains."""
+    if metadata.get("reread_failed_pairs"):
+        return
+    if str(metadata.get("stop") or "") == "timeout":
+        metadata["stop"] = ""
+        metadata["timeout_recovered"] = True
+    if str(metadata.get("sampling_stop") or "") == "timeout":
+        metadata["sampling_stop"] = ""
+    if str(metadata.get("reread_stop") or "") == "timeout":
+        metadata["reread_stop"] = ""
+        metadata["timeout_recovered"] = True
+
+
 def _finish_reread(
     metadata: dict[str, Any],
     notes: Sequence[Mapping[str, Any]],
@@ -2694,60 +2758,37 @@ def _finish_reread(
     metadata["reread_unsent_passage_ids"] = [str(row.get("passage_id") or "") for row in unsent]
     metadata["reread_completed_pairs"] = [dict(pair) for pair in wanted if _reread_pair_key(pair) in done]
     metadata["reread_notes_do_not_change_saturation_indicators"] = True
+    actionable = [row for row in unsent if str(row.get("reason") or "") != "completed_pair"]
+    if metadata.get("reread_incomplete") or actionable:
+        # A pair that already succeeded is not still failed, even when another
+        # pair is the reason this batch stops.
+        _recover_completed_failures(metadata, notes)
+        _clear_recovered_timeout_markers(metadata)
     if metadata.get("reread_incomplete"):
         metadata["reread_status"] = "incomplete"
         metadata["sampling_stop"] = str(metadata.get("reread_stop") or metadata.get("sampling_stop") or "incomplete")
         return
-    actionable = [row for row in unsent if str(row.get("reason") or "") != "completed_pair"]
     if actionable:
-        if metadata.get("stop") == "timeout":
+        remaining_failed = [item for item in (metadata.get("reread_failed_pairs") or []) if isinstance(item, Mapping)]
+        unresolved_timeout = bool(remaining_failed) and (
+            str(metadata.get("stop") or "") == "timeout" or str(metadata.get("reread_stop") or "") == "timeout"
+        )
+        if unresolved_timeout:
             metadata["reread_status"] = "incomplete"
             metadata["reread_stop"] = "timeout"
             metadata["sampling_stop"] = "timeout"
         else:
             metadata["reread_status"] = "budget_limited"
-            metadata["reread_stop"] = str(metadata.get("reread_stop") or "call_allowance")
+            if str(metadata.get("reread_stop") or "") in {"", "timeout"}:
+                metadata["reread_stop"] = str(actionable[0].get("reason") or "call_allowance")
             if not notes and wanted:
-                metadata["sampling_stop"] = metadata.get("sampling_stop") or "call_allowance"
+                metadata["sampling_stop"] = metadata.get("sampling_stop") or metadata.get("reread_stop") or "call_allowance"
         return
     metadata["reread_status"] = "complete" if notes else "skipped"
-    prior_stop = str(metadata.get("reread_stop") or "")
-    prior_failed = [dict(item) for item in (metadata.get("reread_failed_pairs") or []) if isinstance(item, Mapping)]
-    recovered_timeout = str(metadata.get("stop") or "") == "timeout" or prior_stop == "timeout"
+    _recover_completed_failures(metadata, notes)
     metadata["reread_failed_pairs"] = []
     metadata["reread_unattempted_pairs"] = []
-    if str(metadata.get("stop") or "") == "timeout":
-        metadata["stop"] = ""
-        metadata["timeout_recovered"] = True
-    if str(metadata.get("sampling_stop") or "") == "timeout":
-        metadata["sampling_stop"] = ""
-    if recovered_timeout and prior_stop == "timeout":
-        # The active stop is cleared. The timeout stays in the recovery record
-        # and the attempt log, apart from the failure the quiet criterion reads.
-        metadata["reread_stop"] = ""
-        metadata["timeout_recovered"] = True
-        history = [dict(item) for item in (metadata.get("reread_recovered_timeouts") or []) if isinstance(item, Mapping)]
-        history.append(
-            {
-                "recovered": True,
-                "prior_reread_stop": "timeout",
-                "reread_status": metadata.get("reread_status"),
-                "pairs": prior_failed,
-            }
-        )
-        metadata["reread_recovered_timeouts"] = history
-        _remember_attempt(
-            metadata,
-            {
-                "kind": "sampling_reread",
-                "status": "recovered",
-                "reason": "timeout",
-                "recovered": True,
-                "pairs": prior_failed,
-            },
-        )
-    elif recovered_timeout:
-        metadata["timeout_recovered"] = True
+    _clear_recovered_timeout_markers(metadata)
 
 
 def _reread_return(notes: list, metadata: dict[str, Any], logs: list, warnings: list) -> dict:
@@ -2905,11 +2946,6 @@ async def _reread(runtime: SamplingRuntime, state: SamplingState) -> dict:
             metadata["reread_notes_do_not_change_saturation_indicators"] = True
             _sync_allowance(metadata, runtime)
             return _reread_return(notes, metadata, logs, warnings)
-        if metadata.get("stop") == "timeout":
-            metadata["stop"] = ""
-            metadata["timeout_recovered"] = True
-            if metadata.get("sampling_stop") == "timeout":
-                metadata["sampling_stop"] = ""
         _append_reread_note(notes, pair=pair, passage=passage, direction=direction, parsed=dict(result["parsed"] or {}))
         metadata["reread_active_pair"] = None
         done = {_reread_pair_key(row) for row in notes}
@@ -2917,6 +2953,7 @@ async def _reread(runtime: SamplingRuntime, state: SamplingState) -> dict:
         if len(pending) == 1:
             _finish_reread(metadata, notes, wanted, unsent)
         else:
+            _recover_completed_failures(metadata, notes)
             metadata.pop("reread_status", None)
         metadata["reread_notes_do_not_change_saturation_indicators"] = True
         _sync_allowance(metadata, runtime)
@@ -3027,6 +3064,7 @@ async def _reread(runtime: SamplingRuntime, state: SamplingState) -> dict:
     if len(pending) == 1:
         _finish_reread(metadata, notes, wanted, unsent)
     else:
+        _recover_completed_failures(metadata, notes)
         metadata.pop("reread_status", None)
     metadata["reread_notes_do_not_change_saturation_indicators"] = True
     _sync_allowance(metadata, runtime)
@@ -3636,6 +3674,9 @@ async def _record_timeout(graph, config, exc: BaseException, output_dir, runtime
             last["reread_status"] = "timeout"
             last["reread_stop"] = "timeout"
             last["reread_failed_pairs"] = [dict(item) for item in failed_rows]
+            last["reread_recovered_timeouts"] = [
+                dict(item) for item in (metadata.get("reread_recovered_timeouts") or []) if isinstance(item, Mapping)
+            ]
             if "reread_unsent_pairs" not in last:
                 last["reread_unsent_pairs"] = [
                     dict(item) for item in (metadata.get("reread_unsent_pairs") or []) if isinstance(item, Mapping)

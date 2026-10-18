@@ -1,7 +1,7 @@
 # automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, 0.6.14, 0.6.15, and 0.6.16, focused coding in 0.7.0, fixes in 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, 0.7.6, 0.7.7, 0.7.8, and 0.7.9, axial coding and saturation indicators in 0.8.0, fixes in 0.8.1)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
-Status: steps 1 and 2 of the v0.6 plan, plus focused coding in 0.7.0 and the 0.7.1 through 0.7.9 fixes. Axial coding, saturation indicators, and optional selective coding are separate graphs in 0.8.0. See [design-axial-0800.md](design-axial-0800.md). Theoretical sampling is not in this release. 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
+Status: this file is the open-coding design, beginning with steps 1 and 2 of the v0.6 plan. Focused coding is in 0.7.0 and the 0.7.1 through 0.7.9 fixes. Axial coding, saturation indicators, and selective coding are separate experimental graphs from 0.8.0. Within-corpus theoretical sampling and a saturation decision that leaves `judgment` null are in 0.9.0 and later. Package `policy_version` is `0.9.13`. The current index is [README.md](README.md). The 0.8 axial slice is [design-axial-0800.md](design-axial-0800.md). 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
 
 The default procedure is Charmaz-informed automated analysis: initial coding against a frozen snapshot, constant comparison with distinct operations, and `build_themes` as a descriptive reporting view. It is not an axial-coding template.
 
@@ -431,9 +431,11 @@ Package 0.9.11 keeps the full list of stem-only lexical matches in the run expor
 
 `policy_version` was `0.9.11`.
 
-Package 0.9.12 clears `reread_stop` after a reread timeout is recovered, and keeps that timeout on `reread_recovered_timeouts` and in the attempt log. An unresolved timeout still leaves quiet rounds `not_evaluable`. Unsent, failed, and scheduled reread pairs carry the stable question key, and the quiet-round exemption reads that key before the round-specific direction id. `pattern_min_cases` stays 2 and the axial ceiling stays 24000. The design is [design-review-fixes-0912.md](design-review-fixes-0912.md).
+Package 0.9.12 clears `reread_stop` after a reread timeout is recovered, and keeps that timeout on `reread_recovered_timeouts` and in the attempt log. An unresolved timeout still leaves quiet rounds `not_evaluable`. Unsent, failed, and scheduled reread pairs carry the stable question key, and the quiet-round exemption reads that key before the round-specific direction id. `pattern_min_cases` stays 2 and the axial ceiling stays 24000. The design is [design-review-fixes-0912.md](design-review-fixes-0912.md). `policy_version` was `0.9.12`.
 
-`policy_version` is `0.9.12`.
+Package 0.9.13 retires a recovered pair from `reread_failed_pairs` when that pair succeeds, including when a later pair is withheld for `call_allowance`. The timeout stays on `reread_recovered_timeouts` and in the attempt log. The current `reread_stop` is the remaining blocker. Gate export keeps reviewer `disposition` and `downstream_eligible` apart and copies withholding flags. `downstream_precision` and `downstream_withheld_supported_recall` score downstream use. Disposition metrics keep their names. A missing denominator stays null, and an export without `downstream_eligible` leaves the new rates null. The design is [design-review-fixes-0913.md](design-review-fixes-0913.md).
+
+`policy_version` is `0.9.13`.
 
 ## 26. Out of scope
 
