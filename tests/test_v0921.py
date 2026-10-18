@@ -23,8 +23,9 @@ _RATES = (
     "discovery_distortion_rate",
     "gate_false_negative_rate",
     "gate_false_negative_rate_known",
-    "discovery_recovered_per_token",
-    "discovery_recovered_per_dollar",
+    "discovery_recovered_per_reread_token",
+    "discovery_recovered_per_reread_dollar",
+    "claim_correct_rate",
 )
 
 _EXAMPLE = Path("examples/discovery_adjudication_example.json")
@@ -32,9 +33,9 @@ _TEMPLATE = Path("examples/discovery_adjudication_template.csv")
 
 
 def test_package_version_is_0921():
-    assert __version__ == "0.9.21"
-    assert POLICY_VERSION == "0.9.21"
-    assert DISCOVERY_SCHEMA_VERSION == "discovery-eval-1"
+    assert __version__ == "0.9.22"
+    assert POLICY_VERSION == "0.9.22"
+    assert DISCOVERY_SCHEMA_VERSION == "discovery-eval-2"
 
 
 def _gold(adjudication_id, from_id, to_id, passage_id, **extra):
@@ -111,8 +112,8 @@ def test_no_adjudications_and_empty_frozen_set_leave_rates_null():
     assert empty["discovery_distortion_rate"] is None
     assert empty["gate_false_negative_rate"] is None
     assert empty["gate_false_negative_rate_known"] is None
-    assert empty["discovery_recovered_per_token"] is None
-    assert empty["discovery_recovered_per_dollar"] is None
+    assert empty["discovery_recovered_per_reread_token"] is None
+    assert empty["discovery_recovered_per_reread_dollar"] is None
     assert empty["discovery_precision"] == 0.0
     assert empty["discovery_precision_denominator"] == 1
     assert empty["unmatched_proposal_count"] == 1
@@ -237,8 +238,8 @@ def test_incomplete_expenditure_gives_null_per_dollar_and_per_token():
     }
     report = score_discovery(proposals, discovery, incomplete)
     assert report["recovered_count"] == 1
-    assert report["discovery_recovered_per_token"] is None
-    assert report["discovery_recovered_per_dollar"] is None
+    assert report["discovery_recovered_per_reread_token"] is None
+    assert report["discovery_recovered_per_reread_dollar"] is None
 
     complete = {
         "reread_expenditure_complete": True,
@@ -246,8 +247,8 @@ def test_incomplete_expenditure_gives_null_per_dollar_and_per_token():
         "reread_expenditure_cost_usd": 2.0,
     }
     done = score_discovery(proposals, discovery, complete)
-    assert done["discovery_recovered_per_token"] == 0.01
-    assert done["discovery_recovered_per_dollar"] == 0.5
+    assert done["discovery_recovered_per_reread_token"] == 0.01
+    assert done["discovery_recovered_per_reread_dollar"] == 0.5
 
     state = {
         "prompt_log": [
@@ -262,8 +263,8 @@ def test_incomplete_expenditure_gives_null_per_dollar_and_per_token():
         "metadata": {"token_prices": {"input_usd_per_million": 3, "output_usd_per_million": 15}},
     }
     from_state = score_discovery(proposals, discovery, state)
-    assert from_state["discovery_recovered_per_token"] is None
-    assert from_state["discovery_recovered_per_dollar"] is None
+    assert from_state["discovery_recovered_per_reread_token"] is None
+    assert from_state["discovery_recovered_per_reread_dollar"] is None
 
 
 def test_disagreement_does_not_change_the_scored_row():
@@ -321,8 +322,8 @@ def test_passage_mismatch_and_unknown_eligibility_stay_out_of_the_wrong_rates():
         },
     )
     assert zero["recovered_count"] == 0
-    assert zero["discovery_recovered_per_token"] == 0.0
-    assert zero["discovery_recovered_per_dollar"] == 0.0
+    assert zero["discovery_recovered_per_reread_token"] == 0.0
+    assert zero["discovery_recovered_per_reread_dollar"] == 0.0
 
 
 def test_template_is_headers_only_and_example_is_synthetic():
@@ -338,7 +339,8 @@ def test_template_is_headers_only_and_example_is_synthetic():
     assert "synthetic" in loaded["label"].casefold()
     assert "not a study result" in loaded["label"].casefold()
     assert loaded["frozen_hash_status"] == "verified"
-    assert loaded["schema_version"] == "discovery-eval-1"
+    assert loaded["schema_version"] == "discovery-eval-2"
+    assert loaded["source_schema_version"] == "discovery-eval-1"
     assert loaded["disagreements"]
     report = score_discovery([], loaded)
     assert report["discovery_recall"] == 0.0

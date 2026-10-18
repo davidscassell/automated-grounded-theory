@@ -62,8 +62,8 @@ def _book():
 
 
 def test_version_is_0_6_5():
-    assert __version__ == "0.9.21"
-    assert POLICY_VERSION == "0.9.21"
+    assert __version__ == "0.9.22"
+    assert POLICY_VERSION == "0.9.22"
 
 
 def test_negated_near_duplicate_is_proposed_not_merged():

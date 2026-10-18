@@ -73,11 +73,19 @@ _CLAIM_FLAGS = frozenset(
         "participant_link_not_a_relationship",
         "participant_direction_unspecified",
         "participant_link_contested",
+        "participant_link_hypothetical",
+        "participant_link_ambiguous",
     }
 )
+# Longer phrases are listed with the short ones. Matching keeps the longest
+# phrase at a position, so "caused by" is not read as the active verb "caused".
 _CONNECTORS = (
+    ("leads to by", "backward"),
     ("leads to", "forward"),
+    ("lead to by", "backward"),
+    ("led to by", "backward"),
     ("lead to", "forward"),
+    ("led to", "forward"),
     ("results in", "forward"),
     ("because of", "backward"),
     ("due to", "backward"),
@@ -85,8 +93,10 @@ _CONNECTORS = (
     ("consequence of", "backward"),
     ("attributed to", "backward"),
     ("effect of", "backward"),
+    ("caused by", "backward"),
     ("caused", "forward"),
     ("causes", "forward"),
+    ("cause", "forward"),
     ("makes", "forward"),
     ("because", "backward"),
     ("related to", "undirected"),
@@ -99,8 +109,16 @@ _HEDGE_RE = re.compile(
     r"\b(?:might|maybe|perhaps|could|seems|seem|possibly|possible|sort of|not sure|i think|may)\b"
 )
 _DENIAL_RE = re.compile(
-    r"\b(?:do not|does not|don't|doesn't|did not|didn't|never|unrelated|not related|"
+    r"\b(?:do not|does not|don't|doesn't|did not|didn't|never|cannot|can't|"
+    r"isn't|aren't|wasn't|weren't|is not(?!\s+only)|are not(?!\s+only)|"
+    r"was not(?!\s+only)|were not(?!\s+only)|not what|no relation|unrelated|not related|"
     r"no relationship|no connection|not connected|not a cause|not because)\b"
+)
+_HYPOTHETICAL_RE = re.compile(
+    r"\b(?:if|would|someone said|they said|i heard|suppose|supposing|what if|had said)\b"
+)
+_CLAUSE_SPLIT_RE = re.compile(
+    r"[.!?]+|\s+(?:but|although|though|however|while|whereas)\s+|;\s*"
 )
 _LEGACY_ANALYST_NOTE = (
     "0.9.19 stored this analyst interpretation as a row-level exclusion. "
@@ -505,15 +523,16 @@ def _side_has(side: str, terms: set[str]) -> bool:
 
 
 def _connectors(folded: str) -> list[tuple[int, str, str]]:
+    """Recognized connector phrases, longest match at each position.
+
+    A phrase must be a whole word or a whole word sequence. ``cause`` does not
+    match inside ``because``. ``caused`` does not win over ``caused by``.
+    """
     found: list[tuple[int, int, str, str]] = []
     for phrase, kind in _CONNECTORS:
-        start = 0
-        while True:
-            pos = folded.find(phrase, start)
-            if pos < 0:
-                break
-            found.append((pos, -len(phrase), phrase, kind))
-            start = pos + len(phrase)
+        pattern = r"\b" + re.escape(phrase) + r"\b"
+        for match in re.finditer(pattern, folded):
+            found.append((match.start(), -len(phrase), phrase, kind))
     found.sort()
     kept: list[tuple[int, str, str]] = []
     for pos, _length, phrase, kind in found:
@@ -523,51 +542,116 @@ def _connectors(folded: str) -> list[tuple[int, str, str]]:
     return kept
 
 
-def _direction_of(folded: str, from_terms: set[str], to_terms: set[str]) -> str | None:
-    """The direction a connector states, or None when the quote does not link the endpoints."""
-    for pos, phrase, kind in _connectors(folded):
-        left = folded[:pos]
-        right = folded[pos + len(phrase) :]
-        left_from = _side_has(left, from_terms)
-        left_to = _side_has(left, to_terms)
-        right_from = _side_has(right, from_terms)
-        right_to = _side_has(right, to_terms)
-        if kind == "forward":
-            if left_from and right_to and not (left_to and right_from):
-                return "from_to"
-            if left_to and right_from and not (left_from and right_to):
-                return "to_from"
-            continue
-        if kind == "backward":
-            if left_to and right_from and not (left_from and right_to):
-                return "from_to"
-            if left_from and right_to and not (left_to and right_from):
-                return "to_from"
-            continue
-        if (left_from and right_to) or (left_to and right_from) or (left_from and left_to) or (right_from and right_to):
-            return "undirected"
+def _connector_direction(
+    folded: str,
+    pos: int,
+    phrase: str,
+    kind: str,
+    from_terms: set[str],
+    to_terms: set[str],
+) -> str | None:
+    left = folded[:pos]
+    right = folded[pos + len(phrase) :]
+    left_from = _side_has(left, from_terms)
+    left_to = _side_has(left, to_terms)
+    right_from = _side_has(right, from_terms)
+    right_to = _side_has(right, to_terms)
+    if kind == "forward":
+        if left_from and right_to and not (left_to and right_from):
+            return "from_to"
+        if left_to and right_from and not (left_from and right_to):
+            return "to_from"
+        return None
+    if kind == "backward":
+        if left_to and right_from and not (left_from and right_to):
+            return "from_to"
+        if left_from and right_to and not (left_to and right_from):
+            return "to_from"
+        return None
+    if (left_from and right_to) or (left_to and right_from) or (left_from and left_to) or (right_from and right_to):
+        return "undirected"
     return None
+
+
+def _clauses(folded: str) -> list[str]:
+    parts = [part.strip() for part in _CLAUSE_SPLIT_RE.split(folded) if part and part.strip()]
+    return parts or [folded]
+
+
+def _direction_of(folded: str, from_terms: set[str], to_terms: set[str]) -> str | None:
+    """Direction of one clear clause, or ``ambiguous`` when the quote is not that.
+
+    Passive ``caused by`` and ``led to by`` point at the cause on the right.
+    Two claim-bearing clauses, or two connectors in one clause that disagree,
+    are ``ambiguous``. A clause with no recognized connector does not count.
+    """
+    claimed: list[str] = []
+    for clause in _clauses(folded):
+        directions = []
+        for pos, phrase, kind in _connectors(clause):
+            direction = _connector_direction(clause, pos, phrase, kind, from_terms, to_terms)
+            if direction:
+                directions.append(direction)
+        if not directions:
+            continue
+        if len(set(directions)) > 1:
+            return "ambiguous"
+        claimed.append(directions[0])
+    if not claimed:
+        return None
+    if len(claimed) > 1:
+        return "ambiguous"
+    return claimed[0]
+
+
+def _claim_clause(folded: str, from_terms: set[str], to_terms: set[str]) -> str:
+    """The single clause that states the link, or the whole quote when there is not one."""
+    found = []
+    for clause in _clauses(folded):
+        if _direction_of(clause, from_terms, to_terms):
+            found.append(clause)
+    if len(found) == 1:
+        return found[0]
+    return folded
 
 
 def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dict[str, Any] | None:
     """Read one candidate quote. A keyword hit is not itself a tier-3 authorization.
 
-    The rule is deterministic. It does not call a model. A quote authorizes
-    tier 3 only when it states an affirmative, unhedged from-to link.
+    The rule is deterministic. It does not call a model. Tier 3 requires one
+    clause, one recognized connector, affirmative polarity, no hedge, and the
+    from-to direction. Passive voice reverses ``caused by`` and ``led to by``.
+    Negation that governs the connector denies the link. ``if``, ``would``,
+    and ``someone said`` are hypothetical. Anything else that is not one clear
+    pattern stays unvalidated. This is not a general reading of the sentence.
     """
     folded = _norm(text)
     if not folded:
         return None
     padded = f" {folded} "
-    if not any(marker in padded for marker in _ATTRIBUTION) and not re.search(r"\bmakes\b", folded):
+    mentions_link = bool(_connectors(folded)) or any(marker in padded for marker in _ATTRIBUTION)
+    # A denial or a hypothetical with no connector is still a reading. It does not authorize tier 3.
+    if not mentions_link and not _DENIAL_RE.search(padded) and not _HYPOTHETICAL_RE.search(padded):
         return None
     tokens = _distinctive(text)
     if not (tokens & from_terms) or not (tokens & to_terms):
         return None
     direction = _direction_of(folded, from_terms, to_terms)
-    polarity = "negative" if _DENIAL_RE.search(padded) else "affirmative"
-    hedging = "hedged" if _HEDGE_RE.search(padded) else "none"
-    if direction is None:
+    clause = _claim_clause(folded, from_terms, to_terms)
+    clause_padded = f" {clause} "
+    polarity = "negative" if _DENIAL_RE.search(clause_padded) else "affirmative"
+    if direction is None and _DENIAL_RE.search(padded):
+        polarity = "negative"
+    hedging = "hedged" if _HEDGE_RE.search(clause_padded) else "none"
+    hypothetical = bool(_HYPOTHETICAL_RE.search(clause_padded))
+    if direction == "ambiguous":
+        status = "ambiguous"
+        direction = None
+    elif hypothetical:
+        status = "hypothetical"
+    elif direction is None and polarity == "negative":
+        status = "denied"
+    elif direction is None:
         status = "not_a_link"
     elif polarity == "negative":
         status = "denied"
@@ -592,6 +676,10 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
         qualifications.append("participant_link_not_a_relationship")
     elif status == "direction_unspecified":
         qualifications.append("participant_direction_unspecified")
+    elif status == "hypothetical":
+        qualifications.append("participant_link_hypothetical")
+    elif status == "ambiguous":
+        qualifications.append("participant_link_ambiguous")
     return {
         "link_text": str(text).strip(),
         "stated_direction": direction,
@@ -664,7 +752,16 @@ def _participant_link(
     elif authorizing:
         chosen = authorizing[0]
     else:
-        order = ("denied", "reversed", "hedged", "direction_unspecified", "not_a_link", "unvalidated")
+        order = (
+            "denied",
+            "reversed",
+            "hedged",
+            "hypothetical",
+            "ambiguous",
+            "direction_unspecified",
+            "not_a_link",
+            "unvalidated",
+        )
         chosen = sorted(readings, key=lambda item: order.index(item["status"]) if item["status"] in order else len(order))[0]
     component.update(chosen)
     component["present"] = True
@@ -1107,6 +1204,10 @@ def _claim_flags(claims: Mapping[str, Any]) -> list[str]:
         flags.append("participant_link_not_a_relationship")
     if status == "direction_unspecified":
         flags.append("participant_direction_unspecified")
+    if status == "hypothetical":
+        flags.append("participant_link_hypothetical")
+    if status == "ambiguous":
+        flags.append("participant_link_ambiguous")
     analyst = claims.get("analyst_interpretation") if isinstance(claims.get("analyst_interpretation"), Mapping) else {}
     if analyst.get("present"):
         flags.append("analyst_interpretation")

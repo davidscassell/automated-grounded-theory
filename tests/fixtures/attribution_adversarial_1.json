@@ -1,0 +1,204 @@
+{
+  "fixture_version": "attribution-adversarial-1",
+  "note": "Synthetic quotes for the deterministic attribution rule. Not study data. Matching these rows is not general semantic reliability.",
+  "cases": [
+    {
+      "id": "forward-because",
+      "quote": "tools for the shift lead to coworkers on the crew because the night ran long",
+      "outcome": "validated_forward",
+      "status": "validated",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": true,
+      "evidence_tier": 3
+    },
+    {
+      "id": "forward-caused",
+      "quote": "tools for the shift caused coworkers on the crew because the night ran long",
+      "outcome": "validated_forward",
+      "status": "validated",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": true,
+      "evidence_tier": 3
+    },
+    {
+      "id": "forward-led-to",
+      "quote": "tools for the shift led to coworkers on the crew",
+      "outcome": "validated_forward",
+      "status": "validated",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": true,
+      "evidence_tier": 3
+    },
+    {
+      "id": "forward-with-a-nonclaim-sentence",
+      "quote": "tools for the shift lead to coworkers on the crew. the night ran long",
+      "outcome": "validated_forward",
+      "status": "validated",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": true,
+      "evidence_tier": 3
+    },
+    {
+      "id": "passive-caused-by",
+      "quote": "tools for the shift are caused by coworkers on the crew",
+      "outcome": "validated_reverse",
+      "status": "reversed",
+      "stated_direction": "to_from",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "passive-led-to-by",
+      "quote": "tools for the shift were led to by coworkers on the crew",
+      "outcome": "validated_reverse",
+      "status": "reversed",
+      "stated_direction": "to_from",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "active-reverse-lead",
+      "quote": "coworkers on the crew lead to tools for the shift because the night ran long",
+      "outcome": "validated_reverse",
+      "status": "reversed",
+      "stated_direction": "to_from",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "active-reverse-caused",
+      "quote": "coworkers on the crew caused tools for the shift",
+      "outcome": "validated_reverse",
+      "status": "reversed",
+      "stated_direction": "to_from",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "negation-not-what-causes",
+      "quote": "tools for the shift are not what causes coworkers on the crew",
+      "outcome": "denied",
+      "status": "denied",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "negation-do-not",
+      "quote": "tools for the shift do not lead to coworkers on the crew because the night ran long",
+      "outcome": "denied",
+      "status": "denied",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "negation-doesnt",
+      "quote": "tools for the shift doesn't lead to coworkers on the crew",
+      "outcome": "denied",
+      "status": "denied",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "negation-never",
+      "quote": "tools for the shift never lead to coworkers on the crew",
+      "outcome": "denied",
+      "status": "denied",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "negation-no-relation",
+      "quote": "there is no relation between tools for the shift and coworkers on the crew",
+      "outcome": "denied",
+      "status": "denied",
+      "stated_direction": null,
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "hedged-might",
+      "quote": "tools for the shift might lead to coworkers on the crew because the night ran long",
+      "outcome": "hedged",
+      "status": "hedged",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "hedged-not-sure",
+      "quote": "I am not sure tools for the shift lead to coworkers on the crew",
+      "outcome": "hedged",
+      "status": "hedged",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "hypothetical-if",
+      "quote": "if tools for the shift lead to coworkers on the crew the night would change",
+      "outcome": "hypothetical",
+      "status": "hypothetical",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "hypothetical-someone-said",
+      "quote": "someone said tools for the shift lead to coworkers on the crew",
+      "outcome": "hypothetical",
+      "status": "hypothetical",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "hypothetical-would",
+      "quote": "tools for the shift would lead to coworkers on the crew",
+      "outcome": "hypothetical",
+      "status": "hypothetical",
+      "stated_direction": "from_to",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "ambiguous-two-clauses",
+      "quote": "tools for the shift lead to coworkers on the crew but coworkers on the crew lead to tools for the shift",
+      "outcome": "ambiguous",
+      "status": "ambiguous",
+      "stated_direction": null,
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "ambiguous-disagreeing-connectors",
+      "quote": "tools for the shift lead to and are caused by coworkers on the crew",
+      "outcome": "ambiguous",
+      "status": "ambiguous",
+      "stated_direction": null,
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "interviewer-not-a-link",
+      "quote": "I discussed tools for the shift and coworkers on the crew because the interviewer asked about both",
+      "outcome": "not_a_link",
+      "status": "not_a_link",
+      "stated_direction": null,
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    },
+    {
+      "id": "undirected-related",
+      "quote": "tools for the shift are related to coworkers on the crew because they share the night",
+      "outcome": "direction_unspecified",
+      "status": "direction_unspecified",
+      "stated_direction": "undirected",
+      "authorizes_tier_3": false,
+      "evidence_tier": 2
+    }
+  ]
+}

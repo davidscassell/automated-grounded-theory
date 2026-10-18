@@ -1,6 +1,6 @@
 # Discovery evaluation
 
-`policy_version` is `0.9.21`. This note is the discovery scorer. It is not [design-gate-evaluation.md](design-gate-evaluation.md).
+`policy_version` is `0.9.22`. This note is the discovery scorer. It is not [design-gate-evaluation.md](design-gate-evaluation.md).
 
 `score_gate_adjudications` scores a verdict only when its relationship id is already in the accepted or withheld export. An id that is absent is `unmatched` and is excluded. That scorer cannot lower recall for a relationship the run never proposed. Discovery starts from a frozen file of relationships a person identified, including rows the export does not contain.
 
@@ -8,7 +8,9 @@ No live model call is used. Matching does not use embeddings or an LLM judge. A 
 
 ## File
 
-Decision: the schema version is `discovery-eval-1`. It is not `policy_version`. A frozen file can outlive a package bump. `load_discovery_file` rejects any other schema version.
+Decision: the schema version written by `freeze_discovery_set` is `discovery-eval-2`. It is not `policy_version`. A frozen file can outlive a package bump. `load_discovery_file` accepts `discovery-eval-1` and `discovery-eval-2` and rejects any other schema version.
+
+Decision: a `discovery-eval-1` file still loads. Its stored hash is checked against the eval-1 body, which omits `claim_judgment`. After that check the in-memory `schema_version` is `discovery-eval-2`, `source_schema_version` stays `discovery-eval-1`, and every claim verdict is `not_judged`. Freezing that object writes `discovery-eval-2` and a new hash, even when every verdict is `not_judged`, because the schema version and the claim objects are part of the body. An eval-1 file that already contains `claim_judgment`, or a claim verdict other than `not_judged`, raises and must be frozen as `discovery-eval-2`.
 
 The frozen artifact is JSON or JSONL. CSV is an adjudicator template, `examples/discovery_adjudication_template.csv`. A CSV loads with `frozen_hash_status` `absent`. `score_discovery` refuses it until `freeze_discovery_set` has written a hash. `score_discovery(proposals, None)` does not raise. Every rate on that call is null.
 
@@ -42,7 +44,11 @@ Decision: direction, role, and wording are scored only when the gold row sets th
 
 Decision: recovered means the endpoint and passage match and every scored field agrees. Distorted means that match and at least one scored field disagrees. Distorted is not recovered. It stays in the recall denominator and out of the numerator. Missed means an evidence-supported independent row with no candidate. An unmatched proposal is a non-synthetic system row with both endpoint ids that was assigned to no gold row.
 
-Decision: assignment is one gold row to one system row. Independent rows are assigned before `system_proposal` rows, so a review of a system id does not take the match away from an independent discovery. Among candidates, a full agreement wins over a distortion, then the lowest `relationship_id`.
+Decision: independent gold uses one global one-to-one assignment. The primary objective maximizes full-agreement recoveries, then any structural match (including distortions). Ties break by canonical content order of the gold row and the proposal: code ids, passage ids, direction, role, wording, rationale, and statement. `adjudication_id` and `relationship_id` are not part of that order, so renaming or reordering those ids does not change the rates. 0.9.21 assigned greedily in adjudication-id order. That order is not used.
+
+Decision: a `system_proposal` adjudication binds only by `system_relationship_id`. It is not endpoint-matched. Duplicate `system_relationship_id` values in the discovery file raise. A missing id, an id absent from the export, or more than one export row with that id is `unmatched_system_proposal` and is listed in `unmatched_system_relationship_ids`. It is never attached to a different proposal that shares endpoints. A successful bind is `discovery_status` `linked`. That row is not recovered, not distorted, and not an independent recall gold. The bound proposal is removed from the independent pool and is not an unmatched proposal. It stays in the precision denominator because it is still a non-synthetic proposal, and it is not a structural true positive.
+
+Decision: structural matching does not read the proposed `statement`. A statement that denies the gold relationship can still be structurally recovered. That is not a claim that the human-supported interpretation was recovered. `claim_correct_rate` is a separate human measure.
 
 Decision: `evidence_tier`, `evidence_label`, model judgments, and `attribution_source` are not read. A tier 3 label does not turn a wrong direction into a recovery. The result says `metric_source` `human_adjudication`, `model_judgments_used` false, and `tier_labels_used` false. Those fields are not tier labels and they are not model judgments.
 
@@ -64,14 +70,20 @@ Decision: eligibility is known when the export has a boolean `downstream_eligibl
 
 `gate_false_negative_rate` is withheld-but-supported over the population, and only when every population member has known eligibility. Otherwise it is null. `withheld_but_supported_count` can still be positive. `gate_false_negative_rate_known` uses only the known members. Its denominator is `gate_false_negative_rate_known_denominator`. `gate_false_negative_rate_coverage` is known members over the population, and is null when the population is 0. This is the 0.9.14 split. A recovered match with `downstream_eligible` false is both recovered and a gate false negative. The two statuses are separate.
 
-Per relationship, `discovery_status` is `recovered`, `missed`, `distorted`, `unmatched_proposal`, `unlinked`, or `not_scored`. `gate_status` is `withheld_but_supported`, `passed`, `unknown`, or `not_applicable`.
+Per relationship, `discovery_status` is `recovered`, `missed`, `distorted`, `linked`, `unmatched_system_proposal`, `unmatched_proposal`, or `not_scored`. `gate_status` is `withheld_but_supported`, `passed`, `unknown`, or `not_applicable`.
+
+## Claim correctness
+
+Decision: `claim_judgment` is a human reading of the actual proposed statement. It has `verdict` (`correct`, `incorrect`, `partly_correct`, or `not_judged`), plus optional `direction`, `qualification`, and `support`. The default is `not_judged`. Structural recall does not read it.
+
+`claim_correct_rate` is `correct` over judged matched rows. Judged means `correct`, `incorrect`, or `partly_correct`. `partly_correct` is judged and is not correct. `not_judged` is not judged. The denominator `claim_correct_denominator` is that judged count. `claim_matched_count` is independent structural matches, recovered or distorted. `claim_correct_coverage` is judged over matched, and is null when nothing matched. The rate is null when nothing was judged. It is never added to structural recall, precision, or distortion.
 
 ## Expenditure
 
-`discovery_recovered_per_token` is independent rows recovered, divided by `reread_expenditure_tokens`. `discovery_recovered_per_dollar` divides the same numerator by `reread_expenditure_cost_usd`. Both are null unless `reread_expenditure_complete` is true and the denominator is a positive number. An incomplete report stays null even when it already carries a token count or a dollar figure. Zero recoveries over a positive complete spend is 0.
+`discovery_recovered_per_reread_token` is independent rows recovered, divided by `reread_expenditure_tokens`. `discovery_recovered_per_reread_dollar` divides the same numerator by `reread_expenditure_cost_usd`. Both names are scoped to reread expenditure. Other run spend is not in the denominator. Both are null unless `reread_expenditure_complete` is true and the denominator is a positive number. An incomplete report stays null even when it already carries a token count or a dollar figure. Zero recoveries over a positive complete reread spend is 0. The 0.9.21 keys `discovery_recovered_per_token` and `discovery_recovered_per_dollar` are not emitted.
 
 Decision: a mapping with `prompt_log` or `reread_notes` is passed to `reread_interpretation_report`. A mapping that already has `reread_expenditure_complete` and is not a run state is used as given. Omitted expenditure leaves both rates null.
 
 ## What this release does not change
 
-`pattern_min_cases` stays 2. The axial token ceiling stays 24000. `batch_size` stays 1. Tier 4 stays a human `verify`. The 0.9.20 quote rule, claim components, selective fingerprint, and axial exploration policy stay as shipped. This module does not rescore tiers.
+`pattern_min_cases` stays 2. The axial token ceiling stays 24000. `batch_size` stays 1. Tier 4 stays a human `verify`. The 0.9.20 claim components and selective fingerprint stay as shipped. 0.9.22 changes which axial pairs count as examined, and it tightens the quote pattern that can authorize tier 3. Those decisions are in [design-review-fixes-0922.md](design-review-fixes-0922.md). This module does not rescore tiers. Structural recall is recovery of the specified structural fields. It is not recovery of the human-supported interpretation.

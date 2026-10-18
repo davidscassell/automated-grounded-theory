@@ -1,7 +1,7 @@
 # automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, 0.6.14, 0.6.15, and 0.6.16, focused coding in 0.7.0, fixes in 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, 0.7.6, 0.7.7, 0.7.8, and 0.7.9, axial coding and saturation indicators in 0.8.0, fixes in 0.8.1)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
-Status: this file is the open-coding design, beginning with steps 1 and 2 of the v0.6 plan. Focused coding is in 0.7.0 and the 0.7.1 through 0.7.9 fixes. Axial coding, saturation indicators, and selective coding are separate experimental graphs from 0.8.0. Within-corpus theoretical sampling and a saturation decision that leaves `judgment` null are in 0.9.0 and later. Package `policy_version` is `0.9.21`. The current index is [README.md](README.md). The 0.8 axial slice is [design-axial-0800.md](design-axial-0800.md). 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
+Status: this file is the open-coding design, beginning with steps 1 and 2 of the v0.6 plan. Focused coding is in 0.7.0 and the 0.7.1 through 0.7.9 fixes. Axial coding, saturation indicators, and selective coding are separate experimental graphs from 0.8.0. Within-corpus theoretical sampling and a saturation decision that leaves `judgment` null are in 0.9.0 and later. Package `policy_version` is `0.9.22`. The current index is [README.md](README.md). The 0.8 axial slice is [design-axial-0800.md](design-axial-0800.md). 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
 
 The default procedure is Charmaz-informed automated analysis: initial coding against a frozen snapshot, constant comparison with distinct operations, and `build_themes` as a descriptive reporting view. It is not an axial-coding template.
 
@@ -467,7 +467,11 @@ Package 0.9.20 checks the relationship a participant quote actually states. A ke
 
 Package 0.9.21 adds a discovery evaluation beside gate scoring. A frozen human file can record a relationship the run never proposed. Recall, precision, and distortion stay null when their denominators are empty. A wrong direction is distorted. A withheld but supported proposal is a gate false negative, using the same known-eligibility split as 0.9.14. Per-token and per-dollar figures stay null unless reread expenditure is complete. The example file is synthetic. `pattern_min_cases` stays 2, the axial ceiling stays 24000, `batch_size` stays 1, and tier 4 stays human-only. The design is [design-discovery-evaluation.md](design-discovery-evaluation.md) and [design-review-fixes-0921.md](design-review-fixes-0921.md).
 
-`policy_version` is `0.9.21`.
+`policy_version` was `0.9.21`.
+
+Package 0.9.22 keeps completed axial examinations separate from pairs that were only planned or sent. A failed, timed-out, or unsent pair stays retryable. `unique_pairs_explored` counts completed examinations only. The quote pattern that authorizes tier 3 requires one clear clause and one unambiguous connector. Passive voice, negation, a second clause, and a hypothetical stay unvalidated. That pattern is not general semantic reliability. Discovery recall uses a maximum one-to-one assignment that does not depend on adjudication ids. A `system_proposal` row binds only by `system_relationship_id`. Structural recall and human claim correctness are separate rates. The schema is `discovery-eval-2`, and a `discovery-eval-1` file still verifies under its old hash. Recovered-per-token and recovered-per-dollar figures are named as reread expenditure only. The planner still builds the full pair space in memory. `pattern_min_cases` stays 2, the axial ceiling stays 24000, `batch_size` stays 1, and tier 4 stays human-only. The design is [design-review-fixes-0922.md](design-review-fixes-0922.md).
+
+`policy_version` is `0.9.22`.
 
 ## 26. Out of scope
 
