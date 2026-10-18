@@ -30,7 +30,9 @@ from automated_grounded_theory.async_support import (
     CallLimiter,
     ProviderAllowance,
     ainvoke_structured,
+    check_durability,
     node_watchdog,
+    persistence_record,
     run_sync,
     timeout_policy,
 )
@@ -2205,6 +2207,7 @@ def _sampling_checkpoint(runtime: SamplingRuntime):
         metadata.setdefault("model_direction_ids", [])
         metadata.setdefault("model_passage_ids", [])
         metadata["model_sampling_judgment"] = False
+        # Resume restarts this node. The allowance copy is derived again.
         _sync_allowance(metadata, runtime)
         if not state.get("interrupt_enabled", True):
             directions = [dict(row) for row in (state.get("directions") or [])]
@@ -2794,7 +2797,147 @@ def _finish_reread(
     _clear_recovered_timeout_markers(metadata)
 
 
+def _pair_record_id(row: Mapping[str, Any]) -> str:
+    return f"{row.get('direction_id') or ''}\x1f{row.get('passage_id') or ''}"
+
+
+def _pair_view(row: Mapping[str, Any]) -> dict[str, Any]:
+    view = {
+        "direction_id": str(row.get("direction_id") or ""),
+        "passage_id": str(row.get("passage_id") or ""),
+    }
+    for name in ("question_key", "direction_key", "reason"):
+        if row.get(name):
+            view[name] = row.get(name)
+    return view
+
+
+def derive_reread_views(pair_records: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Project pair records onto the exported lists and the stage summary.
+
+    ``reread_completed_pairs`` stays direction id plus passage id. A ledger
+    ``completed_pairs`` row stays question key plus passage id. Both identifiers
+    live on the canonical record.
+    """
+    stored = pair_records if isinstance(pair_records, Mapping) else {}
+    pairs = stored.get("pairs") if isinstance(stored.get("pairs"), Mapping) else {}
+    stage = dict(stored.get("stage") or {}) if isinstance(stored.get("stage"), Mapping) else {}
+    completed: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    unsent: list[dict[str, Any]] = []
+    for record in pairs.values():
+        if not isinstance(record, Mapping):
+            continue
+        view = dict(record.get("view") or {})
+        status = str(record.get("status") or "")
+        if status == "completed":
+            completed.append(view)
+        elif status == "failed":
+            failed.append(view)
+        elif status == "unsent":
+            unsent.append(view)
+    summary = {
+        "reread_status": stage.get("reread_status") if "reread_status" in stage else None,
+        "reread_stop": str(stage.get("reread_stop") or "") if "reread_stop" in stage else "",
+        "completed": len(completed),
+        "failed": len(failed),
+        "unsent": len(unsent),
+    }
+    return {
+        "reread_completed_pairs": completed,
+        "reread_failed_pairs": failed,
+        "reread_unsent_pairs": unsent,
+        "reread_unsent_passage_ids": [str(row.get("passage_id") or "") for row in unsent],
+        "reread_status": summary["reread_status"],
+        "reread_stop": summary["reread_stop"],
+        "reread_stage_summary": summary,
+        "status_present": "reread_status" in stage,
+        "stop_present": "reread_stop" in stage,
+    }
+
+
+def publish_pair_records(metadata: dict[str, Any], notes: Sequence[Mapping[str, Any]] | None = None) -> None:
+    """Store one record per direction-passage pair, then refresh the derived lists.
+
+    A later publish keeps the attempt history. A completed pair replaces a
+    failed or unsent status for that same pair.
+    """
+    stored = metadata.get("pair_records")
+    pairs = dict(stored.get("pairs") or {}) if isinstance(stored, Mapping) else {}
+    notes_by_id = {}
+    for note in notes or []:
+        if isinstance(note, Mapping):
+            notes_by_id[_pair_record_id(note)] = note
+
+    def touch(row: Mapping[str, Any], status: str) -> None:
+        key = _pair_record_id(row)
+        if key == "\x1f" or key.startswith("\x1f") or key.endswith("\x1f"):
+            return
+        prior = dict(pairs.get(key) or {})
+        if prior.get("status") == "completed" and status != "completed":
+            return
+        view = _pair_view(row)
+        reason = str(row.get("reason") or "")
+        result = prior.get("result")
+        note = notes_by_id.get(key)
+        if status == "completed" and isinstance(note, Mapping):
+            result = {"judgment": str(note.get("judgment") or ""), "flags": list(note.get("flags") or [])}
+        attempt = {"status": status, "reason": reason}
+        attempts = [dict(item) for item in (prior.get("attempts") or []) if isinstance(item, Mapping)]
+        if not attempts or attempts[-1] != attempt:
+            attempts.append(attempt)
+        question = stable_question_key(
+            str(
+                view.get("question_key")
+                or (note or {}).get("question_key")
+                or (note or {}).get("direction_key")
+                or prior.get("question_key")
+                or ""
+            )
+        )
+        pairs[key] = {
+            "question_key": question,
+            "direction_id": view["direction_id"],
+            "passage_id": view["passage_id"],
+            "status": status,
+            "result": result,
+            "reason": reason,
+            "attempts": attempts,
+            "view": view,
+        }
+
+    for row in metadata.get("reread_completed_pairs") or []:
+        if isinstance(row, Mapping):
+            touch(row, "completed")
+    for row in metadata.get("reread_failed_pairs") or []:
+        if isinstance(row, Mapping):
+            touch(row, "failed")
+    for row in metadata.get("reread_unsent_pairs") or []:
+        if isinstance(row, Mapping):
+            touch(row, "unsent")
+    stage: dict[str, Any] = {}
+    if "reread_status" in metadata:
+        stage["reread_status"] = metadata.get("reread_status")
+    if "reread_stop" in metadata:
+        stage["reread_stop"] = str(metadata.get("reread_stop") or "")
+    metadata["pair_records"] = {"pairs": pairs, "stage": stage}
+    derived = derive_reread_views(metadata["pair_records"])
+    if "reread_completed_pairs" in metadata or derived["reread_completed_pairs"]:
+        metadata["reread_completed_pairs"] = derived["reread_completed_pairs"]
+    if "reread_failed_pairs" in metadata or derived["reread_failed_pairs"]:
+        metadata["reread_failed_pairs"] = derived["reread_failed_pairs"]
+    if "reread_unsent_pairs" in metadata or derived["reread_unsent_pairs"]:
+        metadata["reread_unsent_pairs"] = derived["reread_unsent_pairs"]
+        metadata["reread_unsent_passage_ids"] = derived["reread_unsent_passage_ids"]
+    if derived["status_present"]:
+        metadata["reread_status"] = derived["reread_status"]
+    if derived["stop_present"]:
+        metadata["reread_stop"] = derived["reread_stop"]
+    metadata["reread_stage_summary"] = derived["reread_stage_summary"]
+
+
 def _reread_return(notes: list, metadata: dict[str, Any], logs: list, warnings: list) -> dict:
+    publish_pair_records(metadata, notes)
     return {"reread_notes": notes, "metadata": metadata, "prompt_log": logs, "warnings": warnings}
 
 
@@ -3342,6 +3485,7 @@ def _saturation_decision(runtime: SamplingRuntime):
                 "prompt_log": logs,
             }
         metadata["model_saturation_judgment"] = None
+        # Resume restarts this node. Indicators are rebuilt from the checkpoint.
         _sync_allowance(metadata, runtime)
         if not state.get("interrupt_enabled", True):
             metadata["saturation_decision"] = None
@@ -3951,6 +4095,7 @@ async def _record_timeout(graph, config, exc: BaseException, output_dir, runtime
         # re-enters it, skips stored notes, and retries the failed pair.
         metadata["reread_status"] = "timeout"
         metadata["reread_stop"] = "timeout"
+        publish_pair_records(metadata, state.get("reread_notes") or [])
         ledger = [dict(item) for item in (state.get("sampling_ledger") or []) if isinstance(item, Mapping)]
         if ledger:
             last = dict(ledger[-1])
@@ -4053,7 +4198,7 @@ def _sampling_recursion_limit(procedure: Mapping[str, Any], *, override: int | N
 _GRAPH_NODE_OVERHEAD = 24
 
 
-async def _invoke(builder, saver, initial, *, thread_id: str, resume, resuming: bool, output_dir, raise_on_timeout: bool, allow_changes: bool, procedure: Mapping[str, Any], runtime: SamplingRuntime, recursion_limit: int | None = None) -> SamplingResult:
+async def _invoke(builder, saver, initial, *, thread_id: str, resume, resuming: bool, output_dir, raise_on_timeout: bool, allow_changes: bool, procedure: Mapping[str, Any], runtime: SamplingRuntime, recursion_limit: int | None = None, durability: str = "async") -> SamplingResult:
     graph = builder.compile(checkpointer=saver)
     limit = _sampling_recursion_limit(procedure, override=recursion_limit)
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": limit}
@@ -4071,15 +4216,16 @@ async def _invoke(builder, saver, initial, *, thread_id: str, resume, resuming: 
             _check_resume(saved.get("procedure") or {}, procedure, allow_changes=allow_changes)
             _restore(runtime, saved)
             if getattr(snapshot, "interrupts", ()):
-                await graph.ainvoke(Command(resume=resume), config)
+                await graph.ainvoke(Command(resume=resume), config, durability=durability)
             else:
-                # A timeout is not a human interrupt. Continue the node that
-                # did not return. Command(resume=...) is only for interrupt().
-                await graph.ainvoke(None, config)
+                # A timeout or an execution error is not a human interrupt.
+                # Continue the node that did not return. Command(resume=...)
+                # is only for interrupt().
+                await graph.ainvoke(None, config, durability=durability)
         else:
             if has_state:
                 raise SamplingError(f"Thread {thread_id!r} already has a run. Pass resuming=True or a new thread_id.")
-            await graph.ainvoke(initial, config)
+            await graph.ainvoke(initial, config, durability=durability)
     except Exception as exc:
         if isinstance(exc, SamplingError):
             raise
@@ -4187,6 +4333,8 @@ async def atheoretical_sample(
     recursion_limit: int | None = None,
     idle_timeout: float | None = None,
     node_timeout: float | None = None,
+    checkpoint_path: str | Path | None = None,
+    durability: str = "async",
 ) -> SamplingResult:
     """Rank sampling directions and record a saturation decision.
 
@@ -4275,26 +4423,50 @@ async def atheoretical_sample(
         _carry_budget(runtime.limiter.provider_allowance, upstream.get("provider_budget"))
         _baseline_sampling_stages(runtime.limiter.provider_allowance, metadata)
         _sync_allowance(metadata, runtime)
+    try:
+        mode = check_durability(durability)
+    except ValueError as exc:
+        raise SamplingError(str(exc)) from exc
+    if checkpoint_path is not None and checkpointer is not None:
+        raise SamplingError("Pass checkpointer or checkpoint_path, not both.")
+    metadata["persistence"] = persistence_record(
+        checkpointer=checkpointer,
+        checkpoint_path=checkpoint_path,
+        durability=mode,
+    )
     from langgraph.checkpoint.memory import InMemorySaver
 
-    saver = checkpointer if checkpointer is not None else InMemorySaver()
     thread = thread_id or uuid.uuid4().hex
     if decision_mode == "llm" and resuming and resume is None:
         resume = {"automated_review": True}
-    return await _invoke(
-        build_sampling_graph(runtime, output_dir=output_dir),
-        saver,
-        None if resuming else _initial(data, metadata, interrupt_enabled=interrupt),
-        thread_id=thread,
-        resume=None if not resuming else resume,
-        resuming=resuming,
-        output_dir=output_dir,
-        raise_on_timeout=raise_on_timeout,
-        allow_changes=allow_changes,
-        procedure=procedure,
-        runtime=runtime,
-        recursion_limit=recursion_limit,
-    )
+
+    async def _run(saver):
+        return await _invoke(
+            build_sampling_graph(runtime, output_dir=output_dir),
+            saver,
+            None if resuming else _initial(data, metadata, interrupt_enabled=interrupt),
+            thread_id=thread,
+            resume=None if not resuming else resume,
+            resuming=resuming,
+            output_dir=output_dir,
+            raise_on_timeout=raise_on_timeout,
+            allow_changes=allow_changes,
+            procedure=procedure,
+            runtime=runtime,
+            recursion_limit=recursion_limit,
+            durability=mode,
+        )
+
+    if checkpoint_path is None:
+        return await _run(checkpointer if checkpointer is not None else InMemorySaver())
+    try:
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+    except ImportError as exc:
+        raise SamplingError(
+            "checkpoint_path requires the sqlite checkpointer. Install the checkpoint extra."
+        ) from exc
+    async with AsyncSqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
+        return await _run(saver)
 
 
 def theoretical_sample(*args, **kwargs) -> SamplingResult:
