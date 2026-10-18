@@ -2878,17 +2878,20 @@ def _plan_node(state: AxialState) -> dict:
         evidence_classes=evidence_classes,
         exploration_quotas=quotas if isinstance(quotas, Mapping) else None,
     )
-    seen_examined = {_pair_key(pair) for pair in examined_pairs}
-    for pair in plan["round"]:
-        key = _pair_key(pair)
-        if not key[0] or not key[1] or key in seen_examined:
-            continue
-        seen_examined.add(key)
-        examined_pairs.append({"from_id": key[0], "to_id": key[1]})
-    metadata["examined_pairs"] = examined_pairs
-    metadata["examined_pair_count"] = len(examined_pairs)
+    # Planning does not examine a pair. examined_pairs stays the completed
+    # history the caller passed in. This round is within_run_examined until
+    # a response completes.
+    metadata["examined_pairs"] = [
+        {"from_id": _pair_key(pair)[0], "to_id": _pair_key(pair)[1]}
+        for pair in examined_pairs
+        if _pair_key(pair)[0] and _pair_key(pair)[1]
+    ]
+    metadata["examined_pair_count"] = len(metadata["examined_pairs"])
     metadata["within_run_examined"] = list(plan["round"])
-    metadata["unique_pairs_explored"] = plan.get("unique_pairs_explored")
+    metadata["unique_pairs_explored"] = len(metadata["examined_pairs"])
+    metadata["pairs_planned"] = len(plan["round"])
+    metadata["pairs_attempted"] = 0
+    metadata["pairs_completed"] = 0
     metadata["exploration_quotas"] = plan.get("exploration_quotas")
     warnings = list(state.get("warnings") or [])
     # The warning is a result of classification. A skipped classification has
@@ -2964,17 +2967,21 @@ def _plan_node(state: AxialState) -> dict:
         "unexamined_pair_count": plan.get("unexamined_pair_count"),
         "unexamined_materialized": plan.get("unexamined_materialized"),
         "within_run_pair_count": plan.get("within_run_pair_count"),
-        "unique_pairs_explored": plan.get("unique_pairs_explored"),
+        "unique_pairs_explored": len(metadata["examined_pairs"]),
+        "pairs_planned": len(plan["round"]),
+        "pairs_attempted": 0,
+        "pairs_completed": 0,
         "exploration_quotas": plan.get("exploration_quotas"),
         "selection_procedure": plan.get("selection_procedure"),
         "lexical_only_count": evidence.get("lexical_only_count"),
         "seed": effective_seed,
         "seed_source": metadata["seed_source"],
         "note": (
-            "The same seed examines the same pairs. Coverage is examined pairs over the unordered pair count. "
-            "Plausible pairs are those with same-passage, same-respondent, or lexical cross-case evidence. "
-            "Evidence classes keep a minimum slot before same-passage pairs fill the rest. "
-            "Examined pairs are not selected again. unique_pairs_explored counts this run and the examined history. "
+            "The same seed selects the same pairs. unique_pairs_explored counts completed examinations only. "
+            "Planned, attempted, and completed counts are separate. "
+            "A failed, timed-out, or unsent pair stays retryable. "
+            "A 0.9.20 or 0.9.21 examined_pairs list was written when the round was planned and cannot be split. "
+            "Passing that list still excludes every pair in it. "
             "max_axial_review_calls defaults to 8, so a default series examines a small fraction of the pairs."
         ),
     }
@@ -3834,6 +3841,50 @@ def _remember_pairs(bucket: list, pairs: Sequence[Mapping[str, Any]]) -> None:
         bucket.append(_pair_record(pair))
 
 
+def _publish_exploration(metadata: dict[str, Any]) -> None:
+    """Exclusion history is completed examinations only.
+
+    ``within_run_examined`` stays the planned round. ``pairs_attempted`` counts
+    requests that were sent. ``pairs_completed`` counts responses that came
+    back, including a valid ``nothing_to_propose``. Failed, timed-out, and
+    unsent pairs are not added to ``examined_pairs``.
+    """
+    accounting = metadata.get("pair_accounting") if isinstance(metadata.get("pair_accounting"), Mapping) else {}
+    prior = [pair for pair in (metadata.get("examined_pairs") or []) if isinstance(pair, Mapping)]
+    completed_rows = [pair for pair in (accounting.get("completed") or []) if isinstance(pair, Mapping)]
+    merged: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for pair in prior + completed_rows:
+        key = _pair_key(pair)
+        if not key[0] or not key[1] or key in seen:
+            continue
+        seen.add(key)
+        merged.append({"from_id": key[0], "to_id": key[1]})
+    metadata["examined_pairs"] = merged
+    metadata["examined_pair_count"] = len(merged)
+    metadata["unique_pairs_explored"] = len(merged)
+    attempted = accounting.get("attempted") or []
+    completed = accounting.get("completed") or []
+    metadata["pairs_planned"] = len(metadata.get("within_run_examined") or [])
+    metadata["pairs_attempted"] = len([pair for pair in attempted if isinstance(pair, Mapping)])
+    metadata["pairs_completed"] = len([pair for pair in completed if isinstance(pair, Mapping)])
+    coverage = dict(metadata.get("pair_coverage") or {})
+    coverage["unique_pairs_explored"] = len(merged)
+    coverage["pairs_planned"] = metadata["pairs_planned"]
+    coverage["pairs_attempted"] = metadata["pairs_attempted"]
+    coverage["pairs_completed"] = metadata["pairs_completed"]
+    coverage["note"] = (
+        "The same seed selects the same pairs. unique_pairs_explored counts completed examinations only. "
+        "Planned, attempted, and completed counts are separate. "
+        "A failed, timed-out, or unsent pair stays retryable. "
+        "A valid empty response is completed. "
+        "A 0.9.20 or 0.9.21 examined_pairs list was written when the round was planned and cannot be split. "
+        "Passing that list still excludes every pair in it. "
+        "max_axial_review_calls defaults to 8, so a default series examines a small fraction of the pairs."
+    )
+    metadata["pair_coverage"] = coverage
+
+
 def _finalize_pair_accounting(metadata: dict[str, Any], pending: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
     """Reconcile planned, attempted, completed, omitted, and remaining pairs."""
     accounting = dict(metadata.get("pair_accounting") or {})
@@ -4459,6 +4510,7 @@ def _propose_node(runtime: AxialRuntime):
                 _note_stage(metadata, "proposals", required=True, status="budget_limited", reason=propose_stop or "budget_limited")
             else:
                 _note_stage(metadata, "proposals", required=True, status="complete")
+        _publish_exploration(metadata)
         return {
             "relationships": relationships,
             "prompt_log": logs,

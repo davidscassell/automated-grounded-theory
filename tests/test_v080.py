@@ -328,8 +328,8 @@ def _run(model=None, **kwargs):
 
 
 def test_version_and_graphs():
-    assert __version__ == "0.9.21"
-    assert POLICY_VERSION == "0.9.21"
+    assert __version__ == "0.9.22"
+    assert POLICY_VERSION == "0.9.22"
     from automated_grounded_theory.axial import aaxial_code
 
     assert inspect.signature(aaxial_code).parameters["batch_size"].default == 1

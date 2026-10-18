@@ -9,11 +9,21 @@ asks which of those the run recovered, distorted, or missed.
 Matching is deterministic. Endpoint identity is a normalized code id. A
 passage anchor is a shared passage id. Quotes, embeddings, and model
 judgments are not match signals. Tier labels are not match signals.
+The proposed statement is not a structural match signal. Structural recall
+measures recovery of the specified structural fields. It does not mean the
+human-supported interpretation was recovered. A separate human
+``claim_judgment`` scores that statement.
+
+Independent gold is assigned by maximum-weight one-to-one matching:
+full agreement first, then any structural match, then a content ordering
+that does not use adjudication ids or relationship ids.
+``system_proposal`` rows bind only by ``system_relationship_id``.
 
 A rate whose denominator is empty stays null. A full gate false-negative
 rate stays null unless eligibility is known for every row in that population,
-the same rule as the 0.9.14 downstream rates. Per-token and per-dollar
-figures stay null unless reread expenditure is complete.
+the same rule as the 0.9.14 downstream rates. Recovered-per-token and
+recovered-per-dollar figures use reread expenditure only, and they stay
+null unless that expenditure is complete.
 """
 
 from __future__ import annotations
@@ -25,11 +35,14 @@ import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-DISCOVERY_SCHEMA_VERSION = "discovery-eval-1"
+DISCOVERY_SCHEMA_VERSION = "discovery-eval-2"
+DISCOVERY_SCHEMA_VERSION_V1 = "discovery-eval-1"
+_ACCEPTED_SCHEMAS = frozenset({DISCOVERY_SCHEMA_VERSION, DISCOVERY_SCHEMA_VERSION_V1})
 
 _KINDS = frozenset({"independent", "system_proposal"})
 _DIRECTIONS = frozenset({"from_to", "to_from", "undirected"})
 _OUTCOMES = frozenset({"rejected", "withheld", "repair_failed", "proposed", "accepted"})
+_CLAIM_VERDICTS = frozenset({"correct", "incorrect", "partly_correct", "not_judged"})
 _WITHHELD_OUTCOMES = frozenset({"rejected", "withheld", "repair_failed"})
 _WITHHELD_DISPOSITIONS = frozenset({"rejected", "provisional", "merged", "withheld"})
 _FLAG_NAMES = (
@@ -59,6 +72,10 @@ DISCOVERY_CSV_COLUMNS = (
     "evidence_supported",
     "system_relationship_id",
     "system_outcome",
+    "claim_verdict",
+    "claim_direction",
+    "claim_qualification",
+    "claim_support",
     "disagreement_adjudicator_id",
     "disagreement_field",
     "disagreement_value",
@@ -71,8 +88,9 @@ _RATE_NAMES = (
     "discovery_distortion_rate",
     "gate_false_negative_rate",
     "gate_false_negative_rate_known",
-    "discovery_recovered_per_token",
-    "discovery_recovered_per_dollar",
+    "discovery_recovered_per_reread_token",
+    "discovery_recovered_per_reread_dollar",
+    "claim_correct_rate",
 )
 
 
@@ -205,7 +223,73 @@ def _stable(value: Any) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
 
-def _one_adjudication(row: Mapping[str, Any], *, passages: list[dict[str, str]] | None = None) -> dict[str, Any]:
+def _empty_claim_judgment() -> dict[str, Any]:
+    return {"verdict": "not_judged", "direction": None, "qualification": None, "support": None}
+
+
+def _claim_judgment(row: Mapping[str, Any], *, legacy: bool) -> dict[str, Any]:
+    """A human reading of the proposed statement. It is not a structural match.
+
+    discovery-eval-1 has no place for this judgment. A file of that version
+    that already carries one must be frozen again as discovery-eval-2.
+    """
+    raw = row.get("claim_judgment")
+    flat = any(key in row for key in ("claim_verdict", "claim_direction", "claim_qualification", "claim_support"))
+    if legacy:
+        # An upgraded in-memory row carries not_judged. A real judgment cannot
+        # stay on a discovery-eval-1 hash; freeze it as discovery-eval-2.
+        if flat:
+            raise DiscoveryEvaluationError(
+                "discovery-eval-1 cannot store claim_judgment. Freeze the file as discovery-eval-2."
+            )
+        if isinstance(raw, Mapping):
+            verdict = str(raw.get("verdict") or "not_judged").strip().casefold().replace(" ", "_").replace("-", "_")
+            extras = any(str(raw.get(key) or "").strip() for key in ("direction", "qualification", "support"))
+            if verdict == "not_judged" and not extras:
+                return _empty_claim_judgment()
+            raise DiscoveryEvaluationError(
+                "discovery-eval-1 cannot store claim_judgment. Freeze the file as discovery-eval-2."
+            )
+        if raw not in (None, "", {}):
+            raise DiscoveryEvaluationError(
+                "discovery-eval-1 cannot store claim_judgment. Freeze the file as discovery-eval-2."
+            )
+        return _empty_claim_judgment()
+    if flat and not isinstance(raw, Mapping):
+        raw = {
+            "verdict": row.get("claim_verdict"),
+            "direction": row.get("claim_direction"),
+            "qualification": row.get("claim_qualification"),
+            "support": row.get("claim_support"),
+        }
+    if raw is None or raw == "":
+        return _empty_claim_judgment()
+    if not isinstance(raw, Mapping):
+        raise DiscoveryEvaluationError("claim_judgment must be an object.")
+    verdict = str(raw.get("verdict") or "not_judged").strip().casefold().replace(" ", "_").replace("-", "_")
+    if verdict not in _CLAIM_VERDICTS:
+        raise DiscoveryEvaluationError(f"Unknown claim verdict {raw.get('verdict')!r}.")
+
+    def _optional(key: str) -> str | None:
+        value = raw.get(key)
+        if value is None or str(value).strip() == "":
+            return None
+        return str(value).strip()
+
+    return {
+        "verdict": verdict,
+        "direction": _optional("direction"),
+        "qualification": _optional("qualification"),
+        "support": _optional("support"),
+    }
+
+
+def _one_adjudication(
+    row: Mapping[str, Any],
+    *,
+    passages: list[dict[str, str]] | None = None,
+    legacy: bool = False,
+) -> dict[str, Any]:
     if not isinstance(row, Mapping):
         raise DiscoveryEvaluationError("An adjudication must be an object.")
     adjudication_id = _text(row.get("adjudication_id"))
@@ -271,6 +355,7 @@ def _one_adjudication(row: Mapping[str, Any], *, passages: list[dict[str, str]] 
         "evidence_supported": evidence_supported,
         "system_relationship_id": system_relationship_id,
         "system_outcome": system_outcome,
+        "claim_judgment": _claim_judgment(row, legacy=legacy),
     }
 
 
@@ -304,20 +389,31 @@ def _one_disagreement(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _normalize_payload(payload: Mapping[str, Any] | Sequence[Any]) -> dict[str, Any]:
+def _schema_of(payload: Mapping[str, Any]) -> str:
+    source = str(payload.get("source_schema_version") or "")
+    version = str(payload.get("schema_version") or "")
+    if source in _ACCEPTED_SCHEMAS:
+        return source
+    if version in _ACCEPTED_SCHEMAS:
+        return version
+    if not version:
+        return DISCOVERY_SCHEMA_VERSION
+    raise DiscoveryEvaluationError(f"schema_version must be {DISCOVERY_SCHEMA_VERSION}.")
+
+
+def _normalize_payload(payload: Mapping[str, Any] | Sequence[Any], *, force_current: bool = False) -> dict[str, Any]:
     if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, Mapping)):
         payload = {"adjudications": list(payload), "schema_version": DISCOVERY_SCHEMA_VERSION}
     if not isinstance(payload, Mapping):
         raise DiscoveryEvaluationError("A discovery file must be an object or a list of adjudications.")
-    version = payload.get("schema_version") or DISCOVERY_SCHEMA_VERSION
-    if version != DISCOVERY_SCHEMA_VERSION:
-        raise DiscoveryEvaluationError(f"schema_version must be {DISCOVERY_SCHEMA_VERSION}.")
+    version = DISCOVERY_SCHEMA_VERSION if force_current else _schema_of(payload)
+    legacy = version == DISCOVERY_SCHEMA_VERSION_V1
     raw_rows = payload.get("adjudications")
     if raw_rows is None:
         raw_rows = []
     if not isinstance(raw_rows, Sequence) or isinstance(raw_rows, (str, bytes)):
         raise DiscoveryEvaluationError("adjudications must be a list.")
-    adjudications = [_one_adjudication(row) for row in raw_rows]
+    adjudications = [_one_adjudication(row, legacy=legacy) for row in raw_rows]
     seen: set[str] = set()
     for row in adjudications:
         if row["adjudication_id"] in seen:
@@ -343,8 +439,15 @@ def _normalize_payload(payload: Mapping[str, Any] | Sequence[Any]) -> dict[str, 
             row["rationale"],
         )
     )
+    system_ids = [
+        row["system_relationship_id"]
+        for row in adjudications
+        if row["kind"] == "system_proposal" and row.get("system_relationship_id")
+    ]
+    if len(system_ids) != len(set(system_ids)):
+        raise DiscoveryEvaluationError("Duplicate system_relationship_id in system_proposal adjudications.")
     return {
-        "schema_version": DISCOVERY_SCHEMA_VERSION,
+        "schema_version": version,
         "label": str(payload.get("label") or ""),
         "note": str(payload.get("note") or ""),
         "adjudications": adjudications,
@@ -352,19 +455,26 @@ def _normalize_payload(payload: Mapping[str, Any] | Sequence[Any]) -> dict[str, 
     }
 
 
-def _canonical_body(doc: Mapping[str, Any]) -> dict[str, Any]:
+def _hash_adjudication(row: Mapping[str, Any], *, legacy: bool) -> dict[str, Any]:
+    item = dict(row)
+    if legacy:
+        item.pop("claim_judgment", None)
+    return item
+
+
+def _canonical_body(doc: Mapping[str, Any], *, legacy: bool) -> dict[str, Any]:
     return {
-        "schema_version": doc["schema_version"],
+        "schema_version": DISCOVERY_SCHEMA_VERSION_V1 if legacy else DISCOVERY_SCHEMA_VERSION,
         "label": doc.get("label") or "",
         "note": doc.get("note") or "",
-        "adjudications": doc["adjudications"],
+        "adjudications": [_hash_adjudication(row, legacy=legacy) for row in doc["adjudications"]],
         "disagreements": doc["disagreements"],
     }
 
 
-def _hash(doc: Mapping[str, Any]) -> str:
+def _hash(doc: Mapping[str, Any], *, legacy: bool) -> str:
     raw = json.dumps(
-        _canonical_body(doc),
+        _canonical_body(doc, legacy=legacy),
         sort_keys=True,
         ensure_ascii=False,
         separators=(",", ":"),
@@ -379,24 +489,33 @@ def _same_hash(stored: Any, computed: str) -> bool:
 
 
 def freeze_discovery_set(payload: Mapping[str, Any] | Sequence[Any]) -> dict[str, Any]:
-    """Normalize a discovery set and attach its frozen hash.
+    """Normalize a discovery set as discovery-eval-2 and attach its frozen hash.
 
-    The hash covers schema version, label, note, adjudications, and
-    disagreements. It does not cover ``frozen_hash`` itself. Quote text is
-    included so an edit to the recorded evidence changes the hash. Matching
-    later ignores that text.
+    The hash covers schema version, label, note, adjudications (including
+    ``claim_judgment``), and disagreements. It does not cover ``frozen_hash``.
+    A discovery-eval-1 body is accepted as input and rewritten to
+    discovery-eval-2. That rewrite changes the hash even when every claim
+    verdict is ``not_judged``, because the schema version and the claim
+    objects are now part of the body. Quote text is included so an edit to
+    the recorded evidence changes the hash. Structural matching later ignores
+    that text and ignores the claim verdict.
     """
-    normalized = _normalize_payload(payload)
-    normalized["frozen_hash"] = _hash(normalized)
+    normalized = _normalize_payload(payload, force_current=True)
+    normalized["schema_version"] = DISCOVERY_SCHEMA_VERSION
+    normalized["source_schema_version"] = DISCOVERY_SCHEMA_VERSION
+    normalized["frozen_hash"] = _hash(normalized, legacy=False)
     normalized["frozen_hash_status"] = "verified"
     return normalized
 
 
 def _finalize(payload: Mapping[str, Any] | Sequence[Any]) -> dict[str, Any]:
     stored = payload.get("frozen_hash") if isinstance(payload, Mapping) else None
-    normalized = _normalize_payload(payload)
+    legacy = False
+    if isinstance(payload, Mapping):
+        legacy = _schema_of(payload) == DISCOVERY_SCHEMA_VERSION_V1
+    normalized = _normalize_payload(payload, force_current=False)
     if stored:
-        computed = _hash(normalized)
+        computed = _hash(normalized, legacy=legacy)
         if not _same_hash(stored, computed):
             raise DiscoveryEvaluationError(
                 "frozen_hash does not match the discovery set. The file changed after it was frozen."
@@ -406,6 +525,12 @@ def _finalize(payload: Mapping[str, Any] | Sequence[Any]) -> dict[str, Any]:
     else:
         normalized["frozen_hash"] = None
         normalized["frozen_hash_status"] = "absent"
+    normalized["source_schema_version"] = (
+        DISCOVERY_SCHEMA_VERSION_V1 if legacy else DISCOVERY_SCHEMA_VERSION
+    )
+    # A checked discovery-eval-1 file is read as discovery-eval-2. Its hash
+    # stays the eval-1 hash. Claim judgments stay not_judged until a new freeze.
+    normalized["schema_version"] = DISCOVERY_SCHEMA_VERSION
     return normalized
 
 
@@ -708,11 +833,13 @@ def _expenditure_view(expenditure: Any) -> Mapping[str, Any] | None:
 
 
 def _value_rates(recovered: int, expenditure: Any, *, scored: bool) -> tuple[float | None, float | None]:
-    """Recovered independent relationships per token and per dollar.
+    """Recovered independent relationships per reread token and per reread dollar.
 
-    Both stay null when adjudications are absent, when expenditure is
+    The denominators are ``reread_expenditure_tokens`` and
+    ``reread_expenditure_cost_usd`` only. Other run spend is not included.
+    Both stay null when adjudications are absent, when reread expenditure is
     incomplete, or when the token or dollar denominator is not positive.
-    Zero recoveries over a positive complete spend is 0, not null.
+    Zero recoveries over a positive complete reread spend is 0, not null.
     """
     if not scored:
         return None, None
@@ -766,8 +893,13 @@ def _absent_report() -> dict[str, Any]:
         "gate_false_negative_rate_known_denominator": None,
         "gate_false_negative_rate_coverage": None,
         **_null_rates(),
+        "claim_correct_denominator": None,
+        "claim_correct_coverage": None,
+        "claim_matched_count": None,
+        "source_schema_version": None,
         "relationships": [],
         "unmatched_proposals": [],
+        "unmatched_system_relationship_ids": None,
     }
 
 
@@ -790,6 +922,206 @@ def _candidate_indexes(
     return found
 
 
+def _gold_content_key(gold: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Canonical gold content. Adjudication ids are not part of the key."""
+    return (
+        _code_id(gold.get("from_id")),
+        _code_id(gold.get("to_id")),
+        tuple(sorted(_gold_passages(gold))),
+        str(gold.get("direction") or ""),
+        str(gold.get("role") or ""),
+        str(gold.get("wording") or ""),
+        " ".join(str(gold.get("rationale") or "").casefold().split()),
+    )
+
+
+def _proposal_content_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Canonical proposal content. Relationship ids are not part of the key."""
+    direction = row.get("stated_direction")
+    if direction is None or str(direction).strip() == "":
+        direction = row.get("direction")
+    role = row.get("paradigm_role")
+    if role is None or str(role).strip() == "":
+        role = row.get("role")
+    return (
+        _code_id(row.get("from_id")),
+        _code_id(row.get("to_id")),
+        tuple(sorted(_system_passage_ids(row))),
+        " ".join(str(direction or "").casefold().split()),
+        " ".join(str(role or "").casefold().split()),
+        " ".join(str(row.get("allowed_wording") or "").casefold().split()),
+        " ".join(str(row.get("statement") or "").casefold().split()),
+    )
+
+
+def _hungarian_maximize(weight: list[list[int]]) -> list[int]:
+    """Column assigned to each row of a square matrix, maximizing the sum.
+
+    Missing structural edges use a large negative weight so a zero-weight
+    padding column is preferred. The result is one column per row.
+    """
+    n = len(weight)
+    if n == 0:
+        return []
+    inf = 10**18
+    u = [0] * (n + 1)
+    v = [0] * (n + 1)
+    p = [0] * (n + 1)
+    way = [0] * (n + 1)
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = [inf] * (n + 1)
+        used = [False] * (n + 1)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = inf
+            j1 = 0
+            for j in range(1, n + 1):
+                if used[j]:
+                    continue
+                cur = -weight[i0 - 1][j - 1] - u[i0] - v[j]
+                if cur < minv[j]:
+                    minv[j] = cur
+                    way[j] = j0
+                if minv[j] < delta:
+                    delta = minv[j]
+                    j1 = j
+            for j in range(n + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+    assignment = [-1] * n
+    for j in range(1, n + 1):
+        if p[j]:
+            assignment[p[j] - 1] = j - 1
+    return assignment
+
+
+def _primary_weight_matrix(
+    gold_count: int,
+    prop_count: int,
+    edges: Sequence[tuple[int, int, int]],
+) -> list[list[int]]:
+    size = max(gold_count, prop_count, 1)
+    missing = -(10**12)
+    matrix = [[0 for _ in range(size)] for _ in range(size)]
+    for row in range(gold_count):
+        for col in range(prop_count):
+            matrix[row][col] = missing
+    for gold_index, prop_index, primary in edges:
+        matrix[gold_index][prop_index] = primary
+    return matrix
+
+
+def _selected_primary(matrix: list[list[int]], gold_count: int, prop_count: int) -> tuple[int, dict[int, int]]:
+    assignment = _hungarian_maximize(matrix)
+    chosen: dict[int, int] = {}
+    total = 0
+    for gold_index, prop_index in enumerate(assignment):
+        if gold_index >= gold_count or prop_index < 0 or prop_index >= prop_count:
+            continue
+        primary = matrix[gold_index][prop_index]
+        if primary <= 0:
+            continue
+        chosen[gold_index] = prop_index
+        total += primary
+    return total, chosen
+
+
+def _assign_independent(
+    gold_rows: Sequence[Mapping[str, Any]],
+    prepared: Sequence[dict[str, Any]],
+    blocked: set[int],
+) -> dict[str, tuple[int, dict[str, Any]]]:
+    """Maximum-weight structural assignment for independent gold only.
+
+    The primary objective maximizes full-agreement matches, then any
+    structural match. Ties break by canonical content order of the gold
+    and the proposal. Adjudication ids and relationship ids are ignored.
+    """
+    gold_indexes = [
+        index
+        for index, gold in enumerate(gold_rows)
+        if gold.get("kind") == "independent"
+    ]
+    prop_indexes = [item["index"] for item in prepared if item["index"] not in blocked]
+    if not gold_indexes or not prop_indexes:
+        return {}
+    local_gold = {gold_index: local for local, gold_index in enumerate(gold_indexes)}
+    local_prop = {prop_index: local for local, prop_index in enumerate(prop_indexes)}
+    span = max(len(gold_indexes), len(prop_indexes))
+    edges: list[tuple[int, int, int, tuple[Any, ...], dict[str, Any]]] = []
+    for gold_index in gold_indexes:
+        gold = gold_rows[gold_index]
+        for prop_index in _candidate_indexes(gold, prepared):
+            if prop_index not in local_prop:
+                continue
+            fields = _field_report(gold, prepared[prop_index]["row"])
+            primary = (span + 1) if not fields["disagreements"] else 1
+            content = (_gold_content_key(gold), _proposal_content_key(prepared[prop_index]["row"]))
+            edges.append((local_gold[gold_index], local_prop[prop_index], primary, content, fields))
+    if not edges:
+        return {}
+    matrix = _primary_weight_matrix(
+        len(gold_indexes),
+        len(prop_indexes),
+        [(gold_i, prop_i, primary) for gold_i, prop_i, primary, _content, _fields in edges],
+    )
+    target, _chosen = _selected_primary(matrix, len(gold_indexes), len(prop_indexes))
+    by_pair = {(gold_i, prop_i): (primary, fields) for gold_i, prop_i, primary, _content, fields in edges}
+
+    def residual(forced: Sequence[tuple[int, int, int]]) -> int:
+        taken_gold = {gold_i for gold_i, _prop_i, _primary in forced}
+        taken_prop = {prop_i for _gold_i, prop_i, _primary in forced}
+        kept = [
+            (gold_i, prop_i, primary)
+            for gold_i, prop_i, primary, _content, _fields in edges
+            if gold_i not in taken_gold and prop_i not in taken_prop
+        ]
+        if not kept:
+            return sum(primary for _gold_i, _prop_i, primary in forced)
+        remap_gold = {}
+        remap_prop = {}
+        reduced: list[tuple[int, int, int]] = []
+        for gold_i, prop_i, primary in kept:
+            remap_gold.setdefault(gold_i, len(remap_gold))
+            remap_prop.setdefault(prop_i, len(remap_prop))
+            reduced.append((remap_gold[gold_i], remap_prop[prop_i], primary))
+        reduced_matrix = _primary_weight_matrix(len(remap_gold), len(remap_prop), reduced)
+        extra, _assignment = _selected_primary(reduced_matrix, len(remap_gold), len(remap_prop))
+        return extra + sum(primary for _gold_i, _prop_i, primary in forced)
+
+    forced: list[tuple[int, int, int]] = []
+    forced_pairs: set[tuple[int, int]] = set()
+    for gold_i, prop_i, primary, _content, _fields in sorted(edges, key=lambda item: item[3]):
+        if any(gold_i == taken or prop_i == other for taken, other, _primary in forced):
+            continue
+        trial = forced + [(gold_i, prop_i, primary)]
+        if residual(trial) == target:
+            forced.append((gold_i, prop_i, primary))
+            forced_pairs.add((gold_i, prop_i))
+    assigned: dict[str, tuple[int, dict[str, Any]]] = {}
+    inverse_gold = {local: gold_index for gold_index, local in local_gold.items()}
+    inverse_prop = {local: prop_index for prop_index, local in local_prop.items()}
+    for gold_i, prop_i in forced_pairs:
+        fields = by_pair[(gold_i, prop_i)][1]
+        assigned[gold_rows[inverse_gold[gold_i]]["adjudication_id"]] = (inverse_prop[prop_i], fields)
+    return assigned
+
+
 def score_discovery(
     proposals: Any,
     discovery: str | Path | Mapping[str, Any] | Sequence[Any] | None = None,
@@ -804,11 +1136,15 @@ def score_discovery(
     ``reread_expenditure_complete`` is used as given.
 
     Recall uses independent, evidence-supported adjudications only.
-    ``system_proposal`` rows are gate-false-negative evidence, not extra
-    recall gold. Distorted matches stay in the recall denominator and out of
-    the numerator. Precision uses non-synthetic proposals that have both
-    endpoint ids. The distortion rate uses recovered and distorted matches
-    only. ``downstream_eligible`` does not enter those three rates.
+    ``system_proposal`` rows bind by ``system_relationship_id`` and are
+    gate-false-negative evidence, not extra recall gold. A missing or
+    duplicate export id is ``unmatched_system_proposal`` and is not attached
+    to a different proposal. Distorted matches stay in the recall denominator
+    and out of the numerator. Precision uses non-synthetic proposals that
+    have both endpoint ids. A bound system proposal is not a structural true
+    positive. The distortion rate uses recovered and distorted matches only.
+    ``downstream_eligible`` does not enter those three rates. Structural
+    recall does not read the proposed statement or ``claim_judgment``.
 
     The gate false-negative population is evidence-supported items the system
     proposed: a matched row, or a ``system_proposal`` adjudication. An
@@ -842,25 +1178,32 @@ def score_discovery(
         )
 
     gold_rows = list(loaded["adjudications"])
+    by_relationship: dict[str, list[int]] = {}
+    for item in prepared:
+        if item["relationship_id"]:
+            by_relationship.setdefault(item["relationship_id"], []).append(item["index"])
     assignment: dict[str, int] = {}
     field_by_gold: dict[str, dict[str, Any]] = {}
+    linked: set[str] = set()
+    unmatched_system_ids: list[str] = []
     used: set[int] = set()
-    ordered = sorted(gold_rows, key=lambda row: (0 if row["kind"] == "independent" else 1, row["adjudication_id"]))
-    for gold in ordered:
-        choices: list[tuple[int, int, str, dict[str, Any]]] = []
-        for index in _candidate_indexes(gold, prepared):
-            if index in used:
-                continue
-            fields = _field_report(gold, prepared[index]["row"])
-            rank = 0 if not fields["disagreements"] else 1
-            choices.append((rank, index, prepared[index]["relationship_id"], fields))
-        if not choices:
+    for gold in gold_rows:
+        if gold["kind"] != "system_proposal":
             continue
-        choices.sort(key=lambda item: (item[0], item[2], item[1]))
-        _rank, index, _relationship_id, fields = choices[0]
+        named = str(gold.get("system_relationship_id") or "")
+        hits = by_relationship.get(named) or []
+        if not named or len(hits) != 1:
+            if named:
+                unmatched_system_ids.append(named)
+            continue
+        used.add(hits[0])
+        assignment[gold["adjudication_id"]] = hits[0]
+        linked.add(gold["adjudication_id"])
+    structural = _assign_independent(gold_rows, prepared, used)
+    for adjudication_id, (index, fields) in structural.items():
         used.add(index)
-        assignment[gold["adjudication_id"]] = index
-        field_by_gold[gold["adjudication_id"]] = fields
+        assignment[adjudication_id] = index
+        field_by_gold[adjudication_id] = fields
 
     relationships: list[dict[str, Any]] = []
     recovered = missed = distorted = 0
@@ -871,6 +1214,7 @@ def score_discovery(
     withheld_known = 0
     recall_denominator = 0
     recall_scoreable = 0
+    claim_matched = claim_judged = claim_correct = 0
 
     for gold in gold_rows:
         in_recall = gold["kind"] == "independent" and gold["evidence_supported"]
@@ -881,16 +1225,22 @@ def score_discovery(
         matched_index = assignment.get(gold["adjudication_id"])
         system = prepared[matched_index]["row"] if matched_index is not None else None
         fields = field_by_gold.get(gold["adjudication_id"])
-        if matched_index is None:
+        claim = gold.get("claim_judgment") if isinstance(gold.get("claim_judgment"), Mapping) else {}
+        claim_verdict = str(claim.get("verdict") or "not_judged")
+        if gold["adjudication_id"] in linked:
+            status = "linked"
+            direction_agrees = role_agrees = wording_agrees = None
+            overlap = sorted(prepared[matched_index]["passages"])
+        elif matched_index is None:
             if in_recall:
                 status = "missed"
                 missed += 1
             elif gold["kind"] == "system_proposal":
-                status = "unlinked"
+                status = "unmatched_system_proposal"
             else:
                 status = "not_scored"
             direction_agrees = role_agrees = wording_agrees = None
-            overlap: list[str] = []
+            overlap = []
         else:
             assert fields is not None
             direction_agrees = fields["direction_agrees"]
@@ -907,6 +1257,12 @@ def score_discovery(
                 matched_recovered += 1
                 if in_recall:
                     recovered += 1
+        if status in {"recovered", "distorted"} and in_recall:
+            claim_matched += 1
+            if claim_verdict in {"correct", "incorrect", "partly_correct"}:
+                claim_judged += 1
+                if claim_verdict == "correct":
+                    claim_correct += 1
         in_population = gold["evidence_supported"] and (
             matched_index is not None or gold["kind"] == "system_proposal"
         )
@@ -941,6 +1297,7 @@ def score_discovery(
                 "role_agrees": role_agrees,
                 "wording_agrees": wording_agrees,
                 "passage_ids": overlap,
+                "claim_verdict": claim_verdict,
                 "eligibility_known": known if in_population else False,
                 "downstream_eligible": eligible if in_population else None,
                 "withheld": withheld,
@@ -971,6 +1328,7 @@ def score_discovery(
             "role_agrees": None,
             "wording_agrees": None,
             "passage_ids": sorted(item["passages"]),
+            "claim_verdict": None,
             "eligibility_known": False,
             "downstream_eligible": None,
             "withheld": False,
@@ -1023,8 +1381,14 @@ def score_discovery(
         "gate_false_negative_rate_known": _rate(withheld_known, population_known),
         "gate_false_negative_rate_known_denominator": population_known,
         "gate_false_negative_rate_coverage": _rate(population_known, population),
-        "discovery_recovered_per_token": per_token,
-        "discovery_recovered_per_dollar": per_dollar,
+        "discovery_recovered_per_reread_token": per_token,
+        "discovery_recovered_per_reread_dollar": per_dollar,
+        "claim_correct_rate": _rate(claim_correct, claim_judged),
+        "claim_correct_denominator": claim_judged,
+        "claim_correct_coverage": _rate(claim_judged, claim_matched),
+        "claim_matched_count": claim_matched,
+        "source_schema_version": loaded.get("source_schema_version"),
         "relationships": relationships,
         "unmatched_proposals": unmatched,
+        "unmatched_system_relationship_ids": unmatched_system_ids,
     }

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.22
+
+- Axial `examined_pairs` records completed examinations only, including a valid empty `nothing_to_propose` response. Planned, attempted, and completed counts are separate. `unique_pairs_explored` counts completed pairs. A failed, timed-out, or unsent pair stays retryable. A 0.9.20 or 0.9.21 `examined_pairs` list was written at planning time and cannot be split; passing it still excludes every pair in it.
+- Tier 3 quote validation requires one clear clause and one unambiguous connector. Passive `caused by` and `led to by` reverse direction. Negation, a second claim clause, and hypothetical wording stay unvalidated. This is not general semantic reliability. The synthetic fixture is `tests/fixtures/attribution_adversarial_1.json`.
+- Discovery recall uses maximum-weight one-to-one matching. Full agreement wins, then any structural match, then canonical content order. Adjudication ids are not a tie-break. A `system_proposal` row binds only by `system_relationship_id`. A missing or duplicate export id is flagged unmatched and is not reassigned.
+- Structural recall and `claim_correct_rate` are separate. The schema is `discovery-eval-2`. A `discovery-eval-1` file still verifies under its old hash and loads as `not_judged`. Freezing it writes a new hash. Structural recall measures the specified structural fields, not recovery of the human-supported interpretation. `claim_correct_rate` is null when nothing was judged and is not folded into recall.
+- `discovery_recovered_per_reread_token` and `discovery_recovered_per_reread_dollar` name reread expenditure only. The planner still builds the full pair space in memory. That limit is open. The saved output still omits a large unexamined list.
+- `pattern_min_cases` stays 2. The axial token ceiling stays 24000. `batch_size` stays 1. Tier 4 stays human-only. The review note is [docs/design-review-fixes-0922.md](docs/design-review-fixes-0922.md). `policy_version` is `0.9.22`.
+
 ## 0.9.21
 
 - Discovery evaluation is separate from gate evaluation. `load_discovery_file`, `freeze_discovery_set`, and `score_discovery` read a frozen human file of independently identified relationships and score recovered, missed, distorted, and unmatched proposals. A relationship the run never proposed can lower recall. Gate scoring still excludes an adjudication id that is absent from the export.

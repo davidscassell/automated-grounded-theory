@@ -1,6 +1,6 @@
 # Design notes
 
-Package `policy_version` is `0.9.21`. This index says which notes describe the package now and which notes are the record of an earlier version. A historical note can disagree with the code. The code, the README, and the current notes below win.
+Package `policy_version` is `0.9.22`. This index says which notes describe the package now and which notes are the record of an earlier version. A historical note can disagree with the code. The code, the README, and the current notes below win.
 
 Axial coding, selective coding, and theoretical sampling are experimental. No study adjudication file is included. The discovery example is synthetic. Live evaluation runs through v31, on package 0.9.9, did not measure analytic accuracy.
 
@@ -10,18 +10,18 @@ Axial coding, selective coding, and theoretical sampling are experimental. No st
 | --- | --- |
 | [../README.md](../README.md) | The pipeline, the defaults, the evidence tiers, quiet rounds, timeouts, and gate scoring. |
 | [methodology.md](methodology.md) | How the open-coding default maps onto the sources already named there. |
-| [design.md](design.md) | The open-coding engineering design, plus a version log through `0.9.21`. The early sections are the 0.6 run. |
+| [design.md](design.md) | The open-coding engineering design, plus a version log through `0.9.22`. The early sections are the 0.6 run. |
 | [design-relationship-tiers.md](design-relationship-tiers.md) | Evidence tiers. `pattern_min_cases` is 2. Tier labels are `category_evidence`, `hypothesis`, `pattern_supported`, `attribution`, and `verified`. |
 | [design-negative-cases-092.md](design-negative-cases-092.md) | Negative-case search at respondent level, and a core that needs tier 2. Later search corrections are in the 0.9.3 review note. |
 | [design-gate-evaluation.md](design-gate-evaluation.md) | `export_gate_relationships`, `load_adjudications`, and `score_gate_adjudications`, including `downstream_precision` and `downstream_withheld_supported_recall`. |
 | [design-discovery-evaluation.md](design-discovery-evaluation.md) | `load_discovery_file`, `freeze_discovery_set`, and `score_discovery`. Recall, precision, distortion, and gate false negatives for a frozen human discovery file. |
-| [design-sampling-0900.md](design-sampling-0900.md) | The sampling graph. Later sections through 0.9.18 are part of the current behavior. 0.9.21 does not change that graph. |
+| [design-sampling-0900.md](design-sampling-0900.md) | The sampling graph. Later sections through 0.9.18 are part of the current behavior. 0.9.22 does not change that graph. |
 | [focused-evaluation.md](focused-evaluation.md) | The offline focused comparison and its live-cost estimate. It does not call an API. |
-| [design-review-fixes-0921.md](design-review-fixes-0921.md) | The 0.9.21 discovery evaluation. This is the latest review note. |
+| [design-review-fixes-0922.md](design-review-fixes-0922.md) | The 0.9.22 exploration accounting, quote pattern, and discovery scoring. This is the latest review note. |
 
 ## Historical
 
-These notes stay so a reader can see what a version changed. They are not the current contract. `design-review-fixes-*` through 0.9.20 are in this list. `design-review-fixes-0921.md` is the latest review note, listed above.
+These notes stay so a reader can see what a version changed. They are not the current contract. `design-review-fixes-*` through 0.9.21 are in this list. `design-review-fixes-0922.md` is the latest review note, listed above.
 
 | Note | Version it records |
 | --- | --- |
@@ -45,8 +45,9 @@ These notes stay so a reader can see what a version changed. They are not the cu
 | [design-review-fixes-0918.md](design-review-fixes-0918.md) | 0.9.18. Timed-out rereads stay in expenditure coverage. 0.9.19 separates participant attribution from analyst memos and fingerprints axial evidence. |
 | [design-review-fixes-0919.md](design-review-fixes-0919.md) | 0.9.19. Participant attribution stays on a quote, and axial resume fingerprints definitions, segments, and case identity. 0.9.20 checks the relationship the quote states, splits claim components, and fingerprints selective inputs. |
 | [design-review-fixes-0920.md](design-review-fixes-0920.md) | 0.9.20. Quote validation, claim components, the selective fingerprint, and axial exploration stay as shipped. 0.9.21 adds a frozen discovery evaluation beside gate scoring. |
+| [design-review-fixes-0921.md](design-review-fixes-0921.md) | 0.9.21. The frozen discovery evaluation stays beside gate scoring. 0.9.22 separates completed axial examinations from unsent pairs and tightens discovery scoring. |
 
-`design-review-fixes-0921.md` is current for the 0.9.21 discovery evaluation and is not only history.
+`design-review-fixes-0922.md` is current for the 0.9.22 exploration and scoring fixes and is not only history.
 
 ## Defaults the tests check
 
