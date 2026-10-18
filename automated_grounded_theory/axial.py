@@ -60,6 +60,7 @@ from automated_grounded_theory.negative_case_search import search_relationships
 from automated_grounded_theory.relationship_tiers import (
     TIER_LABELS,
     apply_evidence_tier,
+    assign_relationship_eligibility,
     candidate_cross_case_passages,
     case_id_of,
     citation_qualifies,
@@ -527,6 +528,14 @@ def _source_mapping(source: Any) -> dict[str, Any]:
             if value:
                 data[name] = value
     data["codebook"] = _book(data.get("codebook"))
+    refreshed = []
+    for row in data.get("relationships") or []:
+        if not isinstance(row, Mapping):
+            continue
+        item = dict(row)
+        assign_relationship_eligibility(item)
+        refreshed.append(item)
+    data["relationships"] = refreshed
     return data
 
 
@@ -1299,6 +1308,7 @@ def _withhold_acceptance(target: dict, *, field: str) -> None:
         if flag not in flags:
             flags.append(flag)
     target["flags"] = flags
+    assign_relationship_eligibility(target)
 
 
 _CAUSAL_ROLES = frozenset({"causal_condition", "consequence"})
@@ -1436,6 +1446,7 @@ def _mark_cross_respondent_pattern(target: dict, *, field: str) -> None:
         if flag not in flags:
             flags.append(flag)
     target["flags"] = flags
+    assign_relationship_eligibility(target)
 
 
 def _flag_same_passage_claim(target: dict, text: str, *, flag: str) -> None:
@@ -1803,6 +1814,7 @@ def _new_relationship(
         )
     if _claims_same_passage(row["statement"]) and row.get("quotes_share_passage") is False:
         _flag_same_passage_claim(row, row["statement"], flag="relationship_same_passage_mismatch")
+    assign_relationship_eligibility(row)
     return row
 
 
@@ -1933,13 +1945,13 @@ def _apply_counterexample(
         relationship.setdefault("negative_cases", []).append(dict(record))
         relationship["evidence_condition"] = "disputed"
         relationship["needs_review"] = True
-        relationship["downstream_eligible"] = False
         relationship["contradiction_note"] = quote
         flags = list(relationship.get("flags") or [])
         for flag in ("relationship_negative", "relationship_contradicted"):
             if flag not in flags:
                 flags.append(flag)
         relationship["flags"] = flags
+        assign_relationship_eligibility(relationship)
     elif judgment == "qualifies" and valid:
         relationship.setdefault("variation_cases", []).append(dict(record))
         relationship["variation_note"] = quote
@@ -2005,9 +2017,9 @@ def _apply_quote(target: dict, action_row: Mapping[str, Any], passages: Mapping[
     else:
         flags.append("unanchored_quote")
         target["evidence_condition"] = "unanchored"
-        target["downstream_eligible"] = False
         target["needs_review"] = True
     target["flags"] = flags
+    assign_relationship_eligibility(target)
 
 
 def _pattern_minimum(procedure: Mapping[str, Any] | None) -> int:
@@ -2068,7 +2080,7 @@ def _legacy_accept(target: dict, *, field: str, role: str = "") -> None:
         target[field] = "accepted"
         target["disposition"] = "accepted"
         target["needs_review"] = True
-        target["downstream_eligible"] = False
+        assign_relationship_eligibility(target)
         return
     if not _both_endpoints_anchored(target):
         _withhold_acceptance(target, field=field)
@@ -2084,6 +2096,7 @@ def _legacy_accept(target: dict, *, field: str, role: str = "") -> None:
         return
     target[field] = "accepted"
     target["disposition"] = "accepted"
+    assign_relationship_eligibility(target)
 
 
 def _tiered_accept(
@@ -2114,6 +2127,7 @@ def _tiered_accept(
             target[field] = "verified"
             target["disposition"] = "accepted"
             _keep_qualification(target)
+            assign_relationship_eligibility(target)
             return
     if tier <= 1:
         _withhold_acceptance(target, field=field)
@@ -2141,6 +2155,7 @@ def _tiered_accept(
         target["flags"] = flags
         target["needs_review"] = True
     _keep_qualification(target)
+    assign_relationship_eligibility(target)
 
 
 def _apply_human_relations(
@@ -2180,12 +2195,12 @@ def _apply_human_relations(
         if action == "reject":
             target["human_disposition"] = "rejected"
             target["disposition"] = "rejected"
-            target["downstream_eligible"] = False
             target["needs_review"] = True
             flags = list(target.get("flags") or [])
             if "relationship_rejected" not in flags:
                 flags.append("relationship_rejected")
             target["flags"] = flags
+            assign_relationship_eligibility(target)
             continue
         if action == "merge":
             into = str(action_row.get("merge_into") or "")
@@ -2195,7 +2210,6 @@ def _apply_human_relations(
             target["human_disposition"] = "merged"
             target["disposition"] = "merged"
             target["merged_into"] = into
-            target["downstream_eligible"] = False
             target["needs_review"] = True
             label = str(action_row.get("label") or kept.get("statement") or "")
             if label:
@@ -2207,6 +2221,7 @@ def _apply_human_relations(
                 if flag not in flags:
                     flags.append(flag)
                 row["flags"] = flags
+            assign_relationship_eligibility(target)
             continue
         if action in {"accept", "verify"}:
             _apply_quote(target, action_row, passages or {})
@@ -2307,8 +2322,8 @@ def _apply_model_relations(
             )
         if requested == "rejected":
             row["disposition"] = "rejected"
-            row["downstream_eligible"] = False
             row["needs_review"] = True
+            assign_relationship_eligibility(row)
         elif requested in {"accepted", "verified"}:
             _tiered_accept(
                 row,
@@ -2436,6 +2451,8 @@ def export_axial_state(state: Mapping[str, Any], directory: str | Path) -> dict[
         paths[name] = str(path)
 
     relationships = _public_relationships(state.get("relationships") or [])
+    for row in relationships:
+        assign_relationship_eligibility(row)
     if stage != "selective":
         write(
             "category_relationships.json",
