@@ -3908,12 +3908,15 @@ def _counts_as_reread_spend(row: Mapping[str, Any]) -> bool:
     """True for a reread request or a repair of ``SamplingRereadNote``.
 
     A selection repair names ``ModelSamplingSelection`` and is not reread spend.
+    A timed-out reread repair has no messages. ``schema`` names the operation.
     """
     kind = str(row.get("kind") or "")
     if kind == "sampling_reread":
         return True
     if kind != "schema_repair":
         return False
+    if str(row.get("schema") or "") == "SamplingRereadNote":
+        return True
     try:
         blob = json.dumps(row.get("messages") or [], ensure_ascii=False)
     except TypeError:
@@ -3922,7 +3925,10 @@ def _counts_as_reread_spend(row: Mapping[str, Any]) -> bool:
 
 
 def _sent_reread_call(row: Mapping[str, Any]) -> bool:
-    """A reread or reread repair that was sent. An omitted request is not unknown usage."""
+    """A reread or reread repair that was sent, including a timeout.
+
+    An omitted request is not unknown usage.
+    """
     if not _counts_as_reread_spend(row):
         return False
     if row.get("received") is False:
@@ -3972,9 +3978,11 @@ def _reread_expenditure(
 
     The known sum includes irrelevant responses, failed parses, and repairs
     that reported input and output tokens. A sent call with missing or
-    all-zero usage is a call without usage. No sent reread calls is complete
-    with a known sum of 0. Rates that divide by relevant rereads stay null
-    when usage is incomplete or when that count is zero.
+    all-zero usage is a call without usage. A timed-out reread or reread
+    repair is that kind of call: the request may have been charged, and its
+    usage stays unknown. No sent reread calls is complete with a known sum
+    of 0. Rates that divide by relevant rereads stay null when usage is
+    incomplete or when that count is zero.
     ``human_confirmed_useful_rereads`` is a hook for a researcher count and
     is not filled from model judgments.
     """
@@ -4023,8 +4031,9 @@ def reread_interpretation_report(state: Mapping[str, Any]) -> dict[str, Any]:
     every relevant note. ``tokens_per_relevant_reread`` counts only those
     attributable tokens. ``reread_expenditure_tokens`` is the known sum.
     ``reread_expenditure_complete`` is true only when every sent reread call
-    reported usage, including when no reread was sent. Coverage is null when
-    there were no reread calls. ``expenditure_tokens_per_relevant_reread``
+    reported usage, including when no reread was sent. A timed-out attempt
+    is a sent call without usage. Coverage is null when there were no reread
+    calls. ``expenditure_tokens_per_relevant_reread``
     and the expenditure cost rate stay null when usage is incomplete or when
     the relevant count is zero. Cost stays null unless the run records both
     token prices and the usage is complete. ``human_confirmed_useful_rereads``
@@ -4218,9 +4227,22 @@ async def _record_timeout(graph, config, exc: BaseException, output_dir, runtime
         _sync_allowance(metadata, runtime)
     after_calls = int((metadata.get("provider_budget") or {}).get("calls_used") or 0)
     if after_calls > before_calls:
+        # Keep the operation that was in flight. Expenditure only counts
+        # reread and reread-repair rows, and a timed-out request can still
+        # be charged. Selection and saturation timeouts stay kind provider.
+        # The provider budget is the limiter count copied above, not this row.
+        if step == "pursuit_reread" and metadata.get("reread_repair_pending"):
+            timeout_kind = "schema_repair"
+            timeout_extra = {"schema": "SamplingRereadNote"}
+        elif step == "pursuit_reread":
+            timeout_kind = "sampling_reread"
+            timeout_extra = {}
+        else:
+            timeout_kind = "provider"
+            timeout_extra = {}
         logs.append(
             _prompt_row(
-                "provider",
+                timeout_kind,
                 [],
                 {},
                 status="timeout",
@@ -4229,6 +4251,8 @@ async def _record_timeout(graph, config, exc: BaseException, output_dir, runtime
                 flagged=True,
                 calls=after_calls - before_calls,
                 pair=metadata.get("reread_active_pair"),
+                received=True,
+                **timeout_extra,
             )
         )
     patched_ledger = None

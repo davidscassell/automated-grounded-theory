@@ -17,8 +17,8 @@ from tests.test_v090 import FakeSamplingCoder, _kwargs, _payload
 
 
 def test_version_is_095():
-    assert __version__ == "0.9.17"
-    assert POLICY_VERSION == "0.9.17"
+    assert __version__ == "0.9.18"
+    assert POLICY_VERSION == "0.9.18"
 
 
 class _SecondRereadTimeout(FakeSamplingCoder):
@@ -94,9 +94,16 @@ def test_a_later_reread_timeout_keeps_the_first_note_and_resume_skips_it():
     assert {(row["direction_id"], row["passage_id"]) for row in partial.metadata["reread_completed_pairs"]} == {(ids[0], passage)}
     assert {(row["direction_id"], row["passage_id"]) for row in partial.metadata["reread_failed_pairs"]} == {(ids[1], passage)}
     assert {(row["direction_id"], row["passage_id"]) for row in partial.metadata["reread_unattempted_pairs"]} == {(ids[2], passage)}
-    reread_rows = [row for row in partial.prompt_log if row.get("kind") == "sampling_reread"]
-    assert len(reread_rows) == 1
-    assert ids[0] in json.dumps(reread_rows)
+    validated = [
+        row for row in partial.prompt_log if row.get("kind") == "sampling_reread" and row.get("status") == "validated"
+    ]
+    timed_out = [
+        row for row in partial.prompt_log if row.get("kind") == "sampling_reread" and row.get("status") == "timeout"
+    ]
+    assert len(validated) == 1
+    assert len(timed_out) == 1
+    assert ids[0] in json.dumps(validated)
+    assert "usage" not in timed_out[0]
     assert any(row.get("status") == "timeout" for row in partial.prompt_log)
     spent = partial.metadata["provider_budget"]["calls_used"]
     resumed = theoretical_sample(
@@ -355,6 +362,10 @@ def test_a_selection_repair_timeout_keeps_the_first_response():
     failed = [row for row in partial.prompt_log if row.get("status") == "parse_failed"]
     assert len(failed) == 1
     assert any(int((row.get("usage") or {}).get("total_tokens") or 0) > 0 for row in partial.metadata["sampling_attempts"])
+    timeouts = [row for row in partial.prompt_log if row.get("status") == "timeout"]
+    assert timeouts
+    assert all(row.get("kind") == "provider" for row in timeouts)
+    assert partial.metadata["reread_interpretations"]["reread_expenditure_calls"] == 0
     resumed = theoretical_sample(
         _corpus(),
         coder,

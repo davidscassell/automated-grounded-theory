@@ -23,8 +23,8 @@ from tests.fake_llm import FakeCoder
 
 
 def test_version_is_0_6_6():
-    assert __version__ == "0.9.17"
-    assert POLICY_VERSION == "0.9.17"
+    assert __version__ == "0.9.18"
+    assert POLICY_VERSION == "0.9.18"
 
 
 def test_concurrent_batches_share_the_ceiling_and_report_the_peak():
