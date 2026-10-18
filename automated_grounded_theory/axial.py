@@ -21,7 +21,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.errors import GraphRecursionError, NodeTimeoutError
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, RetryPolicy, interrupt
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from typing_extensions import Literal, TypedDict
 
 from automated_grounded_theory.async_support import (
@@ -3249,6 +3249,49 @@ def _hold_is(metadata: Mapping[str, Any], kind: str) -> bool:
     return isinstance(hold, Mapping) and str(hold.get("kind") or "") == kind
 
 
+def _relationship_drop_reason(exc: Exception) -> str:
+    text = str(exc).casefold()
+    if "blank statement" in text or ("statement" in text and "field required" in text):
+        return "blank_statement"
+    return "invalid_relationship"
+
+
+def _salvage_proposal_batch(raw: str) -> tuple[list[dict], list[dict]] | None:
+    """Keep schema-valid relationships when one row invalidates the batch.
+
+    Returns None when the text is not a JSON object with a relationship list.
+    An empty kept list means the caller still sends the single repair. A
+    repaired response can replace rows that were already valid, so a batch
+    with at least one valid row is not repaired.
+    """
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    rows = payload.get("relationships")
+    if not isinstance(rows, list):
+        return None
+    kept: list[dict] = []
+    dropped: list[dict] = []
+    for index, item in enumerate(rows):
+        try:
+            draft = AxialRelationshipDraft.model_validate(item)
+        except ValidationError as exc:
+            dropped.append(
+                {
+                    "index": index,
+                    "reason": _relationship_drop_reason(exc),
+                    "error": str(exc),
+                    "draft": dict(item) if isinstance(item, Mapping) else {"value": item},
+                }
+            )
+            continue
+        kept.append(draft.model_dump())
+    return kept, dropped
+
+
 def _preserve_provider_call(
     metadata: dict[str, Any],
     result: Mapping[str, Any],
@@ -4082,27 +4125,37 @@ def _propose_node(runtime: AxialRuntime):
             )
             _note_proposal_repairs(metadata, result["audits"])
             estimated = int(metadata.get("axial_tokens_estimated") or estimated)
+            recovered_drops: list[dict] = []
             if result.get("repair_pending"):
-                _preserve_provider_call(
-                    metadata,
-                    result,
-                    kind="axial_proposal",
-                    schema_name="AxialProposalBatch",
-                    messages=messages,
-                    context={
-                        "sent_chunk": [dict(pair) for pair in sent_chunk],
-                        "estimate": estimate,
-                        "omitted_evidence": payload.get("omitted_evidence"),
-                    },
-                )
-                return {
-                    "relationships": relationships,
-                    "prompt_log": logs,
-                    "axial_calls_used": used,
-                    "relation_round": pending,
-                    "unexamined_pairs": list(state.get("unexamined_pairs") or []),
-                    "metadata": metadata,
-                }
+                salvaged = _salvage_proposal_batch(str((result.get("parsed") or {}).get("raw_response") or ""))
+                if salvaged is not None and salvaged[0]:
+                    kept, recovered_drops = salvaged
+                    result = dict(result)
+                    result["repair_pending"] = False
+                    result["unparsed"] = False
+                    result["reason"] = ""
+                    result["parsed"] = {"relationships": kept, "nothing_to_propose": False}
+                else:
+                    _preserve_provider_call(
+                        metadata,
+                        result,
+                        kind="axial_proposal",
+                        schema_name="AxialProposalBatch",
+                        messages=messages,
+                        context={
+                            "sent_chunk": [dict(pair) for pair in sent_chunk],
+                            "estimate": estimate,
+                            "omitted_evidence": payload.get("omitted_evidence"),
+                        },
+                    )
+                    return {
+                        "relationships": relationships,
+                        "prompt_log": logs,
+                        "axial_calls_used": used,
+                        "relation_round": pending,
+                        "unexamined_pairs": list(state.get("unexamined_pairs") or []),
+                        "metadata": metadata,
+                    }
             if result["refused"] or result["unparsed"]:
                 if not result["audits"]:
                     logs.append(
@@ -4142,6 +4195,16 @@ def _propose_node(runtime: AxialRuntime):
                 diagnostics["rejection_reasons"] = reasons
                 metadata["proposal_diagnostics"] = diagnostics
                 logs[-1].setdefault("rejections", []).append({"reason": reason, "draft": dict(draft)})
+
+            if recovered_drops:
+                diagnostics["partial_batch"] = True
+                recorded = list(diagnostics.get("dropped_relationships") or [])
+                for item in recovered_drops:
+                    draft = item.get("draft") if isinstance(item.get("draft"), Mapping) else {}
+                    _reject(str(item.get("reason") or "invalid_relationship"), draft)
+                    recorded.append(dict(item))
+                diagnostics["dropped_relationships"] = recorded
+                metadata["proposal_diagnostics"] = diagnostics
 
             returned = parsed.get("relationships")
             if parsed.get("nothing_to_propose") is True and not returned:

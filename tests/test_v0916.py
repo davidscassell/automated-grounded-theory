@@ -387,3 +387,109 @@ def test_reviewer_role_overrides_until_a_human_sets_one():
     assert recorded["proposal_paradigm_role"] == "unspecified"
     assert recorded["reviewer_paradigm_role"] == "consequence"
     assert recorded["human_paradigm_role"] is None
+
+
+def _message_text(messages) -> str:
+    parts = []
+    for message in messages:
+        content = getattr(message, "content", "")
+        parts.append(content if isinstance(content, str) else json.dumps(content))
+    return "\n".join(parts)
+
+
+class _RawBatch(FakeAxialCoder):
+    """Return raw JSON for the first proposal. Later calls use the parent fixture."""
+
+    payload: dict = {}
+
+    def with_structured_output(self, schema, **kwargs):
+        parent = FakeAxialCoder.with_structured_output(self, schema, **kwargs)
+
+        def _call(messages):
+            name = getattr(schema, "__name__", "")
+            if name == "AxialProposalBatch" and "REPAIR THIS OUTPUT" not in _message_text(messages):
+                self.call_count += 1
+                from langchain_core.messages import AIMessage
+
+                raw = AIMessage(
+                    content=json.dumps(self.payload),
+                    usage_metadata={"input_tokens": 20, "output_tokens": 8, "total_tokens": 28},
+                )
+                return {"raw": raw, "parsed": None, "parsing_error": ValueError("batch failed")}
+            return parent.invoke(messages)
+
+        from langchain_core.runnables import RunnableLambda
+
+        return RunnableLambda(_call)
+
+
+def test_mixed_batch_keeps_valid_relationships_and_logs_the_rest():
+    """One invalid row does not discard the valid rows or spend a repair.
+
+    A repair can replace the whole batch, including rows that already parsed.
+    A batch with nothing valid still uses that one repair. Each dropped row
+    keeps its index, reason, error, and draft.
+    """
+    kept_statement = "Packing the suitcase before departure sits with the return to work."
+    mixed = _RawBatch(
+        payload={
+            "relationships": [
+                {
+                    "from_id": "c-prep",
+                    "to_id": "c-return",
+                    "paradigm_role": "unspecified",
+                    "statement": kept_statement,
+                    "passage_id": "p1",
+                    "quote": "Packing the suitcase took all night",
+                },
+                {
+                    "from_id": "c-prep",
+                    "to_id": "c-return",
+                    "paradigm_role": "context",
+                    "statement": "   ",
+                    "passage_id": "p1",
+                    "quote": "Packing the suitcase took all night",
+                },
+                {
+                    "from_id": "c-prep",
+                    "to_id": "c-return",
+                    "paradigm_role": "not-a-role",
+                    "statement": "This role is not in the schema.",
+                    "passage_id": "p1",
+                    "quote": "Packing the suitcase took all night",
+                },
+            ]
+        }
+    )
+    result = axial_code(_corpus(), mixed, **_axial())
+    assert [row["statement"] for row in result.relationships] == [kept_statement]
+    diagnostics = result.metadata["proposal_diagnostics"]
+    assert int(diagnostics.get("schema_repairs") or 0) == 0
+    assert diagnostics["partial_batch"] is True
+    assert diagnostics["rejection_reasons"]["blank_statement"] == 1
+    assert diagnostics["rejection_reasons"]["invalid_relationship"] == 1
+    dropped = diagnostics["dropped_relationships"]
+    assert [item["index"] for item in dropped] == [1, 2]
+    assert [item["reason"] for item in dropped] == ["blank_statement", "invalid_relationship"]
+    assert "blank statement" in dropped[0]["error"].casefold()
+    assert dropped[0]["draft"]["statement"] == "   "
+    assert dropped[1]["draft"]["paradigm_role"] == "not-a-role"
+    assert mixed.call_count == 1
+
+    blank = _RawBatch(
+        payload={
+            "relationships": [
+                {
+                    "from_id": "c-prep",
+                    "to_id": "c-return",
+                    "statement": "   ",
+                    "passage_id": "p1",
+                    "quote": "Packing the suitcase took all night",
+                }
+            ]
+        }
+    )
+    repaired = axial_code(_corpus(), blank, **_axial(max_axial_review_calls=2))
+    assert int(repaired.metadata["proposal_diagnostics"].get("schema_repairs") or 0) == 1
+    assert blank.call_count == 2
+    assert repaired.relationships
