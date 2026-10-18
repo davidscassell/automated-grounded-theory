@@ -6767,6 +6767,7 @@ async def aaxial_code(
         raise AxialError("provider_max_attempts includes the initial attempt and must be at least 1.")
     if abs((axial_share_propose + axial_share_counterexample) - 1) > 1e-9:
         raise AxialError("axial shares must sum to 1.")
+    installation_record()
     data = _source_mapping(source)
     procedure = _procedure_from_kwargs(
         data,
@@ -6948,6 +6949,7 @@ async def aselective_code(
         raise AxialError("max_decision_calls must be zero or more. Zero disables reviewer calls.")
     if int(max_axial_review_tokens) < 0 or int(axial_token_budget) < 0:
         raise AxialError("Token allowances must be zero or more.")
+    installation_record()
     data = _source_mapping(source)
     upstream = dict(data.get("metadata") or {})
     axial_procedure = dict(upstream.get("procedure") or {})
