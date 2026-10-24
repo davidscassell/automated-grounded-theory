@@ -169,8 +169,24 @@ from automated_grounded_theory.version import __version__
 
 logger = logging.getLogger("automated_grounded_theory")
 from automated_grounded_theory.decision_review import (
-    DecisionReviewer, SelectionDecision, ClaimDecisions, selection_payload,
-    claims_payload, apply_model_claim_decisions, next_claim_batch,
+    DECISION_REVIEW_CHUNKING,
+    ClaimDecisions,
+    DecisionChunkingCheckpointError,
+    DecisionReviewer,
+    SelectionDecision,
+    add_stop_reason,
+    apply_model_claim_decisions,
+    build_decision_plan,
+    claims_payload,
+    finish_decision_report,
+    load_chunk_progress,
+    merge_selection_ids,
+    next_claim_batch,
+    note_chunk_send,
+    same_chunking_fingerprint,
+    selection_codes,
+    selection_payload,
+    store_decision_report,
 )
 
 DEFAULT_FOCUSED_WEIGHT_FREQUENCY = 1.0
@@ -232,6 +248,7 @@ _PROCEDURE_KEYS = (
     "max_decision_calls",
     "max_decision_tokens",
     "decision_token_budget",
+    "decision_review_chunking",
 )
 _PERFORMANCE_KEYS = (
     "batch_size",
@@ -1946,6 +1963,10 @@ def _manifest_diff(saved: Any, current: Any) -> dict[str, dict[str, Any]]:
 def _check_resume_manifest(saved: Mapping[str, Any], current: Mapping[str, Any], *, allow_changes: bool) -> list[dict]:
     from automated_grounded_theory.api import CheckpointMigrationRequired, CheckpointMismatch
 
+    saved_procedure = saved.get("procedure") if isinstance(saved, Mapping) else None
+    current_procedure = current.get("procedure") if isinstance(current, Mapping) else None
+    if not same_chunking_fingerprint(saved_procedure, current_procedure):
+        raise DecisionChunkingCheckpointError()
     differences = _manifest_diff(saved, current)
     if not differences:
         return []
@@ -3015,9 +3036,12 @@ def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
         stop = stop or "incomplete"
     coverage["queue_complete"] = status in {"complete", "complete_for_queue"}
     coverage["corpus_complete"] = status == "complete"
-    decision_stop = (state.get("metadata") or {}).get("decision_stop")
+    metadata_now = state.get("metadata") or {}
+    decision_stop = metadata_now.get("decision_stop")
     if decision_stop:
         status, complete, stop = "incomplete", False, f"decision_{decision_stop}"
+    elif metadata_now.get("selection_review_complete") is False:
+        status, complete, stop = "incomplete", False, "decision_selection_truncated"
     return {
         "stage": "focused",
         "status": status,
@@ -5754,6 +5778,212 @@ def _claim_node(state: FocusedState) -> dict:
     }
 
 
+def _selection_ceiling(reason: str) -> bool:
+    return reason in {"call_allowance", "token_allowance", "request_budget", "review_error"}
+
+
+async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, *, metadata, logs, warnings) -> dict:
+    """Send at most one selection chunk. A later chunk is another graph visit.
+
+    Codes are ordered by code id before they are packed, so codebook order
+    does not change the chunks. A code that alone exceeds the per-request
+    budget is omitted and the visit continues. The merged raised ids are the
+    model's choices from validated chunks only, in that same code-id order.
+    """
+    reviewer = runtime.reviewer
+    codes = selection_codes(state)
+    ordered = [row["code_id"] for row in codes]
+    if reviewer is None or not ordered:
+        metadata["decision_stop"] = "call_allowance"
+        metadata["selection_source"] = "unreviewed"
+        metadata["selection_review_complete"] = False
+        warnings.append("LLM selection review incomplete: call_allowance.")
+        return {
+            "metadata": metadata,
+            "prompt_log": logs,
+            "warnings": warnings,
+            "focused_not_reread": [passage["passage_id"] for passage in state.get("passages", [])],
+        }
+
+    def estimate(ids: Sequence[str]) -> int:
+        # A wide chunk index keeps the packed request at least as large as the
+        # one that is sent, so a chunk that fits here still fits when sent.
+        payload = selection_payload(state, ids, chunk_index=10**6, chunk_count=10**6)
+        return reviewer.estimate(payload, SelectionDecision)
+
+    plan = build_decision_plan(
+        ordered,
+        estimate,
+        kind="focused_selection",
+        per_request=int(reviewer.token_budget),
+        max_tokens=int(reviewer.max_tokens),
+        max_calls=int(reviewer.max_calls),
+        omit_reason="single_code_exceeds_request_budget",
+    )
+    progress = load_chunk_progress(metadata, plan)
+    index = int(progress.get("next_index") or 0)
+    chunks = list(progress.get("chunks") or [])
+
+    def _close(progress_row: dict) -> dict:
+        nonlocal warnings
+        progress_row["open"] = False
+        metadata["decision_chunk_state"] = progress_row
+        report = finish_decision_report(progress_row)
+        store_decision_report(metadata, report)
+        metadata["selection_review_complete"] = bool(report["complete"])
+        validated = int(progress_row.get("chunks_validated") or 0)
+        stops = [str(item) for item in (progress_row.get("stop_reasons") or [])]
+        ceiling = next((item for item in stops if _selection_ceiling(item)), "")
+        failed = ceiling or ("invalid_decision" if "invalid_decision" in stops else "")
+        omissions = list(progress_row.get("omissions") or [])
+        if validated == 0 and failed:
+            metadata["decision_stop"] = failed
+            metadata["selection_source"] = "unreviewed"
+            metadata["selection_review_applied"] = False
+            if omissions and failed == "request_budget":
+                metadata["decision_stop_detail"] = "single_code_exceeds_request_budget"
+            warnings.append(f"LLM selection review incomplete: {metadata['decision_stop']}.")
+            return {
+                "metadata": metadata,
+                "prompt_log": logs,
+                "warnings": warnings,
+                "focused_not_reread": [passage["passage_id"] for passage in state.get("passages", [])],
+            }
+        if validated == 0 and omissions and not ceiling:
+            proposed = list(state.get("proposed_raised_code_ids") or [])
+            known = list(state.get("known_code_ids") or ordered)
+            not_raised = [code_id for code_id in known if code_id not in set(proposed)]
+            metadata["selection_source"] = "proposal"
+            metadata["selection_review_applied"] = True
+            metadata["selection_review_fallback"] = "proposal_unreviewed_over_request_budget"
+            warnings.append(
+                "LLM selection review left codes unreviewed because each one exceeded "
+                "the per-request budget. The deterministic proposal was kept. "
+                "The selection is not complete."
+            )
+            return {
+                "raised_code_ids": proposed,
+                "not_raised_code_ids": not_raised,
+                "selection_source": "proposal",
+                "metadata": metadata,
+                "prompt_log": logs,
+                "warnings": warnings,
+            }
+        raised = merge_selection_ids(progress_row.get("ordered_ids") or [], progress_row.get("raised_ids") or [])
+        decision = {
+            "raised_code_ids": raised,
+            "rationale": (
+                f"Merged {validated} selection chunk"
+                f"{'' if validated == 1 else 's'} in code-id order."
+            ),
+        }
+        held = {**state, "metadata": metadata, "warnings": warnings}
+        try:
+            updates = _researcher_node(held, model_decision=decision)
+        except (ValueError, FocusedError) as exc:
+            metadata["decision_stop"] = "invalid_decision"
+            metadata["selection_source"] = "unreviewed"
+            metadata["selection_review_applied"] = False
+            metadata["selection_review_complete"] = False
+            warnings.append(f"LLM selection review incomplete: invalid_decision. {exc}")
+            return {
+                "metadata": metadata,
+                "prompt_log": logs,
+                "warnings": warnings,
+                "focused_not_reread": [passage["passage_id"] for passage in state.get("passages", [])],
+            }
+        merged_meta = dict(updates.get("metadata") or metadata)
+        merged_meta["decision_chunk_state"] = progress_row
+        merged_meta["selection_review_complete"] = bool(report["complete"])
+        merged_meta["selection_review_applied"] = True
+        store_decision_report(merged_meta, report)
+        if not report["complete"]:
+            note = "LLM selection review is not complete."
+            if ceiling:
+                merged_meta["decision_stop"] = ceiling
+                merged_meta["decision_stop_detail"] = ceiling
+                note = f"LLM selection review incomplete: {ceiling}."
+            elif omissions:
+                merged_meta["decision_stop_detail"] = "selection_truncated"
+                note = (
+                    "LLM selection review omitted codes that alone exceeded the "
+                    "per-request budget. The selection is not complete."
+                )
+            else:
+                merged_meta["decision_stop_detail"] = "selection_truncated"
+            if note not in list(updates.get("warnings") or warnings):
+                warnings = list(updates.get("warnings") or warnings)
+                warnings.append(note)
+            else:
+                warnings = list(updates.get("warnings") or warnings)
+        else:
+            warnings = list(updates.get("warnings") or warnings)
+        return {**updates, "metadata": merged_meta, "prompt_log": logs, "warnings": warnings}
+
+    if index >= len(chunks):
+        return _close(progress)
+
+    chunk = [str(item) for item in chunks[index]]
+    payload = selection_payload(state, chunk, chunk_index=index, chunk_count=len(chunks))
+    stop = reviewer.refusal_reason(payload, SelectionDecision, metadata)
+    if stop and len(chunk) == 1 and stop == "request_budget":
+        omissions = list(progress.get("omissions") or [])
+        omissions.append({"id": chunk[0], "reason": "single_code_exceeds_request_budget"})
+        progress["omissions"] = omissions
+        progress["next_index"] = index + 1
+        metadata["decision_chunk_state"] = progress
+        if progress["next_index"] >= len(chunks):
+            return _close(progress)
+        progress["open"] = True
+        return {"metadata": metadata, "prompt_log": logs, "warnings": warnings}
+    if stop:
+        add_stop_reason(progress, stop)
+        metadata["decision_stop"] = stop
+        progress["next_index"] = len(chunks)
+        return _close(progress)
+
+    parsed, audit = await reviewer.decide(payload, SelectionDecision, metadata)
+    estimate = int((audit or {}).get("estimated_input_tokens") or reviewer.estimate(payload, SelectionDecision))
+    if audit:
+        logs.append(audit)
+    if parsed is None:
+        reason = str(metadata.get("decision_stop") or "review_error")
+        add_stop_reason(progress, reason)
+        if audit and str(audit.get("status") or "") != "omitted":
+            note_chunk_send(progress, audit, estimate=estimate)
+        progress["next_index"] = len(chunks)
+        return _close(progress)
+
+    note_chunk_send(progress, audit, estimate=estimate)
+    try:
+        ids = [str(item) for item in (parsed.get("raised_code_ids") or [])]
+        if len(ids) != len(set(ids)):
+            raise FocusedError("Duplicate raised code IDs from decision model.")
+        unknown = [item for item in ids if item not in set(chunk)]
+        if unknown:
+            raise FocusedError(f"raised_code_ids are not in this selection chunk: {unknown}")
+    except (ValueError, FocusedError, KeyError) as exc:
+        add_stop_reason(progress, "invalid_decision")
+        progress["invalid_chunks"] = int(progress.get("invalid_chunks") or 0) + 1
+        if isinstance(audit, dict):
+            audit.update(status="error", error=str(exc))
+        metadata["decision_stop"] = "invalid_decision"
+        progress["next_index"] = len(chunks)
+        return _close(progress)
+
+    progress["raised_ids"] = list(progress.get("raised_ids") or []) + ids
+    progress["reviewed_ids"] = list(progress.get("reviewed_ids") or []) + chunk
+    progress["chunks_validated"] = int(progress.get("chunks_validated") or 0) + 1
+    metadata.pop("decision_stop", None)
+    progress["next_index"] = index + 1
+    metadata["decision_chunk_state"] = progress
+    if progress["next_index"] >= len(chunks):
+        return _close(progress)
+    progress["open"] = True
+    metadata["decision_chunk_state"] = progress
+    return {"metadata": metadata, "prompt_log": logs, "warnings": warnings}
+
+
 def _decision_node(runtime: FocusedRuntime, *, claims: bool):
     async def review(state: FocusedState) -> dict:
         if runtime.decision_mode != "llm":
@@ -5764,23 +5994,9 @@ def _decision_node(runtime: FocusedRuntime, *, claims: bool):
         warnings = list(state.get("warnings") or [])
         metadata.pop("decision_stop", None)
         if not claims:
-            parsed, audit = await reviewer.decide(selection_payload(state), SelectionDecision, metadata)
-            if audit:
-                logs.append(audit)
-            if parsed is not None:
-                try:
-                    ids = parsed["raised_code_ids"]
-                    if len(ids) != len(set(ids)):
-                        raise FocusedError("Duplicate raised code IDs from decision model.")
-                    updates = _researcher_node({**state, "metadata": metadata}, model_decision=parsed)
-                    return {**updates, "prompt_log": logs}
-                except (ValueError, FocusedError) as exc:
-                    metadata["decision_stop"] = "invalid_decision"
-                    audit.update(status="error", error=str(exc))
-            metadata["selection_source"] = "unreviewed"
-            warnings.append(f"LLM selection review incomplete: {metadata['decision_stop']}.")
-            return {"metadata": metadata, "prompt_log": logs, "warnings": warnings,
-                    "focused_not_reread": [p["passage_id"] for p in state.get("passages", [])]}
+            return await _selection_review_visit(
+                runtime, state, metadata=metadata, logs=logs, warnings=warnings,
+            )
 
         properties = list(state.get("properties") or [])
         dimensions = list(state.get("dimensions") or [])
@@ -5820,7 +6036,11 @@ def _decision_node(runtime: FocusedRuntime, *, claims: bool):
 
 
 def _route_decision(state: FocusedState) -> str:
-    if (state.get("metadata") or {}).get("decision_stop"):
+    meta = state.get("metadata") or {}
+    progress = meta.get("decision_chunk_state") or {}
+    if isinstance(progress, Mapping) and progress.get("open") and progress.get("kind") == "focused_selection":
+        return "researcher_checkpoint"
+    if meta.get("decision_stop") and not meta.get("selection_review_applied"):
         return "export_focused"
     if not state.get("raised_code_ids"):
         return "review_recode"
@@ -6154,7 +6374,7 @@ def build_focused_graph(runtime: FocusedRuntime | None = None):
     builder.add_edge("load_open_coding", "select_candidates")
     builder.add_edge("select_candidates", "researcher_checkpoint")
     builder.add_conditional_edges("researcher_checkpoint", _route_decision,
-        ["export_focused", "prepare_recode", "review_recode"])
+        ["researcher_checkpoint", "export_focused", "prepare_recode", "review_recode"])
     builder.add_conditional_edges(
         "prepare_recode",
         _route_prepare,
@@ -6557,7 +6777,8 @@ async def afocused_code(
     procedure.update(decision_mode=decision_mode, decision_model=(
         {"model": describe_model(reviewer_model), "model_settings": chat_model_settings(reviewer_model)}
         if reviewer_model is not None else None), max_decision_calls=max_decision_calls,
-        max_decision_tokens=max_decision_tokens, decision_token_budget=decision_token_budget)
+        max_decision_tokens=max_decision_tokens, decision_token_budget=decision_token_budget,
+        decision_review_chunking=DECISION_REVIEW_CHUNKING)
     coder = (
         _resolve_model(model, timeout=focused_request_timeout)
         if isinstance(model, str)

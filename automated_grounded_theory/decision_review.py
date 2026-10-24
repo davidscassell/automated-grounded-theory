@@ -3,11 +3,17 @@
 Model support labels are deliberately separate from human claim_support.
 Calls do not silently retry or repair; a failed review remains incomplete.
 Provider SDK retries, if enabled on the supplied model, remain provider-owned.
+
+Selection review is packed into chunks that each fit the per-request token
+budget. ``batch_size`` is not that pack size. A code that alone exceeds the
+budget is omitted and the review continues. The merged raised set is the
+union of chunk decisions, in canonical code-id order.
 """
 from __future__ import annotations
 
+import hashlib
 import json
-from typing import Literal
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, ConfigDict, Field
@@ -36,6 +42,25 @@ class ClaimDecision(BaseModel):
 class ClaimDecisions(BaseModel):
     model_config = ConfigDict(extra="forbid")
     claims: list[ClaimDecision]
+
+
+# Locked on the focused and axial procedure manifests. A checkpoint saved
+# before this value existed cannot resume into a chunked review.
+DECISION_REVIEW_CHUNKING = "request_budget_v1"
+
+CHUNKING_CHECKPOINT_MESSAGE = (
+    "procedure.decision_review_chunking: this checkpoint was saved before "
+    "decision-review requests were chunked to the per-request budget, or the "
+    "stored chunk plan does not match this resume. Resume cannot continue that "
+    "review. Start a new run."
+)
+
+
+class DecisionChunkingCheckpointError(RuntimeError):
+    """The checkpoint has no usable decision-review chunking fingerprint."""
+
+    def __init__(self, message: str = CHUNKING_CHECKPOINT_MESSAGE) -> None:
+        super().__init__(message)
 
 
 SYSTEM = """You are the automated analytic reviewer for focused coding.
@@ -67,17 +92,28 @@ class DecisionReviewer:
     def estimate(self, payload, schema):
         return request_input_tokens(self.messages(payload), schema)
 
-    async def decide(self, payload, schema, metadata):
-        """Return a validated response and audit row, or a recorded stop reason."""
+    def refusal_reason(self, payload, schema, metadata) -> str | None:
+        """Why this payload would not be sent. Does not record the stop."""
         calls = int(metadata.get("decision_calls_used", 0))
         tokens = int(metadata.get("decision_tokens_used", 0))
         estimate = self.estimate(payload, schema)
-        stop = ("call_allowance" if calls >= self.max_calls else
-                "token_allowance" if tokens + estimate > self.max_tokens else
-                "request_budget" if estimate > self.token_budget else None)
+        if calls >= self.max_calls:
+            return "call_allowance"
+        if tokens + estimate > self.max_tokens:
+            return "token_allowance"
+        if estimate > self.token_budget:
+            return "request_budget"
+        return None
+
+    async def decide(self, payload, schema, metadata):
+        """Return a validated response and audit row, or a recorded stop reason."""
+        stop = self.refusal_reason(payload, schema, metadata)
+        estimate = self.estimate(payload, schema)
         if stop:
             metadata["decision_stop"] = stop
             return None, None
+        calls = int(metadata.get("decision_calls_used", 0))
+        tokens = int(metadata.get("decision_tokens_used", 0))
         metadata["decision_calls_used"] = calls + 1
         metadata["decision_tokens_used"] = tokens + estimate
         messages = self.messages(payload)
@@ -107,22 +143,79 @@ class DecisionReviewer:
             return None, audit
 
 
-def selection_payload(state):
-    """Compact evidence samples; selection is not a complete corpus reread."""
-    by_code = {}
+def selection_codes(state) -> list[dict[str, Any]]:
+    """One row per code, ordered by code id.
+
+    Codebook insertion order is not used. Two quote excerpts are the evidence
+    sample. The row does not include the rest of the corpus.
+    """
+    by_code: dict[Any, list] = {}
     for segment in state.get("segments", []):
         samples = by_code.setdefault(segment.get("code_id"), [])
         if len(samples) < 2:
             quote = str(segment.get("quote") or "")
-            samples.append({"passage_id": segment.get("passage_id"),
-                            "quote": quote[:800], "truncated": len(quote) > 800})
-    codes = [{"code_id": c.get("code_id"), "code": c.get("code"),
-              "definition": c.get("definition"), "evidence_sample": by_code.get(c.get("code_id"), [])}
-             for c in state.get("codebook", {}).values()]
-    return {"kind": "focused_selection", "context": state.get("metadata", {}).get("context"),
-            "proposed_raised_code_ids": state.get("proposed_raised_code_ids", []),
-            "scores": state.get("selection", []), "codes": codes,
-            "evidence_scope": "Up to two quote excerpts per code; not the full corpus."}
+            samples.append({
+                "passage_id": segment.get("passage_id"),
+                "quote": quote[:800],
+                "truncated": len(quote) > 800,
+            })
+    codes = [
+        {
+            "code_id": str(code.get("code_id") or ""),
+            "code": code.get("code"),
+            "definition": code.get("definition"),
+            "evidence_sample": by_code.get(code.get("code_id"), []),
+        }
+        for code in state.get("codebook", {}).values()
+        if str(code.get("code_id") or "")
+    ]
+    codes.sort(key=lambda row: row["code_id"])
+    return codes
+
+
+def selection_payload(state, code_ids: Sequence[str] | None = None, *, chunk_index: int | None = None, chunk_count: int | None = None):
+    """Compact evidence samples; selection is not a complete corpus reread.
+
+    ``code_ids`` limits the request to one chunk. Scores and the proposed
+    raised ids in the payload are limited to that chunk as well. Omitting
+    ``code_ids`` returns every code, still in code-id order.
+    """
+    codes = selection_codes(state)
+    if code_ids is not None:
+        wanted = {str(item) for item in code_ids}
+        codes = [row for row in codes if row["code_id"] in wanted]
+    present = {row["code_id"] for row in codes}
+    proposed = [
+        str(item)
+        for item in (state.get("proposed_raised_code_ids") or [])
+        if str(item) in present
+    ]
+    proposed.sort()
+    scores = [
+        row
+        for row in (state.get("selection") or [])
+        if str((row or {}).get("code_id") or "") in present
+    ]
+    scores.sort(key=lambda row: str((row or {}).get("code_id") or ""))
+    payload = {
+        "kind": "focused_selection",
+        "context": state.get("metadata", {}).get("context"),
+        "proposed_raised_code_ids": proposed,
+        "scores": scores,
+        "codes": codes,
+        "evidence_scope": (
+            "Up to two quote excerpts per code in this request; not the full corpus. "
+            "Choose only code ids included here. An empty selection is allowed. "
+            "A code that is absent was not rejected; it is reviewed in another request or omitted."
+        ),
+    }
+    if chunk_index is not None and chunk_count is not None:
+        payload["review_chunk"] = {
+            "index": int(chunk_index),
+            "count": int(chunk_count),
+            "code_ids": [row["code_id"] for row in codes],
+        }
+    return payload
 
 
 # Characters of passage text included with a claim review. Primary passages
@@ -257,6 +350,281 @@ def next_claim_batch(reviewer, state, records, cursor, tokens_used):
         batch = candidate
     detail = "batch_shrunk_to_fit" if shrunk else None
     return batch, None, detail
+
+
+def pack_decision_chunks(
+    ids: Sequence[str],
+    estimate: Callable[[Sequence[str]], int],
+    *,
+    per_request: int,
+    omit_reason: str,
+) -> dict[str, Any]:
+    """Pack ``ids`` into chunks that each fit ``per_request``.
+
+    ``ids`` must already be in canonical order. This function does not sort
+    and does not read ``batch_size``. A prefix that fits stays together. One
+    id whose own request exceeds ``per_request`` is omitted and packing
+    continues with the next id. The return value has ``chunks`` and
+    ``omissions``. ``omissions`` entries are ``{"id", "reason"}``.
+    """
+    ordered = [str(item) for item in ids if str(item)]
+    budget = int(per_request)
+    chunks: list[list[str]] = []
+    omissions: list[dict[str, str]] = []
+    current: list[str] = []
+
+    def fits(group: Sequence[str]) -> bool:
+        if budget <= 0:
+            return False
+        return int(estimate(group)) <= budget
+
+    for item in ordered:
+        if not fits([item]):
+            if current:
+                chunks.append(current)
+                current = []
+            omissions.append({"id": item, "reason": str(omit_reason)})
+            continue
+        if not current:
+            current = [item]
+            continue
+        if fits([*current, item]):
+            current.append(item)
+            continue
+        chunks.append(current)
+        current = [item]
+    if current:
+        chunks.append(current)
+    return {"chunks": chunks, "omissions": omissions, "ordered_ids": ordered}
+
+
+def decision_plan_hash(
+    *,
+    kind: str,
+    per_request: int,
+    max_tokens: int,
+    max_calls: int,
+    ordered_ids: Sequence[str],
+    chunks: Sequence[Sequence[str]],
+    omissions: Sequence[Mapping[str, Any]],
+) -> str:
+    """Fingerprint the chunk plan a resume has to match."""
+    payload = {
+        "version": DECISION_REVIEW_CHUNKING,
+        "kind": str(kind),
+        "per_request_budget": int(per_request),
+        "max_tokens": int(max_tokens),
+        "max_calls": int(max_calls),
+        "ordered_ids": [str(item) for item in ordered_ids],
+        "chunks": [[str(item) for item in chunk] for chunk in chunks],
+        "omissions": [
+            {"id": str(item.get("id") or ""), "reason": str(item.get("reason") or "")}
+            for item in omissions
+        ],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def build_decision_plan(
+    ids: Sequence[str],
+    estimate: Callable[[Sequence[str]], int],
+    *,
+    kind: str,
+    per_request: int,
+    max_tokens: int,
+    max_calls: int,
+    omit_reason: str,
+) -> dict[str, Any]:
+    packed = pack_decision_chunks(ids, estimate, per_request=per_request, omit_reason=omit_reason)
+    plan_hash = decision_plan_hash(
+        kind=kind,
+        per_request=per_request,
+        max_tokens=max_tokens,
+        max_calls=max_calls,
+        ordered_ids=packed["ordered_ids"],
+        chunks=packed["chunks"],
+        omissions=packed["omissions"],
+    )
+    return {
+        "version": DECISION_REVIEW_CHUNKING,
+        "kind": str(kind),
+        "per_request_budget": int(per_request),
+        "max_tokens": int(max_tokens),
+        "max_calls": int(max_calls),
+        "ordered_ids": packed["ordered_ids"],
+        "chunks": packed["chunks"],
+        "omissions": packed["omissions"],
+        "plan_hash": plan_hash,
+    }
+
+
+def load_chunk_progress(metadata: Mapping[str, Any], plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Continue an open chunk plan, or start one.
+
+    An open plan whose hash or version differs from ``plan`` cannot resume.
+    A finished plan is not reused; the caller only loops while ``open`` is set.
+    """
+    stored = metadata.get("decision_chunk_state") if isinstance(metadata, Mapping) else None
+    if isinstance(stored, Mapping) and stored.get("open"):
+        if (
+            str(stored.get("version") or "") != DECISION_REVIEW_CHUNKING
+            or str(stored.get("plan_hash") or "") != str(plan.get("plan_hash") or "")
+            or str(stored.get("kind") or "") != str(plan.get("kind") or "")
+        ):
+            raise DecisionChunkingCheckpointError()
+        return dict(stored)
+    return {
+        "open": True,
+        "version": DECISION_REVIEW_CHUNKING,
+        "kind": str(plan.get("kind") or ""),
+        "plan_hash": str(plan.get("plan_hash") or ""),
+        "per_request_budget": int(plan.get("per_request_budget") or 0),
+        "ordered_ids": list(plan.get("ordered_ids") or []),
+        "chunks": [list(chunk) for chunk in (plan.get("chunks") or [])],
+        "omissions": [dict(item) for item in (plan.get("omissions") or [])],
+        "next_index": 0,
+        "reviewed_ids": [],
+        "raised_ids": [],
+        "decisions": [],
+        "nominations": [],
+        "chunks_sent": 0,
+        "chunks_validated": 0,
+        "tokens_estimated": 0,
+        "calls": 0,
+        "expenditure_gaps": 0,
+        "stop_reasons": [],
+        "invalid_chunks": 0,
+        "unknown_nomination": "",
+    }
+
+
+def note_chunk_send(progress: dict[str, Any], audit: Mapping[str, Any] | None, *, estimate: int) -> None:
+    """Count one request that was sent, whether or not it validated."""
+    progress["chunks_sent"] = int(progress.get("chunks_sent") or 0) + 1
+    progress["calls"] = int(progress.get("calls") or 0) + 1
+    progress["tokens_estimated"] = int(progress.get("tokens_estimated") or 0) + max(0, int(estimate))
+    usage = audit.get("usage") if isinstance(audit, Mapping) else None
+    known = isinstance(usage, Mapping) and int(usage.get("input_tokens") or 0) > 0
+    if not known:
+        progress["expenditure_gaps"] = int(progress.get("expenditure_gaps") or 0) + 1
+
+
+def add_stop_reason(progress: dict[str, Any], reason: str) -> None:
+    reason = str(reason or "")
+    if not reason:
+        return
+    stops = list(progress.get("stop_reasons") or [])
+    if reason not in stops:
+        stops.append(reason)
+    progress["stop_reasons"] = stops
+
+
+def finish_decision_report(progress: Mapping[str, Any]) -> dict[str, Any]:
+    """Public accounting for one chunked review. Null where the figure is undefined."""
+    omissions = [dict(item) for item in (progress.get("omissions") or [])]
+    stops = [str(item) for item in (progress.get("stop_reasons") or []) if str(item)]
+    reviewed = [str(item) for item in (progress.get("reviewed_ids") or [])]
+    chunks = list(progress.get("chunks") or [])
+    item_count = len(list(progress.get("ordered_ids") or []))
+    sent = int(progress.get("chunks_sent") or 0)
+    validated = int(progress.get("chunks_validated") or 0)
+    invalid = int(progress.get("invalid_chunks") or 0)
+    complete = (
+        item_count == len(reviewed)
+        and not omissions
+        and not stops
+        and invalid == 0
+        and validated == len(chunks)
+    )
+    return {
+        "version": DECISION_REVIEW_CHUNKING,
+        "kind": str(progress.get("kind") or ""),
+        "plan_hash": str(progress.get("plan_hash") or ""),
+        "complete": bool(complete),
+        "chunk_count": len(chunks),
+        "chunks_sent": sent,
+        "chunks_validated": validated,
+        "item_count": item_count,
+        "items_reviewed": len(reviewed),
+        "items_omitted": len(omissions),
+        "omissions": omissions,
+        "stop_reasons": stops or None,
+        "tokens_estimated": int(progress.get("tokens_estimated") or 0) if sent else None,
+        "expenditure_complete": (int(progress.get("expenditure_gaps") or 0) == 0) if sent else None,
+        "calls": int(progress.get("calls") or 0),
+        "per_request_budget": int(progress.get("per_request_budget") or 0),
+        "sized_by": "per_request_budget",
+    }
+
+
+def store_decision_report(metadata: dict[str, Any], report: Mapping[str, Any]) -> None:
+    reviews = dict(metadata.get("decision_reviews") or {})
+    reviews[str(report.get("kind") or "")] = dict(report)
+    metadata["decision_reviews"] = reviews
+
+
+def merge_selection_ids(ordered_ids: Sequence[str], raised_ids: Sequence[str]) -> list[str]:
+    """Union of raised ids, in the canonical code order, ignoring ids outside it."""
+    raised = {str(item) for item in raised_ids}
+    return [str(item) for item in ordered_ids if str(item) in raised]
+
+
+def merge_core_nominations(
+    candidates: Sequence[Mapping[str, Any]],
+    nominations: Sequence[str],
+) -> dict[str, Any]:
+    """Pick one core from chunk nominations.
+
+    A graph-supported nomination beats any nomination that is not
+    graph-supported. Among the eligible nominations the order is
+    pattern-supported centrality, accepted centrality, proposed centrality,
+    then code id. Chunk index is not a tie-break. A model nomination does
+    not change a relationship tier and cannot verify a row.
+    """
+    by_id = {
+        str(row.get("code_id") or ""): row
+        for row in candidates
+        if isinstance(row, Mapping) and str(row.get("code_id") or "")
+    }
+    chosen = []
+    seen = set()
+    for item in nominations:
+        code_id = str(item or "")
+        row = by_id.get(code_id)
+        if row is None or code_id in seen:
+            continue
+        seen.add(code_id)
+        chosen.append(row)
+    if not chosen:
+        return {"core_id": "", "supported": False}
+    supported = [row for row in chosen if row.get("graph_supported")]
+    pool = supported or chosen
+
+    def sort_key(row: Mapping[str, Any]) -> tuple:
+        return (
+            -int(row.get("pattern_supported_centrality") or 0),
+            -int(row.get("accepted_centrality") or 0),
+            -int(row.get("proposed_centrality") or 0),
+            str(row.get("code_id") or ""),
+        )
+
+    pool.sort(key=sort_key)
+    winner = pool[0]
+    return {
+        "core_id": str(winner.get("code_id") or ""),
+        "supported": bool(winner.get("graph_supported")),
+    }
+
+
+def same_chunking_fingerprint(saved: Any, current: Any) -> bool:
+    saved_value = ""
+    current_value = ""
+    if isinstance(saved, Mapping):
+        saved_value = str(saved.get("decision_review_chunking") or "")
+    if isinstance(current, Mapping):
+        current_value = str(current.get("decision_review_chunking") or "")
+    return saved_value == current_value and current_value == DECISION_REVIEW_CHUNKING
 
 
 def apply_model_claim_decisions(claims, decisions, audit):

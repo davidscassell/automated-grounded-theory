@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.24
+
+- Focused selection, axial relationship review, and selective core selection are packed into requests that each fit the per-request budget. `batch_size` stays 1 and is not that pack size. Codes are ordered by `code_id`, relationships by `relationship_id`, and core candidates stay in evidence order. Chunk index does not change which code or core is selected.
+- One code, relationship, or candidate that alone exceeds the per-request budget is omitted and the review continues. The omission reasons are `single_code_exceeds_request_budget`, `single_relationship_exceeds_request_budget`, and `single_candidate_exceeds_request_budget`. A ceiling or an invalid chunk still stops the remaining chunks. Validated chunks already stored are applied.
+- Focused selection merges raised ids from validated chunks in code-id order. A partial review is not complete: status is `incomplete`, and the stop is `decision_<ceiling>` or `decision_selection_truncated`. If every code is individually over the budget, the deterministic proposal is kept and the selection is still not complete. Axial relationship decisions still go through the tier gate. A model cannot set verified or authorize attribution wording. Core nominations prefer a graph-supported candidate, then centrality, then `code_id`.
+- `metadata.decision_reviews` records chunk counts, omissions, calls, and `sized_by`. `stop_reasons`, `tokens_estimated`, and `expenditure_complete` are null when they are undefined. `complete` is true only when every item was in a validated chunk.
+- Resume fingerprints `procedure.decision_review_chunking` (`request_budget_v1`). A 0.9.23 checkpoint, or an open plan whose hash does not match, raises `DecisionChunkingCheckpointError` even when changes are allowed. `pattern_min_cases` stays 2. The axial token ceiling stays 24000. `batch_size` stays 1. Tier 4 stays human-only. The axial planner still builds the full pair space in memory. That limit is open. The review note is [docs/design-review-fixes-0924.md](docs/design-review-fixes-0924.md). `policy_version` is `0.9.24`.
+
 ## 0.9.23
 
 - A `system_proposal` review no longer removes its proposal from independent discovery matching. The same proposal can be recovered for structural recall and linked for the review. Structural recall and precision do not change when proposal reviews are added or removed. The gate false-negative population is still per adjudication, so a review can change that rate.

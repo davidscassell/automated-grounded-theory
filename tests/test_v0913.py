@@ -22,8 +22,8 @@ from tests.test_v090 import FakeSamplingCoder, _kwargs, _payload
 
 
 def test_version_is_0913():
-    assert __version__ == "0.9.23"
-    assert POLICY_VERSION == "0.9.23"
+    assert __version__ == "0.9.24"
+    assert POLICY_VERSION == "0.9.24"
     assert PATTERN_MIN_CASES == 2
     assert DEFAULT_MAX_AXIAL_REVIEW_TOKENS == 24000
     assert STOPPING_QUIET_ROUNDS == 2
