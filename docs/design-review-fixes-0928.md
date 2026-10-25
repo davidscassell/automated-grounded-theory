@@ -1,6 +1,6 @@
 # 0.9.28 review fixes
 
-Status: current for package 0.9.28. The 0.9.27 note stays the record of the focused export, unreviewed endpoints, the first withholding partition, link-governing `if`, the recorded reviewer decision, and the chunk-allowance stop. This note does not change `pattern_min_cases` (2), the axial token ceiling (24000), `batch_size` (1), or the 6000 request budgets. `auto_size_decision_calls` stays off. Tier 4 stays human-only. Undefined metrics stay null. Human input still arrives through `interrupt()` and `Command(resume=...)`.
+Status: historical record of package 0.9.28. The current review note is [design-review-fixes-0929.md](design-review-fixes-0929.md). 0.9.29 keeps counterexamples and qualifications on a merged assertion, preserves ambiguous conditions, and budgets cross-chunk consolidation. The 0.9.27 note stays the record of the focused export, unreviewed endpoints, the first withholding partition, link-governing `if`, the recorded reviewer decision, and the chunk-allowance stop. This note does not change `pattern_min_cases` (2), the axial token ceiling (24000), `batch_size` (1), or the 6000 request budgets. `auto_size_decision_calls` stays off. Tier 4 stays human-only. Undefined metrics stay null. Human input still arrives through `interrupt()` and `Command(resume=...)`.
 
 ## Accepted is not the same as downstream-eligible
 

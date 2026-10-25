@@ -70,11 +70,11 @@ _ASIDE = Path(__file__).resolve().parents[0] / "fixtures" / "discourse_aside_092
 
 
 def test_version_rules_and_unchanged_defaults():
-    assert __version__ == "0.9.28"
-    assert POLICY_VERSION == "0.9.28"
-    assert DECISION_REVIEW_CHUNKING == "request_budget_v5"
-    assert CONDITIONAL_SCOPE_RULE == "discourse_aside_v1"
-    assert DUPLICATE_ASSERTION_RULE == "merge_identical_statement_v1"
+    assert __version__ == "0.9.29"
+    assert POLICY_VERSION == "0.9.29"
+    assert DECISION_REVIEW_CHUNKING == "request_budget_v6"
+    assert CONDITIONAL_SCOPE_RULE == "ambiguous_condition_preserved_v1"
+    assert DUPLICATE_ASSERTION_RULE == "merge_identical_statement_v2"
     assert BUDGET_LEDGER_RULE == "shared_review_ledger_v1"
     assert EXPORT_ASSESSMENT_RULE == "shared_assessment_v1"
     assert CHUNK_REVIEW_RECOVERY == "reuse_validated_v1"
@@ -473,7 +473,12 @@ def test_frozen_review_and_pipeline_repeat_stay_distinct():
         ]
     )
     assert missing["pairwise"][0]["selected_code_jaccard"] is None
-    assert missing["pairwise"][0]["eligibility_changes"] is None
+    missing_eligibility = missing["pairwise"][0]["eligibility_changes"]
+    assert missing_eligibility is not None
+    assert missing_eligibility["matched_changes"] == []
+    assert missing_eligibility["unknown_eligibility"]
+    assert missing_eligibility["unknown_eligibility"][0]["left"] is None
+    assert missing_eligibility["unknown_eligibility"][0]["right"] is True
 
 
 def test_token_shortfall_stops_before_the_first_request(tmp_path):

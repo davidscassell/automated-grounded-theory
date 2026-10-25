@@ -1,0 +1,121 @@
+{
+  "fixture_version": "conditional-adjudication-0929",
+  "note": "Synthetic sentences only. Not study data and not an end-to-end benchmark. Labels were adjudicated for this regression: a conversational hedge is meta-discourse about the utterance; a genuine condition constrains the situation; an ambiguous condition could be read either way and is preserved. A preserved condition is provisional and does not authorize tier 3. Readings stay deterministic_provisional. Two-stem endpoints are what this package counts as grounded. The short training/confidence sentences are the reported reproductions. They still decide authorizes_tier_3. They do not by themselves meet the two-stem grounding rule.",
+  "labels": {
+    "conversational_hedge": "Unambiguous meta-discourse. It does not govern the from-to link. The remaining clause can authorize tier 3.",
+    "genuine_condition": "The if-clause constrains the situation. Status is hypothetical. authorizes_tier_3 is false. The row stays below tier 3.",
+    "ambiguous_condition": "The if-clause may be a hedge or a real condition, including a substantive verb such as help or understand. It is preserved. Status is hypothetical. A provisional reading does not authorize tier 3."
+  },
+  "cases": [
+    {
+      "id": "repro-if-you-help",
+      "label": "ambiguous_condition",
+      "quote": "If you help, training leads to confidence.",
+      "from_code": "training",
+      "to_code": "confidence",
+      "status": "hypothetical",
+      "hypothetical": true,
+      "authorizes_tier_3": false,
+      "evidence_tier_3": false
+    },
+    {
+      "id": "repro-if-you-understand",
+      "label": "ambiguous_condition",
+      "quote": "If you understand, training leads to confidence.",
+      "from_code": "training",
+      "to_code": "confidence",
+      "status": "hypothetical",
+      "hypothetical": true,
+      "authorizes_tier_3": false,
+      "evidence_tier_3": false
+    },
+    {
+      "id": "repro-if-it-rains",
+      "label": "genuine_condition",
+      "quote": "If it rains, training leads to confidence.",
+      "from_code": "training",
+      "to_code": "confidence",
+      "status": "hypothetical",
+      "hypothetical": true,
+      "authorizes_tier_3": false,
+      "evidence_tier_3": false
+    },
+    {
+      "id": "hedge-if-that-makes-sense",
+      "label": "conversational_hedge",
+      "quote": "Training session leads to confidence growth, if that makes sense.",
+      "from_code": "training session",
+      "to_code": "confidence growth",
+      "status": "validated",
+      "hypothetical": false,
+      "authorizes_tier_3": true,
+      "evidence_tier_3": true
+    },
+    {
+      "id": "hedge-if-i-can",
+      "label": "conversational_hedge",
+      "quote": "Training session leads to confidence growth, if I can.",
+      "from_code": "training session",
+      "to_code": "confidence growth",
+      "status": "validated",
+      "hypothetical": false,
+      "authorizes_tier_3": true,
+      "evidence_tier_3": true
+    },
+    {
+      "id": "hedge-parenthetical",
+      "label": "conversational_hedge",
+      "quote": "Training session leads to confidence growth (if that makes sense).",
+      "from_code": "training session",
+      "to_code": "confidence growth",
+      "status": "validated",
+      "hypothetical": false,
+      "authorizes_tier_3": true,
+      "evidence_tier_3": true
+    },
+    {
+      "id": "genuine-if-it-rains-grounded",
+      "label": "genuine_condition",
+      "quote": "If it rains, training session leads to confidence growth.",
+      "from_code": "training session",
+      "to_code": "confidence growth",
+      "status": "hypothetical",
+      "hypothetical": true,
+      "authorizes_tier_3": false,
+      "evidence_tier_3": false
+    },
+    {
+      "id": "ambiguous-if-you-help-grounded",
+      "label": "ambiguous_condition",
+      "quote": "If you help, training session leads to confidence growth.",
+      "from_code": "training session",
+      "to_code": "confidence growth",
+      "status": "hypothetical",
+      "hypothetical": true,
+      "authorizes_tier_3": false,
+      "evidence_tier_3": false
+    },
+    {
+      "id": "ambiguous-if-you-understand-grounded",
+      "label": "ambiguous_condition",
+      "quote": "If you understand, training session leads to confidence growth.",
+      "from_code": "training session",
+      "to_code": "confidence growth",
+      "status": "hypothetical",
+      "hypothetical": true,
+      "authorizes_tier_3": false,
+      "evidence_tier_3": false
+    },
+    {
+      "id": "ambiguous-condition-after",
+      "label": "ambiguous_condition",
+      "quote": "Training session leads to confidence growth if you help.",
+      "from_code": "training session",
+      "to_code": "confidence growth",
+      "status": "hypothetical",
+      "hypothetical": true,
+      "authorizes_tier_3": false,
+      "evidence_tier_3": false
+    }
+  ]
+}

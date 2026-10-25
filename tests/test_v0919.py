@@ -19,8 +19,8 @@ from tests.test_v080 import FakeAxialCoder, _corpus
 
 
 def test_version_is_0919():
-    assert __version__ == "0.9.28"
-    assert POLICY_VERSION == "0.9.28"
+    assert __version__ == "0.9.29"
+    assert POLICY_VERSION == "0.9.29"
 
 
 def _passages(*, attribution: bool) -> list[dict]:

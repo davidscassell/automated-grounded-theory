@@ -153,21 +153,33 @@ READING_BASIS = "deterministic_provisional"
 _OTHER_HYPOTHETICAL_RE = re.compile(
     r"\b(?:would|someone said|they said|i heard|suppose|supposing|what if|had said)\b"
 )
-# Discourse pronouns and function words. A bounded ``if`` whose subject is one
-# of these pronouns, and whose other words stay inside this closed class, is a
-# hedge about the utterance. It is not a list of sentence exceptions. A lexical
-# word such as ``night`` or ``rains`` is outside the class, so that ``if`` stays.
-_DISCOURSE_PRONOUNS = frozenset({"i", "we", "you", "that", "this", "it"})
-_DISCOURSE_FUNCTION = _DISCOURSE_PRONOUNS | frozenset({
-    "can", "could", "may", "might", "possible", "possibly",
-    "make", "makes", "made", "sense",
-    "know", "knew", "see", "saw", "help", "helps", "helped",
-    "want", "wanted", "like", "liked", "follow", "follows",
-    "understand", "understands", "okay", "ok", "right", "please",
-    "mean", "means", "meant", "what", "me", "my", "your", "our",
-    "just", "really", "actually", "so", "then", "a", "an", "the",
-    "to", "of", "is", "are", "am", "be", "been", "was", "were",
-    "get", "got", "do", "does", "did",
+# Unambiguous meta-discourse, matched as a whole span. A substantive verb such
+# as help or understand is not in this set: ``if you help`` can be a real
+# condition, so it is preserved. This is not a whitelist of function words.
+_DISCOURSE_ASIDES = frozenset({
+    "if possible",
+    "if i can",
+    "if we can",
+    "if you can",
+    "if i could",
+    "if we could",
+    "if you could",
+    "if i may",
+    "if we may",
+    "if you may",
+    "if i might",
+    "if that makes sense",
+    "if this makes sense",
+    "if it makes sense",
+    "if that made sense",
+    "if this made sense",
+    "if you know what i mean",
+    "if you see what i mean",
+    "if that is okay",
+    "if that is ok",
+    "if that's okay",
+    "if that's ok",
+    "if this is okay",
 })
 _ASIDE_BOUNDARY_RE = re.compile(r",|;|\u2014|—|--")
 # A noun phrase can contain ``if`` without making the link conditional.
@@ -712,28 +724,17 @@ def _claim_clause(folded: str, from_terms: set[str], to_terms: set[str]) -> str:
 
 
 def _discourse_aside_text(text: str) -> bool:
-    """True when ``text`` is only a discourse hedge, not a condition on the link.
+    """True when ``text`` is an unambiguous discourse hedge, not a condition.
 
-    The span must not contain a link connector. ``if possible`` is a hedge.
-    Otherwise the subject is a discourse pronoun and every following word is in
-    the discourse class. ``if the night is long`` and ``if it rains`` are not.
+    The span must be one of the closed phrases, such as ``if that makes sense``,
+    ``if I can``, or ``if possible``. ``if you help``, ``if you understand``,
+    ``if it rains``, and ``if the night is long`` are not in that set. An
+    ambiguous condition is preserved.
     """
     folded = _norm(text).strip(" ,;()—-.")
-    # Membership in the discourse class is the test. A link verb such as
-    # ``makes`` can also be a connector, and ``makes sense`` is still a hedge.
-    # A lexical conditional has a word outside the class, so it is not stripped.
     if not folded:
         return False
-    match = re.search(r"\bif\b", folded)
-    if not match or folded[: match.start()].strip():
-        return False
-    after = folded[match.end() :].strip(" .!?")
-    if after == "possible":
-        return True
-    tokens = [token.strip(".,!?") for token in after.split() if token.strip(".,!?")]
-    if not tokens or tokens[0] not in _DISCOURSE_PRONOUNS:
-        return False
-    return all(token in _DISCOURSE_FUNCTION for token in tokens)
+    return folded in _DISCOURSE_ASIDES
 
 
 def _strip_discourse_asides(folded: str) -> str:
@@ -763,14 +764,16 @@ def _conditional_governs_link(clause: str) -> bool:
     """True when a conditional governs the from-to link in ``clause``.
 
     ``if`` inside a noun phrase such as ``part of why ... if ...`` does not.
-    A discourse aside does not: a parenthetical or comma-bounded hedge whose
-    subject is a discourse pronoun and whose words stay in that class, such as
-    ``if that makes sense`` or ``if I can``. Stripping that aside does not
-    remove a lexical conditional elsewhere in the sentence. ``if the night is
-    long`` stays. ``if`` before the connector, or a condition after the
-    connector that is not inside that noun phrase, does. ``would`` and reported
-    speech stay hypothetical markers. The reading is still provisional: this is
-    a closed pattern, not a parse of the sentence.
+    An unambiguous discourse aside does not: a parenthetical or comma-bounded
+    span that is exactly ``if that makes sense``, ``if I can``, ``if possible``,
+    or another phrase in that closed set. Stripping that aside does not remove
+    a conditional elsewhere in the sentence. ``if you help``, ``if you
+    understand``, ``if it rains``, and ``if the night is long`` stay. A
+    condition the aside list does not name is preserved, including when it
+    could also be read as a hedge. ``if`` before the connector, or a condition
+    after the connector that is not inside that noun phrase, does govern the
+    link. ``would`` and reported speech stay hypothetical markers. The reading
+    is still provisional: this is a closed pattern, not a parse of the sentence.
     """
     folded = _norm(clause)
     if not folded:
@@ -837,11 +840,13 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
     existential-negation marker before that connector is unsupported and does
     not authorize tier 3. ``would`` and ``someone said`` are hypothetical.
     ``if`` is hypothetical only when it governs this from-to link. An ``if``
-    inside a noun phrase, or a discourse aside such as ``if that makes sense``
-    or ``if I can``, is not. A lexical conditional in the same sentence stays.
-    Anything else that is not one clear pattern stays
-    unvalidated. This is not a general reading of the sentence. Every reading
-    stays provisional until it is checked on natural-language data.
+    inside a noun phrase, or an unambiguous discourse aside such as ``if that
+    makes sense`` or ``if I can``, is not. ``if you help`` and ``if you
+    understand`` are preserved. A lexical conditional in the same sentence
+    stays. A preserved condition does not authorize tier 3. Anything else that
+    is not one clear pattern stays unvalidated. This is not a general reading
+    of the sentence. Every reading stays provisional until it is checked on
+    natural-language data.
     """
     folded = _norm(text)
     if not folded:
@@ -934,6 +939,19 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
         qualifications.append("participant_link_ambiguous")
     elif status == "unsupported":
         qualifications.append("participant_link_unsupported")
+    stripped = _strip_discourse_asides(folded)
+    aside_removed = bool(re.search(r"\bif\b", folded)) and not re.search(r"\bif\b", stripped)
+    if hypothetical or status == "hypothetical":
+        conditional_scope = "preserved"
+    elif aside_removed:
+        conditional_scope = "discourse_aside"
+    else:
+        conditional_scope = None
+    # A preserved condition is provisional. It does not authorize tier 3, even
+    # when the rest of the sentence would have been a clear from-to link.
+    authorizes_tier_3 = (
+        status == "validated" and not hypothetical and conditional_scope != "preserved"
+    )
     return {
         "link_text": str(text).strip(),
         "stated_direction": direction,
@@ -945,7 +963,8 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
         "reading_basis": READING_BASIS,
         "reading_provisional": True,
         "qualifications": qualifications,
-        "authorizes_tier_3": status == "validated",
+        "conditional_scope": conditional_scope,
+        "authorizes_tier_3": authorizes_tier_3,
     }
 
 

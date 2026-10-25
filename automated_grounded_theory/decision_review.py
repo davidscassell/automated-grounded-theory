@@ -51,7 +51,7 @@ class ClaimDecisions(BaseModel):
 
 # Locked on the focused and axial procedure manifests. A checkpoint saved
 # before this value existed cannot resume into a chunked review.
-DECISION_REVIEW_CHUNKING = "request_budget_v5"
+DECISION_REVIEW_CHUNKING = "request_budget_v6"
 INCOMPLETE_REVIEW_APPLICATION = "withhold_incomplete_v1"
 ELIGIBILITY_RULE = "row_gates_components_v1"
 LINK_DENIAL_RULE = "frequency_before_rejection_v1"
@@ -64,8 +64,9 @@ OVERSIZED_RECOVERY = "compact_then_human_v1"
 FOCUS_ENDPOINT_RULE = "unreviewed_endpoint_v1"
 # Overlapping diagnostic reasons, plus one documented primary cause.
 WITHHOLDING_CAUSE_RULE = "overlapping_reasons_v1"
-# A discourse aside does not govern the from-to link. A real conditional does.
-CONDITIONAL_SCOPE_RULE = "discourse_aside_v1"
+# A closed set of discourse hedges does not govern the from-to link.
+# An ambiguous or genuine condition is preserved and does not authorize tier 3.
+CONDITIONAL_SCOPE_RULE = "ambiguous_condition_preserved_v1"
 # A focused selection whose plan exceeds the call allowance or the token
 # allowance stops before the first request. Auto-sizing raises only the call
 # allowance. It does not raise the token allowance, and it does not mean the
@@ -78,8 +79,15 @@ CHUNK_REVIEW_RECOVERY = "reuse_validated_v1"
 SELECTION_CHUNK_ORDER_ID = "id"
 SELECTION_CHUNK_ORDER_SHUFFLE = "seeded_shuffle"
 SELECTION_CHUNK_ORDERS = (SELECTION_CHUNK_ORDER_ID, SELECTION_CHUNK_ORDER_SHUFFLE)
-# Optional pass over provisionally raised and near-miss codes. Off unless set.
-SELECTION_CONSOLIDATION = "cross_chunk_v1"
+# Optional budgeted pass over provisionally raised and near-miss codes. Off unless set.
+# One request never exceeds the per-request token budget. One call is reserved for it.
+SELECTION_CONSOLIDATION = "budgeted_cross_chunk_v1"
+CONSOLIDATION_CALLS_RESERVED = 1
+CONSOLIDATION_BUDGET_RULE = "reserved_request_budget_v1"
+# A failed context review is unknown. It is not a decision that the code was not raised.
+CONTEXT_SENSITIVITY_RULE = "failures_unknown_v1"
+# Eligibility is compared on statements present in both runs. Additions stay separate.
+ELIGIBILITY_COMPARISON_RULE = "matched_statements_v1"
 # tokens_required is input-only. Output tokens and a retry margin are not added.
 TOKEN_ESTIMATE_INCLUDES_OUTPUT_TOKENS = False
 TOKEN_ESTIMATE_INCLUDES_RETRY_OR_REPAIR_MARGIN = False
@@ -109,7 +117,8 @@ CHUNK_CONTEXT_NOTE = (
     "and near-miss codes. It is off unless the caller sets it, and setting it is a decision."
 )
 # Identical statements for one directed pair are one assertion.
-DUPLICATE_ASSERTION_RULE = "merge_identical_statement_v1"
+# Counterexamples, qualifications, and review history are kept before reassessment.
+DUPLICATE_ASSERTION_RULE = "merge_identical_statement_v2"
 # Decision-call ceilings are shared by named steps. Each step records its own use.
 BUDGET_LEDGER_RULE = "shared_review_ledger_v1"
 # Gate export and run export read one relationship assessment.
@@ -140,6 +149,9 @@ CHUNKING_CHECKPOINT_MESSAGE = (
     "focused endpoints, overlapping withholding reasons, discourse-aside "
     "conditionals, duplicate-assertion merge, the shared review ledger, the "
     "shared export assessment, validated-chunk recovery, or the chunk-allowance stop used the 0.9.28 rules, "
+    "or before preserved conditions, evidence-preserving duplicate merge, "
+    "budgeted selection consolidation, unknown failed context reviews, and "
+    "matched eligibility comparison used the 0.9.29 rules, "
     "or the stored chunk plan does not match this resume. Resume cannot continue "
     "that review. Start a new run."
 )
@@ -557,12 +569,12 @@ def apply_selection_compaction(
 
 
 def review_procedure_fields() -> dict[str, str]:
-    """Procedure fingerprint for 0.9.28 review rules.
+    """Procedure fingerprint for 0.9.29 review rules.
 
     The chunk partition is separate from the call and token ceilings. A higher
     ceiling can continue the same chunks. A different partition cannot.
     ``auto_size_decision_calls`` is a caller decision and is not one of these
-    constants. A 0.9.27 checkpoint is missing these values and cannot resume.
+    constants. A 0.9.28 checkpoint is missing these values and cannot resume.
     """
     return {
         "decision_review_chunking": DECISION_REVIEW_CHUNKING,
@@ -581,6 +593,9 @@ def review_procedure_fields() -> dict[str, str]:
         "budget_ledger_rule": BUDGET_LEDGER_RULE,
         "export_assessment_rule": EXPORT_ASSESSMENT_RULE,
         "chunk_review_recovery": CHUNK_REVIEW_RECOVERY,
+        "consolidation_budget_rule": CONSOLIDATION_BUDGET_RULE,
+        "context_sensitivity_rule": CONTEXT_SENSITIVITY_RULE,
+        "eligibility_comparison_rule": ELIGIBILITY_COMPARISON_RULE,
     }
 
 
@@ -1108,7 +1123,10 @@ async def measure_chunk_context_sensitivity(
 ) -> dict[str, Any]:
     """Review one code beside each companion group and report if its selection changes.
 
-    The caller supplies the reviewer. This helper does not choose a paid model.
+    A missing parse or an audit status of ``error`` is unknown. It is not a
+    decision that the code was left unraised. ``selection_changed`` uses only
+    reviews whose ``code_raised`` is a boolean. The caller supplies the
+    reviewer. This helper does not choose a paid model.
     """
     target = str(code_id)
     outcomes = []
@@ -1118,19 +1136,51 @@ async def measure_chunk_context_sensitivity(
             if item and item not in ids:
                 ids.append(item)
         payload = selection_payload(state, ids, chunk_index=0, chunk_count=1)
-        parsed, audit = await reviewer.decide(payload, SelectionDecision, {})
-        raised = [str(item) for item in ((parsed or {}).get("raised_code_ids") or [])]
+        # The caller named these companions. A code that is not in the codebook
+        # still has to be visible, or a failed review of that companion cannot
+        # be told apart from a review that never saw it.
+        present = {str(row.get("code_id") or "") for row in (payload.get("codes") or [])}
+        for item in ids:
+            if item in present:
+                continue
+            payload["codes"].append({
+                "code_id": item,
+                "code": item,
+                "definition": item,
+                "evidence_sample": [],
+            })
+            present.add(item)
+        review_chunk = payload.get("review_chunk")
+        if isinstance(review_chunk, dict):
+            review_chunk["code_ids"] = [str(row.get("code_id") or "") for row in payload["codes"]]
+        call_metadata: dict[str, Any] = {}
+        parsed, audit = await reviewer.decide(payload, SelectionDecision, call_metadata)
+        audit_status = audit.get("status") if isinstance(audit, Mapping) else None
+        failed = parsed is None or audit_status == "error"
+        if failed:
+            code_raised = None
+            status = audit_status or "error"
+            raised: list[str] = []
+        else:
+            raised = [str(item) for item in (parsed.get("raised_code_ids") or [])]
+            code_raised = target in set(raised)
+            status = audit_status
         outcomes.append({
             "companions": [str(item) for item in companions],
-            "code_raised": target in set(raised),
+            "code_raised": code_raised,
+            "status": status,
             "raised_code_ids": raised,
             "prompt_hash": None if not isinstance(audit, Mapping) else audit.get("prompt_hash"),
+            "decision_stop": call_metadata.get("decision_stop"),
         })
-    flags = [bool(row["code_raised"]) for row in outcomes]
+    flags = [row["code_raised"] for row in outcomes if isinstance(row["code_raised"], bool)]
     return {
         "code_id": target,
         "outcomes": outcomes,
-        "selection_changed": len(set(flags)) > 1,
+        "selection_changed": None if len(flags) < 2 else len(set(flags)) > 1,
+        "reviews_attempted": len(outcomes),
+        "reviews_successful": len(flags),
+        "context_sensitivity_rule": CONTEXT_SENSITIVITY_RULE,
         "chunk_context_note": CHUNK_CONTEXT_NOTE,
     }
 
@@ -1295,6 +1345,17 @@ def finish_decision_report(progress: Mapping[str, Any]) -> dict[str, Any]:
             if progress.get("claim_review_calls_reserved") is None
             else int(progress.get("claim_review_calls_reserved") or 0)
         ),
+        "consolidation_calls_reserved": (
+            None
+            if progress.get("consolidation_calls_reserved") is None
+            else int(progress.get("consolidation_calls_reserved") or 0)
+        ),
+        "consolidation_request_budget": (
+            None
+            if progress.get("consolidation_request_budget") is None
+            else int(progress.get("consolidation_request_budget") or 0)
+        ),
+        "selection_consolidation_status": progress.get("selection_consolidation_status"),
         "focused_review_tokens_required": (
             None
             if progress.get("focused_review_tokens_required") is None
@@ -1368,12 +1429,12 @@ def merge_core_nominations(
 
 
 def same_chunking_fingerprint(saved: Any, current: Any) -> bool:
-    """True when the resume carries the current chunking and 0.9.28 rules.
+    """True when the resume carries the current chunking and 0.9.29 rules.
 
     A missing key fails. ``allow_changes`` is not consulted here, so an older
     checkpoint cannot continue by ignoring the new quote, denial, recovery,
-    endpoint, cause, conditional, duplicate, ledger, assessment, or
-    chunk-allowance rule.
+    endpoint, cause, conditional, duplicate, ledger, assessment,
+    chunk-allowance, consolidation, context-sensitivity, or eligibility rule.
     """
     if not isinstance(saved, Mapping) or not isinstance(current, Mapping):
         return False
@@ -1390,6 +1451,9 @@ def same_chunking_fingerprint(saved: Any, current: Any) -> bool:
         "budget_ledger_rule": BUDGET_LEDGER_RULE,
         "export_assessment_rule": EXPORT_ASSESSMENT_RULE,
         "chunk_review_recovery": CHUNK_REVIEW_RECOVERY,
+        "consolidation_budget_rule": CONSOLIDATION_BUDGET_RULE,
+        "context_sensitivity_rule": CONTEXT_SENSITIVITY_RULE,
+        "eligibility_comparison_rule": ELIGIBILITY_COMPARISON_RULE,
     }
     for key, required in expected.items():
         saved_value = str(saved.get(key) or "")

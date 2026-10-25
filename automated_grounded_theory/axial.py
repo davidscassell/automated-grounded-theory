@@ -217,6 +217,9 @@ _PROCEDURE_KEYS = (
     "budget_ledger_rule",
     "export_assessment_rule",
     "chunk_review_recovery",
+    "consolidation_budget_rule",
+    "context_sensitivity_rule",
+    "eligibility_comparison_rule",
 )
 _LOCKED_KEYS = frozenset({"seed", "source_hash"})
 
@@ -5445,30 +5448,158 @@ def _quote_identity(item: Mapping[str, Any]) -> tuple[str, str, str]:
     )
 
 
+_QUALIFICATION_FLAGS = frozenset({
+    "relationship_qualified",
+    "absence_is_not_contradiction",
+    "frequency_qualified",
+    "frequency_negation",
+    "participant_denies_link",
+    "participant_link_contested",
+    "negation_does_not_reject_link",
+    "participant_direction_reversed",
+    "participant_link_hedged",
+    "participant_link_not_a_relationship",
+    "participant_direction_unspecified",
+    "participant_link_hypothetical",
+    "participant_link_ambiguous",
+    "participant_link_unsupported",
+})
+_EVIDENCE_LISTS = (
+    "counterexamples",
+    "variation_cases",
+    "negative_cases",
+    "review_history",
+    "claim_revision_history",
+    "validation_revision_history",
+)
+_NOTE_FIELDS = (
+    "qualification_reason",
+    "variation_note",
+    "condition_note",
+    "contradiction_note",
+)
+
+
+def _canonical_record(item: Mapping[str, Any]) -> str:
+    return json.dumps(dict(item), sort_keys=True, ensure_ascii=False, default=str)
+
+
+def _copy_maps(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return []
+    return [dict(item) for item in value if isinstance(item, Mapping)]
+
+
+def _union_maps(rows: Sequence[Mapping[str, Any]], field: str) -> list[dict[str, Any]]:
+    found: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        for item in _copy_maps(row.get(field)):
+            found.setdefault(_canonical_record(item), item)
+    return [found[key] for key in sorted(found)]
+
+
+def _qualification_flags(row: Mapping[str, Any]) -> list[str]:
+    flags = {
+        str(item)
+        for item in (row.get("flags") or [])
+        if str(item) in _QUALIFICATION_FLAGS
+    }
+    extra = row.get("qualifications")
+    if isinstance(extra, Sequence) and not isinstance(extra, (str, bytes)):
+        flags.update(str(item) for item in extra if str(item))
+    reason = str(row.get("qualification_reason") or "").strip()
+    if reason in _QUALIFICATION_FLAGS:
+        flags.add(reason)
+    return sorted(flags)
+
+
+def _union_flags(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    flags: set[str] = set()
+    for row in rows:
+        flags.update(str(item) for item in (row.get("flags") or []) if str(item))
+        flags.update(_qualification_flags(row))
+    return sorted(flags)
+
+
+def _union_notes(rows: Sequence[Mapping[str, Any]], field: str) -> list[str]:
+    notes = {
+        str(row.get(field) or "").strip()
+        for row in rows
+        if str(row.get(field) or "").strip()
+    }
+    return sorted(notes)
+
+
+def _evidence_signature(row: Mapping[str, Any]) -> str:
+    payload = {
+        "evidence_tier": row.get("evidence_tier"),
+        "disposition": str(row.get("disposition") or ""),
+        "reviewer_disposition": str(row.get("reviewer_disposition") or ""),
+        "qualification_flags": _qualification_flags(row),
+        "qualification_reason": str(row.get("qualification_reason") or ""),
+    }
+    for field in _EVIDENCE_LISTS:
+        payload[field] = [_canonical_record(item) for item in _copy_maps(row.get(field))]
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def _provenance_snapshot(row: Mapping[str, Any]) -> dict[str, Any]:
+    notes = {
+        field: (str(row.get(field) or "").strip() or None)
+        for field in _NOTE_FIELDS
+    }
+    return {
+        "relationship_id": str(row.get("relationship_id") or ""),
+        "evidence_tier": row.get("evidence_tier"),
+        "disposition": row.get("disposition"),
+        "reviewer_disposition": row.get("reviewer_disposition"),
+        "passage_id": row.get("passage_id"),
+        "quote": row.get("quote"),
+        "counterexamples": _copy_maps(row.get("counterexamples")),
+        "variation_cases": _copy_maps(row.get("variation_cases")),
+        "negative_cases": _copy_maps(row.get("negative_cases")),
+        "qualification_flags": _qualification_flags(row),
+        "qualification_reason": notes["qualification_reason"],
+        "variation_note": notes["variation_note"],
+        "condition_note": notes["condition_note"],
+        "contradiction_note": notes["contradiction_note"],
+        "review_history": _copy_maps(row.get("review_history")),
+        "claim_revision_history": _copy_maps(row.get("claim_revision_history")),
+        "validation_revision_history": _copy_maps(row.get("validation_revision_history")),
+    }
+
+
 def _assertion_provenance(row: Mapping[str, Any]) -> list[dict[str, Any]]:
     prior = row.get("assertion_provenance")
-    if isinstance(prior, list) and prior:
+    if row.get("merged_relationship_ids") and isinstance(prior, list) and prior:
         return [dict(item) for item in prior if isinstance(item, Mapping)]
-    return [
-        {
-            "relationship_id": str(row.get("relationship_id") or ""),
-            "evidence_tier": row.get("evidence_tier"),
-            "disposition": row.get("disposition"),
-            "reviewer_disposition": row.get("reviewer_disposition"),
-            "passage_id": row.get("passage_id"),
-            "quote": row.get("quote"),
-        }
-    ]
+    return [_provenance_snapshot(row)]
+
+
+def _apply_note_union(base: dict[str, Any], rows: Sequence[Mapping[str, Any]], field: str) -> None:
+    notes = _union_notes(rows, field)
+    plural = f"{field}s"
+    base[plural] = notes
+    if len(notes) == 1:
+        base[field] = notes[0]
+    elif notes:
+        base[field] = " | ".join(notes)
+    else:
+        base[field] = ""
 
 
 def consolidate_duplicate_assertions(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """One row per identical statement on a directed pair.
 
-    The kept id is the lowest relationship id. Quotes are unioned. The tier is
-    not copied from the highest input: the caller reassesses the merged quotes.
-    ``conflicting_evidence`` is the provenance list when the pre-merge tiers or
-    dispositions differ, and null otherwise. An empty statement is not merged.
-    A different statement, or the opposite direction, stays its own row.
+    The kept id is the lowest relationship id. Supporting quotes are unioned.
+    Counterexamples, variation cases, negative cases, qualification flags, and
+    review histories are unioned before the caller reassesses the merged
+    quotes. Which id is lowest does not change that evidence. Provenance keeps
+    each source row's evidence and review history. ``conflicting_evidence`` is
+    that provenance when the pre-merge tiers, dispositions, or that evidence
+    differ, and null otherwise. An empty statement is not merged. A different
+    statement, or the opposite direction, stays its own row. The tier is not
+    copied from the highest input.
     """
     order: list[tuple] = []
     groups: dict[tuple, list[dict[str, Any]]] = {}
@@ -5515,12 +5646,16 @@ def consolidate_duplicate_assertions(rows: Sequence[Mapping[str, Any]]) -> list[
                     continue
                 seen.add(identity)
                 quotes.append(quote)
+        for field in _EVIDENCE_LISTS:
+            base[field] = _union_maps(ordered, field)
+        base["flags"] = _union_flags(ordered)
+        for field in _NOTE_FIELDS:
+            _apply_note_union(base, ordered, field)
         base["case_quotes"] = quotes
         base["assertion_provenance"] = provenance
         base["merged_relationship_ids"] = [str(item.get("relationship_id") or "") for item in provenance]
-        tiers = {item.get("evidence_tier") for item in provenance}
-        dispositions = {str(item.get("disposition") or "") for item in provenance}
-        base["conflicting_evidence"] = list(provenance) if len(tiers) > 1 or len(dispositions) > 1 else None
+        conflict = len({_evidence_signature(item) for item in ordered}) > 1
+        base["conflicting_evidence"] = list(provenance) if conflict else None
         merged.append(base)
     return merged
 
