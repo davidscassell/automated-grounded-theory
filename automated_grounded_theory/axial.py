@@ -61,6 +61,7 @@ from automated_grounded_theory.decision_review import (
     merge_core_nominations,
     note_chunk_send,
     close_budget_step,
+    note_token_preflight,
     open_budget_step,
     prompt_hash,
     review_procedure_fields,
@@ -115,6 +116,11 @@ from automated_grounded_theory.version import __version__
 
 logger = logging.getLogger("automated_grounded_theory")
 
+# The number stays 24000. From 0.9.32 it is the token allowance of each
+# decision step (relation review, saturation review, and core selection),
+# not one pool those steps share. Coding, counterexamples, memos, and the
+# storyline keep a separate pool of the same number. A run can spend one
+# allowance on each decision step. That change of meaning is a decision.
 DEFAULT_MAX_AXIAL_REVIEW_TOKENS = 24000
 DEFAULT_AXIAL_TOKEN_BUDGET = 6000
 _AXIAL_EXPORT_NAMES = (
@@ -215,6 +221,9 @@ _PROCEDURE_KEYS = (
     "chunk_allowance_rule",
     "duplicate_assertion_rule",
     "budget_ledger_rule",
+    "decision_token_scope",
+    "case_count_rule",
+    "reread_estimate_rule",
     "export_assessment_rule",
     "chunk_review_recovery",
 )
@@ -3217,7 +3226,11 @@ def _axial_token_plan(
         "changes_default": False,
         "note": (
             "Planning estimate only. max_axial_review_tokens is unchanged. "
-            "The package default remains 24000. The estimate uses pairs in this round. "
+            "The package default remains 24000. This plan compares proposal, "
+            "counterexample, memo, and storyline calls with that number as their "
+            "shared pool. Relation review, saturation review, and core selection "
+            "each have their own allowance of the same number and are not in this estimate. "
+            "The estimate uses pairs in this round. "
             "pool_estimate is the raw full-pool figure and is not a cap warning."
         ),
     }
@@ -3244,6 +3257,47 @@ def _decision_step_calls(runtime: AxialRuntime, step: str) -> int:
     if allowance is None:
         return 0
     return int(allowance.stage_used.get(step, 0))
+
+
+def _decision_step_tokens(runtime: AxialRuntime, step: str) -> int:
+    """Tokens already charged to this decision step, not to another step."""
+    allowance = getattr(getattr(runtime, "limiter", None), "provider_allowance", None)
+    if allowance is None:
+        return 0
+    return int(getattr(allowance, "stage_tokens_used", {}).get(step, 0))
+
+
+def _decision_step_token_ceiling(runtime: AxialRuntime, step: str) -> int | None:
+    allowance = getattr(getattr(runtime, "limiter", None), "provider_allowance", None)
+    if allowance is None:
+        return None
+    ceilings = getattr(allowance, "stage_token_ceilings", {}) or {}
+    if step not in ceilings:
+        return int(getattr(getattr(runtime, "reviewer", None), "max_tokens", 0) or 0)
+    ceiling = ceilings.get(step)
+    return None if ceiling is None else int(ceiling)
+
+
+def _note_decision_token_preflight(
+    runtime: AxialRuntime,
+    metadata: dict[str, Any],
+    step: str,
+    chunks: Sequence[Sequence[str]],
+    estimate,
+) -> None:
+    """Required versus available for this step, before it spends."""
+    required = 0
+    for chunk in chunks:
+        ids = [str(item) for item in chunk]
+        if ids:
+            required += int(estimate(ids))
+    note_token_preflight(
+        metadata,
+        step=step,
+        token_allowance=_decision_step_token_ceiling(runtime, step),
+        starting_tokens=_decision_step_tokens(runtime, step),
+        tokens_required=required,
+    )
 
 
 def _align_step_calls(runtime: AxialRuntime, metadata: Mapping[str, Any], step: str) -> int:
@@ -3309,10 +3363,15 @@ def _sync_allowance(metadata: dict[str, Any], runtime: AxialRuntime) -> None:
     }
     step_names = ("axial_relation_review", "axial_saturation_review", "axial_core_review")
     if any(name in allowance.stage_ceilings for name in step_names):
-        # Each decision step has its own call ceiling. The total is the sum of
-        # those steps. It is not one pool that an earlier step can exhaust.
+        # Each decision step has its own call ceiling and its own token ceiling.
+        # The totals are sums. An earlier step does not reduce a later step.
         metadata["decision_calls_used"] = sum(int(allowance.stage_used.get(name, 0)) for name in step_names)
-        metadata["decision_tokens_used"] = allowance.tokens_estimated
+        if any(name in getattr(allowance, "stage_token_ceilings", {}) for name in step_names):
+            metadata["decision_tokens_used"] = sum(
+                int(getattr(allowance, "stage_tokens_used", {}).get(name, 0)) for name in step_names
+            )
+        else:
+            metadata["decision_tokens_used"] = allowance.tokens_estimated
         budget = metadata.get("provider_budget") if isinstance(metadata.get("provider_budget"), dict) else None
         if budget is not None:
             stages = dict(budget.get("stages") or {})
@@ -4901,6 +4960,13 @@ async def _advance_relation_review(
     )
     progress = load_chunk_progress(metadata, plan)
     _drop_cleared_allowance_stops(metadata, progress)
+    _note_decision_token_preflight(
+        runtime,
+        metadata,
+        "axial_relation_review",
+        list(progress.get("chunks") or [])[int(progress.get("next_index") or 0):],
+        estimate,
+    )
 
     def _apply(progress_row: dict) -> list[dict]:
         decisions = [dict(item) for item in (progress_row.get("decisions") or []) if isinstance(item, Mapping)]
@@ -4928,6 +4994,7 @@ async def _advance_relation_review(
             progress_row,
             "axial_relation_review",
             usage=_decision_step_calls(runtime, "axial_relation_review"),
+            token_usage=_decision_step_tokens(runtime, "axial_relation_review"),
         )
         report = finish_decision_report(progress_row)
         store_decision_report(metadata, report)
@@ -5680,8 +5747,7 @@ def _saturation_checkpoint(runtime: AxialRuntime):
                 shared_with=SHARED_REVIEW_STEPS,
                 usage=saturation_used,
             )
-            parsed, audit = await runtime.reviewer.decide(
-                {
+            saturation_payload = {
                     "kind": "axial_saturation_review",
                     "indicators": {
                         "last_document_new_code_rate": report.get("last_document_new_code_rate"),
@@ -5718,7 +5784,16 @@ def _saturation_checkpoint(runtime: AxialRuntime):
                             "Your assessment is a model judgment and does not set judgment."
                         ),
                     },
-                },
+            }
+            _note_decision_token_preflight(
+                runtime,
+                metadata,
+                "axial_saturation_review",
+                [["saturation"]],
+                lambda _ids: runtime.reviewer.refusal_reason(saturation_payload, ModelSaturationDecision, metadata)[1],
+            )
+            parsed, audit = await runtime.reviewer.decide(
+                saturation_payload,
                 ModelSaturationDecision,
                 metadata,
             )
@@ -5732,6 +5807,7 @@ def _saturation_checkpoint(runtime: AxialRuntime):
                 step="axial_saturation_review",
                 stop_reason=None if parsed else str(metadata.get("decision_stop") or "") or None,
                 usage=_decision_step_calls(runtime, "axial_saturation_review"),
+                token_usage=_decision_step_tokens(runtime, "axial_saturation_review"),
             )
             if parsed:
                 reading = pair_coverage_reading(
@@ -6038,6 +6114,13 @@ async def _advance_core_review(
     )
     progress = load_chunk_progress(metadata, plan)
     _drop_cleared_allowance_stops(metadata, progress)
+    _note_decision_token_preflight(
+        runtime,
+        metadata,
+        "axial_core_review",
+        list(progress.get("chunks") or [])[int(progress.get("next_index") or 0):],
+        estimate,
+    )
 
     def _finish_choice(progress_row: dict, warnings: list[str]) -> dict:
         progress_row["open"] = False
@@ -6048,6 +6131,7 @@ async def _advance_core_review(
             progress_row,
             "axial_core_review",
             usage=_decision_step_calls(runtime, "axial_core_review"),
+            token_usage=_decision_step_tokens(runtime, "axial_core_review"),
         )
         report = finish_decision_report(progress_row)
         store_decision_report(metadata, report)
@@ -7783,8 +7867,15 @@ class AxialDecisionReviewer:
             audit["response"] = parsed
             audit["status"] = "validated"
             if shared is not None:
-                metadata["axial_tokens_estimated"] = shared.tokens_estimated
-                metadata["decision_tokens_used"] = shared.tokens_estimated
+                ceilings = getattr(shared, "stage_token_ceilings", {}) or {}
+                if stage in ceilings:
+                    by_tokens = dict(metadata.get("decision_tokens_by_step") or {})
+                    by_tokens[stage] = int(getattr(shared, "stage_tokens_used", {}).get(stage, 0))
+                    metadata["decision_tokens_by_step"] = by_tokens
+                    metadata["decision_tokens_used"] = sum(int(value) for value in by_tokens.values())
+                else:
+                    metadata["axial_tokens_estimated"] = shared.tokens_estimated
+                    metadata["decision_tokens_used"] = shared.tokens_estimated
             else:
                 metadata["decision_tokens_used"] = tokens + estimate
             return parsed, audit
@@ -7869,11 +7960,16 @@ def _runtime(
     stages: dict[str, int] = {}
     if coding_calls is not None:
         stages["coding"] = max(0, int(coding_calls))
+    stage_token_ceilings: dict[str, int] = {}
     if review_calls is not None:
-        # One ceiling per decision step. Relation review does not spend the
-        # calls reserved for saturation review or core selection.
+        # One call ceiling and one token ceiling per decision step. Relation
+        # review does not spend the calls or the tokens reserved for saturation
+        # review or core selection. max_review_tokens stays 24000 by default.
+        # It is each step's allowance, not one shared decision pool. Coding
+        # still uses the shared max_tokens pool of the same number.
         for name in ("axial_relation_review", "axial_saturation_review", "axial_core_review"):
             stages[name] = max(0, int(review_calls))
+            stage_token_ceilings[name] = max(0, int(max_review_tokens))
     if selective_call_ceiling is not None:
         stages["selective"] = max(0, int(selective_call_ceiling))
     allowance = ProviderAllowance(
@@ -7881,6 +7977,7 @@ def _runtime(
         tokens_estimated=max(0, int(tokens_already)),
         stages=stages or None,
         token_reserve=max(0, int(token_reserve)),
+        stage_token_ceilings=stage_token_ceilings or None,
     )
     runtime.limiter.provider_allowance = allowance
     if runtime.reviewer is not None:

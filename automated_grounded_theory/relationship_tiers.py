@@ -220,21 +220,34 @@ def allowed_wording(tier: int | None, n: int | None = None) -> str | None:
     return "verified within the recorded scope"
 
 
+_CASE_IDENTITY_KEYS = (
+    "respondent_id",
+    "participant_id",
+    "case_id",
+    "respondent",
+    "participant",
+)
+
+
 def case_id_of(passage: Mapping[str, Any] | None) -> str:
     """Respondent when the passage names one, otherwise the document.
 
-    Passages keep ``respondent_id`` on ``metadata``. A top-level id still wins.
-    Reading the metadata id collapses a respondent's question-documents into
-    one case, so a tier-2 count on a multi-question corpus gets stricter.
+    Identity is the first of ``respondent_id``, ``participant_id``,
+    ``case_id``, ``respondent``, or ``participant``. A top-level value wins
+    over metadata. ``respondent`` and ``participant`` are the names corpus
+    metadata already uses. Several quotes from one person are one case,
+    including after a duplicate merge, and in either relationship-id order.
+    Question-documents that share that identity do not each meet
+    ``pattern_min_cases``.
     """
     if not isinstance(passage, Mapping):
         return ""
-    for key in ("respondent_id", "participant_id", "case_id"):
+    for key in _CASE_IDENTITY_KEYS:
         value = str(passage.get(key) or "").strip()
         if value:
             return value
     metadata = passage.get("metadata") if isinstance(passage.get("metadata"), Mapping) else {}
-    for key in ("respondent_id", "participant_id", "case_id"):
+    for key in _CASE_IDENTITY_KEYS:
         value = str(metadata.get(key) or "").strip()
         if value:
             return value

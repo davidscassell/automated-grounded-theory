@@ -33,8 +33,8 @@ _LINK = "tools for the shift lead to coworkers on the crew"
 
 
 def test_version_keeps_the_request_budget_and_replaces_the_hedge_rule():
-    assert __version__ == "0.9.31"
-    assert POLICY_VERSION == "0.9.31"
+    assert __version__ == "0.9.32"
+    assert POLICY_VERSION == "0.9.32"
     assert DECISION_REVIEW_CHUNKING == "request_budget_v6"
     assert CONDITIONAL_SCOPE_RULE == "condition_scope_v1"
     current = review_procedure_fields()
