@@ -47,8 +47,8 @@ from automated_grounded_theory.schemas import CodeProposal, PassageCoding
 
 
 def test_version_is_0_6_11():
-    assert __version__ == "0.9.28"
-    assert POLICY_VERSION == "0.9.28"
+    assert __version__ == "0.9.29"
+    assert POLICY_VERSION == "0.9.29"
 
 
 def _coding(quote: str, label: str) -> dict:

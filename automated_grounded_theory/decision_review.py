@@ -51,7 +51,7 @@ class ClaimDecisions(BaseModel):
 
 # Locked on the focused and axial procedure manifests. A checkpoint saved
 # before this value existed cannot resume into a chunked review.
-DECISION_REVIEW_CHUNKING = "request_budget_v5"
+DECISION_REVIEW_CHUNKING = "request_budget_v6"
 INCOMPLETE_REVIEW_APPLICATION = "withhold_incomplete_v1"
 ELIGIBILITY_RULE = "row_gates_components_v1"
 LINK_DENIAL_RULE = "frequency_before_rejection_v1"
@@ -65,7 +65,7 @@ FOCUS_ENDPOINT_RULE = "unreviewed_endpoint_v1"
 # Overlapping diagnostic reasons, plus one documented primary cause.
 WITHHOLDING_CAUSE_RULE = "overlapping_reasons_v1"
 # A discourse aside does not govern the from-to link. A real conditional does.
-CONDITIONAL_SCOPE_RULE = "discourse_aside_v1"
+CONDITIONAL_SCOPE_RULE = "closed_hedge_v1"
 # A focused selection whose plan exceeds the call allowance or the token
 # allowance stops before the first request. Auto-sizing raises only the call
 # allowance. It does not raise the token allowance, and it does not mean the
@@ -109,7 +109,7 @@ CHUNK_CONTEXT_NOTE = (
     "and near-miss codes. It is off unless the caller sets it, and setting it is a decision."
 )
 # Identical statements for one directed pair are one assertion.
-DUPLICATE_ASSERTION_RULE = "merge_identical_statement_v1"
+DUPLICATE_ASSERTION_RULE = "merge_all_evidence_v1"
 # Decision-call ceilings are shared by named steps. Each step records its own use.
 BUDGET_LEDGER_RULE = "shared_review_ledger_v1"
 # Gate export and run export read one relationship assessment.
@@ -127,6 +127,11 @@ FOCUSED_REVIEW_STEPS = (
 )
 # Off unless the caller sets it. It is a decision, not an analytic default.
 AUTO_SIZE_DECISION_CALLS = False
+# A near miss shared a chunk with a raised code. The cap is not the whole book.
+CONSOLIDATION_NEAR_MISS_CAP = 8
+CONSOLIDATION_STATUS_ATTEMPTED = "attempted"
+CONSOLIDATION_STATUS_SKIPPED = "skipped"
+CONSOLIDATION_STATUS_COMPLETED = "completed"
 # Compaction shortens evidence before a code is omitted. Level 1 keeps one
 # short quote. Level 2 drops quotes. Level 3 also truncates the definition.
 SELECTION_COMPACTION_QUOTE_CHARS = 160
@@ -140,6 +145,8 @@ CHUNKING_CHECKPOINT_MESSAGE = (
     "focused endpoints, overlapping withholding reasons, discourse-aside "
     "conditionals, duplicate-assertion merge, the shared review ledger, the "
     "shared export assessment, validated-chunk recovery, or the chunk-allowance stop used the 0.9.28 rules, "
+    "or before duplicate merges kept every row's evidence, closed-list hedges, "
+    "budgeted consolidation, or the 0.9.29 rules, "
     "or the stored chunk plan does not match this resume. Resume cannot continue "
     "that review. Start a new run."
 )
@@ -516,6 +523,77 @@ def pack_decision_chunks(
     return {"chunks": chunks, "omissions": omissions, "ordered_ids": ordered}
 
 
+def rank_near_misses(
+    chunks: Sequence[Sequence[str]],
+    raised_ids: Sequence[str],
+    reviewed_ids: Sequence[str],
+    *,
+    cap: int = CONSOLIDATION_NEAR_MISS_CAP,
+) -> tuple[list[str], list[str]]:
+    """Reviewed codes that shared a chunk with a raise, ranked and capped.
+
+    A code that was reviewed and not raised, but never sat beside a raised
+    code, is not a near miss. The cap keeps the later request off the whole
+    codebook. Rank is how many raised chunks the code shared, then code id.
+    """
+    raised = {str(item) for item in raised_ids if str(item)}
+    shared: dict[str, int] = {}
+    for chunk in chunks:
+        ids = [str(item) for item in chunk if str(item)]
+        if not any(item in raised for item in ids):
+            continue
+        for item in ids:
+            if item in raised:
+                continue
+            shared[item] = shared.get(item, 0) + 1
+    seen: list[str] = []
+    for item in reviewed_ids:
+        text = str(item)
+        if text in shared and text not in seen:
+            seen.append(text)
+    seen.sort(key=lambda item: (-shared[item], item))
+    limit = max(0, int(cap))
+    return seen[:limit], seen[limit:]
+
+
+def consolidation_allowance_reserve(
+    ids: Sequence[str],
+    estimate: Callable[[Sequence[str]], int],
+    *,
+    per_request: int,
+) -> dict[str, int]:
+    """Calls and input tokens a budgeted consolidation of ``ids`` would use.
+
+    The plan packs the ids under ``per_request``, then one synthesis pass when
+    that packing takes more than one request. It is an upper bound for the
+    preflight, not a dollar bound.
+    """
+    packed = pack_decision_chunks(
+        ids,
+        estimate,
+        per_request=per_request,
+        omit_reason="single_code_exceeds_request_budget",
+    )
+    chunks = [list(chunk) for chunk in (packed.get("chunks") or []) if chunk]
+    tokens = sum(int(estimate(chunk)) for chunk in chunks)
+    synthesis_calls = 0
+    if len(chunks) > 1:
+        representatives = [chunk[0] for chunk in chunks]
+        synthesis = pack_decision_chunks(
+            representatives,
+            estimate,
+            per_request=per_request,
+            omit_reason="single_code_exceeds_request_budget",
+        )
+        synthesis_chunks = [list(chunk) for chunk in (synthesis.get("chunks") or []) if chunk]
+        synthesis_calls = len(synthesis_chunks)
+        tokens += sum(int(estimate(chunk)) for chunk in synthesis_chunks)
+    return {
+        "consolidation_calls_reserved": len(chunks) + synthesis_calls,
+        "consolidation_tokens_reserved": tokens,
+    }
+
+
 def apply_selection_compaction(
     codes: Sequence[Mapping[str, Any]],
     compaction: Mapping[str, int] | None,
@@ -557,7 +635,7 @@ def apply_selection_compaction(
 
 
 def review_procedure_fields() -> dict[str, str]:
-    """Procedure fingerprint for 0.9.28 review rules.
+    """Procedure fingerprint for the 0.9.29 review rules.
 
     The chunk partition is separate from the call and token ceilings. A higher
     ceiling can continue the same chunks. A different partition cannot.
@@ -1108,7 +1186,10 @@ async def measure_chunk_context_sensitivity(
 ) -> dict[str, Any]:
     """Review one code beside each companion group and report if its selection changes.
 
-    The caller supplies the reviewer. This helper does not choose a paid model.
+    A missing parse or a raised error is unknown. It is not an empty selection.
+    ``selection_changed`` is computed only from validated reviews, and it is
+    null when fewer than two of those reviews succeeded. The caller supplies
+    the reviewer. This helper does not choose a paid model.
     """
     target = str(code_id)
     outcomes = []
@@ -1118,19 +1199,47 @@ async def measure_chunk_context_sensitivity(
             if item and item not in ids:
                 ids.append(item)
         payload = selection_payload(state, ids, chunk_index=0, chunk_count=1)
-        parsed, audit = await reviewer.decide(payload, SelectionDecision, {})
-        raised = [str(item) for item in ((parsed or {}).get("raised_code_ids") or [])]
+        status = "error"
+        error = None
+        parsed = None
+        audit: Any = None
+        try:
+            parsed, audit = await reviewer.decide(payload, SelectionDecision, {})
+        except Exception as exc:
+            error = str(exc)
+            parsed = None
+        raised: list[str] | None = None
+        code_raised = None
+        if error is None:
+            audit_status = str(audit.get("status") or "") if isinstance(audit, Mapping) else ""
+            if not isinstance(parsed, Mapping) or "raised_code_ids" not in parsed:
+                status = audit_status or "unparsed"
+                error = status
+            else:
+                status = audit_status or "validated"
+                if status not in {"validated", "ok"}:
+                    error = status
+                else:
+                    status = "validated"
+                    raised = [str(item) for item in (parsed.get("raised_code_ids") or [])]
+                    code_raised = target in set(raised)
         outcomes.append({
             "companions": [str(item) for item in companions],
-            "code_raised": target in set(raised),
+            "status": status,
+            "error": error,
+            "code_raised": code_raised,
             "raised_code_ids": raised,
             "prompt_hash": None if not isinstance(audit, Mapping) else audit.get("prompt_hash"),
         })
-    flags = [bool(row["code_raised"]) for row in outcomes]
+    valid = [row for row in outcomes if row["status"] == "validated" and isinstance(row["code_raised"], bool)]
+    flags = [bool(row["code_raised"]) for row in valid]
+    changed = len(set(flags)) > 1 if len(valid) >= 2 else None
     return {
         "code_id": target,
         "outcomes": outcomes,
-        "selection_changed": len(set(flags)) > 1,
+        "attempted_reviews": len(outcomes),
+        "successful_reviews": len(valid),
+        "selection_changed": changed,
         "chunk_context_note": CHUNK_CONTEXT_NOTE,
     }
 
@@ -1368,7 +1477,7 @@ def merge_core_nominations(
 
 
 def same_chunking_fingerprint(saved: Any, current: Any) -> bool:
-    """True when the resume carries the current chunking and 0.9.28 rules.
+    """True when the resume carries the current chunking and 0.9.29 rules.
 
     A missing key fails. ``allow_changes`` is not consulted here, so an older
     checkpoint cannot continue by ignoring the new quote, denial, recovery,
