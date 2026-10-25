@@ -256,6 +256,7 @@ _PROCEDURE_KEYS = (
     "pattern_quote_rule",
     "pair_count_rule",
     "core_candidate_rule",
+    "oversized_recovery",
 )
 _PERFORMANCE_KEYS = (
     "batch_size",
@@ -5795,8 +5796,10 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
     Codes are ordered by code id before they are packed, so codebook order
     does not change the chunks. That order does not decide which codes are
     promoted: an incomplete review is withheld. A code that alone exceeds the
-    per-request budget is omitted and the visit continues. Only a complete
-    review applies raised ids, in code-id order.
+    per-request budget is compacted and retried. If it still does not fit, it
+    is omitted and the other codes continue. The model does not exclude it.
+    Only a complete review applies raised ids, in code-id order. A human
+    exclusion is reported and counts as resolved.
     """
     reviewer = runtime.reviewer
     codes = selection_codes(state)
@@ -5824,21 +5827,45 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
             "focused_not_reread": [passage["passage_id"] for passage in state.get("passages", [])],
         }
 
+    budget = int(reviewer.token_budget)
+
+    def estimate_at(code_id: str, level: int) -> int:
+        compaction = {code_id: level} if level else None
+        payload = selection_payload(
+            state, [code_id], chunk_index=10**6, chunk_count=10**6, compaction=compaction,
+        )
+        return reviewer.estimate(payload, SelectionDecision)
+
+    compaction: dict[str, int] = {}
+    for code_id in ordered:
+        fit: int | None = None
+        for level in (0, 1, 2, 3):
+            if budget > 0 and estimate_at(code_id, level) <= budget:
+                fit = level
+                break
+        if fit is not None and fit > 0:
+            compaction[code_id] = fit
+
     def estimate(ids: Sequence[str]) -> int:
         # A wide chunk index keeps the packed request at least as large as the
         # one that is sent, so a chunk that fits here still fits when sent.
-        payload = selection_payload(state, ids, chunk_index=10**6, chunk_count=10**6)
+        payload = selection_payload(
+            state, ids, chunk_index=10**6, chunk_count=10**6, compaction=compaction,
+        )
         return reviewer.estimate(payload, SelectionDecision)
 
     plan = build_decision_plan(
         ordered,
         estimate,
         kind="focused_selection",
-        per_request=int(reviewer.token_budget),
+        per_request=budget,
         max_tokens=int(reviewer.max_tokens),
         max_calls=int(reviewer.max_calls),
         omit_reason="single_code_exceeds_request_budget",
+        compaction=compaction,
     )
+    for item in plan.get("omissions") or []:
+        item["detail"] = "omitted_oversized"
     progress = load_chunk_progress(metadata, plan)
     if progress.get("provisional") and not metadata.get("decision_stop"):
         ceilings = {"call_allowance", "token_allowance", "request_budget", "review_error"}
@@ -5872,6 +5899,8 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         metadata["selection_reviewed_code_ids"] = [str(item) for item in (progress_row.get("reviewed_ids") or [])]
         metadata["selection_uncovered_code_ids"] = uncovered
         metadata["provisional_raised_code_ids"] = provisional
+        metadata["selection_human_exclusions"] = list(report.get("human_exclusions") or [])
+        metadata["selection_items_excluded"] = int(report.get("items_excluded") or 0)
         metadata["selection_chunk_order_selects"] = False
         metadata["selection_resume"] = {
             "resumable": not bool(report["complete"]),
@@ -5889,19 +5918,29 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
             metadata["selection_withheld"] = True
             metadata["selection_downstream_eligible"] = False
             metadata["selection_review_complete"] = False
+            planned = list(progress_row.get("chunks") or [])
+            unrecovered = bool(omissions) and not ceiling and not failed and validated > 0 and validated == len(planned)
             if ceiling:
                 metadata["decision_stop"] = ceiling
                 metadata["decision_stop_detail"] = ceiling
             elif failed:
                 metadata["decision_stop"] = failed
                 metadata["decision_stop_detail"] = failed
+            elif unrecovered:
+                add_stop_reason(progress_row, "oversized_unrecovered")
+                metadata["decision_stop"] = "oversized_unrecovered"
+                metadata["decision_stop_detail"] = "omitted_oversized"
+                metadata["selection_review_fallback"] = "omitted_oversized"
+                report = finish_decision_report(progress_row)
+                metadata["decision_chunk_state"] = progress_row
+                store_decision_report(metadata, report)
             else:
                 metadata["decision_stop"] = "selection_incomplete"
                 metadata["decision_stop_detail"] = (
                     "proposal_unreviewed_over_request_budget" if omissions else "selection_incomplete"
                 )
-            if omissions and not ceiling:
-                metadata["selection_review_fallback"] = "proposal_unreviewed_over_request_budget"
+                if omissions:
+                    metadata["selection_review_fallback"] = "proposal_unreviewed_over_request_budget"
             note = (
                 "LLM selection review is provisional and was not applied. "
                 f"Stop: {metadata['decision_stop']}. "
@@ -5956,6 +5995,8 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         merged_meta["selection_withheld"] = False
         merged_meta["selection_status"] = "applied"
         merged_meta["selection_downstream_eligible"] = True
+        merged_meta["selection_human_exclusions"] = list(report.get("human_exclusions") or [])
+        merged_meta["selection_items_excluded"] = int(report.get("items_excluded") or 0)
         merged_meta["selection_resume"] = {**metadata["selection_resume"], "resumable": False}
         store_decision_report(merged_meta, report)
         warnings = list(updates.get("warnings") or warnings)
@@ -5965,64 +6006,126 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         return _close(progress)
 
     chunk = [str(item) for item in chunks[index]]
-    payload = selection_payload(state, chunk, chunk_index=index, chunk_count=len(chunks))
-    stop = reviewer.refusal_reason(payload, SelectionDecision, metadata)
-    if stop and len(chunk) == 1 and stop == "request_budget":
-        omissions = list(progress.get("omissions") or [])
-        omissions.append({"id": chunk[0], "reason": "single_code_exceeds_request_budget"})
-        progress["omissions"] = omissions
+    compaction_map = {
+        str(key): int(value) for key, value in (progress.get("compaction") or {}).items()
+    }
+    recovery_budgets = {
+        str(key): int(value)
+        for key, value in (progress.get("recovery_budgets") or {}).items()
+        if not isinstance(value, bool)
+    }
+    recovery_budget = recovery_budgets.get(chunk[0]) if len(chunk) == 1 else None
+    saved_budget = int(reviewer.token_budget)
+    if recovery_budget:
+        reviewer.token_budget = int(recovery_budget)
+        fitted: int | None = None
+        for level in (0, 1, 2, 3):
+            trial = dict(compaction_map)
+            if level:
+                trial[chunk[0]] = level
+            else:
+                trial.pop(chunk[0], None)
+            trial_payload = selection_payload(
+                state, chunk, chunk_index=index, chunk_count=len(chunks), compaction=trial,
+            )
+            if reviewer.estimate(trial_payload, SelectionDecision) <= int(recovery_budget):
+                fitted = level
+                compaction_map = trial
+                break
+        if fitted is None:
+            reviewer.token_budget = saved_budget
+            chunks_now = [list(item) for item in chunks]
+            if chunks_now and [str(item) for item in chunks_now[-1]] == chunk:
+                chunks_now = chunks_now[:-1]
+            progress["chunks"] = chunks_now
+            restored = list(progress.get("omissions") or [])
+            if not any(str(item.get("id") or "") == chunk[0] for item in restored):
+                restored.append({
+                    "id": chunk[0],
+                    "reason": "single_code_exceeds_request_budget",
+                    "detail": "omitted_oversized",
+                })
+            progress["omissions"] = restored
+            kept_budgets = dict(recovery_budgets)
+            kept_budgets.pop(chunk[0], None)
+            progress["recovery_budgets"] = kept_budgets
+            progress["next_index"] = len(chunks_now)
+            add_stop_reason(progress, "oversized_unrecovered")
+            metadata["decision_chunk_state"] = progress
+            return _close(progress)
+    if recovery_budget:
+        reviewer.token_budget = int(recovery_budget)
+    try:
+        payload = selection_payload(
+            state, chunk, chunk_index=index, chunk_count=len(chunks), compaction=compaction_map,
+        )
+        stop = reviewer.refusal_reason(payload, SelectionDecision, metadata)
+        if stop and len(chunk) == 1 and stop == "request_budget":
+            omissions = list(progress.get("omissions") or [])
+            omissions.append({
+                "id": chunk[0],
+                "reason": "single_code_exceeds_request_budget",
+                "detail": "omitted_oversized",
+            })
+            progress["omissions"] = omissions
+            progress["next_index"] = index + 1
+            metadata["decision_chunk_state"] = progress
+            if progress["next_index"] >= len(chunks):
+                return _close(progress)
+            progress["open"] = True
+            return {"metadata": metadata, "prompt_log": logs, "warnings": warnings}
+        if stop:
+            add_stop_reason(progress, stop)
+            metadata["decision_stop"] = stop
+            progress["next_index"] = index
+            return _close(progress)
+
+        parsed, audit = await reviewer.decide(payload, SelectionDecision, metadata)
+        estimate = int((audit or {}).get("estimated_input_tokens") or reviewer.estimate(payload, SelectionDecision))
+        if audit:
+            logs.append(audit)
+        if parsed is None:
+            reason = str(metadata.get("decision_stop") or "review_error")
+            add_stop_reason(progress, reason)
+            if audit and str(audit.get("status") or "") != "omitted":
+                note_chunk_send(progress, audit, estimate=estimate)
+            progress["next_index"] = index
+            return _close(progress)
+
+        note_chunk_send(progress, audit, estimate=estimate)
+        try:
+            ids = [str(item) for item in (parsed.get("raised_code_ids") or [])]
+            if len(ids) != len(set(ids)):
+                raise FocusedError("Duplicate raised code IDs from decision model.")
+            unknown = [item for item in ids if item not in set(chunk)]
+            if unknown:
+                raise FocusedError(f"raised_code_ids are not in this selection chunk: {unknown}")
+        except (ValueError, FocusedError, KeyError) as exc:
+            add_stop_reason(progress, "invalid_decision")
+            progress["invalid_chunks"] = int(progress.get("invalid_chunks") or 0) + 1
+            if isinstance(audit, dict):
+                audit.update(status="error", error=str(exc))
+            metadata["decision_stop"] = "invalid_decision"
+            progress["next_index"] = len(chunks)
+            return _close(progress)
+
+        progress["raised_ids"] = list(progress.get("raised_ids") or []) + ids
+        progress["reviewed_ids"] = list(progress.get("reviewed_ids") or []) + chunk
+        progress["chunks_validated"] = int(progress.get("chunks_validated") or 0) + 1
+        # A recovered item was reviewed. Drop the named stop so a later close can apply.
+        progress["stop_reasons"] = [
+            item for item in (progress.get("stop_reasons") or []) if str(item) != "oversized_unrecovered"
+        ]
+        metadata.pop("decision_stop", None)
         progress["next_index"] = index + 1
         metadata["decision_chunk_state"] = progress
         if progress["next_index"] >= len(chunks):
             return _close(progress)
         progress["open"] = True
+        metadata["decision_chunk_state"] = progress
         return {"metadata": metadata, "prompt_log": logs, "warnings": warnings}
-    if stop:
-        add_stop_reason(progress, stop)
-        metadata["decision_stop"] = stop
-        progress["next_index"] = index
-        return _close(progress)
-
-    parsed, audit = await reviewer.decide(payload, SelectionDecision, metadata)
-    estimate = int((audit or {}).get("estimated_input_tokens") or reviewer.estimate(payload, SelectionDecision))
-    if audit:
-        logs.append(audit)
-    if parsed is None:
-        reason = str(metadata.get("decision_stop") or "review_error")
-        add_stop_reason(progress, reason)
-        if audit and str(audit.get("status") or "") != "omitted":
-            note_chunk_send(progress, audit, estimate=estimate)
-        progress["next_index"] = index
-        return _close(progress)
-
-    note_chunk_send(progress, audit, estimate=estimate)
-    try:
-        ids = [str(item) for item in (parsed.get("raised_code_ids") or [])]
-        if len(ids) != len(set(ids)):
-            raise FocusedError("Duplicate raised code IDs from decision model.")
-        unknown = [item for item in ids if item not in set(chunk)]
-        if unknown:
-            raise FocusedError(f"raised_code_ids are not in this selection chunk: {unknown}")
-    except (ValueError, FocusedError, KeyError) as exc:
-        add_stop_reason(progress, "invalid_decision")
-        progress["invalid_chunks"] = int(progress.get("invalid_chunks") or 0) + 1
-        if isinstance(audit, dict):
-            audit.update(status="error", error=str(exc))
-        metadata["decision_stop"] = "invalid_decision"
-        progress["next_index"] = len(chunks)
-        return _close(progress)
-
-    progress["raised_ids"] = list(progress.get("raised_ids") or []) + ids
-    progress["reviewed_ids"] = list(progress.get("reviewed_ids") or []) + chunk
-    progress["chunks_validated"] = int(progress.get("chunks_validated") or 0) + 1
-    metadata.pop("decision_stop", None)
-    progress["next_index"] = index + 1
-    metadata["decision_chunk_state"] = progress
-    if progress["next_index"] >= len(chunks):
-        return _close(progress)
-    progress["open"] = True
-    metadata["decision_chunk_state"] = progress
-    return {"metadata": metadata, "prompt_log": logs, "warnings": warnings}
+    finally:
+        reviewer.token_budget = saved_budget
 
 
 def _decision_node(runtime: FocusedRuntime, *, claims: bool):
@@ -6076,16 +6179,35 @@ def _decision_node(runtime: FocusedRuntime, *, claims: bool):
     return review
 
 
+def _selection_omissions(progress: Mapping[str, Any]) -> list[dict[str, Any]]:
+    return [dict(item) for item in (progress.get("omissions") or []) if isinstance(item, Mapping) and str(item.get("id") or "")]
+
+
 def _selection_can_resume(meta: Mapping[str, Any]) -> bool:
-    """True when a later visit can review a chunk this run did not validate."""
+    """True when a later visit can review a chunk, or an omitted item can be recovered.
+
+    A review that validated nothing does not pause. Raising the call allowance
+    cannot review an item that was never a planned chunk; that item uses the
+    oversized recovery pause once every planned chunk has been validated.
+    """
     progress = meta.get("decision_chunk_state") or {}
     if not isinstance(progress, Mapping) or progress.get("kind") != "focused_selection":
         return False
     if not progress.get("open") and not progress.get("provisional"):
         return False
+    if "invalid_decision" in {str(item) for item in (progress.get("stop_reasons") or [])}:
+        return False
     chunks = list(progress.get("chunks") or [])
     validated = int(progress.get("chunks_validated") or 0)
-    return bool(chunks) and 0 < validated < len(chunks)
+    if bool(chunks) and 0 < validated < len(chunks):
+        return True
+    return bool(chunks) and validated == len(chunks) and validated > 0 and bool(_selection_omissions(progress))
+
+
+def _clear_oversized_stop(progress: dict[str, Any]) -> None:
+    progress["stop_reasons"] = [
+        item for item in (progress.get("stop_reasons") or []) if str(item) != "oversized_unrecovered"
+    ]
 
 
 def _route_decision(state: FocusedState) -> str:
@@ -6117,9 +6239,106 @@ def _route_after_selection_pause(state: FocusedState) -> str:
     return "export_focused"
 
 
+def _leave_selection(metadata: dict[str, Any], progress: dict[str, Any]) -> dict:
+    metadata["selection_withheld"] = True
+    progress["open"] = False
+    metadata["decision_chunk_state"] = progress
+    resume_row = dict(metadata.get("selection_resume") or {})
+    resume_row["resumable"] = False
+    metadata["selection_resume"] = resume_row
+    return {"metadata": metadata}
+
+
+def _oversized_recovery_pause(metadata: dict[str, Any], progress: dict[str, Any]) -> dict:
+    """Ask a researcher to review one omitted item or to record an exclusion.
+
+    The loop replays through LangGraph ``interrupt``. Completed reviews stay
+    on ``progress``. The model is not offered a way to exclude an item.
+    """
+    while _selection_omissions(progress):
+        omissions = _selection_omissions(progress)
+        decision = interrupt(
+            {
+                "kind": "oversized_recovery",
+                "decision_stop": "oversized_unrecovered",
+                "unrecovered_ids": [str(item.get("id") or "") for item in omissions],
+                "omissions": omissions,
+                "compaction": dict(progress.get("compaction") or {}),
+                "reviewed_code_ids": [str(item) for item in (progress.get("reviewed_ids") or [])],
+                "instructions": (
+                    "Compaction did not fit these items in the request budget. "
+                    "The model did not exclude them. Completed chunk reviews are kept. "
+                    "Resume with {\"review_oversized\": {\"id\": \"...\", \"decision_token_budget\": N}} "
+                    "to review one item at a changed request budget, "
+                    "or {\"exclude_item\": {\"id\": \"...\", \"reason\": \"...\"}} "
+                    "for a researcher to record an exclusion. "
+                    "Resume with {\"leave_selection\": true} to export without excluding."
+                ),
+            }
+        )
+        if isinstance(decision, Mapping) and isinstance(decision.get("review_oversized"), Mapping):
+            spec = decision["review_oversized"]
+            code_id = str(spec.get("id") or "")
+            budget = spec.get("decision_token_budget")
+            known = {str(item.get("id") or "") for item in omissions}
+            if code_id not in known or type(budget) is not int or budget <= 0:
+                raise FocusedError(
+                    "review_oversized needs an omitted id and a positive integer decision_token_budget."
+                )
+            progress["omissions"] = [item for item in omissions if str(item.get("id") or "") != code_id]
+            chunks = [list(chunk) for chunk in (progress.get("chunks") or [])]
+            chunks.append([code_id])
+            progress["chunks"] = chunks
+            budgets = dict(progress.get("recovery_budgets") or {})
+            budgets[code_id] = int(budget)
+            progress["recovery_budgets"] = budgets
+            progress["next_index"] = len(chunks) - 1
+            progress["open"] = True
+            progress["provisional"] = True
+            _clear_oversized_stop(progress)
+            metadata.pop("decision_stop", None)
+            metadata["selection_withheld"] = False
+            metadata["selection_status"] = "provisional"
+            metadata["decision_chunk_state"] = progress
+            return {"metadata": metadata}
+        if isinstance(decision, Mapping) and isinstance(decision.get("exclude_item"), Mapping):
+            spec = decision["exclude_item"]
+            code_id = str(spec.get("id") or "")
+            reason = str(spec.get("reason") or "").strip()
+            known = {str(item.get("id") or "") for item in omissions}
+            if code_id not in known or not reason:
+                raise FocusedError("exclude_item needs an omitted id and a non-empty reason.")
+            progress["omissions"] = [item for item in omissions if str(item.get("id") or "") != code_id]
+            exclusions = [dict(item) for item in (progress.get("human_exclusions") or []) if isinstance(item, Mapping)]
+            exclusions.append({"id": code_id, "reason": reason, "actor": "human"})
+            progress["human_exclusions"] = exclusions
+            metadata["selection_human_exclusions"] = exclusions
+            metadata["decision_chunk_state"] = progress
+            continue
+        if isinstance(decision, Mapping) and decision.get("leave_selection") is True:
+            return _leave_selection(metadata, progress)
+        raise FocusedError(
+            "Resume an oversized item with {'review_oversized': {'id': '...', 'decision_token_budget': N}}, "
+            "{'exclude_item': {'id': '...', 'reason': '...'}}, or {'leave_selection': true}."
+        )
+    progress["open"] = True
+    progress["next_index"] = len(list(progress.get("chunks") or []))
+    _clear_oversized_stop(progress)
+    metadata.pop("decision_stop", None)
+    metadata["selection_withheld"] = False
+    metadata["selection_status"] = "provisional"
+    metadata["decision_chunk_state"] = progress
+    return {"metadata": metadata}
+
+
 def _selection_pause_node(state: FocusedState) -> dict:
     """Pause a withheld selection so a later resume can review the remainder."""
     metadata = dict(state.get("metadata") or {})
+    progress = dict(metadata.get("decision_chunk_state") or {})
+    chunks = list(progress.get("chunks") or [])
+    validated = int(progress.get("chunks_validated") or 0)
+    if validated == len(chunks) and validated > 0 and _selection_omissions(progress):
+        return _oversized_recovery_pause(metadata, progress)
     decision = interrupt(
         {
             "kind": "focused_selection_incomplete",
@@ -6143,14 +6362,7 @@ def _selection_pause_node(state: FocusedState) -> dict:
         raise FocusedError(
             "Resume an incomplete selection with {'continue_selection': true} or {'leave_selection': true}."
         )
-    metadata["selection_withheld"] = True
-    progress = dict(metadata.get("decision_chunk_state") or {})
-    progress["open"] = False
-    metadata["decision_chunk_state"] = progress
-    resume_row = dict(metadata.get("selection_resume") or {})
-    resume_row["resumable"] = False
-    metadata["selection_resume"] = resume_row
-    return {"metadata": metadata}
+    return _leave_selection(metadata, progress)
 
 
 def _export_node(runtime: FocusedRuntime):
@@ -6826,8 +7038,12 @@ async def afocused_code(
 
     ``interrupt`` defaults to true. The graph pauses inside
     ``researcher_checkpoint`` with :func:`langgraph.types.interrupt`. An
-    incomplete LLM selection pauses at ``selection_pause`` instead. Resume that
-    pause with ``{"continue_selection": true}`` or ``{"leave_selection": true}``.
+    incomplete LLM selection pauses at ``selection_pause`` instead. Resume an
+    unfinished chunk with ``{"continue_selection": true}`` or
+    ``{"leave_selection": true}``. An item that still exceeds the request
+    budget after compaction resumes with ``{"review_oversized": {"id": "...",
+    "decision_token_budget": N}}`` or ``{"exclude_item": {"id": "...",
+    "reason": "..."}}``.
     Resume a human checkpoint by calling this function again with
     ``resuming=True`` and ``resume`` set to the value for
     :class:`~langgraph.types.Command`. The same checkpointer and ``thread_id``
@@ -7269,7 +7485,10 @@ async def _invoke(
                 # LLM review normally resumes itself. An incomplete selection
                 # is the exception: the caller says whether to continue it.
                 choosing_selection = isinstance(resume, Mapping) and (
-                    resume.get("continue_selection") is True or resume.get("leave_selection") is True
+                    resume.get("continue_selection") is True
+                    or resume.get("leave_selection") is True
+                    or isinstance(resume.get("review_oversized"), Mapping)
+                    or isinstance(resume.get("exclude_item"), Mapping)
                 )
                 command_resume = (
                     resume

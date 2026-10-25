@@ -23,8 +23,8 @@ from tests.test_v0919 import _rewrite_saved_source_hash, _source
 
 
 def test_version_is_0920():
-    assert __version__ == "0.9.25"
-    assert POLICY_VERSION == "0.9.25"
+    assert __version__ == "0.9.26"
+    assert POLICY_VERSION == "0.9.26"
 
 
 def _quoted(text: str) -> dict:

@@ -197,6 +197,7 @@ _PROCEDURE_KEYS = (
     "pattern_quote_rule",
     "pair_count_rule",
     "core_candidate_rule",
+    "oversized_recovery",
 )
 _LOCKED_KEYS = frozenset({"seed", "source_hash"})
 

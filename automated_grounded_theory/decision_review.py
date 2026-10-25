@@ -5,9 +5,13 @@ Calls do not silently retry or repair; a failed review remains incomplete.
 Provider SDK retries, if enabled on the supplied model, remain provider-owned.
 
 Selection review is packed into chunks that each fit the per-request token
-budget. ``batch_size`` is not that pack size. A code that alone exceeds the
-budget is omitted and the review continues. A complete review merges raised
-ids in canonical code-id order. An incomplete review is not applied.
+budget. ``batch_size`` is not that pack size. A focused-selection code that
+alone exceeds the budget is compacted and retried. If it still does not fit,
+it is omitted and the review of the other codes continues. The model does
+not exclude it. A complete review merges raised ids in canonical code-id
+order. An incomplete review is not applied. A human may later review one
+omitted code at a changed request budget, or record an exclusion with a
+reason. Completed chunk reviews are kept.
 """
 from __future__ import annotations
 
@@ -46,20 +50,26 @@ class ClaimDecisions(BaseModel):
 
 # Locked on the focused and axial procedure manifests. A checkpoint saved
 # before this value existed cannot resume into a chunked review.
-DECISION_REVIEW_CHUNKING = "request_budget_v2"
+DECISION_REVIEW_CHUNKING = "request_budget_v3"
 INCOMPLETE_REVIEW_APPLICATION = "withhold_incomplete_v1"
 ELIGIBILITY_RULE = "row_gates_components_v1"
-LINK_DENIAL_RULE = "affirmative_rejection_v1"
-PATTERN_QUOTE_RULE = "distinct_endpoint_quotes_v1"
+LINK_DENIAL_RULE = "frequency_before_rejection_v1"
+PATTERN_QUOTE_RULE = "endpoint_support_in_span_v1"
 PAIR_COUNT_RULE = "space_and_examined_v1"
 CORE_CANDIDATE_RULE = "focused_categories_v1"
+OVERSIZED_RECOVERY = "compact_then_human_v1"
+# Compaction shortens evidence before a code is omitted. Level 1 keeps one
+# short quote. Level 2 drops quotes. Level 3 also truncates the definition.
+SELECTION_COMPACTION_QUOTE_CHARS = 160
+SELECTION_COMPACTION_DEFINITION_CHARS = 1200
 
 CHUNKING_CHECKPOINT_MESSAGE = (
     "procedure.decision_review_chunking: this checkpoint was saved before "
     "decision-review requests were chunked to the per-request budget, or before "
-    "an incomplete review was withheld instead of applied, or the stored chunk "
-    "plan does not match this resume. Resume cannot continue that review. "
-    "Start a new run."
+    "an incomplete review was withheld instead of applied, or before endpoint "
+    "support, frequency qualification, and oversized-item recovery used the "
+    "0.9.26 rules, or the stored chunk plan does not match this resume. "
+    "Resume cannot continue that review. Start a new run."
 )
 
 
@@ -180,7 +190,14 @@ def selection_codes(state) -> list[dict[str, Any]]:
     return codes
 
 
-def selection_payload(state, code_ids: Sequence[str] | None = None, *, chunk_index: int | None = None, chunk_count: int | None = None):
+def selection_payload(
+    state,
+    code_ids: Sequence[str] | None = None,
+    *,
+    chunk_index: int | None = None,
+    chunk_count: int | None = None,
+    compaction: Mapping[str, int] | None = None,
+):
     """Compact evidence samples; selection is not a complete corpus reread.
 
     ``code_ids`` limits the request to one chunk. Scores and the proposed
@@ -191,6 +208,7 @@ def selection_payload(state, code_ids: Sequence[str] | None = None, *, chunk_ind
     if code_ids is not None:
         wanted = {str(item) for item in code_ids}
         codes = [row for row in codes if row["code_id"] in wanted]
+    codes = apply_selection_compaction(codes, compaction)
     present = {row["code_id"] for row in codes}
     proposed = [
         str(item)
@@ -405,8 +423,48 @@ def pack_decision_chunks(
     return {"chunks": chunks, "omissions": omissions, "ordered_ids": ordered}
 
 
+def apply_selection_compaction(
+    codes: Sequence[Mapping[str, Any]],
+    compaction: Mapping[str, int] | None,
+) -> list[dict[str, Any]]:
+    """Shorten evidence for codes whose compaction level is above zero.
+
+    Level 0 is the ordinary row. Level 1 keeps one quote, cut to
+    ``SELECTION_COMPACTION_QUOTE_CHARS``. Level 2 drops quotes. Level 3 also
+    cuts the definition to ``SELECTION_COMPACTION_DEFINITION_CHARS``. The
+    code id stays. This does not drop the code.
+    """
+    levels = {str(key): int(value) for key, value in (compaction or {}).items()}
+    rows: list[dict[str, Any]] = []
+    for code in codes:
+        row = dict(code)
+        level = levels.get(str(row.get("code_id") or ""), 0)
+        if level <= 0:
+            rows.append(row)
+            continue
+        samples = [dict(item) for item in (row.get("evidence_sample") or []) if isinstance(item, Mapping)]
+        if level == 1 and samples:
+            quote = str(samples[0].get("quote") or "")[:SELECTION_COMPACTION_QUOTE_CHARS]
+            row["evidence_sample"] = [{
+                "passage_id": samples[0].get("passage_id"),
+                "quote": quote,
+                "truncated": True,
+                "compacted": True,
+            }]
+        else:
+            row["evidence_sample"] = []
+        if level >= 3:
+            definition = str(row.get("definition") or "")
+            if len(definition) > SELECTION_COMPACTION_DEFINITION_CHARS:
+                row["definition"] = definition[:SELECTION_COMPACTION_DEFINITION_CHARS]
+                row["definition_truncated"] = True
+        row["evidence_compaction"] = level
+        rows.append(row)
+    return rows
+
+
 def review_procedure_fields() -> dict[str, str]:
-    """Procedure fingerprint for 0.9.25 review rules.
+    """Procedure fingerprint for 0.9.26 review rules.
 
     The chunk partition is separate from the call and token ceilings. A higher
     ceiling can continue the same chunks. A different partition cannot.
@@ -419,6 +477,7 @@ def review_procedure_fields() -> dict[str, str]:
         "pattern_quote_rule": PATTERN_QUOTE_RULE,
         "pair_count_rule": PAIR_COUNT_RULE,
         "core_candidate_rule": CORE_CANDIDATE_RULE,
+        "oversized_recovery": OVERSIZED_RECOVERY,
     }
 
 
@@ -431,6 +490,7 @@ def decision_plan_hash(
     ordered_ids: Sequence[str],
     chunks: Sequence[Sequence[str]],
     omissions: Sequence[Mapping[str, Any]],
+    compaction: Mapping[str, int] | None = None,
 ) -> str:
     """Fingerprint the chunk partition a resume has to match.
 
@@ -449,6 +509,10 @@ def decision_plan_hash(
             {"id": str(item.get("id") or ""), "reason": str(item.get("reason") or "")}
             for item in omissions
         ],
+        "compaction": {
+            str(key): int(value)
+            for key, value in sorted((compaction or {}).items())
+        },
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -463,8 +527,10 @@ def build_decision_plan(
     max_tokens: int,
     max_calls: int,
     omit_reason: str,
+    compaction: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     packed = pack_decision_chunks(ids, estimate, per_request=per_request, omit_reason=omit_reason)
+    stored_compaction = {str(key): int(value) for key, value in (compaction or {}).items()}
     plan_hash = decision_plan_hash(
         kind=kind,
         per_request=per_request,
@@ -473,6 +539,7 @@ def build_decision_plan(
         ordered_ids=packed["ordered_ids"],
         chunks=packed["chunks"],
         omissions=packed["omissions"],
+        compaction=stored_compaction,
     )
     return {
         "version": DECISION_REVIEW_CHUNKING,
@@ -483,6 +550,7 @@ def build_decision_plan(
         "ordered_ids": packed["ordered_ids"],
         "chunks": packed["chunks"],
         "omissions": packed["omissions"],
+        "compaction": stored_compaction,
         "plan_hash": plan_hash,
     }
 
@@ -524,6 +592,12 @@ def load_chunk_progress(metadata: Mapping[str, Any], plan: Mapping[str, Any]) ->
         "stop_reasons": [],
         "invalid_chunks": 0,
         "unknown_nomination": "",
+        "compaction": {
+            str(key): int(value)
+            for key, value in (plan.get("compaction") or {}).items()
+        },
+        "human_exclusions": [],
+        "recovery_budgets": {},
     }
 
 
@@ -554,19 +628,32 @@ def finish_decision_report(progress: Mapping[str, Any]) -> dict[str, Any]:
     stops = [str(item) for item in (progress.get("stop_reasons") or []) if str(item)]
     reviewed = [str(item) for item in (progress.get("reviewed_ids") or [])]
     chunks = list(progress.get("chunks") or [])
-    item_count = len(list(progress.get("ordered_ids") or []))
+    ordered = [str(item) for item in (progress.get("ordered_ids") or [])]
+    item_count = len(ordered)
     sent = int(progress.get("chunks_sent") or 0)
     validated = int(progress.get("chunks_validated") or 0)
     invalid = int(progress.get("invalid_chunks") or 0)
+    exclusions = [
+        dict(item)
+        for item in (progress.get("human_exclusions") or [])
+        if isinstance(item, Mapping)
+    ]
+    excluded_ids = {
+        str(item.get("id") or "")
+        for item in exclusions
+        if str(item.get("actor") or "") == "human" and str(item.get("reason") or "").strip()
+    }
     omitted_ids = {str(item.get("id") or "") for item in omissions}
     reviewed_set = set(reviewed)
     uncovered = [
-        str(item)
-        for item in (progress.get("ordered_ids") or [])
-        if str(item) not in reviewed_set and str(item) not in omitted_ids
+        item
+        for item in ordered
+        if item not in reviewed_set and item not in omitted_ids and item not in excluded_ids
     ]
+    # Complete when every item was reviewed or explicitly excluded by a human.
+    # An omitted item the model never saw is not an exclusion.
     complete = (
-        item_count == len(reviewed)
+        set(ordered) <= (reviewed_set | excluded_ids)
         and not omissions
         and not stops
         and not uncovered
@@ -584,9 +671,15 @@ def finish_decision_report(progress: Mapping[str, Any]) -> dict[str, Any]:
         "item_count": item_count,
         "items_reviewed": len(reviewed),
         "items_omitted": len(omissions),
+        "items_excluded": len(excluded_ids),
         "items_uncovered": len(uncovered),
         "uncovered_ids": uncovered,
         "omissions": omissions,
+        "human_exclusions": exclusions,
+        "compaction": {
+            str(key): int(value)
+            for key, value in (progress.get("compaction") or {}).items()
+        },
         "chunk_order_selects_codes": False,
         "stop_reasons": stops or None,
         "tokens_estimated": int(progress.get("tokens_estimated") or 0) if sent else None,
@@ -657,13 +750,26 @@ def merge_core_nominations(
 
 
 def same_chunking_fingerprint(saved: Any, current: Any) -> bool:
-    saved_value = ""
-    current_value = ""
-    if isinstance(saved, Mapping):
-        saved_value = str(saved.get("decision_review_chunking") or "")
-    if isinstance(current, Mapping):
-        current_value = str(current.get("decision_review_chunking") or "")
-    return saved_value == current_value and current_value == DECISION_REVIEW_CHUNKING
+    """True when the resume carries the current chunking and 0.9.26 rules.
+
+    A missing key fails. ``allow_changes`` is not consulted here, so an older
+    checkpoint cannot continue by ignoring the new quote, denial, or recovery
+    rule.
+    """
+    if not isinstance(saved, Mapping) or not isinstance(current, Mapping):
+        return False
+    expected = {
+        "decision_review_chunking": DECISION_REVIEW_CHUNKING,
+        "pattern_quote_rule": PATTERN_QUOTE_RULE,
+        "link_denial_rule": LINK_DENIAL_RULE,
+        "oversized_recovery": OVERSIZED_RECOVERY,
+    }
+    for key, required in expected.items():
+        saved_value = str(saved.get(key) or "")
+        current_value = str(current.get(key) or "")
+        if not saved_value or saved_value != current_value or current_value != required:
+            return False
+    return True
 
 
 def apply_model_claim_decisions(claims, decisions, audit):
