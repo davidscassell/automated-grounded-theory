@@ -28,8 +28,8 @@ from tests.test_v070 import _book, _entry, _passages, _source
 
 
 def test_version_is_072():
-    assert __version__ == "0.9.32"
-    assert POLICY_VERSION == "0.9.32"
+    assert __version__ == "0.9.33"
+    assert POLICY_VERSION == "0.9.33"
 
 
 def _passages_for_shares():

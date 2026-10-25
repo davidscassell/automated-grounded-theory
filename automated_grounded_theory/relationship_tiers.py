@@ -204,8 +204,12 @@ _LEGACY_ANALYST_NOTE = (
 )
 
 
-def allowed_wording(tier: int | None, n: int | None = None) -> str | None:
-    """The wording a relationship at this tier may use. None when the tier is unknown."""
+def allowed_wording(tier: int | None, n: int | None = None, *, unit: str = "respondents") -> str | None:
+    """The wording a relationship at this tier may use. None when the tier is unknown.
+
+    ``unit`` is ``respondents`` only when every supporting case is a respondent.
+    A document fallback uses ``documents``.
+    """
     if tier is None:
         return None
     if tier <= 0:
@@ -214,7 +218,8 @@ def allowed_wording(tier: int | None, n: int | None = None) -> str | None:
         return "may be related"
     if tier == 2:
         count = "N" if n is None else str(n)
-        return f"co-occurs in {count} respondents"
+        label = unit if unit in {"respondents", "documents"} else "documents"
+        return f"co-occurs in {count} {label}"
     if tier == 3:
         return "participants attribute X to Y"
     return "verified within the recorded scope"
@@ -229,7 +234,47 @@ _CASE_IDENTITY_KEYS = (
 )
 
 
-def case_id_of(passage: Mapping[str, Any] | None) -> str:
+def case_identity_of(
+    passage: Mapping[str, Any] | None,
+    *,
+    one_document_one_respondent: bool = False,
+) -> tuple[str, str]:
+    """Return ``(case_id, source)``.
+
+    Source is ``respondent`` when the passage names a person, ``document_fallback``
+    when the id is only the document, and ``one_document_one_respondent`` when
+    the caller declared that one document is one respondent. A passage id is
+    ``passage`` and is not a respondent count.
+    """
+    if not isinstance(passage, Mapping):
+        return "", ""
+    for key in _CASE_IDENTITY_KEYS:
+        value = str(passage.get(key) or "").strip()
+        if value:
+            return value, "respondent"
+    metadata = passage.get("metadata") if isinstance(passage.get("metadata"), Mapping) else {}
+    for key in _CASE_IDENTITY_KEYS:
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            return value, "respondent"
+    declared = bool(one_document_one_respondent) or bool(
+        passage.get("one_document_one_respondent") or metadata.get("one_document_one_respondent")
+    )
+    for key in ("doc_id", "document_id"):
+        value = str(passage.get(key) or "").strip()
+        if value:
+            return value, "one_document_one_respondent" if declared else "document_fallback"
+    passage_id = str(passage.get("passage_id") or "")
+    if passage_id:
+        return passage_id, "passage"
+    return "", ""
+
+
+def case_id_of(
+    passage: Mapping[str, Any] | None,
+    *,
+    one_document_one_respondent: bool = False,
+) -> str:
     """Respondent when the passage names one, otherwise the document.
 
     Identity is the first of ``respondent_id``, ``participant_id``,
@@ -238,24 +283,59 @@ def case_id_of(passage: Mapping[str, Any] | None) -> str:
     metadata already uses. Several quotes from one person are one case,
     including after a duplicate merge, and in either relationship-id order.
     Question-documents that share that identity do not each meet
-    ``pattern_min_cases``.
+    ``pattern_min_cases``. The source of a document fallback is
+    ``case_identity_of``.
     """
-    if not isinstance(passage, Mapping):
-        return ""
-    for key in _CASE_IDENTITY_KEYS:
-        value = str(passage.get(key) or "").strip()
-        if value:
-            return value
-    metadata = passage.get("metadata") if isinstance(passage.get("metadata"), Mapping) else {}
-    for key in _CASE_IDENTITY_KEYS:
-        value = str(metadata.get(key) or "").strip()
-        if value:
-            return value
-    for key in ("doc_id", "document_id"):
-        value = str(passage.get(key) or "").strip()
-        if value:
-            return value
-    return str(passage.get("passage_id") or "")
+    return case_identity_of(passage, one_document_one_respondent=one_document_one_respondent)[0]
+
+
+def case_counts_are_respondents(cases: Sequence[Mapping[str, Any]] | None) -> bool | None:
+    """False when any counted case used a document or passage fallback. Null when there are no cases."""
+    rows = [item for item in (cases or []) if isinstance(item, Mapping) and item.get("case_id")]
+    if not rows:
+        return None
+    for item in rows:
+        source = str(item.get("case_identity_source") or "")
+        if source not in {"respondent", "one_document_one_respondent"}:
+            return False
+    return True
+
+
+def summarize_case_identity(rows: Sequence[Mapping[str, Any]] | None) -> dict[str, Any]:
+    """Count identity sources across relationship rows. This is not a validity claim."""
+    counts = {
+        "respondent": 0,
+        "one_document_one_respondent": 0,
+        "document_fallback": 0,
+        "passage": 0,
+    }
+    seen: set[tuple[str, str]] = set()
+    for row in rows or []:
+        if not isinstance(row, Mapping):
+            continue
+        for case in row.get("supporting_cases") or []:
+            if not isinstance(case, Mapping):
+                continue
+            case_id = str(case.get("case_id") or "")
+            source = str(case.get("case_identity_source") or "document_fallback")
+            if source not in counts:
+                source = "document_fallback"
+            key = (case_id, source)
+            if not case_id or key in seen:
+                continue
+            seen.add(key)
+            counts[source] += 1
+    total = sum(counts.values())
+    fallback = counts["document_fallback"] + counts["passage"]
+    return {
+        **counts,
+        "cases": total,
+        "case_counts_are_respondents": None if total == 0 else fallback == 0,
+        "note": (
+            "case_counts_are_respondents is true only when every supporting case is a respondent "
+            "or a document the caller declared to be one respondent. A document fallback is not a respondent count."
+        ),
+    }
 
 
 def _norm(text: str) -> str:
@@ -362,6 +442,7 @@ def _add_quote(
     passages: Mapping[str, Mapping[str, Any]],
     terms: set[str],
     labels: set[str],
+    one_document_one_respondent: bool = False,
 ) -> None:
     text = str(quote or "").strip()
     if not text or not terms or _is_label(text, labels):
@@ -373,7 +454,7 @@ def _add_quote(
     if not found:
         return
     passage = passages.get(found) or {}
-    case_id = case_id_of(passage)
+    case_id, source = case_identity_of(passage, one_document_one_respondent=one_document_one_respondent)
     if not case_id:
         return
     span = locate_quote(text, str(passage.get("text") or ""))
@@ -386,6 +467,7 @@ def _add_quote(
     )
     row["grounded"] = len(overlap) >= _GROUNDED_STEMS
     row["matched_stems"] = sorted(overlap)
+    row["case_identity_source"] = source
     existing = bucket.setdefault(case_id, [])
     key = (endpoint, _norm(text), found)
     if key not in {(item["endpoint"], _norm(item["quote"]), item["passage_id"]) for item in existing}:
@@ -397,6 +479,8 @@ def _collect_quotes(
     passages: Mapping[str, Mapping[str, Any]],
     codebook: Mapping[str, Any] | None,
     segments: Sequence[Mapping[str, Any]] | None,
+    *,
+    one_document_one_respondent: bool = False,
 ) -> dict[str, dict[str, list[dict[str, Any]]]]:
     """Per-case verbatim quotes for each endpoint. A category label is not a quote."""
     found: dict[str, dict[str, list[dict[str, Any]]]] = {"from": {}, "to": {}}
@@ -442,6 +526,7 @@ def _collect_quotes(
                 passages=passages,
                 terms=meta["terms"],
                 labels=meta["labels"],
+                one_document_one_respondent=one_document_one_respondent,
             )
     return found
 
@@ -482,9 +567,19 @@ def _supporting_cases(found: Mapping[str, Mapping[str, list[dict[str, Any]]]]) -
         to_passages = {item["passage_id"] for item in to_grounded}
         both = bool(from_grounded) and bool(to_grounded)
         same = bool(from_passages & to_passages)
+        sources = [str(item.get("case_identity_source") or "") for item in quotes if item.get("case_identity_source")]
+        if "respondent" in sources:
+            source = "respondent"
+        elif "one_document_one_respondent" in sources:
+            source = "one_document_one_respondent"
+        elif "document_fallback" in sources:
+            source = "document_fallback"
+        else:
+            source = sources[0] if sources else "document_fallback"
         rows.append(
             {
                 "case_id": case_id,
+                "case_identity_source": source,
                 "passage_ids": passage_ids,
                 "quotes": quotes,
                 "both_endpoints": both,
@@ -1160,6 +1255,23 @@ def _undefined_fields(pattern_min_cases: int, cooccurrence: dict[str, Any] | Non
     }
 
 
+def qualify_statement(statement: str, condition: str | None) -> tuple[str, bool | None]:
+    """Keep a recorded condition on the sentence that is presented.
+
+    The model's sentence stays available as ``statement``. When it leaves the
+    condition out, the presented sentence appends that span and the check is
+    false. A statement that already contains the span is unchanged.
+    """
+    base = str(statement or "").strip()
+    span = str(condition or "").strip()
+    if not span:
+        return base, None
+    if _norm(span) in _norm(base):
+        return base, True
+    qualified = f"{base} ({span})" if base else span
+    return qualified, False
+
+
 def assess_relationship(
     relationship: Mapping[str, Any],
     *,
@@ -1168,6 +1280,7 @@ def assess_relationship(
     segments: Sequence[Mapping[str, Any]] | None = None,
     memos: Sequence[Mapping[str, Any]] | None = None,
     pattern_min_cases: int = PATTERN_MIN_CASES,
+    one_document_one_respondent: bool = False,
 ) -> dict[str, Any]:
     """Score a relationship up to tier 3. Tier 4 is left to ``promote_verified``.
 
@@ -1181,7 +1294,14 @@ def assess_relationship(
         return _undefined_fields(minimum)
     usable = _usable_passages(passages)
     cooccurrence = _cooccurrence(relationship, usable, codebook, segments)
-    found = _collect_quotes(relationship, usable, codebook, segments)
+    declared = bool(one_document_one_respondent or relationship.get("one_document_one_respondent"))
+    found = _collect_quotes(
+        relationship,
+        usable,
+        codebook,
+        segments,
+        one_document_one_respondent=declared,
+    )
     cases = _supporting_cases(found)
     from_cases = {case["case_id"] for case in cases if any(item["endpoint"] == "from" for item in case["quotes"])}
     to_cases = {case["case_id"] for case in cases if any(item["endpoint"] == "to" for item in case["quotes"])}
@@ -1211,14 +1331,21 @@ def assess_relationship(
         tier = 3 if authorizes and rival == "reported" else 2
     else:
         tier = 1
-    wording = allowed_wording(tier, len(both_cases) if tier >= 2 else None)
+    identity_cases = cases if (from_cases or to_cases) else []
+    counts_are_respondents = case_counts_are_respondents(identity_cases)
+    wording_unit = "respondents" if counts_are_respondents else "documents"
+    wording = allowed_wording(tier, len(both_cases) if tier >= 2 else None, unit=wording_unit)
+    presented, statement_keeps_condition = qualify_statement(
+        str(relationship.get("statement") or ""),
+        participant.get("condition"),
+    )
     claims = _empty_claims()
     pattern_supported = tier >= 2
     claims["pattern"] = {
         "component": "pattern",
         "present": pattern_supported,
         "evidence_tier": 2 if pattern_supported else tier,
-        "allowed_wording": allowed_wording(2, len(both_cases)) if pattern_supported else wording,
+        "allowed_wording": allowed_wording(2, len(both_cases), unit=wording_unit) if pattern_supported else wording,
         "evidence_use": SUPPORTED_EVIDENCE if pattern_supported else HYPOTHESIS_EXPLORATION,
         "downstream_eligible": pattern_supported,
         "supports_core": pattern_supported,
@@ -1255,6 +1382,12 @@ def assess_relationship(
         "participant_link": participant if participant.get("present") else None,
         "condition": participant.get("condition"),
         "condition_retained": participant.get("condition_retained"),
+        "presented_statement": presented,
+        "statement_omits_condition": (
+            None if statement_keeps_condition is None else statement_keeps_condition is False
+        ),
+        "case_identity_summary": summarize_case_identity([{"supporting_cases": identity_cases}]),
+        "case_counts_are_respondents": counts_are_respondents,
         "core_support_component": "pattern" if pattern_supported else None,
         "shared_quote_for_both_endpoints": any(
             isinstance(case, Mapping) and case.get("shared_quote_for_both_endpoints") for case in cases
@@ -1574,15 +1707,17 @@ def assign_relationship_eligibility(row: dict) -> str:
 
 
 def effective_statement(row: Mapping[str, Any]) -> str:
-    """The statement validation reads now.
+    """The statement validation and presentation read now.
 
     A researcher's sentence replaces the working statement. The model's
-    earlier sentence stays on ``model_statement`` and is not rechecked.
+    earlier sentence stays on ``statement``. A recorded condition that the
+    working sentence leaves out is appended, so the presented sentence is
+    not unqualified.
     """
     human = str(row.get("human_statement") or "").strip()
-    if human:
-        return human
-    return str(row.get("statement") or "").strip()
+    base = human if human else str(row.get("statement") or "").strip()
+    presented, _kept = qualify_statement(base, str(row.get("condition") or "") or None)
+    return presented
 
 
 def effective_paradigm_role(row: Mapping[str, Any]) -> str:
@@ -1686,6 +1821,8 @@ def _claim_flags(claims: Mapping[str, Any]) -> list[str]:
         flags.append("participant_link_not_a_relationship")
     if status == "direction_unspecified":
         flags.append("participant_direction_unspecified")
+    if "condition_not_in_statement" in qualifications:
+        flags.append("condition_not_in_statement")
     if status == "hypothetical":
         flags.append("participant_link_hypothetical")
     if status == "ambiguous":
@@ -1762,6 +1899,10 @@ def apply_evidence_tier(relationship: dict, **kwargs: Any) -> dict[str, Any]:
     """
     _note_legacy_analyst_exclusion(relationship)
     previous = _claim_snapshot(relationship)
+    declared = bool(kwargs.get("one_document_one_respondent") or relationship.get("one_document_one_respondent"))
+    if declared:
+        relationship["one_document_one_respondent"] = True
+        kwargs = {**kwargs, "one_document_one_respondent": True}
     fields = assess_relationship(relationship, **kwargs)
     relationship.update(fields)
     flags = [str(item) for item in (relationship.get("flags") or []) if str(item) not in _CLAIM_FLAGS]

@@ -52,8 +52,7 @@ from automated_grounded_theory.decision_review import (
     PARTIAL_SELECTION_BIAS,
     PARTIAL_SELECTION_SHUFFLE_BIAS,
     SELECTION_CONSOLIDATION,
-    SHARED_DECISION_REVIEW,
-    SHARED_REVIEW_STEPS,
+    PER_STEP_DECISION_REVIEW,
     SYSTEM,
     SelectionDecision,
     chunk_input_fingerprint,
@@ -70,12 +69,12 @@ _ASIDE = Path(__file__).resolve().parents[0] / "fixtures" / "discourse_aside_092
 
 
 def test_version_rules_and_unchanged_defaults():
-    assert __version__ == "0.9.32"
-    assert POLICY_VERSION == "0.9.32"
+    assert __version__ == "0.9.33"
+    assert POLICY_VERSION == "0.9.33"
     assert DECISION_REVIEW_CHUNKING == "request_budget_v6"
     assert CONDITIONAL_SCOPE_RULE == "condition_scope_v1"
     assert DUPLICATE_ASSERTION_RULE == "merge_all_evidence_v1"
-    assert BUDGET_LEDGER_RULE == "shared_review_ledger_v1"
+    assert BUDGET_LEDGER_RULE == "per_step_review_ledger_v1"
     assert EXPORT_ASSESSMENT_RULE == "shared_assessment_v1"
     assert CHUNK_REVIEW_RECOVERY == "reuse_validated_v1"
     assert "validated-chunk recovery" in CHUNKING_CHECKPOINT_MESSAGE
@@ -334,30 +333,33 @@ def test_core_selection_keeps_its_own_call_allowance():
         include_storyline=False,
         max_decision_calls=8,
         max_axial_review_tokens=24000,
-        axial_token_budget=one,
+        axial_token_budget=10**9,
         batch_size=1,
     )
     report = finished.metadata["decision_reviews"]["axial_core_review"]
     assert report["stop_reasons"] in (None, [])
     assert report["complete"] is True
-    assert report["chunks_sent"] == 8
+    assert report["chunks_sent"] == 1
     assert report["starting_usage"] == 0
-    assert report["calls_made"] == 8
-    assert report["remaining_allowance"] == 0
+    assert report["calls_made"] == 1
+    assert report["remaining_allowance"] == 7
     assert report["prior_step_calls"] == 4
     assert report["prior_step_calls_reduce_allowance"] is False
-    assert report["allowance_scope"] == SHARED_DECISION_REVIEW
+    assert report["allowance_scope"] == PER_STEP_DECISION_REVIEW
     assert report["allowance"] == 8
+    assert report["shared_with"] == []
+    assert finished.metadata["core_candidates_eligible"] == 8
+    assert finished.metadata["core_candidates_compared"] == 8
     step = finished.metadata["decision_budget_steps"][-1]
     assert step["step"] == "axial_core_review"
     assert step["starting_usage"] == 0
-    assert step["calls_made"] == 8
-    assert step["remaining_allowance"] == 0
+    assert step["calls_made"] == 1
+    assert step["remaining_allowance"] == 7
     assert step["stop_reason"] is None
     assert step["prior_step_calls"] == 4
     assert step["prior_step_calls_reduce_allowance"] is False
-    assert step["shared_with"] == list(SHARED_REVIEW_STEPS)
-    assert finished.metadata["decision_calls_used"] == 8
+    assert step["shared_with"] == []
+    assert finished.metadata["decision_calls_used"] == 1
     assert "temperature 0" in finished.metadata["model_configuration"]["note"]
     assert "not a reproducibility guarantee" in TEMPERATURE_REPRODUCIBILITY_NOTE
 
@@ -1251,27 +1253,6 @@ def test_finished_incomplete_core_resumes_on_a_larger_budget():
     label = "packing " * 40
     book = {f"c{index:02d}": {"code_id": f"c{index:02d}", "code": label, "definition": label} for index in range(8)}
     passages = [{"passage_id": "p1", "doc_id": "d1", "text": "A short note about packing."}]
-    state = {
-        "codebook": book,
-        "passages": passages,
-        "segments": [],
-        "relationships": [],
-        "properties": [],
-        "dimensions": [],
-        "metadata": {},
-    }
-    candidates = _score_candidates(state)
-    reviewer = AxialDecisionReviewer(FakeAxialCoder(), max_calls=8, max_tokens=24000, token_budget=10**9)
-    blank = {"decision_calls_used": 0}
-
-    def estimate(ids):
-        subset = [row for row in candidates if row["code_id"] in set(ids)]
-        payload = _core_review_payload(
-            subset, preferred=[], snapshot=graph_snapshot([]), chunk_index=10**6, chunk_count=10**6,
-        )
-        return reviewer.refusal_reason(payload, ModelCoreDecision, blank)[1]
-
-    one = estimate([candidates[0]["code_id"]])
     source = {
         "codebook": book,
         "passages": passages,
@@ -1286,34 +1267,44 @@ def test_finished_incomplete_core_resumes_on_a_larger_budget():
         interrupt=False,
         include_memos=False,
         include_storyline=False,
-        max_axial_review_tokens=24000,
-        axial_token_budget=one,
+        axial_token_budget=10**9,
         batch_size=1,
         checkpointer=saver,
         thread_id="finished-core",
     )
-    finished = selective_code(source, FakeAxialCoder(), max_decision_calls=1, **common)
+    finished = selective_code(
+        source,
+        FakeAxialCoder(),
+        max_decision_calls=1,
+        max_axial_review_tokens=0,
+        **common,
+    )
     assert finished.interrupted is False
-    assert finished.metadata["decision_stop"] == "call_allowance"
+    assert finished.metadata["decision_stop"] == "token_allowance"
     assert finished.metadata["core_selection_complete"] is False
-    assert finished.metadata["decision_reviews"]["axial_core_review"]["chunks_sent"] == 1
+    assert finished.metadata["decision_reviews"]["axial_core_review"]["chunks_sent"] == 0
+    assert finished.metadata["core_candidates_compared"] == 0
+    assert finished.metadata["core_candidates_eligible"] == 8
     resumed = selective_code(
         source,
         FakeAxialCoder(),
-        max_decision_calls=8,
+        max_decision_calls=1,
+        max_axial_review_tokens=24000,
         resuming=True,
         allow_changes=False,
         **common,
     )
     report = resumed.metadata["decision_reviews"]["axial_core_review"]
     assert report["complete"] is True
-    assert report["chunks_sent"] == 8
-    assert report["starting_usage"] == 1
-    assert report["calls_made"] == 7
+    assert report["chunks_sent"] == 1
+    assert report["starting_usage"] == 0
+    assert report["calls_made"] == 1
     assert report["remaining_allowance"] == 0
     assert report["budget_stop_reason"] is None
     assert report["prior_step_calls_reduce_allowance"] is False
-    assert report["allowance_scope"] == SHARED_DECISION_REVIEW
+    assert report["allowance_scope"] == PER_STEP_DECISION_REVIEW
+    assert report["shared_with"] == []
+    assert resumed.metadata["core_candidates_compared"] == 8
     assert resumed.metadata["core_selection_withheld"] is False
     assert resumed.model_core_id
     with pytest.raises(AxialError, match="not waiting on a checkpoint"):

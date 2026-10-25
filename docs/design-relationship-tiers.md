@@ -20,9 +20,11 @@ Negative-case search stays. It was already in the counterexample step. Strauss a
 | --- | --- | --- | --- |
 | 0 | `category_evidence` | One verbatim quote for one endpoint | a category is present |
 | 1 | `hypothesis` | Each endpoint anchored somewhere, possibly in different cases | may be related |
-| 2 | `pattern_supported` | At least `pattern_min_cases` cases, each with a verbatim quote for both endpoints | co-occurs in N respondents |
+| 2 | `pattern_supported` | At least `pattern_min_cases` cases, each with a verbatim quote for both endpoints | co-occurs in N respondents, or co-occurs in N documents when any supporting case is a document or passage fallback |
 | 3 | `attribution` | Tier 2, plus a participant quote that states the link and is anchored to the passages, plus a rival check that returned a relevant judgment. An analyst memo does not supply this tier. | participants attribute X to Y |
 | 4 | `verified` | Tier 3, plus a researcher `verify` with a named scope | verified within the recorded scope |
+
+The respondent count is used only when every supporting case is a respondent, or a document the caller declared with `one_document_one_respondent`. Otherwise the wording says documents. Each supporting case records `case_identity_source`, and the run summary counts those sources. A recorded condition stays on `presented_statement`. The model's `statement` is kept. If that sentence leaves the condition out, the row is flagged `condition_not_in_statement` and is not shown as an unqualified claim.
 
 A category label is not a quote. The quote has to be a verbatim substring of a located passage and share a distinctive stem with that endpoint. Tier 1 is flagged `cross_case` when the two endpoint quotes are not in the same case, and `hypothesis_not_supported`. Accepting it does not happen. The row stays.
 

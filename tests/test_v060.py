@@ -30,7 +30,7 @@ from tests.fake_llm import FakeCoder
 
 
 def test_version_and_batch_size_default():
-    assert __version__ == "0.9.32"
+    assert __version__ == "0.9.33"
     assert inspect.signature(open_code).parameters["batch_size"].default == 1
     assert inspect.signature(aopen_code).parameters["batch_size"].default == 1
     assert RunConfig.__dataclass_fields__["batch_size"].default == 1

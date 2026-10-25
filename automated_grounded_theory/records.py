@@ -11,7 +11,7 @@ import json
 from itertools import combinations
 from typing import Any, Mapping, Sequence
 
-POLICY_VERSION = "0.9.32"
+POLICY_VERSION = "0.9.33"
 
 COMPARISON_OPS = (
     "alias_duplicate",
