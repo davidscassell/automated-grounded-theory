@@ -12,7 +12,7 @@ The coding-pool warning still compares the proposal, counterexample, memo, and s
 
 ## Reread requests
 
-Levels 0 through 3 shorten the codebook: full definitions, then other-code definitions dropped, then every definition dropped, then raised codes only. The first level that fits `token_budget` is what is sent. A passage that does not fit at level 3 is listed on `reread_requests_over_budget`. The queue continues. Claim review still opens when it was reserved. The estimate's token total and `focused_review_requests_projected` include only requests that fit the cap and the remaining token allowance. `focused_review_requests_withheld` counts passages that cannot fit the cap. The worst-case preflight reports the same projected fields, stays labeled as a worst case, and does not block selection.
+Levels 0 through 3 shorten the codebook: full definitions, then other-code definitions dropped, then every definition dropped, then raised codes only. The first level that fits `token_budget` is what is sent. A passage that does not fit at level 3 is listed on `reread_requests_over_budget`. The queue continues. Claim review still opens when it was reserved. A synthetic counterexample is a real request: it is sized and sent. Coverage helpers still omit it from corpus counts. An empty batch is not how that request is recorded. The estimate's token total and `focused_review_requests_projected` include only requests that fit the cap and the remaining token allowance. `focused_review_requests_withheld` counts passages that cannot fit the cap. The worst-case preflight reports the same projected fields, stays labeled as a worst case, and does not block selection.
 
 ## Core selection
 

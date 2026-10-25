@@ -4328,7 +4328,13 @@ def _fit_reread_request(
     definitions. That passage is withheld. It does not reject the other passages.
     """
     batch_items = [item if isinstance(item, Mapping) else {"passage_id": item, "purpose": "develop"} for item in items]
-    batch_ids = _queue_passage_ids(batch_items)
+    # Synthetic counterexamples are real requests. Coverage helpers omit them.
+    # The fitter must still size and send them.
+    batch_ids = []
+    for item in batch_items:
+        passage_id = str(item.get("passage_id") or "") if isinstance(item, Mapping) else str(item)
+        if passage_id:
+            batch_ids.append(passage_id)
     by_id = {str(item.get("passage_id") or ""): item for item in (state.get("passages") or [])}
     batch = [by_id[passage_id] for passage_id in batch_ids if passage_id in by_id]
     if not batch:
