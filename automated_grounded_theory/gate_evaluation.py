@@ -140,6 +140,7 @@ _INSPECT_FLAG_KEYS = (
 # to the explained rows. The primary counts do.
 WITHHOLDING_CAUSES = (
     "endpoint_unreviewed_by_focus",
+    "endpoint_not_selected_by_focus",
     "participant_denies_link",
     "partial_endpoint_evidence",
     "wording_withheld",
@@ -302,6 +303,11 @@ def withholding_reasons(row: Mapping[str, Any], rules: Sequence[str] | None = No
         or str(row.get("eligibility_reason") or "") == "endpoint_unreviewed_by_focus"
     ):
         add("endpoint_unreviewed_by_focus")
+    if (
+        "endpoint_not_selected_by_focus" in names
+        or str(row.get("eligibility_reason") or "") == "endpoint_not_selected_by_focus"
+    ):
+        add("endpoint_not_selected_by_focus")
     if "participant_denies_link" in names:
         add("participant_denies_link")
     ends = [item for item in (row.get("endpoint_anchoring") or []) if isinstance(item, Mapping)]

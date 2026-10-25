@@ -175,6 +175,8 @@ _NOUN_EMBED_RE = re.compile(
     r"\b(?:part of why|the reason|a reason|reason why|question of if|question of whether)\b"
 )
 ENDPOINT_UNREVIEWED_BY_FOCUS = "endpoint_unreviewed_by_focus"
+ENDPOINT_NOT_SELECTED_BY_FOCUS = "endpoint_not_selected_by_focus"
+_FOCUS_ENDPOINT_FLAGS = frozenset({ENDPOINT_UNREVIEWED_BY_FOCUS, ENDPOINT_NOT_SELECTED_BY_FOCUS})
 # Epistemic and existential-negation markers. A hit in the clause text before
 # the first connector is unsupported. This is not a list of the only sentences
 # that can fail: any of these markers fails closed. ``doubt`` also matches
@@ -1331,41 +1333,88 @@ def selection_limits_eligibility(metadata: Mapping[str, Any] | None) -> bool:
     return str(metadata.get("selection_status") or "") == "provisional"
 
 
-def stamp_focus_review(row: dict, metadata: Mapping[str, Any] | None) -> None:
-    """Copy a withheld focused selection onto a relationship, when one applies.
+def selection_restricts_to_raised(metadata: Mapping[str, Any] | None) -> bool:
+    """True when a finished focused selection limits later stages to raised codes.
 
-    A complete selection, and a run with no focused selection, leave the row
-    unchanged. The stamp is what later eligibility reads, so a refresh does
-    not drop the limit.
+    An incomplete or withheld selection does not. Its raised list is empty
+    because the review was not applied, not because nothing was selected.
+    A run with no focused selection does not restrict either.
     """
-    if not isinstance(row, dict) or not selection_limits_eligibility(metadata):
+    if not isinstance(metadata, Mapping) or selection_limits_eligibility(metadata):
+        return False
+    if metadata.get("selection_review_complete") is not True:
+        return False
+    if metadata.get("selection_withheld") is True:
+        return False
+    if str(metadata.get("selection_status") or "") != "applied":
+        return False
+    return isinstance(metadata.get("raised_code_ids"), (list, tuple))
+
+
+def stamp_focus_review(row: dict, metadata: Mapping[str, Any] | None) -> None:
+    """Copy the focused selection onto a relationship, when one applies.
+
+    A withheld or provisional selection stamps the codes it reviewed. A
+    complete applied selection stamps the codes it raised. A run with no
+    focused selection leaves the row unchanged. The stamp is what later
+    eligibility reads, so a refresh does not drop the limit.
+    """
+    if not isinstance(row, dict):
         return
-    reviewed = [str(item) for item in ((metadata or {}).get("selection_reviewed_code_ids") or [])]
+    if selection_limits_eligibility(metadata):
+        reviewed = [str(item) for item in ((metadata or {}).get("selection_reviewed_code_ids") or [])]
+        row["focus_review"] = {
+            "limits_eligibility": True,
+            "reviewed_code_ids": reviewed,
+            "rule": "unreviewed_endpoint_v1",
+        }
+        return
+    if not selection_restricts_to_raised(metadata):
+        return
+    source = metadata or {}
+    reviewed = [str(item) for item in (source.get("selection_reviewed_code_ids") or [])]
+    raised = [str(item) for item in (source.get("raised_code_ids") or [])]
     row["focus_review"] = {
         "limits_eligibility": True,
         "reviewed_code_ids": reviewed,
-        "rule": "unreviewed_endpoint_v1",
+        "raised_code_ids": raised,
+        "rule": "raised_endpoint_v1",
     }
 
 
 def _sync_unreviewed_flag(row: dict) -> None:
-    """Mark an endpoint the withheld focused selection never reviewed.
+    """Mark an endpoint the focused selection did not leave eligible.
 
-    Both endpoints have to be in ``reviewed_code_ids``. A reviewed pair keeps
-    the other eligibility rules. The flag is removed when the stamp is absent.
+    A withheld selection flags an endpoint it never reviewed. A complete
+    selection flags an endpoint it reviewed and did not raise as
+    ``endpoint_not_selected_by_focus``. An endpoint that was never reviewed
+    stays ``endpoint_unreviewed_by_focus``. Both flags are removed when the
+    stamp is absent.
     """
-    flags = [str(item) for item in (row.get("flags") or []) if str(item) != ENDPOINT_UNREVIEWED_BY_FOCUS]
+    flags = [str(item) for item in (row.get("flags") or []) if str(item) not in _FOCUS_ENDPOINT_FLAGS]
     review = row.get("focus_review")
     limited = isinstance(review, Mapping) and review.get("limits_eligibility") is True
+    reason = str(row.get("eligibility_reason") or "")
     if limited:
         reviewed = {str(item) for item in (review.get("reviewed_code_ids") or [])}
         ends = [str(row.get("from_id") or ""), str(row.get("to_id") or "")]
-        if any(end and end not in reviewed for end in ends):
+        if str(review.get("rule") or "") == "raised_endpoint_v1":
+            raised = {str(item) for item in (review.get("raised_code_ids") or [])}
+            reviewed_known = isinstance(review.get("reviewed_code_ids"), list)
+            if reviewed_known and any(end and end not in reviewed for end in ends):
+                flags.append(ENDPOINT_UNREVIEWED_BY_FOCUS)
+                row["eligibility_reason"] = ENDPOINT_UNREVIEWED_BY_FOCUS
+            elif any(end and end not in raised for end in ends):
+                flags.append(ENDPOINT_NOT_SELECTED_BY_FOCUS)
+                row["eligibility_reason"] = ENDPOINT_NOT_SELECTED_BY_FOCUS
+            elif reason in _FOCUS_ENDPOINT_FLAGS:
+                row.pop("eligibility_reason", None)
+        elif any(end and end not in reviewed for end in ends):
             flags.append(ENDPOINT_UNREVIEWED_BY_FOCUS)
             row["eligibility_reason"] = ENDPOINT_UNREVIEWED_BY_FOCUS
-        elif row.get("eligibility_reason") == ENDPOINT_UNREVIEWED_BY_FOCUS:
+        elif reason == ENDPOINT_UNREVIEWED_BY_FOCUS:
             row.pop("eligibility_reason", None)
-    elif row.get("eligibility_reason") == ENDPOINT_UNREVIEWED_BY_FOCUS:
+    elif reason in _FOCUS_ENDPOINT_FLAGS:
         row.pop("eligibility_reason", None)
     row["flags"] = flags
 
@@ -1380,7 +1429,9 @@ def relationship_evidence_use(row: Mapping[str, Any]) -> str:
     Rejected, empty, synthetic, unanchored, disputed, and causal-wording rows
     are ``withheld``. A missing tier is not supported evidence. An endpoint
     the withheld focused selection never reviewed is ``hypothesis_exploration``
-    with reason ``endpoint_unreviewed_by_focus``.
+    with reason ``endpoint_unreviewed_by_focus``. An endpoint a complete
+    selection reviewed and did not raise is ``hypothesis_exploration`` with
+    reason ``endpoint_not_selected_by_focus``.
     """
     if not isinstance(row, Mapping) or row.get("synthetic"):
         return WITHHELD_EVIDENCE
@@ -1392,6 +1443,8 @@ def relationship_evidence_use(row: Mapping[str, Any]) -> str:
     # An endpoint the focused selection never reviewed stays exploratory.
     # That holds even when quotes would otherwise support the row.
     if ENDPOINT_UNREVIEWED_BY_FOCUS in flags:
+        return HYPOTHESIS_EXPLORATION
+    if ENDPOINT_NOT_SELECTED_BY_FOCUS in flags:
         return HYPOTHESIS_EXPLORATION
     disposition = str(row.get("human_disposition") or row.get("disposition") or "").strip().casefold()
     if disposition in {"rejected", "merged"}:

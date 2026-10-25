@@ -2022,12 +2022,74 @@ def _check_resume_manifest(saved: Mapping[str, Any], current: Mapping[str, Any],
         raise CheckpointMigrationRequired(structural)
     # A higher call or token allowance continues the same review. It is not a
     # general procedure change, and it does not by itself invalidate a chunk.
-    budget_only = set(differences) <= {"procedure.max_decision_calls", "procedure.max_decision_tokens"}
+    budget_only = set(differences) <= {
+        "procedure.max_decision_calls",
+        "procedure.max_decision_tokens",
+        "procedure.max_focused_review_calls",
+        "procedure.max_focused_review_tokens",
+    }
     if budget_only:
         return [{"event": "budget_resume", "differences": differences}]
     if not allow_changes:
         raise CheckpointMismatch(differences)
     return [{"event": "continuation", "differences": differences}]
+
+
+def _allowance_stop(value: str) -> bool:
+    text = str(value or "")
+    return text in {
+        "call_allowance",
+        "token_allowance",
+        "request_budget",
+        CHUNK_ALLOWANCE_INSUFFICIENT,
+    }
+
+
+def _budget_resume_entry(state: Mapping[str, Any]) -> str | None:
+    """Node that already ran when a finished stage can continue on a larger budget.
+
+    The graph has reached the end, so there is no open interrupt. Returning the
+    node to rewind to lets that stage run again. A finished complete stage
+    returns None.
+    """
+    meta = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
+    progress = meta.get("decision_chunk_state") if isinstance(meta.get("decision_chunk_state"), Mapping) else {}
+    stops = {str(item) for item in (progress.get("stop_reasons") or [])}
+    decision_stop = str(meta.get("decision_stop") or "")
+    selection_open = progress.get("kind") == "focused_selection" and (
+        meta.get("selection_review_complete") is not True or meta.get("selection_withheld") is True
+    )
+    if selection_open and (
+        _allowance_stop(decision_stop) or any(_allowance_stop(item) for item in stops) or progress.get("provisional")
+    ):
+        return "select_candidates"
+    if meta.get("decision_review_complete") is False and _allowance_stop(decision_stop):
+        return "review_recode"
+    if _allowance_stop(str(state.get("recode_stop") or "")) or _allowance_stop(str(meta.get("stop") or "")):
+        if meta.get("selection_review_applied") is True or state.get("raised_code_ids"):
+            return "researcher_checkpoint"
+    return None
+
+
+def _prepare_budget_continuation(state: Mapping[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
+    """Clear an allowance stop so the re-entered stage can spend the new budget."""
+    merged = dict(metadata)
+    progress = dict(merged.get("decision_chunk_state") or {})
+    if progress.get("kind") == "focused_selection" and merged.get("selection_review_complete") is not True:
+        progress["open"] = True
+        progress["provisional"] = True
+        merged["decision_chunk_state"] = progress
+        merged.pop("decision_stop", None)
+        # The route treats a withheld selection as finished. Continuing the
+        # chunks has to clear that until the visit closes again.
+        merged["selection_withheld"] = False
+        merged["selection_status"] = "provisional"
+    elif merged.get("decision_review_complete") is False:
+        merged.pop("decision_stop", None)
+    updates: dict[str, Any] = {"metadata": merged}
+    if _allowance_stop(str(state.get("recode_stop") or "")):
+        updates["recode_stop"] = ""
+    return updates
 
 
 def _decision_to_coding(decision: Mapping[str, Any], book: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
@@ -5910,6 +5972,61 @@ async def _consolidate_selection_chunks(runtime, state, progress, metadata, logs
     progress["consolidation_raised_code_ids"] = chosen
 
 
+def _focused_reread_preflight(state: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Estimate the focused reread against its own token allowance.
+
+    Zero ``max_focused_review_calls`` or ``max_focused_review_tokens`` still
+    runs selection, so this check does not apply. The estimate is input tokens
+    for the planned reread batches. It is not a dollar bound.
+    """
+    meta = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
+    procedure = meta.get("procedure") if isinstance(meta.get("procedure"), Mapping) else {}
+    performance = meta.get("performance") if isinstance(meta.get("performance"), Mapping) else {}
+    max_calls = int(procedure.get("max_focused_review_calls") or 0)
+    max_tokens = int(procedure.get("max_focused_review_tokens") or 0)
+    if max_calls <= 0 or max_tokens <= 0:
+        return None
+    book = state.get("codebook") or {}
+    raised: list[str] = []
+    for key, entry in book.items():
+        code_id = str(entry.get("code_id") or key) if isinstance(entry, Mapping) else str(key)
+        if code_id and code_id not in raised:
+            raised.append(code_id)
+    plan = plan_recode_queue(
+        state.get("passages") or [],
+        state.get("segments") or [],
+        raised,
+        list(book.values()) if isinstance(book, Mapping) else [],
+        seed=int(procedure.get("seed") or 0),
+        neighbor_limit=_stored_limit(procedure.get("focused_neighbor_limit")),
+        outside_limit=_stored_limit(procedure.get("focused_outside_limit")),
+        negative_case_limit=_stored_limit(procedure.get("focused_negative_case_limit")),
+        shares=_shares_from_procedure(procedure),
+        incidents=meta.get("researcher_incidents") or [],
+        claims=list(state.get("properties") or []) + list(state.get("dimensions") or []),
+        max_calls=max_calls,
+        batch_size=max(1, int(performance.get("batch_size") or 1)),
+        sampling_seed=procedure.get("focused_sampling_seed"),
+        memos=state.get("memos") or [],
+    )
+    queue = list(plan.get("queue") or [])
+    batch_size = max(1, int(performance.get("batch_size") or 1))
+    probe = {**state, "raised_code_ids": raised}
+    total = 0
+    batches = 0
+    cursor = 0
+    while cursor < len(queue) and batches < max_calls:
+        total += _queue_batch_estimate(probe, queue[cursor:cursor + batch_size])
+        cursor += batch_size
+        batches += 1
+    return {
+        "focused_review_tokens_required": total,
+        "focused_review_tokens_available": max_tokens,
+        "focused_review_token_shortfall": max(0, total - max_tokens),
+        "blocked": total > max_tokens and total > 0,
+    }
+
+
 async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, *, metadata, logs, warnings) -> dict:
     """Send at most one selection chunk. A later chunk is another graph visit.
 
@@ -6159,13 +6276,12 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
     else:
         configured = int(reviewer.max_calls)
     required = len(chunks)
-    if (
-        bool(getattr(runtime, "auto_size_decision_calls", False))
-        and configured > 0
-        and required > configured
-    ):
-        # Raises the call allowance only. The token allowance stays as configured.
-        reviewer.max_calls = required
+    auto_size = bool(getattr(runtime, "auto_size_decision_calls", False))
+    # The configured allowance is reserved for claim review. Selection is sized
+    # to its own chunks, so auto-sizing cannot spend the claim review's calls.
+    claim_reserve = configured if auto_size and configured > 0 and required > 0 else 0
+    if claim_reserve:
+        reviewer.max_calls = required + claim_reserve
     allowance = int(reviewer.max_calls)
     token_allowance = int(reviewer.max_tokens)
     tokens_used = int(metadata.get("decision_tokens_used") or 0)
@@ -6183,7 +6299,8 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
     reused = {int(item) for item in (progress.get("reused_chunk_indexes") or [])}
     pending_chunks = [chunks[item] for item in range(len(chunks)) if item not in reused]
     calls_still = len(pending_chunks)
-    calls_available = max(0, allowance - calls_used)
+    selection_ceiling = allowance - claim_reserve if claim_reserve else allowance
+    calls_available = max(0, selection_ceiling - calls_used)
     tokens_required = 0
     for chunk_ids in pending_chunks:
         ids = [str(item) for item in chunk_ids]
@@ -6192,12 +6309,15 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
     tokens_available = max(0, token_allowance - tokens_used)
     shortfall = max(0, calls_still - calls_available)
     token_shortfall = max(0, tokens_required - tokens_available)
-    auto_size = bool(getattr(runtime, "auto_size_decision_calls", False))
     reviewer_on = allowance > 0
     # calls_still is what this visit still has to send. A zero token ceiling
     # cannot cover a positive estimate, so that check fails here too.
+    # A zero focused-review ceiling still runs selection, so that allowance
+    # is not part of this stop.
+    reread_preflight = _focused_reread_preflight(state)
+    reread_blocked = bool(reread_preflight and reread_preflight.get("blocked"))
     call_blocked = reviewer_on and calls_still > calls_available
-    token_blocked = reviewer_on and tokens_required > tokens_available
+    token_blocked = reviewer_on and (tokens_required > tokens_available or reread_blocked)
     can_finish = reviewer_on and not call_blocked and not token_blocked
     fields = preflight_fields(
         calls_required=calls_still,
@@ -6230,6 +6350,19 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
     metadata["preflight_can_finish"] = can_finish
     metadata["auto_size_covers_calls_only"] = auto_size
     metadata["auto_size_raised_tokens"] = False
+    metadata["claim_review_calls_reserved"] = claim_reserve
+    progress["claim_review_calls_reserved"] = claim_reserve
+    if reread_preflight:
+        metadata["focused_review_tokens_required"] = reread_preflight["focused_review_tokens_required"]
+        metadata["focused_review_tokens_available"] = reread_preflight["focused_review_tokens_available"]
+        metadata["focused_review_token_shortfall"] = reread_preflight["focused_review_token_shortfall"]
+        progress["focused_review_tokens_required"] = reread_preflight["focused_review_tokens_required"]
+        progress["focused_review_tokens_available"] = reread_preflight["focused_review_tokens_available"]
+    else:
+        metadata["focused_review_tokens_required"] = None
+        metadata["focused_review_tokens_available"] = None
+        metadata["focused_review_token_shortfall"] = None
+    metadata["token_estimate_is_dollar_bound"] = False
     metadata["token_estimate_includes_output_tokens"] = fields["token_estimate_includes_output_tokens"]
     metadata["token_estimate_includes_retry_or_repair_margin"] = fields["token_estimate_includes_retry_or_repair_margin"]
     metadata["token_estimate_includes_fixed_prompt_overhead"] = fields["token_estimate_includes_fixed_prompt_overhead"]
@@ -6258,6 +6391,15 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         )
         if auto_size:
             parts.append("Raising the call allowance does not mean this review can finish.")
+        if claim_reserve:
+            parts.append(
+                f"{claim_reserve} calls are reserved for claim review and are not part of the selection allowance."
+            )
+        if reread_blocked and reread_preflight:
+            parts.append(
+                f"The focused review allowance is {reread_preflight['focused_review_tokens_available']} tokens. "
+                f"The reread estimate is {reread_preflight['focused_review_tokens_required']}."
+            )
         note = " ".join(parts)
         if note not in warnings:
             warnings.append(note)
@@ -6783,6 +6925,11 @@ def _selection_export(state: Mapping[str, Any]) -> dict[str, Any]:
             "token_estimate_includes_fixed_prompt_overhead"
         ),
         "token_estimate_scope": metadata.get("token_estimate_scope"),
+        "token_estimate_is_dollar_bound": metadata.get("token_estimate_is_dollar_bound"),
+        "claim_review_calls_reserved": metadata.get("claim_review_calls_reserved"),
+        "focused_review_tokens_required": metadata.get("focused_review_tokens_required"),
+        "focused_review_tokens_available": metadata.get("focused_review_tokens_available"),
+        "focused_review_token_shortfall": metadata.get("focused_review_token_shortfall"),
         "chunks_reused": metadata.get("chunks_reused"),
         "selection_consolidation": metadata.get("selection_consolidation"),
     }
@@ -6846,6 +6993,11 @@ def load_focused_export(directory: str | Path) -> dict[str, Any]:
         "token_estimate_includes_retry_or_repair_margin",
         "token_estimate_includes_fixed_prompt_overhead",
         "token_estimate_scope",
+        "token_estimate_is_dollar_bound",
+        "claim_review_calls_reserved",
+        "focused_review_tokens_required",
+        "focused_review_tokens_available",
+        "focused_review_token_shortfall",
         "chunks_reused",
         "selection_consolidation",
     )
@@ -7979,9 +8131,13 @@ async def _invoke(
                     f"No focused-coding checkpoint was found for thread {thread_id!r}. "
                     "Start a run before resuming."
                 )
+            saved_values = dict(snapshot.values or {})
+            saved_meta = dict(saved_values.get("metadata") or {})
+            finished_entry = None
             if not (getattr(snapshot, "interrupts", ()) or getattr(snapshot, "next", ())):
-                raise FocusedError(f"Thread {thread_id!r} is not waiting on a researcher checkpoint.")
-            saved_meta = dict((snapshot.values or {}).get("metadata") or {})
+                finished_entry = _budget_resume_entry(saved_values)
+                if finished_entry is None:
+                    raise FocusedError(f"Thread {thread_id!r} is not waiting on a researcher checkpoint.")
             continuation = _check_resume_manifest(
                 saved_meta.get("checkpoint_manifest") or {},
                 metadata.get("checkpoint_manifest") or {},
@@ -8015,6 +8171,15 @@ async def _invoke(
                     config,
                     durability=durability,
                 )
+            elif finished_entry:
+                # The graph already exported. A larger budget continues the
+                # stage that stopped, and validated chunks are reused.
+                merged = {**saved_meta, **metadata}
+                if continuation:
+                    merged["continuations"] = list(saved_meta.get("continuations") or []) + continuation
+                prepared = _prepare_budget_continuation(saved_values, merged)
+                await graph.aupdate_state(config, prepared, as_node=finished_entry)
+                await graph.ainvoke(None, config, durability=durability)
             else:
                 # An execution error left the node unfinished. Retry from the
                 # last checkpoint. Command(resume=...) is only for interrupt().

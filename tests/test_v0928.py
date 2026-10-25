@@ -35,6 +35,7 @@ from automated_grounded_theory.async_support import ProviderAllowance, run_sync
 from automated_grounded_theory.prompts import message_text
 from automated_grounded_theory.axial import (
     AxialDecisionReviewer,
+    AxialError,
     ModelCoreDecision,
     _commit_relations,
     _core_review_payload,
@@ -281,7 +282,7 @@ def test_one_decision_call_charges_the_shared_review_stage_once():
     assert allowance.stage_used["review"] == 1
 
 
-def test_core_selection_stops_on_the_shared_allowance_remainder():
+def test_core_selection_keeps_its_own_call_allowance():
     label = "packing " * 40
     book = {f"c{index:02d}": {"code_id": f"c{index:02d}", "code": label, "definition": label} for index in range(8)}
     passages = [{"passage_id": "p1", "doc_id": "d1", "text": "A short note about packing."}]
@@ -337,19 +338,24 @@ def test_core_selection_stops_on_the_shared_allowance_remainder():
         batch_size=1,
     )
     report = finished.metadata["decision_reviews"]["axial_core_review"]
-    assert report["stop_reasons"] == ["call_allowance"]
-    assert report["chunks_sent"] == 4
-    assert report["starting_usage"] == 4
-    assert report["calls_made"] == 4
+    assert report["stop_reasons"] in (None, [])
+    assert report["complete"] is True
+    assert report["chunks_sent"] == 8
+    assert report["starting_usage"] == 0
+    assert report["calls_made"] == 8
     assert report["remaining_allowance"] == 0
+    assert report["prior_step_calls"] == 4
+    assert report["prior_step_calls_reduce_allowance"] is False
     assert report["allowance_scope"] == SHARED_DECISION_REVIEW
     assert report["allowance"] == 8
     step = finished.metadata["decision_budget_steps"][-1]
     assert step["step"] == "axial_core_review"
-    assert step["starting_usage"] == 4
-    assert step["calls_made"] == 4
+    assert step["starting_usage"] == 0
+    assert step["calls_made"] == 8
     assert step["remaining_allowance"] == 0
-    assert step["stop_reason"] == "call_allowance"
+    assert step["stop_reason"] is None
+    assert step["prior_step_calls"] == 4
+    assert step["prior_step_calls_reduce_allowance"] is False
     assert step["shared_with"] == list(SHARED_REVIEW_STEPS)
     assert finished.metadata["decision_calls_used"] == 8
     assert "temperature 0" in finished.metadata["model_configuration"]["note"]
@@ -491,7 +497,9 @@ def test_token_shortfall_stops_before_the_first_request(tmp_path):
     assert report["tokens_required"] == capped.metadata["selection_tokens_required"]
     assert report["tokens_required"] == report["tokens_available"] + report["token_shortfall"]
     assert report["calls_required"] == report["chunks_required"]
-    assert report["calls_available"] == report["decision_call_allowance"]
+    assert report["claim_review_calls_reserved"] == 1
+    assert report["decision_call_allowance"] == report["chunks_required"] + report["claim_review_calls_reserved"]
+    assert report["calls_available"] == report["chunks_required"]
     assert report["calls_required"] <= report["calls_available"]
     assert report["preflight_can_finish"] is False
     assert report["auto_size_covers_calls_only"] is True
@@ -1070,3 +1078,238 @@ def test_every_export_bucket_explains_ineligible_rows():
     assert downstream_ids == {"rel-accepted-ok"}
     assert "rel-accepted-ineligible" not in downstream_ids
     assert sum(exported["withholding_cause_counts"].values()) == exported["explained_rows"] == len(ineligible_ids)
+
+
+def test_complete_selection_withholds_endpoints_that_were_not_raised():
+    skipped = _tier_two_source(None)
+    skipped.update(
+        selection_review_complete=True,
+        selection_withheld=False,
+        selection_status="applied",
+        selection_reviewed_code_ids=["tools", "crew"],
+        raised_code_ids=["tools"],
+    )
+    held = axial_code(
+        skipped,
+        FakeAxialCoder(),
+        seed=3,
+        interrupt=False,
+        max_axial_review_calls=0,
+        axial_relations=False,
+        batch_size=1,
+    )
+    row = held.relationships[0]
+    assert row["eligibility_reason"] == "endpoint_not_selected_by_focus"
+    assert "endpoint_not_selected_by_focus" in row["flags"]
+    assert "endpoint_unreviewed_by_focus" not in row["flags"]
+    assert row["downstream_eligible"] is False
+    assert row["evidence_use"] == "hypothesis_exploration"
+    exported = export_gate_relationships([row])
+    accepted = exported["accepted"][0]
+    assert accepted["primary_withholding_cause"] == "endpoint_not_selected_by_focus"
+    assert accepted["reviewer_disposition"] != "ineligible"
+
+    both = _tier_two_source(None)
+    both.update(
+        selection_review_complete=True,
+        selection_withheld=False,
+        selection_status="applied",
+        selection_reviewed_code_ids=["tools", "crew"],
+        raised_code_ids=["tools", "crew"],
+    )
+    kept = axial_code(
+        both,
+        FakeAxialCoder(),
+        seed=3,
+        interrupt=False,
+        max_axial_review_calls=0,
+        axial_relations=False,
+        batch_size=1,
+    )
+    assert kept.relationships[0]["downstream_eligible"] is True
+    assert "endpoint_not_selected_by_focus" not in (kept.relationships[0].get("flags") or [])
+
+    pool = _tier_two_source(None)
+    book = dict(pool["codebook"])
+    book["other"] = {"code_id": "other", "code": "other work", "definition": "other work"}
+    pool["codebook"] = book
+    pool.update(
+        selection_review_complete=True,
+        selection_withheld=False,
+        selection_status="applied",
+        selection_reviewed_code_ids=["tools", "crew", "other"],
+        raised_code_ids=["tools", "crew"],
+    )
+    planned = axial_code(
+        pool,
+        FakeAxialCoder(),
+        seed=3,
+        interrupt=False,
+        max_axial_review_calls=0,
+        axial_relations=True,
+        batch_size=1,
+    )
+    assert planned.metadata["axial_pair_pool"] == "raised_focused_categories"
+    assert planned.metadata["pair_coverage"]["pair_count"] == 1
+    assert planned.metadata["axial_pair_pool_excluded_code_ids"] == ["other"]
+
+
+def test_auto_size_reserves_claim_review_calls(tmp_path):
+    finished = _focused(
+        [
+            _code("c-b", "DROP this code"),
+            _code("c-a", "KEEP this code"),
+        ],
+        tmp_path,
+        max_decision_calls=2,
+        auto_size_decision_calls=True,
+    )
+    assert finished.metadata["selection_review_complete"] is True
+    assert finished.metadata["claim_review_calls_reserved"] == 2
+    assert finished.metadata["decision_call_allowance"] >= 2
+    assert finished.metadata.get("decision_stop") != "call_allowance"
+    assert "16%" in finished.metadata["token_estimate_scope"]
+    assert finished.metadata["token_estimate_is_dollar_bound"] is False
+    assert "dollar bound" in finished.metadata["token_estimate_scope"]
+
+
+def test_focused_review_token_allowance_is_in_the_preflight(tmp_path):
+    capped = focused_code(
+        _focused_source([_code("c-a", "KEEP this code")]),
+        model=FakeAxialCoder(),
+        decision_model=_KeepSelector(),
+        decision_mode="llm",
+        seed=3,
+        batch_size=1,
+        interrupt=False,
+        max_focused_review_calls=2,
+        max_focused_review_tokens=1,
+        max_decision_calls=4,
+        max_decision_tokens=200000,
+        output_dir=tmp_path,
+    )
+    assert capped.metadata["decision_stop"] == CHUNK_ALLOWANCE_INSUFFICIENT
+    assert capped.metadata["focused_review_tokens_required"] > 1
+    assert capped.metadata["focused_review_tokens_available"] == 1
+    assert capped.metadata["focused_review_token_shortfall"] > 0
+    assert capped.metadata["decision_reviews"]["focused_selection"]["chunks_sent"] == 0
+    assert not any(entry.get("kind") == "decision_review" for entry in capped.prompt_log)
+
+
+def test_finished_incomplete_selection_resumes_on_a_larger_budget():
+    saver = InMemorySaver()
+    source = _focused_source(_large_codes())
+    first = _ScriptedSelector()
+    finished = focused_code(
+        source,
+        **_focused_common(
+            saver,
+            "finished-budget",
+            first,
+            interrupt=False,
+            max_decision_calls=1,
+            auto_size_decision_calls=True,
+            max_decision_tokens=1000,
+        ),
+    )
+    assert finished.interrupted is False
+    assert finished.metadata["decision_stop"] == CHUNK_ALLOWANCE_INSUFFICIENT
+    assert first.calls == 0
+    second = _ScriptedSelector()
+    resumed = focused_code(
+        source,
+        **_focused_common(
+            saver,
+            "finished-budget",
+            second,
+            interrupt=False,
+            resuming=True,
+            allow_changes=False,
+            max_decision_calls=1,
+            auto_size_decision_calls=True,
+            max_decision_tokens=200000,
+        ),
+    )
+    assert resumed.metadata["continuations"][0]["event"] == "budget_resume"
+    assert resumed.raised_code_ids == ["c-a", "c-c"]
+    assert second.calls >= 1
+
+
+def test_finished_incomplete_core_resumes_on_a_larger_budget():
+    label = "packing " * 40
+    book = {f"c{index:02d}": {"code_id": f"c{index:02d}", "code": label, "definition": label} for index in range(8)}
+    passages = [{"passage_id": "p1", "doc_id": "d1", "text": "A short note about packing."}]
+    state = {
+        "codebook": book,
+        "passages": passages,
+        "segments": [],
+        "relationships": [],
+        "properties": [],
+        "dimensions": [],
+        "metadata": {},
+    }
+    candidates = _score_candidates(state)
+    reviewer = AxialDecisionReviewer(FakeAxialCoder(), max_calls=8, max_tokens=24000, token_budget=10**9)
+    blank = {"decision_calls_used": 0}
+
+    def estimate(ids):
+        subset = [row for row in candidates if row["code_id"] in set(ids)]
+        payload = _core_review_payload(
+            subset, preferred=[], snapshot=graph_snapshot([]), chunk_index=10**6, chunk_count=10**6,
+        )
+        return reviewer.refusal_reason(payload, ModelCoreDecision, blank)[1]
+
+    one = estimate([candidates[0]["code_id"]])
+    source = {
+        "codebook": book,
+        "passages": passages,
+        "segments": [],
+        "relationships": [],
+        "metadata": {"stage": "axial"},
+    }
+    saver = InMemorySaver()
+    common = dict(
+        seed=3,
+        decision_mode="llm",
+        interrupt=False,
+        include_memos=False,
+        include_storyline=False,
+        max_axial_review_tokens=24000,
+        axial_token_budget=one,
+        batch_size=1,
+        checkpointer=saver,
+        thread_id="finished-core",
+    )
+    finished = selective_code(source, FakeAxialCoder(), max_decision_calls=1, **common)
+    assert finished.interrupted is False
+    assert finished.metadata["decision_stop"] == "call_allowance"
+    assert finished.metadata["core_selection_complete"] is False
+    assert finished.metadata["decision_reviews"]["axial_core_review"]["chunks_sent"] == 1
+    resumed = selective_code(
+        source,
+        FakeAxialCoder(),
+        max_decision_calls=8,
+        resuming=True,
+        allow_changes=False,
+        **common,
+    )
+    report = resumed.metadata["decision_reviews"]["axial_core_review"]
+    assert report["complete"] is True
+    assert report["chunks_sent"] == 8
+    assert report["starting_usage"] == 1
+    assert report["calls_made"] == 7
+    assert report["remaining_allowance"] == 0
+    assert report["budget_stop_reason"] is None
+    assert report["prior_step_calls_reduce_allowance"] is False
+    assert report["allowance_scope"] == SHARED_DECISION_REVIEW
+    assert resumed.metadata["core_selection_withheld"] is False
+    assert resumed.model_core_id
+    with pytest.raises(AxialError, match="not waiting on a checkpoint"):
+        selective_code(
+            source,
+            FakeAxialCoder(),
+            max_decision_calls=8,
+            resuming=True,
+            allow_changes=False,
+            **common,
+        )

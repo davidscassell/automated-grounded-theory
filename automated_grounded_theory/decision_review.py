@@ -88,7 +88,9 @@ TOKEN_ESTIMATE_SCOPE_NOTE = (
     "tokens_required sums estimated input tokens for each chunk that still has to be sent. "
     "Each estimate includes the fixed system prompt, the chunk payload, and the response schema. "
     "It does not include output tokens. "
-    "It does not include a retry or repair margin. Decision review does not retry or schema-repair."
+    "It does not include a retry or repair margin. Decision review does not retry or schema-repair. "
+    "The estimate counts input only. On a completed focused review it ran about 16% above "
+    "provider-reported input tokens. That gap is not a dollar bound, and the estimate is not rescaled to remove it."
 )
 # A partial focused selection walks code ids unless the caller asks for a shuffle.
 PARTIAL_SELECTION_BIAS = (
@@ -589,18 +591,20 @@ def open_budget_step(
     allowance_scope: str,
     allowance: int | None,
     shared_with: Sequence[str] = (),
+    usage: int | None = None,
 ) -> None:
     """Record the allowance already spent when a budgeted step starts.
 
     A step that is already open is left as it is, so a later chunk of the same
-    step does not reset ``starting_usage``.
+    step does not reset ``starting_usage``. ``usage`` is this step's own calls.
+    When it is omitted, the shared counter is used.
     """
     steps = [dict(item) for item in (metadata.get("decision_budget_steps") or []) if isinstance(item, Mapping)]
     for item in steps:
         if item.get("step") == step and item.get("open"):
             metadata["decision_budget_steps"] = steps
             return
-    used = int(metadata.get("decision_calls_used") or 0)
+    used = int(metadata.get("decision_calls_used") or 0) if usage is None else max(0, int(usage))
     allowance_n = None if allowance is None else int(allowance)
     steps.append(
         {
@@ -618,10 +622,21 @@ def open_budget_step(
     metadata["decision_budget_steps"] = steps
 
 
-def close_budget_step(metadata: dict[str, Any], *, step: str, stop_reason: str | None = None) -> None:
-    """Close the open step, or refresh its stop after the calls are known."""
+def close_budget_step(
+    metadata: dict[str, Any],
+    *,
+    step: str,
+    stop_reason: str | None = None,
+    usage: int | None = None,
+) -> None:
+    """Close the open step, or refresh its stop after the calls are known.
+
+    ``usage`` is this step's own calls. When it is omitted, the shared counter
+    is used. Earlier steps are recorded and do not reduce this step's remaining
+    allowance when the step has its own ceiling.
+    """
     steps = [dict(item) for item in (metadata.get("decision_budget_steps") or []) if isinstance(item, Mapping)]
-    used_now = int(metadata.get("decision_calls_used") or 0)
+    used_now = int(metadata.get("decision_calls_used") or 0) if usage is None else max(0, int(usage))
     reason = str(stop_reason or "") or None
     target = None
     for item in reversed(steps):
@@ -643,6 +658,16 @@ def close_budget_step(metadata: dict[str, Any], *, step: str, stop_reason: str |
     if reason or target.get("open"):
         target["stop_reason"] = reason
     target["open"] = False
+    if step in SHARED_REVIEW_STEPS:
+        prior_names = set(SHARED_REVIEW_STEPS[: SHARED_REVIEW_STEPS.index(step)])
+        prior_calls = sum(
+            int(item.get("calls_made") or 0)
+            for item in steps
+            if item is not target and item.get("step") in prior_names
+        )
+        carried = int(metadata.get("decision_calls_carried") or 0)
+        target["prior_step_calls"] = prior_calls if prior_calls else carried
+        target["prior_step_calls_reduce_allowance"] = False
     metadata["decision_budget_steps"] = steps
 
 
@@ -662,6 +687,9 @@ def stamp_budget_on_progress(progress: dict[str, Any], metadata: Mapping[str, An
     progress["calls_made"] = record.get("calls_made")
     progress["remaining_allowance"] = record.get("remaining_allowance")
     progress["budget_stop_reason"] = record.get("stop_reason")
+    if "prior_step_calls" in record:
+        progress["prior_step_calls"] = record.get("prior_step_calls")
+        progress["prior_step_calls_reduce_allowance"] = record.get("prior_step_calls_reduce_allowance")
 
 
 def budget_ledger(metadata: Mapping[str, Any] | None) -> list[dict[str, Any]]:
@@ -680,15 +708,23 @@ def budget_ledger(metadata: Mapping[str, Any] | None) -> list[dict[str, Any]]:
                 "calls_made": item.get("calls_made"),
                 "remaining_allowance": item.get("remaining_allowance"),
                 "stop_reason": item.get("stop_reason"),
+                "prior_step_calls": item.get("prior_step_calls"),
+                "prior_step_calls_reduce_allowance": item.get("prior_step_calls_reduce_allowance"),
             }
         )
     return rows
 
 
-def seal_budget_step(metadata: dict[str, Any], progress: dict[str, Any], step: str) -> None:
+def seal_budget_step(
+    metadata: dict[str, Any],
+    progress: dict[str, Any],
+    step: str,
+    *,
+    usage: int | None = None,
+) -> None:
     """Close the step from this progress row and copy the account onto it."""
     stops = [str(item) for item in (progress.get("stop_reasons") or []) if str(item)]
-    close_budget_step(metadata, step=step, stop_reason=stops[0] if stops else None)
+    close_budget_step(metadata, step=step, stop_reason=stops[0] if stops else None, usage=usage)
     stamp_budget_on_progress(progress, metadata, step)
 
 
@@ -1060,6 +1096,7 @@ def preflight_fields(
         "token_estimate_includes_retry_or_repair_margin": TOKEN_ESTIMATE_INCLUDES_RETRY_OR_REPAIR_MARGIN,
         "token_estimate_includes_fixed_prompt_overhead": TOKEN_ESTIMATE_INCLUDES_FIXED_PROMPT_OVERHEAD,
         "token_estimate_scope": TOKEN_ESTIMATE_SCOPE_NOTE,
+        "token_estimate_is_dollar_bound": False,
     }
 
 
@@ -1247,6 +1284,27 @@ def finish_decision_report(progress: Mapping[str, Any]) -> dict[str, Any]:
         "calls_made": progress.get("calls_made") if "calls_made" in progress else None,
         "remaining_allowance": progress.get("remaining_allowance") if "remaining_allowance" in progress else None,
         "budget_stop_reason": progress.get("budget_stop_reason") if "budget_stop_reason" in progress else None,
+        "prior_step_calls": progress.get("prior_step_calls") if "prior_step_calls" in progress else None,
+        "prior_step_calls_reduce_allowance": (
+            progress.get("prior_step_calls_reduce_allowance")
+            if "prior_step_calls_reduce_allowance" in progress
+            else None
+        ),
+        "claim_review_calls_reserved": (
+            None
+            if progress.get("claim_review_calls_reserved") is None
+            else int(progress.get("claim_review_calls_reserved") or 0)
+        ),
+        "focused_review_tokens_required": (
+            None
+            if progress.get("focused_review_tokens_required") is None
+            else int(progress.get("focused_review_tokens_required") or 0)
+        ),
+        "focused_review_tokens_available": (
+            None
+            if progress.get("focused_review_tokens_available") is None
+            else int(progress.get("focused_review_tokens_available") or 0)
+        ),
     }
 
 
