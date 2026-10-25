@@ -39,10 +39,10 @@ _STATEMENT = "tools for the shift may be related to coworkers on the crew"
 
 
 def test_version_and_fingerprint():
-    assert __version__ == "0.9.30"
-    assert POLICY_VERSION == "0.9.30"
+    assert __version__ == "0.9.31"
+    assert POLICY_VERSION == "0.9.31"
     assert DECISION_REVIEW_CHUNKING == "request_budget_v6"
-    assert CONDITIONAL_SCOPE_RULE == "unambiguous_hedge_v1"
+    assert CONDITIONAL_SCOPE_RULE == "condition_scope_v1"
     assert DUPLICATE_ASSERTION_RULE == "merge_all_evidence_v1"
     current = review_procedure_fields()
     assert same_chunking_fingerprint(current, current) is True
@@ -368,15 +368,16 @@ def test_codes_outside_a_raised_chunk_are_not_near_misses_and_a_split_can_be_att
             warnings,
         )
     )
-    assert metadata["selection_consolidation_status"] == "failed"
-    assert metadata["selection_consolidation_reason"] == "request_budget"
-    assert metadata["selection_consolidation_error"] == "request_budget"
+    assert metadata["selection_consolidation_status"] == "unresolved-synthesis"
+    assert metadata["selection_consolidation_reason"] == "synthesis_cannot_fit"
+    assert metadata["selection_consolidation_error"] is None
     assert metadata["selection_consolidation"] is None
     assert metadata.get("selection_consolidation_skipped") is None
     assert progress["consolidation_closed"] is False
     assert "consolidation_done" not in metadata
     assert progress["raised_ids"] == ["c-0", "c-1"]
     assert progress["consolidation_calls_sent"] >= 1
+    assert len(progress["consolidation_validated_groups"]) == 2
     assert metadata.get("decision_stop") is None
 
     class _NeverFits:

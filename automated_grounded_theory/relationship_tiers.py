@@ -165,10 +165,17 @@ _DISCOURSE_ASIDES = frozenset({
     "if i am honest",
 })
 _ASIDE_BOUNDARY_RE = re.compile(r",|;|\u2014|—|--")
-# A noun phrase can contain ``if`` without making the link conditional.
-_NOUN_EMBED_RE = re.compile(
-    r"\b(?:part of why|the reason|a reason|reason why|question of if|question of whether)\b"
+# Condition markers, longest first so ``provided that`` wins over ``provided``.
+# This is a scope check, not a list of the only sentences that can be conditional.
+_CONDITION_MARKER_RE = re.compile(
+    r"\b(?:on condition that|provided that|providing that|as long as|so long as|"
+    r"only when|except when|except if|in case|assuming that|provided|providing|"
+    r"assuming|unless|if)\b"
 )
+# Positive evidence that ``if`` or ``whether`` is inside a noun phrase.
+# ``the reason`` and ``part of why`` are not that evidence.
+_EMBEDDED_CONDITION_RE = re.compile(r"\bquestion of\s*$")
+_MATRIX_COPULA_RE = re.compile(r"\s+is\s+(?:simple|clear|obvious|plain)\b.*$")
 ENDPOINT_UNREVIEWED_BY_FOCUS = "endpoint_unreviewed_by_focus"
 ENDPOINT_NOT_SELECTED_BY_FOCUS = "endpoint_not_selected_by_focus"
 _FOCUS_ENDPOINT_FLAGS = frozenset({ENDPOINT_UNREVIEWED_BY_FOCUS, ENDPOINT_NOT_SELECTED_BY_FOCUS})
@@ -743,39 +750,59 @@ def _strip_discourse_asides(folded: str) -> str:
     return _norm("".join(pieces))
 
 
+def _condition_text(clause: str) -> str | None:
+    """The condition span that governs ``clause``, or None.
+
+    Discourse asides are removed first. ``if that makes sense`` does not count.
+    ``if I can``, ``if possible``, ``unless``, ``provided that``, ``as long as``,
+    ``only when``, ``in case``, ``assuming``, ``on condition that``, and
+    ``except when`` do. The span runs from the marker through the next clause
+    break. A trailing matrix copula (``if it rains is simple``) is not part of
+    the condition. ``if`` or ``whether`` counts as embedded only when the words
+    immediately before it are ``question of``. ``the reason`` and ``part of why``
+    are not embedding, so the condition stays.
+    """
+    stripped = _strip_discourse_asides(_norm(clause))
+    if not stripped:
+        return None
+    for match in _CONDITION_MARKER_RE.finditer(stripped):
+        marker = match.group(0)
+        prefix = stripped[:match.start()]
+        if marker in {"if", "whether"} and _EMBEDDED_CONDITION_RE.search(prefix):
+            continue
+        tail = stripped[match.start():]
+        end = len(tail)
+        for index, char in enumerate(tail):
+            if char in ".?!;,":
+                end = index
+                break
+        span = _MATRIX_COPULA_RE.sub("", tail[:end]).strip()
+        if span:
+            return span
+    return None
+
+
 def _conditional_governs_link(clause: str) -> bool:
     """True when a conditional governs the from-to link in ``clause``.
 
-    ``if`` inside a noun phrase such as ``part of why ... if ...`` does not.
-    A discourse aside does not: the span is an exact hedge that cannot be a
-    condition, such as ``if that makes sense``, ``if you know what I mean``,
-    or ``if I'm honest``. Stripping that aside does not remove any other
-    conditional. ``if I can``, ``if possible``, ``if you help``, ``if you
-    understand``, and ``if the night is long`` stay. ``if`` before the
-    connector, or a condition after the
-    connector that is not inside that noun phrase, does. ``would`` and reported
-    speech stay hypothetical markers. The reading is still provisional: this is
-    a closed pattern, not a parse of the sentence.
+    A condition marker keeps the link conditional. ``the reason ... if ...``
+    does not remove that marker. Only ``question of if`` or ``question of
+    whether`` is noun-phrase embedding. A discourse aside does not govern:
+    the span is an exact hedge that cannot be a condition, such as ``if that
+    makes sense``, ``if you know what I mean``, or ``if I'm honest``.
+    ``if I can``, ``if possible``, ``unless it rains``, and ``provided that
+    it rains`` stay. ``would`` and reported speech stay hypothetical markers.
+    The reading is still provisional: this is a closed pattern, not a parse
+    of the sentence.
     """
     folded = _norm(clause)
     if not folded:
         return False
     if _OTHER_HYPOTHETICAL_RE.search(folded):
         return True
-    stripped = _strip_discourse_asides(folded)
-    if not re.search(r"\bif\b", stripped):
+    if _condition_text(folded) is None:
         return False
-    connectors = _connectors(stripped)
-    if not connectors:
-        return False
-    link_pos = min(pos for pos, _phrase, _kind in connectors)
-    for match in re.finditer(r"\bif\b", stripped):
-        if_pos = match.start()
-        before = stripped[:if_pos]
-        if _NOUN_EMBED_RE.search(before) and if_pos > link_pos:
-            continue
-        return True
-    return False
+    return bool(_connectors(_strip_discourse_asides(folded)))
 
 
 def _recognized_affirmative_prefix(prefix: str) -> bool:
@@ -821,13 +848,17 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
     ``nothing to do with``, denies the link. An epistemic or
     existential-negation marker before that connector is unsupported and does
     not authorize tier 3. ``would`` and ``someone said`` are hypothetical.
-    ``if`` is hypothetical only when it governs this from-to link. An ``if``
-    inside a noun phrase, or an exact hedge that cannot be a condition, such
-    as ``if that makes sense``, is not. ``if I can`` and ``if possible`` stay
-    in the quote. Any other condition stays hypothetical or ambiguous. A
-    provisional reading does not authorize tier 3. This is not a general reading of the
-    sentence. Every reading stays provisional until it is checked on
-    natural-language data. Human-adjudicated examples are not in this package.
+    A condition marker is hypothetical when it governs this from-to link.
+    ``unless``, ``provided that``, ``as long as``, ``only when``, ``in case``,
+    ``assuming``, ``on condition that``, and ``except when`` are condition
+    markers, as is ``if``. ``the reason`` before ``if`` does not remove the
+    condition. Only ``question of if`` or ``question of whether`` is embedding.
+    An exact hedge that cannot be a condition, such as ``if that makes sense``,
+    is not hypothetical. ``if I can`` and ``if possible`` stay in the quote.
+    The condition span is kept on the reading. A provisional reading does not
+    authorize tier 3. This is not a general reading of the sentence. Every
+    reading stays provisional until it is checked on natural-language data.
+    Human-adjudicated examples are not in this package.
     """
     folded = _norm(text)
     if not folded:
@@ -875,7 +906,8 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
     hedging = "qualified" if frequency_scope else (
         "hedged" if _HEDGE_RE.search(f" {stripped_clause} ") else "none"
     )
-    hypothetical = _conditional_governs_link(clause)
+    condition = _condition_text(clause) or _condition_text(folded)
+    hypothetical = _conditional_governs_link(clause) or bool(condition)
     unsupported = _unsupported_before_connector(clause)
     if unsupported:
         status = "unsupported"
@@ -921,6 +953,8 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
         qualifications.append("participant_direction_unspecified")
     elif status == "hypothetical":
         qualifications.append("participant_link_hypothetical")
+        if condition:
+            qualifications.append("participant_link_conditional")
     elif status == "ambiguous":
         qualifications.append("participant_link_ambiguous")
     elif status == "unsupported":
@@ -936,6 +970,10 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
         "reading_basis": READING_BASIS,
         "reading_provisional": True,
         "qualifications": qualifications,
+        # The condition span stays on the reading. A later check requires the
+        # proposed statement to retain it before the quote can authorize tier 3.
+        "condition": condition,
+        "condition_retained": None,
         # Only a validated reading can authorize tier 3. Hypothetical,
         # ambiguous, and every other provisional status cannot.
         "authorizes_tier_3": status == "validated",
@@ -1017,6 +1055,19 @@ def _participant_link(
             "unvalidated",
         )
         chosen = sorted(readings, key=lambda item: order.index(item["status"]) if item["status"] in order else len(order))[0]
+    chosen = dict(chosen)
+    condition = chosen.get("condition")
+    statement = _norm(str(relationship.get("statement") or ""))
+    retained = None
+    if condition:
+        retained = _norm(str(condition)) in statement
+        if not retained:
+            qualifications = [str(item) for item in (chosen.get("qualifications") or [])]
+            if "condition_not_in_statement" not in qualifications:
+                qualifications.append("condition_not_in_statement")
+            chosen["qualifications"] = qualifications
+            chosen["authorizes_tier_3"] = False
+    chosen["condition_retained"] = retained
     component.update(chosen)
     component["present"] = True
     component["evidence_use"] = HYPOTHESIS_EXPLORATION
@@ -1189,6 +1240,8 @@ def assess_relationship(
         "cases_with_both_endpoints": len(both_cases),
         "claims": claims,
         "participant_link": participant if participant.get("present") else None,
+        "condition": participant.get("condition"),
+        "condition_retained": participant.get("condition_retained"),
         "core_support_component": "pattern" if pattern_supported else None,
         "shared_quote_for_both_endpoints": any(
             isinstance(case, Mapping) and case.get("shared_quote_for_both_endpoints") for case in cases

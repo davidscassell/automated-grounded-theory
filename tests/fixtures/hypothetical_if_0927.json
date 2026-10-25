@@ -5,8 +5,8 @@
     {
       "id": "noun-phrase-if",
       "quote": "Part of why tools for the shift lead to coworkers on the crew if the night is long",
-      "status": "validated",
-      "hypothetical": false
+      "status": "hypothetical",
+      "hypothetical": true
     },
     {
       "id": "aside-if-i-can",
