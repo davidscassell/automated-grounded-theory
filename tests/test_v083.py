@@ -266,12 +266,17 @@ def test_selective_omission_and_parse_failure_are_not_complete(tmp_path):
 
 
 def test_omitted_llm_review_is_budget_limited(monkeypatch):
+    """A decision step stops on its own ceiling. Coding keeps the separate pool.
+
+    The proposal estimate fits 1500. The decision estimate does not, so the
+    review is omitted for that step and proposals still complete.
+    """
     def estimate(messages, schema, tokenizer=None):
         name = getattr(schema, "__name__", "")
         if name == "AxialProposalBatch":
             return 1402
         if name in {"AxialRelationDecisions", "ModelSaturationDecision", "ModelCoreDecision"}:
-            return 1166
+            return 1600
         return 30
 
     _install_estimates(monkeypatch, estimate)

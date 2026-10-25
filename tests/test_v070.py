@@ -475,7 +475,9 @@ def test_allowance_exhaustion_is_incomplete_and_skips_the_model():
     )
     assert silent.call_count == 0
     assert tokens.metadata["status"] == "incomplete"
-    assert tokens.metadata["stop"] == "token_allowance"
+    assert tokens.metadata["stop"] == "reread_allowance_insufficient"
+    assert tokens.metadata["reread_stop"] == "reread_allowance_insufficient"
+    assert tokens.raised_code_ids
     assert set(tokens.focused_not_reread) == {"p1", "p2", "p3"}
 
     none, both = _run(
