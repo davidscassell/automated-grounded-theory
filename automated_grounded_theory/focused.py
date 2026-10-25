@@ -169,6 +169,8 @@ from automated_grounded_theory.version import __version__
 
 logger = logging.getLogger("automated_grounded_theory")
 from automated_grounded_theory.decision_review import (
+    AUTO_SIZE_DECISION_CALLS,
+    CHUNK_ALLOWANCE_INSUFFICIENT,
     DECISION_REVIEW_CHUNKING,
     ClaimDecisions,
     DecisionChunkingCheckpointError,
@@ -257,6 +259,11 @@ _PROCEDURE_KEYS = (
     "pair_count_rule",
     "core_candidate_rule",
     "oversized_recovery",
+    "focus_endpoint_rule",
+    "withholding_cause_rule",
+    "conditional_scope_rule",
+    "chunk_allowance_rule",
+    "auto_size_decision_calls",
 )
 _PERFORMANCE_KEYS = (
     "batch_size",
@@ -403,6 +410,7 @@ class FocusedRuntime:
     duplicate_similarity: float = DEFAULT_FOCUSED_DUPLICATE_SIMILARITY
     step_timeout: float = 0.0
     decision_step_timeout: float = 0.0
+    auto_size_decision_calls: bool = False
 
     def __post_init__(self) -> None:
         if self.limiter is None:
@@ -5868,7 +5876,13 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         item["detail"] = "omitted_oversized"
     progress = load_chunk_progress(metadata, plan)
     if progress.get("provisional") and not metadata.get("decision_stop"):
-        ceilings = {"call_allowance", "token_allowance", "request_budget", "review_error"}
+        ceilings = {
+            "call_allowance",
+            "token_allowance",
+            "request_budget",
+            "review_error",
+            CHUNK_ALLOWANCE_INSUFFICIENT,
+        }
         progress["stop_reasons"] = [
             item for item in (progress.get("stop_reasons") or []) if str(item) not in ceilings
         ]
@@ -5920,7 +5934,10 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
             metadata["selection_review_complete"] = False
             planned = list(progress_row.get("chunks") or [])
             unrecovered = bool(omissions) and not ceiling and not failed and validated > 0 and validated == len(planned)
-            if ceiling:
+            if CHUNK_ALLOWANCE_INSUFFICIENT in stops:
+                metadata["decision_stop"] = CHUNK_ALLOWANCE_INSUFFICIENT
+                metadata["decision_stop_detail"] = CHUNK_ALLOWANCE_INSUFFICIENT
+            elif ceiling:
                 metadata["decision_stop"] = ceiling
                 metadata["decision_stop_detail"] = ceiling
             elif failed:
@@ -6001,6 +6018,49 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         store_decision_report(merged_meta, report)
         warnings = list(updates.get("warnings") or warnings)
         return {**updates, "metadata": merged_meta, "prompt_log": logs, "warnings": warnings}
+
+    # The caller's allowance lives on the procedure. A later visit must not
+    # read the reviewer's already-raised max_calls as that configured value,
+    # or the raised flag disappears after the first chunk.
+    procedure = metadata.get("procedure") if isinstance(metadata.get("procedure"), Mapping) else {}
+    stored_calls = procedure.get("max_decision_calls")
+    if isinstance(stored_calls, int) and not isinstance(stored_calls, bool) and stored_calls >= 0:
+        configured = stored_calls
+    else:
+        configured = int(reviewer.max_calls)
+    required = len(chunks)
+    if (
+        bool(getattr(runtime, "auto_size_decision_calls", False))
+        and configured > 0
+        and required > configured
+    ):
+        # Raises the call allowance only. The token ceiling and the per-request
+        # budget still refuse a chunk that does not fit.
+        reviewer.max_calls = required
+    allowance = int(reviewer.max_calls)
+    sent = int(progress.get("chunks_sent") or 0)
+    validated_now = int(progress.get("chunks_validated") or 0)
+    shortfall = max(0, required - allowance)
+    progress["chunks_required"] = required
+    progress["decision_call_allowance"] = allowance
+    progress["chunk_shortfall"] = shortfall
+    metadata["selection_chunks_required"] = required
+    metadata["decision_call_allowance"] = allowance
+    metadata["decision_call_allowance_configured"] = configured
+    metadata["selection_chunk_shortfall"] = shortfall
+    metadata["auto_size_decision_calls"] = bool(getattr(runtime, "auto_size_decision_calls", False))
+    metadata["decision_call_allowance_raised"] = allowance != configured
+    # Zero still means the reviewer is off. That stop stays call_allowance.
+    # A plan that cannot finish inside a positive allowance is not started.
+    if allowance > 0 and sent == 0 and validated_now == 0 and required > allowance:
+        add_stop_reason(progress, CHUNK_ALLOWANCE_INSUFFICIENT)
+        note = (
+            "LLM selection review was not sent. "
+            f"{required} chunks are required and the decision-call allowance is {allowance}."
+        )
+        if note not in warnings:
+            warnings.append(note)
+        return _close(progress)
 
     if index >= len(chunks):
         return _close(progress)
@@ -6199,6 +6259,15 @@ def _selection_can_resume(meta: Mapping[str, Any]) -> bool:
         return False
     chunks = list(progress.get("chunks") or [])
     validated = int(progress.get("chunks_validated") or 0)
+    stops = {str(item) for item in (progress.get("stop_reasons") or [])}
+    # Nothing was sent. A later resume can raise the call allowance and review
+    # the same plan. That is the only pause for this stop.
+    if (
+        CHUNK_ALLOWANCE_INSUFFICIENT in stops
+        and bool(chunks)
+        and int(progress.get("chunks_sent") or 0) == 0
+    ):
+        return True
     if bool(chunks) and 0 < validated < len(chunks):
         return True
     return bool(chunks) and validated == len(chunks) and validated > 0 and bool(_selection_omissions(progress))
@@ -6432,6 +6501,121 @@ def _research_development(development: Mapping[str, Any]) -> dict[str, Any]:
     return dropped if isinstance(dropped, dict) else payload
 
 
+def _selection_export(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Raised ids, completeness, and the provisional ids, in one record.
+
+    A withheld selection keeps ``raised_code_ids`` empty. The provisional ids
+    are stored beside it and are not the applied set.
+    """
+    metadata = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
+    return {
+        "raised_code_ids": [str(item) for item in _selected_ids(state, "raised_code_ids")],
+        "not_raised_code_ids": [str(item) for item in _selected_ids(state, "not_raised_code_ids")],
+        "provisional_raised_code_ids": [str(item) for item in (metadata.get("provisional_raised_code_ids") or [])],
+        "selection_review_complete": metadata.get("selection_review_complete"),
+        "selection_status": metadata.get("selection_status"),
+        "selection_withheld": metadata.get("selection_withheld"),
+        "selection_source": metadata.get("selection_source") or state.get("selection_source"),
+        "selection_reviewed_code_ids": [str(item) for item in (metadata.get("selection_reviewed_code_ids") or [])],
+        "selection_uncovered_code_ids": [str(item) for item in (metadata.get("selection_uncovered_code_ids") or [])],
+    }
+
+
+def load_focused_export(directory: str | Path) -> dict[str, Any]:
+    """Read a focused export directory into an axial source.
+
+    ``focused_run.json`` and ``focused_selection.json`` both carry the raised
+    ids, the selection completeness, and the provisional ids. The selection
+    file wins when both name the ids. Provisional ids are not copied into
+    ``raised_code_ids``. A directory that is not a focused export raises
+    ``FileNotFoundError``.
+    """
+    place = Path(directory)
+    if place.is_file() and place.name in {"focused_run.json", "focused_selection.json"}:
+        place = place.parent
+    if not place.is_dir():
+        raise FileNotFoundError(f"No focused export directory at {place}")
+    run_path = place / "focused_run.json"
+    selection_path = place / "focused_selection.json"
+    if not run_path.is_file() and not selection_path.is_file():
+        raise FileNotFoundError(
+            f"No focused export in {place}. Expected focused_run.json or focused_selection.json."
+        )
+
+    def read(path: Path) -> Any:
+        if not path.is_file():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    run = read(run_path)
+    selection = read(selection_path)
+    if not isinstance(run, Mapping):
+        run = {}
+    if not isinstance(selection, Mapping):
+        selection = {}
+    metadata = dict(run.get("metadata") or {})
+    keys = (
+        "raised_code_ids",
+        "not_raised_code_ids",
+        "provisional_raised_code_ids",
+        "selection_review_complete",
+        "selection_status",
+        "selection_withheld",
+        "selection_source",
+        "selection_reviewed_code_ids",
+        "selection_uncovered_code_ids",
+    )
+    record = {}
+    for key in keys:
+        if key in selection:
+            record[key] = selection.get(key)
+        elif key in run:
+            record[key] = run.get(key)
+        elif key in metadata:
+            record[key] = metadata.get(key)
+    for key in (
+        "raised_code_ids",
+        "not_raised_code_ids",
+        "provisional_raised_code_ids",
+        "selection_reviewed_code_ids",
+        "selection_uncovered_code_ids",
+    ):
+        if key in record:
+            record[key] = [str(item) for item in (record.get(key) or [])]
+    metadata.update(record)
+    codebook = run.get("codebook")
+    if not isinstance(codebook, list):
+        codebook = read(place / "codebook.json")
+    if not isinstance(codebook, list):
+        codebook = []
+    passages = run.get("passages")
+    if not isinstance(passages, list):
+        passages = read(place / "passages.json")
+    if not isinstance(passages, list):
+        passages = []
+    segments = read(place / "coded_segments.json")
+    if not isinstance(segments, list):
+        segments = []
+    properties = []
+    development = read(place / "category_development.json")
+    if isinstance(development, Mapping):
+        properties = list(development.get("properties") or [])
+        dimensions = list(development.get("dimensions") or [])
+    else:
+        dimensions = []
+    return {
+        **record,
+        "codebook": codebook,
+        "passages": passages,
+        "segments": segments,
+        "properties": properties,
+        "dimensions": dimensions,
+        "metadata": metadata,
+        "warnings": list(run.get("warnings") or []),
+        "prompt_log": read(place / "prompt_log.json") or [],
+    }
+
+
 def export_focused_state(state: Mapping[str, Any], directory: str | Path) -> dict[str, str]:
     place = Path(directory)
     place.mkdir(parents=True, exist_ok=True)
@@ -6439,15 +6623,12 @@ def export_focused_state(state: Mapping[str, Any], directory: str | Path) -> dic
     selection = list(state.get("selection") or [])
     raised = set(_selected_ids(state, "raised_code_ids"))
     _write_json(place / "category_development.json", development)
+    selection_record = _selection_export(state)
     _write_json(
         place / "focused_selection.json",
         {
-            "raised_code_ids": list(_selected_ids(state, "raised_code_ids")),
-            "not_raised_code_ids": list(
-                _selected_ids(state, "not_raised_code_ids")
-            ),
+            **selection_record,
             "scores": selection,
-            "selection_source": (state.get("metadata") or {}).get("selection_source"),
         },
     )
     _write_csv(
@@ -6484,10 +6665,32 @@ def export_focused_state(state: Mapping[str, Any], directory: str | Path) -> dic
     )
     metadata = dict(state.get("metadata") or {})
     metadata.update(_status_fields(state))
+    metadata.update(selection_record)
     metadata["saturation_judgment"] = None
     records = list(development.get("properties") or []) + list(development.get("dimensions") or [])
     eligible = [row for row in records if row.get("downstream_eligible")]
-    _write_json(place / "focused_run.json", {"metadata": metadata, "warnings": list(state.get("warnings") or [])})
+    book = state.get("codebook") or {}
+    if isinstance(book, Mapping):
+        codebook_rows = [dict(value) for value in book.values() if isinstance(value, Mapping)]
+    else:
+        codebook_rows = [dict(value) for value in book if isinstance(value, Mapping)]
+    passages = [
+        dict(item)
+        for item in (state.get("passages") or [])
+        if isinstance(item, Mapping) and not _is_synthetic_passage(item)
+    ]
+    _write_json(place / "codebook.json", codebook_rows)
+    _write_json(place / "passages.json", passages)
+    _write_json(
+        place / "focused_run.json",
+        {
+            **selection_record,
+            "codebook": codebook_rows,
+            "passages": passages,
+            "metadata": metadata,
+            "warnings": list(state.get("warnings") or []),
+        },
+    )
     _write_json(
         place / "downstream_claims.json",
         {
@@ -6561,6 +6764,8 @@ def export_focused_state(state: Mapping[str, Any], directory: str | Path) -> dic
         "downstream_claims.json": str(place / "downstream_claims.json"),
         "code_id_sidecar.json": str(place / "code_id_sidecar.json"),
         "focused_run.json": str(place / "focused_run.json"),
+        "codebook.json": str(place / "codebook.json"),
+        "passages.json": str(place / "passages.json"),
         "coded_segments.json": str(place / "coded_segments.json"),
         "assignments.json": str(place / "assignments.json"),
         "prompt_log.json": str(place / "prompt_log.json"),
@@ -7005,6 +7210,7 @@ async def afocused_code(
     max_decision_calls: int = 8,
     max_decision_tokens: int = 24000,
     decision_token_budget: int = 6000,
+    auto_size_decision_calls: bool = AUTO_SIZE_DECISION_CALLS,
     interrupt: bool = True,
     resume: Any = None,
     resuming: bool = False,
@@ -7065,6 +7271,8 @@ async def afocused_code(
                         ("decision_token_budget", decision_token_budget)):
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError(f"{name} must be a non-negative integer.")
+    if not isinstance(auto_size_decision_calls, bool):
+        raise ValueError("auto_size_decision_calls must be true or false. The default is false.")
     if decision_mode == "human" and decision_model is not None:
         raise ValueError("decision_model requires decision_mode='llm'.")
     source = _as_result(open_coding_result)
@@ -7113,6 +7321,7 @@ async def afocused_code(
         {"model": describe_model(reviewer_model), "model_settings": chat_model_settings(reviewer_model)}
         if reviewer_model is not None else None), max_decision_calls=max_decision_calls,
         max_decision_tokens=max_decision_tokens, decision_token_budget=decision_token_budget,
+        auto_size_decision_calls=bool(auto_size_decision_calls),
         **review_procedure_fields())
     coder = (
         _resolve_model(model, timeout=focused_request_timeout)
@@ -7183,6 +7392,7 @@ async def afocused_code(
             if decision_mode == "llm"
             else 0.0
         ),
+        auto_size_decision_calls=bool(auto_size_decision_calls),
     )
     metadata["timeout_policy"] = timeout_policy(
         run_timeout_seconds=float(procedure["focused_request_timeout"]),

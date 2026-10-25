@@ -115,7 +115,8 @@ def _withholding_flags(row: Mapping[str, Any]) -> list[str]:
     return found
 
 
-# Reasons a reader can count. Zero is a measured count. A missing export is null.
+# Flag and rule names a reader can tally. These are not a partition: one row
+# can carry several, and an eligible row can carry an inspect flag.
 _WITHHELD_REASON_KEYS = (
     "shared_quote_inspect",
     "frequency_qualified",
@@ -130,6 +131,71 @@ _INSPECT_FLAG_KEYS = (
     "frequency_negation",
     "negation_does_not_reject_link",
 )
+# One primary cause per withheld row. The counts sum to the withheld rows.
+# ``other_withheld`` is the residual so a row is never left uncounted.
+WITHHOLDING_CAUSES = (
+    "endpoint_unreviewed_by_focus",
+    "llm_reviewer_rejected",
+    "participant_denies_link",
+    "partial_endpoint_evidence",
+    "wording_withheld",
+    "insufficient_cases",
+    "omitted_oversized",
+    "other_withheld",
+)
+_WORDING_CAUSE = frozenset({
+    "causal_wording_withheld",
+    "wording_exceeds_tier",
+    "role_evidence_exceeds_tier",
+    "consequence_wording",
+    "role_evidence",
+})
+_PARTIAL_CAUSE = frozenset({
+    "endpoint_evidence_partial",
+    "endpoint_unanchored",
+    "unanchored_quote",
+    "missing_quote",
+})
+
+
+def primary_withholding_cause(row: Mapping[str, Any], rules: Sequence[str] | None = None) -> str:
+    """The one cause that withheld this row.
+
+    Priority is fixed so the causes partition the withheld rows. An inspect
+    flag such as ``shared_quote_inspect`` is not a cause. ``other_withheld``
+    is used only when none of the named causes match, so the counts still
+    sum to the withheld rows.
+    """
+    flags = {str(item) for item in (row.get("flags") or []) if str(item)}
+    names = flags | {str(item) for item in (rules or []) if str(item)}
+    if (
+        "endpoint_unreviewed_by_focus" in names
+        or str(row.get("eligibility_reason") or "") == "endpoint_unreviewed_by_focus"
+    ):
+        return "endpoint_unreviewed_by_focus"
+    disposition = str(row.get("disposition") or "").strip().casefold()
+    model_disposition = str(row.get("model_disposition") or "").strip().casefold()
+    if disposition == "rejected" and (
+        str(row.get("review_actor") or "") == "llm"
+        or model_disposition == "rejected"
+        or row.get("reviewer_decided") is True
+    ):
+        return "llm_reviewer_rejected"
+    if "participant_denies_link" in names:
+        return "participant_denies_link"
+    ends = [item for item in (row.get("endpoint_anchoring") or []) if isinstance(item, Mapping)]
+    unanchored = bool(ends) and any(not item.get("anchored") for item in ends)
+    if names & _PARTIAL_CAUSE or unanchored or "acceptance_withheld" in names:
+        return "partial_endpoint_evidence"
+    if names & _WORDING_CAUSE:
+        return "wording_withheld"
+    tier = row.get("evidence_tier")
+    tier_n = tier if isinstance(tier, int) and not isinstance(tier, bool) else None
+    if tier_n is None or tier_n < 2:
+        return "insufficient_cases"
+    if "omitted_oversized" in names:
+        return "omitted_oversized"
+    return "other_withheld"
 
 
 def export_gate_relationships(relationships: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -139,7 +205,13 @@ def export_gate_relationships(relationships: Sequence[Mapping[str, Any]]) -> dic
     is listed under ``proposed`` and is not scored as either. ``disposition``
     is the reviewer disposition. ``downstream_eligible`` is copied only when
     the row stores a boolean, and the withholding flags are copied beside it.
-    The input rows are not modified.
+    ``withheld_reason_counts`` tallies withholding flags and rules. Inspect
+    flags such as ``shared_quote_inspect`` are not reasons, even on a withheld
+    row. ``withholding_cause_counts`` is one primary cause per withheld row,
+    and those counts sum to the withheld rows. ``inspect_flag_counts`` is
+    separate.
+    All three are null when there is nothing to count. The input rows are not
+    modified.
     """
     accepted: list[dict[str, Any]] = []
     withheld: list[dict[str, Any]] = []
@@ -166,28 +238,35 @@ def export_gate_relationships(relationships: Sequence[Mapping[str, Any]]) -> dic
         if outcome == "accepted":
             accepted.append(item)
         elif outcome == "withheld":
+            cause = primary_withholding_cause(row, rules)
+            item["withholding_cause"] = cause
             withheld.append(item)
         else:
             proposed.append(item)
     if not counted:
         withheld_reason_counts = None
         inspect_flag_counts = None
+        withholding_cause_counts = None
     else:
         withheld_reason_counts = {name: 0 for name in _WITHHELD_REASON_KEYS}
         inspect_flag_counts = {name: 0 for name in _INSPECT_FLAG_KEYS}
+        withholding_cause_counts = {name: 0 for name in WITHHOLDING_CAUSES}
         for outcome, names in counted:
             if outcome == "withheld":
                 for name in _WITHHELD_REASON_KEYS:
-                    if name in names:
+                    if name in names and name not in _INSPECT_FLAG_KEYS:
                         withheld_reason_counts[name] += 1
             for name in _INSPECT_FLAG_KEYS:
                 if name in names:
                     inspect_flag_counts[name] += 1
+        for item in withheld:
+            withholding_cause_counts[str(item.get("withholding_cause") or "other_withheld")] += 1
     return {
         "accepted": accepted,
         "withheld": withheld,
         "proposed": proposed,
         "withheld_reason_counts": withheld_reason_counts,
+        "withholding_cause_counts": withholding_cause_counts,
         "inspect_flag_counts": inspect_flag_counts,
     }
 

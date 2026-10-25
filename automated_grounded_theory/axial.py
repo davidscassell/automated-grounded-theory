@@ -61,7 +61,7 @@ from automated_grounded_theory.decision_review import (
     store_decision_report,
 )
 from automated_grounded_theory.category_state import plan_relation_pairs, property_stability
-from automated_grounded_theory.focused import _rationale_indicates_irrelevance
+from automated_grounded_theory.focused import _rationale_indicates_irrelevance, load_focused_export
 from automated_grounded_theory.retrieval import cosine
 from automated_grounded_theory.saturation import (
     CODE_FREQUENCY_SHIFT_LABEL,
@@ -85,6 +85,7 @@ from automated_grounded_theory.relationship_tiers import (
     TIER_LABELS,
     apply_evidence_tier,
     assign_relationship_eligibility,
+    stamp_focus_review,
     candidate_cross_case_passages,
     case_id_of,
     citation_qualifies,
@@ -198,6 +199,10 @@ _PROCEDURE_KEYS = (
     "pair_count_rule",
     "core_candidate_rule",
     "oversized_recovery",
+    "focus_endpoint_rule",
+    "withholding_cause_rule",
+    "conditional_scope_rule",
+    "chunk_allowance_rule",
 )
 _LOCKED_KEYS = frozenset({"seed", "source_hash"})
 
@@ -546,6 +551,8 @@ def _book(codebook: Any) -> dict[str, dict]:
 
 
 def _source_mapping(source: Any) -> dict[str, Any]:
+    if isinstance(source, (str, Path)):
+        source = load_focused_export(source)
     if isinstance(source, Mapping):
         data = dict(source)
     else:
@@ -575,11 +582,15 @@ def _source_mapping(source: Any) -> dict[str, Any]:
     if not isinstance(source, Mapping) and hasattr(source, "raised_code_ids"):
         data["raised_code_ids"] = [str(item) for item in (getattr(source, "raised_code_ids") or [])]
     data["codebook"] = _book(data.get("codebook"))
+    focus = _focus_selection_fields(data)
+    carried = dict(data.get("metadata") or {})
+    carried.update(focus)
     refreshed = []
     for row in data.get("relationships") or []:
         if not isinstance(row, Mapping):
             continue
         item = dict(row)
+        stamp_focus_review(item, carried)
         assign_relationship_eligibility(item)
         refreshed.append(item)
     data["relationships"] = refreshed
@@ -1924,6 +1935,7 @@ def _new_relationship(
     segments: Sequence[Mapping[str, Any]] | None = None,
     memos: Sequence[Mapping[str, Any]] | None = None,
     pattern_min_cases: int = 2,
+    metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     quote = str(draft.get("quote") or "")
     text = str(passage.get("text") or "")
@@ -1956,6 +1968,9 @@ def _new_relationship(
         "human_disposition": None,
         "claim_support": "undefined",
         "actor": "model",
+        "reviewer_decided": False,
+        "reviewer_disposition": None,
+        "model_rationale": None,
         "provenance": {"actor": "model", "stage": "axial", "model": model_name, "pair_band": band},
         "negative_cases": [],
         "counterexamples": [],
@@ -1967,6 +1982,7 @@ def _new_relationship(
         "synthetic": False,
         "merged_into": None,
     }
+    stamp_focus_review(row, metadata)
     _annotate_endpoints(row, codebook, segments, passages)
     if passages is not None:
         apply_evidence_tier(
@@ -2497,6 +2513,9 @@ def _apply_model_relations(
             row["proposal_paradigm_role"] = row.get("paradigm_role")
         reviewer_role = decision.get("paradigm_role")
         row["model_disposition"] = requested
+        # The evidence gate may later rewrite model_disposition. This is the
+        # reviewer's own decision and is not rewritten.
+        row["reviewer_disposition"] = requested
         row["model_paradigm_role"] = reviewer_role
         row["reviewer_paradigm_role"] = reviewer_role
         if not str(row.get("human_paradigm_role") or "").strip() and str(reviewer_role or "").strip():
@@ -2505,6 +2524,7 @@ def _apply_model_relations(
         _flag_same_passage_claim(row, str(decision.get("rationale") or ""), flag="reviewer_same_passage_mismatch")
         _flag_reviewer_causal_claim(row, str(decision.get("rationale") or ""))
         row["review_actor"] = "llm"
+        row["reviewer_decided"] = True
         row["review_model"] = (audit or {}).get("model")
         history = list(row.get("review_history") or [])
         history.append(
@@ -2555,11 +2575,21 @@ def _focus_selection_fields(data: Mapping[str, Any]) -> dict[str, Any]:
         "selection_withheld",
         "selection_source",
         "selection_downstream_eligible",
+        "provisional_raised_code_ids",
+        "selection_reviewed_code_ids",
+        "selection_uncovered_code_ids",
     ):
         if key in data:
             fields[key] = data.get(key)
         elif key in incoming:
             fields[key] = incoming.get(key)
+    for key in (
+        "provisional_raised_code_ids",
+        "selection_reviewed_code_ids",
+        "selection_uncovered_code_ids",
+    ):
+        if key in fields and isinstance(fields[key], (list, tuple)):
+            fields[key] = [str(item) for item in fields[key]]
     return fields
 
 
@@ -2729,7 +2759,11 @@ def axial_attrition(state: Mapping[str, Any]) -> dict[str, Any]:
     ``pair_space_size`` is the full unordered pair space. It is null when
     planning did not record it. Neither field is the materialized plan list.
     ``evidence_tiers`` is null when no row has a numeric tier.
-    ``deduplicated_relationships`` is null unless ``comparison_runs`` is present.
+    ``grounded_endpoints`` counts rows at tier 2 or higher, the same rows
+    those tier counts add up to. ``endpoint_anchoring_complete`` is the
+    count of rows whose endpoint-anchoring list is complete. It is not the
+    tier-2 count. ``deduplicated_relationships`` is null unless
+    ``comparison_runs`` is present.
     """
     metadata = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
     relationships = _public_relationships(state.get("relationships") or [])
@@ -2755,7 +2789,17 @@ def axial_attrition(state: Mapping[str, Any]) -> dict[str, Any]:
     else:
         proposals = len(relationships) + discarded
     valid_statements = sum(1 for row in relationships if str(row.get("statement") or "").strip())
-    grounded = sum(1 for row in relationships if _both_endpoints_anchored(row))
+    # ``grounded_endpoints`` uses the tier-assignment definition: a row at
+    # tier 2 or higher. ``endpoint_anchoring_complete`` is the older list
+    # check and is not that count, so the two cannot be read as the same stage.
+    def _tier_value(item: Mapping[str, Any]) -> int | None:
+        tier = item.get("evidence_tier")
+        if isinstance(tier, bool) or not isinstance(tier, int):
+            return None
+        return tier
+
+    grounded = sum(1 for row in relationships if (_tier_value(row) or -1) >= 2)
+    anchoring_complete = sum(1 for row in relationships if _both_endpoints_anchored(row))
     tiers: dict[str, int] = {}
     for row in relationships:
         tier = row.get("evidence_tier")
@@ -2785,6 +2829,7 @@ def axial_attrition(state: Mapping[str, Any]) -> dict[str, Any]:
         "proposals": proposals,
         "valid_statements": valid_statements,
         "grounded_endpoints": grounded,
+        "endpoint_anchoring_complete": anchoring_complete,
         "evidence_tiers": tiers or None,
         "accepted_rows": accepted,
         "downstream_eligible_rows": eligible,
@@ -2808,6 +2853,7 @@ def export_axial_state(state: Mapping[str, Any], directory: str | Path) -> dict[
 
     relationships = _public_relationships(state.get("relationships") or [])
     for row in relationships:
+        stamp_focus_review(row, metadata)
         assign_relationship_eligibility(row)
     if stage != "selective":
         write(
@@ -4601,6 +4647,7 @@ def _propose_node(runtime: AxialRuntime):
                         segments=state.get("segments") or [],
                         memos=state.get("memos") or [],
                         pattern_min_cases=_pattern_minimum(procedure),
+                        metadata=metadata,
                     )
                 )
             diagnostics["rejection_reasons"] = reasons
@@ -7297,7 +7344,7 @@ class AxialDecisionReviewer:
     def messages(self, payload):
         return [
             SystemMessage(content=_AXIAL_REVIEW_SYSTEM),
-            HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
+            HumanMessage(content=json.dumps(payload, ensure_ascii=False, sort_keys=True)),
         ]
 
     def refusal_reason(self, payload, schema, metadata) -> tuple[str | None, int]:

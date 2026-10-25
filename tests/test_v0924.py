@@ -46,9 +46,9 @@ from tests.test_v080 import FakeAxialCoder, _corpus
 
 
 def test_version_and_defaults_stay_put():
-    assert __version__ == "0.9.26"
-    assert POLICY_VERSION == "0.9.26"
-    assert DECISION_REVIEW_CHUNKING == "request_budget_v3"
+    assert __version__ == "0.9.27"
+    assert POLICY_VERSION == "0.9.27"
+    assert DECISION_REVIEW_CHUNKING == "request_budget_v4"
     assert PATTERN_MIN_CASES == 2
     assert DEFAULT_MAX_AXIAL_REVIEW_TOKENS == 24000
     import inspect
@@ -277,21 +277,21 @@ def test_oversized_code_list_makes_focused_selection_calls():
 
     truncated = _run_focused(codes, _KeepSelector())
     truncated_report = _selection_report(truncated)
-    assert truncated_report["chunks_sent"] >= 1
+    # 0.9.27 does not spend calls on a plan the default allowance cannot finish.
+    assert truncated_report["chunks_required"] > truncated_report["decision_call_allowance"]
+    assert truncated_report["chunks_sent"] == 0
     assert truncated_report["complete"] is False
     assert truncated_report["items_uncovered"] > 0
     assert truncated_report["chunk_order_selects_codes"] is False
+    assert "chunk_allowance_insufficient" in (truncated_report["stop_reasons"] or [])
     assert truncated.raised_code_ids == []
     assert truncated.metadata["selection_review_applied"] is False
     assert truncated.metadata["selection_downstream_eligible"] is False
     assert truncated.metadata["selection_status"] == "provisional"
     assert truncated.metadata["complete"] is False
     assert truncated.metadata["status"] == "incomplete"
-    assert truncated.metadata["stop"] in {
-        "decision_token_allowance",
-        "decision_call_allowance",
-        "decision_selection_incomplete",
-    }
+    assert truncated.metadata["stop"] == "decision_chunk_allowance_insufficient"
+    assert truncated.metadata["decision_stop"] == "chunk_allowance_insufficient"
 
 
 def test_one_code_over_the_request_budget_is_compacted_and_reviewed():
