@@ -40,8 +40,8 @@ FIXTURE = Path("tests/fixtures/link_denial_0925.json")
 
 
 def test_version_rules_and_defaults():
-    assert __version__ == "0.9.32"
-    assert POLICY_VERSION == "0.9.32"
+    assert __version__ == "0.9.33"
+    assert POLICY_VERSION == "0.9.33"
     assert DECISION_REVIEW_CHUNKING == "request_budget_v6"
     assert INCOMPLETE_REVIEW_APPLICATION == "withhold_incomplete_v1"
     assert ELIGIBILITY_RULE == "row_gates_components_v1"

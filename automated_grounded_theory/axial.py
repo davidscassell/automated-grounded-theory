@@ -49,12 +49,14 @@ from automated_grounded_theory.backends import (
 )
 from automated_grounded_theory.batching import request_input_tokens, shrink_repair_messages
 from automated_grounded_theory.decision_review import (
+    CORE_CANDIDATES_DO_NOT_FIT,
+    CORE_COMPARISON_RULE,
     DECISION_REVIEW_CHUNKING,
-    SHARED_DECISION_REVIEW,
-    SHARED_REVIEW_STEPS,
+    PER_STEP_DECISION_REVIEW,
     DecisionChunkingCheckpointError,
     add_stop_reason,
     budget_ledger,
+    build_core_comparison_plan,
     build_decision_plan,
     finish_decision_report,
     load_chunk_progress,
@@ -105,6 +107,7 @@ from automated_grounded_theory.relationship_tiers import (
     effective_paradigm_role,
     effective_statement,
     has_causal_wording,
+    summarize_case_identity,
     promote_verified,
     role_evidence_overreach,
     statement_wording_overreach,
@@ -222,10 +225,15 @@ _PROCEDURE_KEYS = (
     "duplicate_assertion_rule",
     "budget_ledger_rule",
     "decision_token_scope",
+    "core_comparison_rule",
+    "reread_request_rule",
+    "condition_statement_rule",
+    "case_identity_source_rule",
     "case_count_rule",
     "reread_estimate_rule",
     "export_assessment_rule",
     "chunk_review_recovery",
+    "one_document_one_respondent",
 )
 _LOCKED_KEYS = frozenset({"seed", "source_hash"})
 
@@ -2008,6 +2016,11 @@ def _new_relationship(
     stamp_focus_review(row, metadata)
     _annotate_endpoints(row, codebook, segments, passages)
     if passages is not None:
+        procedure = {}
+        if isinstance(metadata, Mapping):
+            stored = metadata.get("procedure")
+            if isinstance(stored, Mapping):
+                procedure = stored
         apply_evidence_tier(
             row,
             passages=passages,
@@ -2015,6 +2028,7 @@ def _new_relationship(
             segments=segments,
             memos=memos,
             pattern_min_cases=pattern_min_cases,
+            one_document_one_respondent=bool(procedure.get("one_document_one_respondent")),
         )
     if _claims_same_passage(row["statement"]) and row.get("quotes_share_passage") is False:
         _flag_same_passage_claim(row, row["statement"], flag="relationship_same_passage_mismatch")
@@ -2243,6 +2257,7 @@ def _refresh_evidence(
     segments: Sequence[Mapping[str, Any]] | None,
     memos: Sequence[Mapping[str, Any]] | None,
     pattern_min_cases: int,
+    one_document_one_respondent: bool = False,
 ) -> None:
     if passages is None:
         return
@@ -2253,6 +2268,7 @@ def _refresh_evidence(
         segments=segments,
         memos=memos,
         pattern_min_cases=pattern_min_cases,
+        one_document_one_respondent=one_document_one_respondent,
     )
     _keep_qualification(target)
 
@@ -2876,6 +2892,7 @@ def export_axial_state(state: Mapping[str, Any], directory: str | Path) -> dict[
         paths[name] = str(path)
 
     relationships = _public_relationships(state.get("relationships") or [])
+    metadata["case_identity_summary"] = summarize_case_identity(relationships)
     for row in relationships:
         stamp_focus_review(row, metadata)
         assign_relationship_eligibility(row)
@@ -2910,6 +2927,10 @@ def export_axial_state(state: Mapping[str, Any], directory: str | Path) -> dict[
                 "candidates": list(state.get("core_candidates") or []),
                 "researcher_core_id": (state.get("metadata") or {}).get("researcher_core_id") or "",
                 "model_core_id": (state.get("metadata") or {}).get("model_core_id") or "",
+                "core_candidates_eligible": (state.get("metadata") or {}).get("core_candidates_eligible"),
+                "core_candidates_compared": (state.get("metadata") or {}).get("core_candidates_compared"),
+                "core_comparison_stop": (state.get("metadata") or {}).get("core_comparison_stop"),
+                "core_comparison_rule": (state.get("metadata") or {}).get("core_comparison_rule"),
             },
         )
     memos = [
@@ -3206,9 +3227,13 @@ def _axial_token_plan(
     warning = ""
     if ceiling and shortfall:
         warning = (
-            "Axial token plan exceeds max_axial_review_tokens. "
-            f"The planning estimate for {planned} planned pairs is {estimate} and the ceiling is {ceiling}, "
+            "Axial coding-pool plan exceeds the shared coding allowance. "
+            f"The planning estimate for {planned} planned pairs is {estimate} and that pool's ceiling is {ceiling}, "
             f"a shortfall of {shortfall}. "
+            "That pool covers proposals, counterexamples, memos, and the storyline. "
+            "It is not the per-step decision allowance. "
+            "Relation review, saturation review, and core selection each have their own allowance "
+            f"of {ceiling} and are not in this estimate. "
             f"The raw pool estimate for {pool} unordered pairs is {pool_estimate} and is not the cap comparison. "
             "This does not change the ceiling."
         )
@@ -4935,9 +4960,9 @@ async def _advance_relation_review(
     open_budget_step(
         metadata,
         step="axial_relation_review",
-        allowance_scope=SHARED_DECISION_REVIEW,
+        allowance_scope=PER_STEP_DECISION_REVIEW,
         allowance=int(reviewer.max_calls),
-        shared_with=SHARED_REVIEW_STEPS,
+        shared_with=(),
         usage=relation_used,
     )
     by_id = {str(row.get("relationship_id") or ""): row for row in relationships if str(row.get("relationship_id") or "")}
@@ -5682,6 +5707,7 @@ def _commit_relations(state: AxialState) -> dict:
                 segments=segments,
                 memos=memos,
                 pattern_min_cases=pattern_min_cases,
+                one_document_one_respondent=bool(procedure.get("one_document_one_respondent")),
             )
             if row.get("verification_requested") and str(row.get("verification_actor") or "") == "human":
                 outcome = promote_verified(row, actor="human", scope=str(row.get("verification_scope") or ""))
@@ -5696,6 +5722,7 @@ def _commit_relations(state: AxialState) -> dict:
             row["tentative_few_documents"] = True
             row["needs_review"] = True
         stamp_relationship_assessment(row)
+    metadata["case_identity_summary"] = summarize_case_identity(relationships)
     slots = _empty_slots(relationships, lens=str(procedure.get("coding_lens") or "paradigm"))
     if slots:
         warnings = list(state.get("warnings") or [])
@@ -5742,9 +5769,9 @@ def _saturation_checkpoint(runtime: AxialRuntime):
             open_budget_step(
                 metadata,
                 step="axial_saturation_review",
-                allowance_scope=SHARED_DECISION_REVIEW,
+                allowance_scope=PER_STEP_DECISION_REVIEW,
                 allowance=int(runtime.reviewer.max_calls),
-                shared_with=SHARED_REVIEW_STEPS,
+                shared_with=(),
                 usage=saturation_used,
             )
             saturation_payload = {
@@ -6027,8 +6054,10 @@ _CORE_REVIEW_INSTRUCTION = (
     "A choice without graph support is kept as model_core_id and flagged "
     "core_unsupported_by_graph. It is not promoted. "
     "core_stability is undefined below the recorded minimum n. "
-    "Choose one code_id from this request. "
-    "The final core is merged across requests by evidence tier, not by which request came first. "
+    "This request contains every eligible candidate. "
+    "Choose one code_id by comparing those candidates with each other. "
+    "Do not choose a core because only one candidate was supplied. "
+    "A request that does not contain every eligible candidate is not a comparison and is not sent. "
     "You cannot set verified or authorize attribution wording."
 )
 
@@ -6064,21 +6093,21 @@ async def _advance_core_review(
     metadata: dict[str, Any],
     logs: list,
 ) -> dict:
-    """Send one core-selection chunk. Further chunks return to this node.
+    """Compare every eligible core candidate in one request, or withhold.
 
-    Candidate order is the evidence order from ``_score_candidates``. A
-    candidate that alone exceeds the per-request budget is omitted. Nominations
-    are merged by evidence tier: a graph-supported nomination beats one that
-    is not. The selection is complete only when every candidate was reviewed.
+    Candidate order is the evidence order from ``_score_candidates``. The
+    set is not split. A one-candidate request is sent only when that
+    candidate is the whole eligible set. If the set does not fit the
+    per-request budget, nothing is sent and no core is chosen.
     """
     reviewer = runtime.reviewer
     core_used = _align_step_calls(runtime, metadata, "axial_core_review")
     open_budget_step(
         metadata,
         step="axial_core_review",
-        allowance_scope=SHARED_DECISION_REVIEW,
+        allowance_scope=PER_STEP_DECISION_REVIEW,
         allowance=int(reviewer.max_calls),
-        shared_with=SHARED_REVIEW_STEPS,
+        shared_with=(),
         usage=core_used,
     )
     preferred = [str(row.get("code_id") or "") for row in candidates if row.get("graph_supported")]
@@ -6103,16 +6132,21 @@ async def _advance_core_review(
         )
         return reviewer.refusal_reason(payload, ModelCoreDecision, metadata)[1]
 
-    plan = build_decision_plan(
+    plan = build_core_comparison_plan(
         ordered_ids,
         estimate,
-        kind="axial_core_review",
         per_request=int(reviewer.token_budget),
         max_tokens=int(reviewer.max_tokens),
         max_calls=int(reviewer.max_calls),
-        omit_reason="single_candidate_exceeds_request_budget",
     )
     progress = load_chunk_progress(metadata, plan)
+    metadata["core_comparison_rule"] = CORE_COMPARISON_RULE
+    metadata["core_candidates_eligible"] = int(plan.get("core_candidates_eligible") or 0)
+    metadata["core_candidates_compared"] = 0
+    if plan.get("core_comparison_reason"):
+        metadata["core_comparison_stop"] = str(plan["core_comparison_reason"])
+        metadata["decision_stop"] = str(plan["core_comparison_reason"])
+        add_stop_reason(progress, str(plan["core_comparison_reason"]))
     _drop_cleared_allowance_stops(metadata, progress)
     _note_decision_token_preflight(
         runtime,
@@ -6148,6 +6182,28 @@ async def _advance_core_review(
             progress_row["open"] = True
             progress_row["provisional"] = True
             metadata["decision_chunk_state"] = progress_row
+            stops = [str(item) for item in (progress_row.get("stop_reasons") or [])]
+            if CORE_CANDIDATES_DO_NOT_FIT in stops:
+                metadata["model_core_id"] = ""
+                metadata["model_core_judgment"] = False
+                metadata["core_candidates_compared"] = 0
+                metadata["provisional_core_id"] = ""
+                metadata["core_selection_truncated"] = True
+                metadata["core_selection_withheld"] = True
+                metadata["core_status"] = "withheld"
+                metadata["core_downstream_eligible"] = False
+                metadata["decision_stop"] = CORE_CANDIDATES_DO_NOT_FIT
+                eligible = int(metadata.get("core_candidates_eligible") or len(candidates))
+                warnings.append(
+                    "Core selection was not applied. The eligible candidates do not fit one request. "
+                    f"{eligible} candidates were eligible and 0 were compared."
+                )
+                return {
+                    "core_candidates": candidates,
+                    "metadata": metadata,
+                    "prompt_log": logs,
+                    "warnings": warnings,
+                }
             merged = merge_core_nominations(candidates, nominations)
             metadata["model_core_id"] = ""
             metadata["model_core_judgment"] = False
@@ -6224,6 +6280,14 @@ async def _advance_core_review(
     if index >= len(chunks):
         return _finish_choice(progress, warnings)
     chunk_ids = [str(item) for item in chunks[index]]
+    eligible_n = int(metadata.get("core_candidates_eligible") or 0)
+    if eligible_n and (len(chunks) != 1 or len(chunk_ids) != eligible_n):
+        add_stop_reason(progress, CORE_CANDIDATES_DO_NOT_FIT)
+        metadata["decision_stop"] = CORE_CANDIDATES_DO_NOT_FIT
+        metadata["core_comparison_stop"] = CORE_CANDIDATES_DO_NOT_FIT
+        metadata["core_candidates_compared"] = 0
+        progress["next_index"] = len(chunks)
+        return _finish_choice(progress, warnings)
     subset = [by_id[item] for item in chunk_ids if item in by_id]
     only_full_chunk = len(chunks) == 1 and not progress.get("omissions")
     payload = _core_review_payload(
@@ -6234,16 +6298,13 @@ async def _advance_core_review(
         chunk_count=len(chunks),
     )
     stop, _estimate = reviewer.refusal_reason(payload, ModelCoreDecision, metadata)
-    if stop == "request_budget" and len(chunk_ids) == 1:
-        omissions = list(progress.get("omissions") or [])
-        omissions.append({"id": chunk_ids[0], "reason": "single_candidate_exceeds_request_budget"})
-        progress["omissions"] = omissions
-        progress["next_index"] = index + 1
-        metadata["decision_chunk_state"] = progress
-        if progress["next_index"] >= len(chunks):
-            return _finish_choice(progress, warnings)
-        progress["open"] = True
-        return {"core_candidates": candidates, "metadata": metadata, "prompt_log": logs, "warnings": warnings}
+    if stop == "request_budget":
+        add_stop_reason(progress, CORE_CANDIDATES_DO_NOT_FIT)
+        metadata["decision_stop"] = CORE_CANDIDATES_DO_NOT_FIT
+        metadata["core_comparison_stop"] = CORE_CANDIDATES_DO_NOT_FIT
+        metadata["core_candidates_compared"] = 0
+        progress["next_index"] = len(chunks)
+        return _finish_choice(progress, warnings)
     parsed, audit = await reviewer.decide(payload, ModelCoreDecision, metadata)
     if audit:
         logs.append(audit)
@@ -6256,6 +6317,7 @@ async def _advance_core_review(
         progress["next_index"] = index
         return _finish_choice(progress, warnings)
     note_chunk_send(progress, audit, estimate=int((audit or {}).get("estimated_input_tokens") or 0))
+    metadata["core_candidates_compared"] = len(chunk_ids)
     chosen = str(parsed.get("core_id") or "")
     progress["rationale"] = str(parsed.get("rationale") or progress.get("rationale") or "")
     if chosen in set(chunk_ids):
@@ -7730,6 +7792,7 @@ def _procedure_from_kwargs(data: Mapping[str, Any], **kwargs: Any) -> dict[str, 
         "core_stability_min_n_note": (
             "A design choice for this package. It is not a quotation from the method literature."
         ),
+        "one_document_one_respondent": bool(kwargs.get("one_document_one_respondent", False)),
     }
     return procedure
 
@@ -8012,6 +8075,7 @@ async def aaxial_code(
     max_axial_review_tokens: int = DEFAULT_MAX_AXIAL_REVIEW_TOKENS,
     axial_token_budget: int = DEFAULT_AXIAL_TOKEN_BUDGET,
     pattern_min_cases: int = 2,
+    one_document_one_respondent: bool = False,
     negative_case_search: bool = True,
     core_stability_min_n: int = CORE_STABILITY_MIN_N,
     batch_size: int = 1,
@@ -8077,6 +8141,7 @@ async def aaxial_code(
         batch_size=batch_size,
         max_axial_review_tokens=max_axial_review_tokens,
         pattern_min_cases=pattern_min_cases,
+        one_document_one_respondent=one_document_one_respondent,
         max_decision_calls=max_decision_calls,
         negative_case_search=negative_case_search,
         core_stability_min_n=core_stability_min_n,
@@ -8228,6 +8293,7 @@ async def aselective_code(
     decision_mode: str = "human",
     decision_model: BaseChatModel | None = None,
     max_decision_calls: int = 4,
+    one_document_one_respondent: bool = False,
     max_axial_review_tokens: int = DEFAULT_MAX_AXIAL_REVIEW_TOKENS,
     axial_token_budget: int = DEFAULT_AXIAL_TOKEN_BUDGET,
     batch_size: int = 1,
@@ -8299,6 +8365,9 @@ async def aselective_code(
         "core_stability_min_n": max(2, int(axial_procedure.get("core_stability_min_n") or CORE_STABILITY_MIN_N)),
         "core_stability_min_n_note": (
             "A design choice for this package. It is not a quotation from the method literature."
+        ),
+        "one_document_one_respondent": bool(
+            one_document_one_respondent or axial_procedure.get("one_document_one_respondent")
         ),
         **review_procedure_fields(),
     }

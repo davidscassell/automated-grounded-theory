@@ -112,10 +112,19 @@ CHUNK_CONTEXT_NOTE = (
 )
 # Identical statements for one directed pair are one assertion.
 DUPLICATE_ASSERTION_RULE = "merge_all_evidence_v1"
-# Decision-call ceilings are shared by named steps. Each step records its own use.
-BUDGET_LEDGER_RULE = "shared_review_ledger_v1"
+# Each axial decision step records its own calls and tokens. The ledger is not one pool.
+BUDGET_LEDGER_RULE = "per_step_review_ledger_v1"
 # Each decision step has its own token allowance. The number is not raised.
 DECISION_TOKEN_SCOPE = "per_step_v1"
+# Core selection compares every eligible candidate in one request, or withholds.
+CORE_COMPARISON_RULE = "all_candidates_one_request_v1"
+CORE_CANDIDATES_DO_NOT_FIT = "core_candidates_do_not_fit"
+# A reread request is packed to the per-request budget. Only sendable requests are estimated.
+REREAD_REQUEST_RULE = "pack_to_request_budget_v1"
+# A recorded condition stays on the presented statement.
+CONDITION_STATEMENT_RULE = "retain_recorded_condition_v1"
+# Case counts name whether the id is a respondent or a document fallback.
+CASE_IDENTITY_SOURCE_RULE = "source_or_declared_document_v1"
 # Supporting cases are distinct respondents, including after a duplicate merge.
 CASE_COUNT_RULE = "respondent_identity_v1"
 # The reread allowance is checked after selection, on the raised codes and the queue.
@@ -123,6 +132,8 @@ REREAD_ESTIMATE_RULE = "post_selection_v1"
 # Gate export and run export read one relationship assessment.
 EXPORT_ASSESSMENT_RULE = "shared_assessment_v1"
 SHARED_DECISION_REVIEW = "shared_decision_review"
+# Axial relation review, saturation review, and core selection do not share an allowance.
+PER_STEP_DECISION_REVIEW = "per_step_decision_review"
 FOCUSED_DECISION_REVIEW = "focused_decision_review"
 SHARED_REVIEW_STEPS = (
     "axial_relation_review",
@@ -168,6 +179,10 @@ CHUNKING_CHECKPOINT_MESSAGE = (
     "or before each decision step had its own token allowance, supporting cases "
     "were counted by respondent identity, the reread was estimated after selection, "
     "or the 0.9.32 rules, "
+    "or before reread requests were packed to the per-request budget, core selection "
+    "compared every eligible candidate in one request, a recorded condition stayed "
+    "on the presented statement, decision allowances were labeled per step, case "
+    "identity named its source, or the 0.9.33 rules, "
     "or the stored chunk plan does not match this resume. Resume cannot continue "
     "that review. Start a new run."
 )
@@ -544,6 +559,89 @@ def pack_decision_chunks(
     return {"chunks": chunks, "omissions": omissions, "ordered_ids": ordered}
 
 
+def plan_core_comparison(
+    ids: Sequence[str],
+    estimate: Callable[[Sequence[str]], int],
+    *,
+    per_request: int,
+) -> dict[str, Any]:
+    """Compare every eligible core candidate in one request, or withhold.
+
+    A request that cannot hold the full set is not split. A one-candidate
+    chunk is not a comparison, and it is not a core choice. ``compared`` is
+    the number of candidates in the request that can be sent, or zero when
+    the set does not fit.
+    """
+    ordered = [str(item) for item in ids if str(item)]
+    budget = int(per_request)
+    eligible = len(ordered)
+    if not ordered:
+        return {"chunks": [], "eligible": 0, "compared": 0, "reason": None, "estimate": 0}
+    needed = int(estimate(ordered))
+    if budget > 0 and needed <= budget:
+        return {
+            "chunks": [ordered],
+            "eligible": eligible,
+            "compared": eligible,
+            "reason": None,
+            "estimate": needed,
+        }
+    return {
+        "chunks": [],
+        "eligible": eligible,
+        "compared": 0,
+        "reason": CORE_CANDIDATES_DO_NOT_FIT,
+        "estimate": needed,
+    }
+
+
+def build_core_comparison_plan(
+    ids: Sequence[str],
+    estimate: Callable[[Sequence[str]], int],
+    *,
+    per_request: int,
+    max_tokens: int,
+    max_calls: int,
+) -> dict[str, Any]:
+    """One core-comparison request, or a plan that sends nothing.
+
+    The hash includes the per-request budget, so a withheld plan does not
+    resume as a larger request. ``max_tokens`` and ``max_calls`` limit how
+    far a fitting plan gets. They do not split the candidates.
+    """
+    comparison = plan_core_comparison(ids, estimate, per_request=per_request)
+    ordered = [str(item) for item in ids if str(item)]
+    omissions: list[dict[str, str]] = []
+    if comparison.get("reason") == CORE_CANDIDATES_DO_NOT_FIT:
+        omissions = [{"id": item, "reason": CORE_CANDIDATES_DO_NOT_FIT} for item in ordered]
+    chunks = [list(chunk) for chunk in (comparison.get("chunks") or [])]
+    plan_hash = decision_plan_hash(
+        kind="axial_core_review",
+        per_request=per_request,
+        max_tokens=max_tokens,
+        max_calls=max_calls,
+        ordered_ids=ordered,
+        chunks=chunks,
+        omissions=omissions,
+    )
+    return {
+        "version": DECISION_REVIEW_CHUNKING,
+        "kind": "axial_core_review",
+        "per_request_budget": int(per_request),
+        "max_tokens": int(max_tokens),
+        "max_calls": int(max_calls),
+        "ordered_ids": ordered,
+        "chunks": chunks,
+        "omissions": omissions,
+        "compaction": {},
+        "plan_hash": plan_hash,
+        "core_candidates_eligible": int(comparison.get("eligible") or 0),
+        "core_candidates_compared": int(comparison.get("compared") or 0),
+        "core_comparison_reason": comparison.get("reason"),
+        "estimate": int(comparison.get("estimate") or 0),
+    }
+
+
 def rank_near_misses(
     chunks: Sequence[Sequence[str]],
     raised_ids: Sequence[str],
@@ -681,6 +779,10 @@ def review_procedure_fields() -> dict[str, str]:
         "duplicate_assertion_rule": DUPLICATE_ASSERTION_RULE,
         "budget_ledger_rule": BUDGET_LEDGER_RULE,
         "decision_token_scope": DECISION_TOKEN_SCOPE,
+        "core_comparison_rule": CORE_COMPARISON_RULE,
+        "reread_request_rule": REREAD_REQUEST_RULE,
+        "condition_statement_rule": CONDITION_STATEMENT_RULE,
+        "case_identity_source_rule": CASE_IDENTITY_SOURCE_RULE,
         "case_count_rule": CASE_COUNT_RULE,
         "reread_estimate_rule": REREAD_ESTIMATE_RULE,
         "export_assessment_rule": EXPORT_ASSESSMENT_RULE,
@@ -1509,7 +1611,11 @@ def finish_decision_report(progress: Mapping[str, Any]) -> dict[str, Any]:
         "sized_by": "per_request_budget",
         "allowance_scope": progress.get("allowance_scope"),
         "allowance": progress.get("allowance") if "allowance" in progress else None,
-        "shared_with": list(progress.get("shared_with") or []) or None,
+        "shared_with": (
+            list(progress.get("shared_with") or [])
+            if "shared_with" in progress
+            else None
+        ),
         "starting_usage": progress.get("starting_usage") if "starting_usage" in progress else None,
         "calls_made": progress.get("calls_made") if "calls_made" in progress else None,
         "remaining_allowance": progress.get("remaining_allowance") if "remaining_allowance" in progress else None,
@@ -1631,6 +1737,10 @@ def same_chunking_fingerprint(saved: Any, current: Any) -> bool:
         "duplicate_assertion_rule": DUPLICATE_ASSERTION_RULE,
         "budget_ledger_rule": BUDGET_LEDGER_RULE,
         "decision_token_scope": DECISION_TOKEN_SCOPE,
+        "core_comparison_rule": CORE_COMPARISON_RULE,
+        "reread_request_rule": REREAD_REQUEST_RULE,
+        "condition_statement_rule": CONDITION_STATEMENT_RULE,
+        "case_identity_source_rule": CASE_IDENTITY_SOURCE_RULE,
         "case_count_rule": CASE_COUNT_RULE,
         "reread_estimate_rule": REREAD_ESTIMATE_RULE,
         "export_assessment_rule": EXPORT_ASSESSMENT_RULE,

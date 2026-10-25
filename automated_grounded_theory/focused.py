@@ -295,6 +295,10 @@ _PROCEDURE_KEYS = (
     "duplicate_assertion_rule",
     "budget_ledger_rule",
     "decision_token_scope",
+    "core_comparison_rule",
+    "reread_request_rule",
+    "condition_statement_rule",
+    "case_identity_source_rule",
     "case_count_rule",
     "reread_estimate_rule",
     "export_assessment_rule",
@@ -2559,15 +2563,38 @@ def apply_passage_recode(
     }
 
 
-def _compact_codes(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {
-            "code_id": entry.get("code_id"),
-            "code": entry.get("code"),
-            "definition": entry.get("definition"),
-        }
-        for entry in entries
-    ]
+def _compact_codes(
+    entries: Sequence[Mapping[str, Any]],
+    *,
+    drop_definition: bool = False,
+) -> list[dict[str, Any]]:
+    rows = []
+    for entry in entries:
+        row = {"code_id": entry.get("code_id"), "code": entry.get("code")}
+        if not drop_definition:
+            row["definition"] = entry.get("definition")
+        rows.append(row)
+    return rows
+
+
+def _codes_at_reread_level(
+    raised: Sequence[Mapping[str, Any]],
+    other: Sequence[Mapping[str, Any]],
+    level: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Shorten the codebook until a reread request can fit the per-request cap.
+
+    Level 0 keeps definitions. Level 1 drops other-code definitions. Level 2
+    drops every definition. Level 3 keeps raised codes only, without definitions.
+    """
+    level = int(level)
+    if level <= 0:
+        return _compact_codes(raised), _compact_codes(other)
+    if level == 1:
+        return _compact_codes(raised), _compact_codes(other, drop_definition=True)
+    if level == 2:
+        return _compact_codes(raised, drop_definition=True), _compact_codes(other, drop_definition=True)
+    return _compact_codes(raised, drop_definition=True), []
 
 
 def _initial_code_rows(
@@ -2614,8 +2641,10 @@ def _compete_messages(
     other: Sequence[Mapping[str, Any]] | None = None,
     initial_codes: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
     feedback: str = "",
+    code_level: int = 0,
 ) -> list:
-    codes = _equal_footing_codes(raised, other or [])
+    raised_rows, other_rows = _codes_at_reread_level(raised, other or [], code_level)
+    codes = _equal_footing_codes(raised_rows, other_rows)
     payload = {
         "codes": codes,
         "equal_footing": (
@@ -2697,6 +2726,7 @@ def _recode_request(
     initial_codes: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
     claims: Mapping[str, Mapping[str, Any]] | None = None,
     feedback: str = "",
+    code_level: int = 0,
 ):
     """Messages and schema for one batch.
 
@@ -2722,10 +2752,14 @@ def _recode_request(
                 other=other,
                 initial_codes=initial_codes,
                 feedback=feedback,
+                code_level=code_level,
             ),
             FocusedCompeteBatch,
         )
-    return _recode_messages(passages, raised, other=other, feedback=feedback), FocusedRecodeBatch
+    return (
+        _recode_messages(passages, raised, other=other, feedback=feedback, code_level=code_level),
+        FocusedRecodeBatch,
+    )
 
 
 def _claim_test_messages(
@@ -2946,10 +2980,13 @@ def _recode_messages(
     *,
     other: Sequence[Mapping[str, Any]] | None = None,
     feedback: str = "",
+    code_level: int = 0,
 ) -> list:
+    raised_rows, other_rows = _codes_at_reread_level(raised, other or [], code_level)
     payload = {
-        "raised_codes": _compact_codes(raised),
-        "other_codes": _compact_codes(other or []),
+        "raised_codes": raised_rows,
+        "other_codes": other_rows,
+        "code_level": int(code_level),
         "prefer_existing_codes": (
             "Prefer a code in raised_codes or other_codes. "
             "Add a new label only when none of those codes fit the passage."
@@ -2991,18 +3028,10 @@ def _allowance_block(state: Mapping[str, Any]) -> tuple[str, list[str]] | None:
         return None
     batch_size = max(1, int(performance.get("batch_size") or 1))
     batch_items = [item if isinstance(item, Mapping) else {"passage_id": item, "purpose": "develop"} for item in remaining[:batch_size]]
-    batch_ids = _queue_passage_ids(batch_items)
-    by_id = {str(item.get("passage_id") or ""): item for item in (state.get("passages") or [])}
-    batch = [by_id[pid] for pid in batch_ids if pid in by_id]
-    raised_ids = set(state.get("raised_code_ids") or [])
-    raised, other = _split_codebook(state.get("codebook") or {}, raised_ids)
-    purposes = {str(item.get("passage_id") or ""): str(item.get("purpose") or "develop") for item in batch_items}
-    initial = {
-        passage_id: _initial_code_rows(passage_id, state.get("segments") or [], state.get("codebook") or {})
-        for passage_id in batch_ids
-    }
-    messages, schema = _recode_request(batch, raised, other=other, purposes=purposes, initial_codes=initial)
-    estimate = request_input_tokens(messages, schema, resolve_tokenizer(None))
+    fitted = _fit_reread_request(state, batch_items)
+    if fitted is None or fitted.get("level") is None:
+        return None
+    estimate = int(fitted.get("estimate") or 0)
     observation = (meta.get("token_estimate_observation") or {})
     raw_total = int(observation.get("raw") or 0)
     provider_input = int(observation.get("input") or 0)
@@ -4281,14 +4310,30 @@ def _reallocate_unspent_claim_calls(
     ]
 
 
-def _queue_batch_estimate(state: Mapping[str, Any], items: Sequence[Any]) -> int:
-    """Estimated input tokens for one reallocated batch. Same builder as the allowance check."""
+def _reread_token_budget(state: Mapping[str, Any]) -> int:
+    performance = (state.get("metadata") or {}).get("performance") or {}
+    budget = int(performance.get("token_budget") or 0)
+    return budget if budget > 0 else DEFAULT_FOCUSED_TOKEN_BUDGET
+
+
+def _fit_reread_request(
+    state: Mapping[str, Any],
+    items: Sequence[Any],
+    *,
+    token_budget: int | None = None,
+) -> dict[str, Any] | None:
+    """The smallest codebook shortening that fits ``token_budget``.
+
+    None means the passages do not fit even with raised codes only and no
+    definitions. That passage is withheld. It does not reject the other passages.
+    """
     batch_items = [item if isinstance(item, Mapping) else {"passage_id": item, "purpose": "develop"} for item in items]
     batch_ids = _queue_passage_ids(batch_items)
     by_id = {str(item.get("passage_id") or ""): item for item in (state.get("passages") or [])}
     batch = [by_id[passage_id] for passage_id in batch_ids if passage_id in by_id]
     if not batch:
-        return 0
+        return None
+    budget = _reread_token_budget(state) if token_budget is None else int(token_budget)
     raised_ids = set(state.get("raised_code_ids") or [])
     raised, other = _split_codebook(state.get("codebook") or {}, raised_ids)
     purposes = {str(item.get("passage_id") or ""): str(item.get("purpose") or "develop") for item in batch_items}
@@ -4296,15 +4341,48 @@ def _queue_batch_estimate(state: Mapping[str, Any], items: Sequence[Any]) -> int
         passage_id: _initial_code_rows(passage_id, state.get("segments") or [], state.get("codebook") or {})
         for passage_id in batch_ids
     }
-    messages, schema = _recode_request(
-        batch,
-        raised,
-        other=other,
-        purposes=purposes,
-        initial_codes=initial,
-        claims=_claims_by_passage(batch_items),
-    )
-    return request_input_tokens(messages, schema, resolve_tokenizer(None))
+    claims = _claims_by_passage(batch_items)
+    last_estimate = 0
+    for level in (0, 1, 2, 3):
+        messages, schema = _recode_request(
+            batch,
+            raised,
+            other=other,
+            purposes=purposes,
+            initial_codes=initial,
+            claims=claims,
+            code_level=level,
+        )
+        estimate = request_input_tokens(messages, schema, resolve_tokenizer(None))
+        last_estimate = estimate
+        if budget <= 0 or estimate <= budget:
+            return {
+                "level": level,
+                "estimate": estimate,
+                "messages": messages,
+                "schema": schema,
+                "passage_ids": batch_ids,
+            }
+    return {
+        "level": None,
+        "estimate": last_estimate,
+        "messages": None,
+        "schema": None,
+        "passage_ids": batch_ids,
+        "reason": REREAD_REQUEST_EXCEEDS_TOKEN_BUDGET,
+    }
+
+
+def _queue_batch_estimate(state: Mapping[str, Any], items: Sequence[Any]) -> int:
+    """Estimated input tokens for one batch that can be sent.
+
+    A batch that does not fit the per-request cap contributes nothing. The
+    allowance check does not treat that passage as a reason to stop the others.
+    """
+    fitted = _fit_reread_request(state, items)
+    if fitted is None or fitted.get("level") is None:
+        return 0
+    return int(fitted.get("estimate") or 0)
 
 
 def _fit_unspent_claim_calls(
@@ -4344,6 +4422,25 @@ def _fit_unspent_claim_calls(
         "max_focused_review_tokens": max_tokens,
         "reason": "token_allowance" if blocked else "",
     }
+
+
+def _claim_round_pending(state: Mapping[str, Any]) -> bool:
+    """True when a claim-compete round is still owed and has not been opened.
+
+    A passage that does not fit the per-request cap does not cancel that round.
+    """
+    if state.get("compete_round_done"):
+        return False
+    metadata = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
+    procedure = metadata.get("procedure") if isinstance(metadata.get("procedure"), Mapping) else {}
+    if procedure.get("focused_claim_compete_round", True) is False:
+        return False
+    targets = metadata.get("reread_call_targets") if isinstance(metadata.get("reread_call_targets"), Mapping) else {}
+    try:
+        reserved = int(targets.get("claim_compete") or 0)
+    except (TypeError, ValueError):
+        reserved = 0
+    return reserved > 0
 
 
 def _prepare_node(state: FocusedState) -> dict:
@@ -4545,11 +4642,13 @@ def _prepare_node(state: FocusedState) -> dict:
             metadata["focused_review_tokens_available"] = post["focused_review_tokens_available"]
             metadata["focused_review_token_shortfall"] = post["focused_review_token_shortfall"]
             metadata["focused_review_estimate_basis"] = "raised_codes_and_queue"
+            metadata["focused_review_requests_projected"] = post.get("focused_review_requests_projected")
+            metadata["focused_review_requests_withheld"] = post.get("focused_review_requests_withheld")
             updates["metadata"] = metadata
             state = {**state, "metadata": metadata}
             if post["short"]:
                 note = (
-                    "The reread allowance does not cover the queue estimated after selection. "
+                    "The reread allowance does not cover a request that fits the per-request cap. "
                     f"{post['focused_review_tokens_required']} tokens are required and "
                     f"{post['focused_review_tokens_available']} are available. "
                     "Selection was kept. The reread was not started."
@@ -4588,7 +4687,7 @@ def _prepare_node(state: FocusedState) -> dict:
         for item in ((state.get("metadata") or {}).get("reread_requests_over_budget") or [])
         if isinstance(item, Mapping)
     ]
-    segments = list(state.get("segments") or [])
+    chosen_level = 0
     for item in queue[cursor:]:
         passage_id = str(item.get("passage_id") or "") if isinstance(item, Mapping) else str(item)
         passage = by_id.get(passage_id)
@@ -4599,31 +4698,15 @@ def _prepare_node(state: FocusedState) -> dict:
             first_purpose = str(chosen_items[0].get("purpose") or "develop")
             if (first_purpose == "claim_compete") != (this_purpose == "claim_compete"):
                 break
-        trial = chosen + [passage]
         trial_items = chosen_items + [item if isinstance(item, Mapping) else {"passage_id": passage_id, "purpose": "develop"}]
-        trial_purposes = {
-            str(row.get("passage_id") or ""): str(row.get("purpose") or "develop") for row in trial_items
-        }
-        trial_initial = {
-            str(row.get("passage_id") or ""): _initial_code_rows(str(row.get("passage_id") or ""), segments, codebook)
-            for row in trial_items
-        }
-        messages, schema = _recode_request(
-            trial,
-            raised,
-            other=other,
-            purposes=trial_purposes,
-            initial_codes=trial_initial,
-            claims=_claims_by_passage(trial_items),
-        )
-        estimate = request_input_tokens(messages, schema, resolve_tokenizer(None))
-        if estimate > token_budget:
+        fitted = _fit_reread_request(state, trial_items, token_budget=token_budget)
+        if fitted is None or fitted.get("level") is None:
             if chosen:
                 break
             over_budget.append(
                 {
                     "passage_id": passage_id,
-                    "estimate": estimate,
+                    "estimate": int((fitted or {}).get("estimate") or 0),
                     "token_budget": token_budget,
                     "reason": REREAD_REQUEST_EXCEEDS_TOKEN_BUDGET,
                 }
@@ -4632,23 +4715,29 @@ def _prepare_node(state: FocusedState) -> dict:
             continue
         chosen.append(passage)
         chosen_items.append(trial_items[-1])
+        chosen_level = int(fitted.get("level") or 0)
         if len(chosen) >= batch_size:
             break
     if not chosen:
         updates["round_jobs"] = []
-        updates["recode_cursor"] = cursor + len(skipped)
+        new_cursor = cursor + len(skipped)
+        updates["recode_cursor"] = new_cursor
+        metadata = dict(updates.get("metadata") or state.get("metadata") or {})
+        if skipped:
+            metadata["reread_requests_over_budget"] = over_budget
+            metadata["reread_request_token_budget"] = token_budget
+            metadata["reread_request_bound"] = (
+                "token_budget is the per-request cap for a reread. "
+                "The default stays 6000. A passage that alone exceeds it is withheld. "
+                "Other passages and claim review are not blocked by that passage."
+            )
+            updates["metadata"] = metadata
+        if new_cursor < len(queue) or _claim_round_pending({**state, "metadata": metadata}):
+            return updates
         if not skipped:
             updates["focused_not_reread"] = []
             updates["recode_stop"] = "complete"
             return updates
-        metadata = dict(updates.get("metadata") or state.get("metadata") or {})
-        metadata["reread_requests_over_budget"] = over_budget
-        metadata["reread_request_token_budget"] = token_budget
-        metadata["reread_request_bound"] = (
-            "token_budget is the per-request cap for a reread. "
-            "The default stays 6000. A passage that alone exceeds it is not sent."
-        )
-        updates["metadata"] = metadata
         updates["recode_stop"] = REREAD_REQUEST_EXCEEDS_TOKEN_BUDGET
         updates["focused_not_reread"] = [str(item.get("passage_id") or "") for item in over_budget if item.get("passage_id")]
         return updates
@@ -4658,24 +4747,21 @@ def _prepare_node(state: FocusedState) -> dict:
         metadata["reread_request_token_budget"] = token_budget
         metadata["reread_request_bound"] = (
             "token_budget is the per-request cap for a reread. "
-            "The default stays 6000. A passage that alone exceeds it is not sent."
+            "The default stays 6000. A passage that alone exceeds it is withheld. "
+            "Other passages and claim review are not blocked by that passage."
         )
         updates["metadata"] = metadata
+    segments = list(state.get("segments") or [])
     purposes = {str(item.get("passage_id") or ""): str(item.get("purpose") or "develop") for item in chosen_items}
     initial_codes = {
         str(item.get("passage_id") or ""): _initial_code_rows(str(item.get("passage_id") or ""), segments, codebook)
         for item in chosen_items
     }
     claim_by_passage = _claims_by_passage(chosen_items)
-    messages, schema = _recode_request(
-        chosen,
-        raised,
-        other=other,
-        purposes=purposes,
-        initial_codes=initial_codes,
-        claims=claim_by_passage,
-    )
-    estimate = request_input_tokens(messages, schema, resolve_tokenizer(None))
+    fitted_job = _fit_reread_request(state, chosen_items, token_budget=token_budget) or {}
+    estimate = int(fitted_job.get("estimate") or 0)
+    raw_level = fitted_job.get("level")
+    chosen_level = chosen_level if raw_level is None else int(raw_level)
     calls = int(state.get("focused_calls_used") or 0)
     tokens = int(state.get("focused_tokens_estimated") or 0)
     max_calls = int(procedure.get("max_focused_review_calls") or 0)
@@ -4699,6 +4785,7 @@ def _prepare_node(state: FocusedState) -> dict:
             "purposes": purposes,
             "initial_codes": initial_codes,
             "claims": claim_by_passage,
+            "code_level": chosen_level,
             "claim_pairs": _claim_pairs(claim_by_passage),
             "claim_sources": {
                 str(item.get("passage_id") or ""): str(item.get("source") or "") for item in chosen_items
@@ -4752,6 +4839,7 @@ def _worker(runtime: FocusedRuntime):
         purposes = dict(job.get("purposes") or {})
         initial_codes = dict(job.get("initial_codes") or {})
         claims = dict(job.get("claims") or {})
+        code_level = int(job.get("code_level") or 0)
         messages, schema = _recode_request(
             passages,
             raised,
@@ -4759,6 +4847,7 @@ def _worker(runtime: FocusedRuntime):
             purposes=purposes,
             initial_codes=initial_codes,
             claims=claims,
+            code_level=code_level,
         )
         raw_parts: list[str] = []
         audits: list[dict] = []
@@ -5125,6 +5214,7 @@ def _followup(runtime: FocusedRuntime):
                         initial_codes=initial_codes,
                         claims=claims,
                         feedback=feedback,
+                        code_level=int(job.get("code_level") or 0),
                     )
                     kept = parsed
                     if call_limit > 0:
@@ -6583,21 +6673,93 @@ def _codebook_ids(book: Mapping[str, Any] | Sequence[Any]) -> list[str]:
     return raised
 
 
-def _sum_reread_estimates(
+def _project_reread_sends(
     state: Mapping[str, Any],
     queue: Sequence[Any],
     *,
     max_calls: int,
+    max_tokens: int,
     batch_size: int,
-) -> int:
-    total = 0
-    batches = 0
+    token_budget: int,
+) -> dict[str, Any]:
+    """Count reread requests that can actually be sent.
+
+    A passage that does not fit the per-request cap is withheld and adds no
+    tokens. The token total is the prefix of sendable requests that still
+    fits ``max_tokens``. ``short`` is true only when the first sendable
+    request itself exceeds that allowance, so nothing can start.
+    """
+    items = list(queue)
+    by_id = {
+        str(item.get("passage_id") or ""): item
+        for item in (state.get("passages") or [])
+        if isinstance(item, Mapping)
+    }
     cursor = 0
-    while cursor < len(queue) and batches < max_calls:
-        total += _queue_batch_estimate(state, queue[cursor:cursor + batch_size])
-        cursor += batch_size
-        batches += 1
-    return total
+    calls = 0
+    spent = 0
+    projected_tokens = 0
+    projected_requests = 0
+    withheld: list[dict[str, Any]] = []
+    first_sendable: int | None = None
+    while cursor < len(items) and calls < max_calls:
+        chosen_items: list[Any] = []
+        skipped_here = 0
+        for item in items[cursor:]:
+            passage_id = str(item.get("passage_id") or "") if isinstance(item, Mapping) else str(item)
+            if passage_id not in by_id:
+                if chosen_items:
+                    break
+                skipped_here += 1
+                continue
+            this_purpose = str(item.get("purpose") or "develop") if isinstance(item, Mapping) else "develop"
+            if chosen_items:
+                first_purpose = str(chosen_items[0].get("purpose") or "develop")
+                if (first_purpose == "claim_compete") != (this_purpose == "claim_compete"):
+                    break
+            trial = chosen_items + [
+                item if isinstance(item, Mapping) else {"passage_id": passage_id, "purpose": "develop"}
+            ]
+            fitted = _fit_reread_request(state, trial, token_budget=token_budget)
+            if fitted is None or fitted.get("level") is None:
+                if chosen_items:
+                    break
+                withheld.append(
+                    {
+                        "passage_id": passage_id,
+                        "estimate": int((fitted or {}).get("estimate") or 0),
+                        "token_budget": token_budget,
+                        "reason": REREAD_REQUEST_EXCEEDS_TOKEN_BUDGET,
+                    }
+                )
+                skipped_here += 1
+                continue
+            chosen_items.append(trial[-1])
+            if len(chosen_items) >= max(1, batch_size):
+                break
+        if not chosen_items:
+            step = skipped_here or 1
+            cursor += step
+            continue
+        fitted_job = _fit_reread_request(state, chosen_items, token_budget=token_budget) or {}
+        estimate = int(fitted_job.get("estimate") or 0)
+        if first_sendable is None:
+            first_sendable = estimate
+        if spent + estimate > max_tokens:
+            break
+        projected_tokens += estimate
+        projected_requests += 1
+        spent += estimate
+        calls += 1
+        cursor += skipped_here + len(chosen_items)
+    short = first_sendable is not None and projected_requests == 0 and first_sendable > max_tokens
+    required = int(first_sendable or 0) if short else projected_tokens
+    return {
+        "focused_review_tokens_required": required,
+        "focused_review_requests_projected": projected_requests,
+        "focused_review_requests_withheld": len(withheld),
+        "short": short,
+    }
 
 
 def _plan_reread_queue(state: Mapping[str, Any], raised: Sequence[str]) -> list[Any]:
@@ -6643,16 +6805,27 @@ def _reread_estimate_for(
     if max_calls <= 0 or max_tokens <= 0:
         return None
     batch_size = max(1, int(performance.get("batch_size") or 1))
+    token_budget = int(performance.get("token_budget") or 0) or DEFAULT_FOCUSED_TOKEN_BUDGET
     planned = list(queue) if queue is not None else _plan_reread_queue(state, raised)
     probe = {**state, "raised_code_ids": list(raised)}
-    total = _sum_reread_estimates(probe, planned, max_calls=max_calls, batch_size=batch_size)
+    projected = _project_reread_sends(
+        probe,
+        planned,
+        max_calls=max_calls,
+        max_tokens=max_tokens,
+        batch_size=batch_size,
+        token_budget=token_budget,
+    )
+    required = int(projected["focused_review_tokens_required"])
     return {
-        "focused_review_tokens_required": total,
+        "focused_review_tokens_required": required,
         "focused_review_tokens_available": max_tokens,
-        "focused_review_token_shortfall": max(0, total - max_tokens),
-        "short": total > max_tokens and total > 0,
+        "focused_review_token_shortfall": max(0, required - max_tokens),
+        "short": bool(projected["short"]),
         "queue_items": len(planned),
         "raised_codes": len(list(raised)),
+        "focused_review_requests_projected": int(projected["focused_review_requests_projected"]),
+        "focused_review_requests_withheld": int(projected["focused_review_requests_withheld"]),
     }
 
 
@@ -6670,6 +6843,8 @@ def _focused_reread_preflight(state: Mapping[str, Any]) -> dict[str, Any] | None
         "focused_review_tokens_required_worst_case": estimate["focused_review_tokens_required"],
         "focused_review_tokens_available": estimate["focused_review_tokens_available"],
         "focused_review_token_shortfall_worst_case": estimate["focused_review_token_shortfall"],
+        "focused_review_requests_projected_worst_case": estimate.get("focused_review_requests_projected"),
+        "focused_review_requests_withheld_worst_case": estimate.get("focused_review_requests_withheld"),
         "worst_case": True,
         "worst_case_assumes_all_codes_raised": True,
         "blocked": False,
@@ -7115,6 +7290,12 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
             "focused_review_token_shortfall_worst_case"
         ]
         metadata["focused_review_worst_case_note"] = reread_preflight["note"]
+        metadata["focused_review_requests_projected_worst_case"] = reread_preflight.get(
+            "focused_review_requests_projected_worst_case"
+        )
+        metadata["focused_review_requests_withheld_worst_case"] = reread_preflight.get(
+            "focused_review_requests_withheld_worst_case"
+        )
         progress["focused_review_tokens_required_worst_case"] = reread_preflight[
             "focused_review_tokens_required_worst_case"
         ]
@@ -7123,6 +7304,8 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         metadata["focused_review_tokens_available_worst_case"] = None
         metadata["focused_review_token_shortfall_worst_case"] = None
         metadata["focused_review_worst_case_note"] = None
+        metadata["focused_review_requests_projected_worst_case"] = None
+        metadata["focused_review_requests_withheld_worst_case"] = None
     metadata["token_estimate_is_dollar_bound"] = False
     metadata["token_estimate_includes_output_tokens"] = fields["token_estimate_includes_output_tokens"]
     metadata["token_estimate_includes_retry_or_repair_margin"] = fields["token_estimate_includes_retry_or_repair_margin"]
@@ -7707,6 +7890,14 @@ def _selection_export(state: Mapping[str, Any]) -> dict[str, Any]:
         "focused_review_token_shortfall_worst_case": metadata.get("focused_review_token_shortfall_worst_case"),
         "focused_review_worst_case_note": metadata.get("focused_review_worst_case_note"),
         "focused_review_estimate_basis": metadata.get("focused_review_estimate_basis"),
+        "focused_review_requests_projected": metadata.get("focused_review_requests_projected"),
+        "focused_review_requests_withheld": metadata.get("focused_review_requests_withheld"),
+        "focused_review_requests_projected_worst_case": metadata.get(
+            "focused_review_requests_projected_worst_case"
+        ),
+        "focused_review_requests_withheld_worst_case": metadata.get(
+            "focused_review_requests_withheld_worst_case"
+        ),
         "reread_stop": metadata.get("reread_stop"),
         "reread_requests_over_budget": metadata.get("reread_requests_over_budget"),
         "reread_request_bound": metadata.get("reread_request_bound"),
@@ -7782,6 +7973,10 @@ def load_focused_export(directory: str | Path) -> dict[str, Any]:
         "focused_review_token_shortfall_worst_case",
         "focused_review_worst_case_note",
         "focused_review_estimate_basis",
+        "focused_review_requests_projected",
+        "focused_review_requests_withheld",
+        "focused_review_requests_projected_worst_case",
+        "focused_review_requests_withheld_worst_case",
         "reread_stop",
         "reread_requests_over_budget",
         "reread_request_bound",

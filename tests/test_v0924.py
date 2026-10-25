@@ -46,8 +46,8 @@ from tests.test_v080 import FakeAxialCoder, _corpus
 
 
 def test_version_and_defaults_stay_put():
-    assert __version__ == "0.9.32"
-    assert POLICY_VERSION == "0.9.32"
+    assert __version__ == "0.9.33"
+    assert POLICY_VERSION == "0.9.33"
     assert DECISION_REVIEW_CHUNKING == "request_budget_v6"
     assert PATTERN_MIN_CASES == 2
     assert DEFAULT_MAX_AXIAL_REVIEW_TOKENS == 24000
@@ -439,13 +439,17 @@ def test_oversized_candidate_list_makes_core_selection_calls():
         batch_size=1,
     )
     sent = _core_calls(finished)
-    assert len(sent) >= 2
-    assert all(int(row.get("estimated_input_tokens") or 0) <= 6000 for row in sent)
+    assert sent == []
     report = finished.metadata["decision_reviews"]["axial_core_review"]
-    assert report["chunks_sent"] >= 2
-    assert report["expenditure_complete"] is True
-    assert report["tokens_estimated"] is not None
-    assert finished.metadata["model_core_judgment"] is True
+    assert report["chunks_sent"] == 0
+    assert report["complete"] is False
+    assert finished.metadata["model_core_id"] == ""
+    assert finished.metadata["model_core_judgment"] is not True
+    assert finished.metadata["core_candidates_compared"] == 0
+    assert finished.metadata["core_candidates_eligible"] > 1
+    assert finished.metadata["decision_stop"] == "core_candidates_do_not_fit"
+    assert finished.metadata["core_selection_withheld"] is True
+    assert finished.metadata["core_downstream_eligible"] is False
     assert finished.metadata["performance"]["batch_size"] == 1
 
     truncated = selective_code(
@@ -460,14 +464,14 @@ def test_oversized_candidate_list_makes_core_selection_calls():
         batch_size=1,
     )
     truncated_report = truncated.metadata["decision_reviews"]["axial_core_review"]
-    assert truncated_report["chunks_sent"] >= 1
+    assert truncated_report["chunks_sent"] == 0
     assert truncated_report["complete"] is False
-    assert truncated_report["items_uncovered"] > 0
     assert truncated.metadata["core_selection_complete"] is False
-    assert truncated.metadata["core_selection_truncated"] is True
+    assert truncated.metadata["core_selection_withheld"] is True
     assert truncated.metadata["model_core_id"] == ""
+    assert truncated.metadata["core_candidates_compared"] == 0
     assert truncated.metadata["core_downstream_eligible"] is False
-    assert truncated.metadata["core_status"] == "provisional"
+    assert truncated.metadata["decision_stop"] == "core_candidates_do_not_fit"
     assert truncated.metadata["complete"] is False
 
 
@@ -480,7 +484,7 @@ def test_chunk_order_does_not_change_the_core_and_tiers_still_win():
         interrupt=False,
         include_memos=False,
         include_storyline=False,
-        axial_token_budget=6000,
+        axial_token_budget=50000,
         max_axial_review_tokens=24000,
         max_decision_calls=8,
     )
@@ -492,12 +496,13 @@ def test_chunk_order_does_not_change_the_core_and_tiers_still_win():
         interrupt=False,
         include_memos=False,
         include_storyline=False,
-        axial_token_budget=6000,
+        axial_token_budget=50000,
         max_axial_review_tokens=24000,
         max_decision_calls=8,
     )
-    assert len(_core_calls(left)) >= 2
-    assert len(_core_calls(right)) >= 2
+    assert len(_core_calls(left)) == 1
+    assert len(_core_calls(right)) == 1
+    assert left.metadata["core_candidates_compared"] == right.metadata["core_candidates_compared"] == 2
     assert left.model_core_id == right.model_core_id == "c-keep"
     assert left.metadata.get("core_unsupported_by_graph") is not True
 
