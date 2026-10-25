@@ -191,7 +191,13 @@ def _blob(messages) -> str:
     return " ".join(str(getattr(message, "content", "")) for message in messages)
 
 
-def test_shared_token_allowance_covers_coding_and_decision_review(monkeypatch):
+def test_decision_steps_do_not_share_the_coding_token_pool(monkeypatch):
+    """The 1500 ceiling is the coding pool and, separately, each decision step.
+
+    A coding request of 1402 and a decision request of 1166 each fit. They are
+    not one pool, so the validated estimates can sum above 1500. Decision spend
+    stays off ``axial_tokens_estimated``. Each step still cannot exceed 1500.
+    """
     def estimate(messages, schema, tokenizer=None):
         name = getattr(schema, "__name__", "")
         if name == "AxialProposalBatch":
@@ -220,13 +226,21 @@ def test_shared_token_allowance_covers_coding_and_decision_review(monkeypatch):
         if row.get("status") == "validated"
     ]
     assert validated
-    assert sum(validated) <= 1500
-    assert result.metadata["axial_tokens_estimated"] <= 1500
-    assert result.metadata["decision_stop"] == "token_allowance"
-    omitted = [row for row in result.prompt_log if row.get("kind") == "decision_review" and row.get("status") == "omitted"]
-    assert omitted
-    assert all(row.get("reason") == "token_allowance" and row.get("needs_review") for row in omitted)
-    assert coder.call_count == 1
+    assert 1402 in validated
+    assert 1166 in validated
+    assert sum(validated) > 1500
+    assert result.metadata["axial_tokens_estimated"] == 1402
+    steps = [
+        step
+        for step in result.metadata["decision_budget_steps"]
+        if int(step.get("tokens_used") or 0) > 0
+    ]
+    assert steps
+    for step in steps:
+        assert step["token_allowance"] == 1500
+        assert int(step["tokens_used"]) <= 1500
+        assert step["prior_step_tokens_reduce_allowance"] is False
+    assert coder.call_count == 3
 
 
 class _RepairCoder(FakeAxialCoder):

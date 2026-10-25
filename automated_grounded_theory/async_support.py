@@ -157,9 +157,12 @@ class ProviderAllowance:
     and a retry all acquire from this object before the provider is called.
     Repairs and retries use the stage that originated the request. A request
     that does not fit is not sent. ``max_calls`` or a stage ceiling of ``None``
-    leaves that side open. Zero is a closed ceiling. ``max_tokens`` is one
-    pool across stages. ``snapshot`` and ``restore`` are the checkpoint copy
-    of the counters, so a new runtime can continue the same allowance.
+    leaves that side open. Zero is a closed ceiling. ``max_tokens`` is the
+    pool for stages that do not name a token ceiling. A stage listed in
+    ``stage_token_ceilings`` spends only that ceiling. Its tokens do not
+    reduce another stage or this pool. ``snapshot`` and ``restore`` are the
+    checkpoint copy of the counters, so a new runtime can continue the same
+    allowance.
     """
 
     def __init__(
@@ -171,6 +174,7 @@ class ProviderAllowance:
         tokens_estimated: int = 0,
         stages: Mapping[str, int | None] | None = None,
         token_reserve: int = 0,
+        stage_token_ceilings: Mapping[str, int | None] | None = None,
     ) -> None:
         self.max_calls = None if max_calls is None else max(0, int(max_calls))
         self.max_tokens = None if max_tokens is None else max(0, int(max_tokens))
@@ -180,11 +184,16 @@ class ProviderAllowance:
         self.refusals: list[dict[str, Any]] = []
         self.stage_ceilings: dict[str, int | None] = {}
         self.stage_used: dict[str, int] = {}
+        self.stage_token_ceilings: dict[str, int | None] = {}
+        self.stage_tokens_used: dict[str, int] = {}
         self.observed_raw = 0
         self.observed_input = 0
         for name, ceiling in (stages or {}).items():
             self.stage_ceilings[str(name)] = None if ceiling is None else max(0, int(ceiling))
             self.stage_used[str(name)] = 0
+        for name, ceiling in (stage_token_ceilings or {}).items():
+            self.stage_token_ceilings[str(name)] = None if ceiling is None else max(0, int(ceiling))
+            self.stage_tokens_used[str(name)] = 0
 
     def remaining_calls(self, stage: str | None = None) -> int | None:
         if stage and self.stage_ceilings:
@@ -196,7 +205,12 @@ class ProviderAllowance:
             return None
         return max(0, self.max_calls - self.calls_used)
 
-    def remaining_tokens(self) -> int | None:
+    def remaining_tokens(self, stage: str | None = None) -> int | None:
+        if stage and stage in self.stage_token_ceilings:
+            ceiling = self.stage_token_ceilings.get(stage)
+            if ceiling is None:
+                return None
+            return max(0, int(ceiling) - int(self.stage_tokens_used.get(stage, 0)))
         if self.max_tokens is None:
             return None
         return max(0, self.max_tokens - self.tokens_estimated)
@@ -212,8 +226,15 @@ class ProviderAllowance:
                 name: {
                     "calls_used": self.stage_used.get(name, 0),
                     "max_calls": self.stage_ceilings.get(name),
+                    "tokens_used": self.stage_tokens_used.get(name, 0),
+                    "max_tokens": self.stage_token_ceilings.get(name),
                 }
-                for name in set(self.stage_ceilings) | set(self.stage_used)
+                for name in (
+                    set(self.stage_ceilings)
+                    | set(self.stage_used)
+                    | set(self.stage_token_ceilings)
+                    | set(self.stage_tokens_used)
+                )
             },
             "observed_raw": self.observed_raw,
             "observed_input": self.observed_input,
@@ -240,9 +261,13 @@ class ProviderAllowance:
         for name, row in (snapshot.get("stages") or {}).items():
             if isinstance(row, Mapping):
                 used = row.get("calls_used")
+                token_used = row.get("tokens_used")
             else:
                 used = row
+                token_used = None
             self.stage_used[str(name)] = max(0, int(used or 0))
+            if token_used is not None:
+                self.stage_tokens_used[str(name)] = max(0, int(token_used or 0))
 
     def preview(
         self,
@@ -328,6 +353,19 @@ class ProviderAllowance:
         if stage_limited and bucket not in self.stage_ceilings and self.max_calls is not None:
             call_max = self.max_calls
             used = self.calls_used
+        uses_stage_tokens = bucket in self.stage_token_ceilings
+        stage_token_ceiling = self.stage_token_ceilings.get(bucket) if uses_stage_tokens else None
+        stage_token_used = int(self.stage_tokens_used.get(bucket, 0)) if uses_stage_tokens else 0
+        stage_spent = self._guarded(stage_token_used)
+        token_refuse = False
+        token_spent_reported = self.tokens_estimated
+        token_ceiling_reported = self.max_tokens
+        if uses_stage_tokens and stage_token_ceiling is not None and stage_spent + estimate > int(stage_token_ceiling):
+            token_refuse = True
+            token_spent_reported = stage_token_used
+            token_ceiling_reported = int(stage_token_ceiling)
+        elif not uses_stage_tokens and compared_ceiling is not None and spent + estimate > compared_ceiling:
+            token_refuse = True
         if call_max is not None and used >= call_max:
             row = {
                 "status": "refused",
@@ -337,11 +375,11 @@ class ProviderAllowance:
                 "estimated_input_tokens": raw_estimate,
                 "guarded_estimate": estimate,
                 "calls_used": used,
-                "tokens_estimated": self.tokens_estimated,
+                "tokens_estimated": token_spent_reported if uses_stage_tokens else self.tokens_estimated,
                 "max_calls": call_max,
-                "max_tokens": self.max_tokens,
+                "max_tokens": token_ceiling_reported if uses_stage_tokens else self.max_tokens,
             }
-        elif compared_ceiling is not None and spent + estimate > compared_ceiling:
+        elif token_refuse:
             row = {
                 "status": "refused",
                 "reason": "token_allowance",
@@ -350,14 +388,23 @@ class ProviderAllowance:
                 "estimated_input_tokens": raw_estimate,
                 "guarded_estimate": estimate,
                 "calls_used": used,
-                "tokens_estimated": self.tokens_estimated,
+                "tokens_estimated": token_spent_reported,
                 "max_calls": call_max,
-                "max_tokens": self.max_tokens,
+                "max_tokens": token_ceiling_reported,
             }
         else:
             if commit:
                 self.calls_used += 1
-                self.tokens_estimated += raw_estimate
+                if uses_stage_tokens:
+                    self.stage_tokens_used[bucket] = stage_token_used + raw_estimate
+                    token_spent_reported = self.stage_tokens_used[bucket]
+                    token_ceiling_reported = (
+                        self.max_tokens if stage_token_ceiling is None else int(stage_token_ceiling)
+                    )
+                else:
+                    self.tokens_estimated += raw_estimate
+                    token_spent_reported = self.tokens_estimated
+                    token_ceiling_reported = self.max_tokens
                 if stage_limited:
                     self.stage_used[bucket] = self.stage_used.get(bucket, 0) + 1
                     used = self.stage_used[bucket]
@@ -371,9 +418,9 @@ class ProviderAllowance:
                 "estimated_input_tokens": raw_estimate,
                 "guarded_estimate": estimate,
                 "calls_used": used if commit else used,
-                "tokens_estimated": self.tokens_estimated,
+                "tokens_estimated": token_spent_reported,
                 "max_calls": call_max,
-                "max_tokens": self.max_tokens,
+                "max_tokens": token_ceiling_reported,
             }
         if commit and row["status"] != "acquired":
             self.refusals.append(dict(row))

@@ -40,8 +40,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_version_and_batch_size_stay_split_from_procedure():
-    assert __version__ == "0.9.31"
-    assert POLICY_VERSION == "0.9.31"
+    assert __version__ == "0.9.32"
+    assert POLICY_VERSION == "0.9.32"
     assert inspect.signature(focused_code).parameters["batch_size"].default == 1
     assert inspect.signature(afocused_code).parameters["batch_size"].default == 1
     assert DEFAULT_FOCUSED_BATCH_SIZE == 1
@@ -475,7 +475,9 @@ def test_allowance_exhaustion_is_incomplete_and_skips_the_model():
     )
     assert silent.call_count == 0
     assert tokens.metadata["status"] == "incomplete"
-    assert tokens.metadata["stop"] == "token_allowance"
+    assert tokens.metadata["stop"] == "reread_allowance_insufficient"
+    assert tokens.metadata["reread_stop"] == "reread_allowance_insufficient"
+    assert tokens.raised_code_ids
     assert set(tokens.focused_not_reread) == {"p1", "p2", "p3"}
 
     none, both = _run(

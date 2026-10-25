@@ -37,8 +37,8 @@ _FIXTURE = Path(__file__).resolve().parents[0] / "fixtures" / "hypothetical_if_0
 
 
 def test_version_and_the_auto_size_default():
-    assert __version__ == "0.9.31"
-    assert POLICY_VERSION == "0.9.31"
+    assert __version__ == "0.9.32"
+    assert POLICY_VERSION == "0.9.32"
     assert DECISION_REVIEW_CHUNKING == "request_budget_v6"
     assert AUTO_SIZE_DECISION_CALLS is False
     assert focused_code.__wrapped__.__defaults__ is not None or True

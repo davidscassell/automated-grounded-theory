@@ -114,6 +114,12 @@ CHUNK_CONTEXT_NOTE = (
 DUPLICATE_ASSERTION_RULE = "merge_all_evidence_v1"
 # Decision-call ceilings are shared by named steps. Each step records its own use.
 BUDGET_LEDGER_RULE = "shared_review_ledger_v1"
+# Each decision step has its own token allowance. The number is not raised.
+DECISION_TOKEN_SCOPE = "per_step_v1"
+# Supporting cases are distinct respondents, including after a duplicate merge.
+CASE_COUNT_RULE = "respondent_identity_v1"
+# The reread allowance is checked after selection, on the raised codes and the queue.
+REREAD_ESTIMATE_RULE = "post_selection_v1"
 # Gate export and run export read one relationship assessment.
 EXPORT_ASSESSMENT_RULE = "shared_assessment_v1"
 SHARED_DECISION_REVIEW = "shared_decision_review"
@@ -159,6 +165,9 @@ CHUNKING_CHECKPOINT_MESSAGE = (
     "or before condition scope was kept on the relationship, an unreviewed "
     "consolidation candidate stayed unresolved, consolidation attempts accumulated, "
     "or the 0.9.31 rules, "
+    "or before each decision step had its own token allowance, supporting cases "
+    "were counted by respondent identity, the reread was estimated after selection, "
+    "or the 0.9.32 rules, "
     "or the stored chunk plan does not match this resume. Resume cannot continue "
     "that review. Start a new run."
 )
@@ -649,7 +658,7 @@ def apply_selection_compaction(
 
 
 def review_procedure_fields() -> dict[str, str]:
-    """Procedure fingerprint for the 0.9.31 review rules.
+    """Procedure fingerprint for the 0.9.32 review rules.
 
     The chunk partition is separate from the call and token ceilings. A higher
     ceiling can continue the same chunks. A different partition cannot.
@@ -671,6 +680,9 @@ def review_procedure_fields() -> dict[str, str]:
         "chunk_allowance_rule": CHUNK_ALLOWANCE_RULE,
         "duplicate_assertion_rule": DUPLICATE_ASSERTION_RULE,
         "budget_ledger_rule": BUDGET_LEDGER_RULE,
+        "decision_token_scope": DECISION_TOKEN_SCOPE,
+        "case_count_rule": CASE_COUNT_RULE,
+        "reread_estimate_rule": REREAD_ESTIMATE_RULE,
         "export_assessment_rule": EXPORT_ASSESSMENT_RULE,
         "chunk_review_recovery": CHUNK_REVIEW_RECOVERY,
     }
@@ -709,8 +721,54 @@ def open_budget_step(
             "remaining_allowance": None if allowance_n is None else max(0, allowance_n - used),
             "stop_reason": None,
             "open": True,
+            "token_allowance": None,
+            "starting_tokens": None,
+            "tokens_required": None,
+            "tokens_available": None,
+            "tokens_used": None,
+            "remaining_tokens": None,
         }
     )
+    metadata["decision_budget_steps"] = steps
+
+
+def note_token_preflight(
+    metadata: dict[str, Any],
+    *,
+    step: str,
+    token_allowance: int | None,
+    starting_tokens: int,
+    tokens_required: int,
+) -> None:
+    """Record required versus available tokens before this step spends.
+
+    A step that already recorded its preflight keeps those figures. A later
+    chunk of the same step does not replace the account opened before the
+    first send.
+    """
+    steps = [dict(item) for item in (metadata.get("decision_budget_steps") or []) if isinstance(item, Mapping)]
+    target = None
+    for item in reversed(steps):
+        if item.get("step") == step and item.get("open"):
+            target = item
+            break
+    if target is None:
+        metadata["decision_budget_steps"] = steps
+        return
+    if target.get("token_preflight_recorded"):
+        metadata["decision_budget_steps"] = steps
+        return
+    allowance_n = None if token_allowance is None else int(token_allowance)
+    started = max(0, int(starting_tokens))
+    required = max(0, int(tokens_required))
+    available = None if allowance_n is None else max(0, allowance_n - started)
+    target["token_allowance"] = allowance_n
+    target["starting_tokens"] = started
+    target["tokens_required"] = required
+    target["tokens_available"] = available
+    target["tokens_used"] = 0
+    target["remaining_tokens"] = available
+    target["token_preflight_recorded"] = True
     metadata["decision_budget_steps"] = steps
 
 
@@ -720,6 +778,7 @@ def close_budget_step(
     step: str,
     stop_reason: str | None = None,
     usage: int | None = None,
+    token_usage: int | None = None,
 ) -> None:
     """Close the open step, or refresh its stop after the calls are known.
 
@@ -750,6 +809,14 @@ def close_budget_step(
     if reason or target.get("open"):
         target["stop_reason"] = reason
     target["open"] = False
+    if token_usage is not None or target.get("token_preflight_recorded"):
+        start_tokens = int(target.get("starting_tokens") or 0)
+        used_tokens = start_tokens if token_usage is None else max(0, int(token_usage))
+        target["tokens_used"] = max(0, used_tokens - start_tokens)
+        token_allowance = target.get("token_allowance")
+        target["remaining_tokens"] = (
+            None if token_allowance is None else max(0, int(token_allowance) - used_tokens)
+        )
     if step in SHARED_REVIEW_STEPS:
         prior_names = set(SHARED_REVIEW_STEPS[: SHARED_REVIEW_STEPS.index(step)])
         prior_calls = sum(
@@ -760,6 +827,13 @@ def close_budget_step(
         carried = int(metadata.get("decision_calls_carried") or 0)
         target["prior_step_calls"] = prior_calls if prior_calls else carried
         target["prior_step_calls_reduce_allowance"] = False
+        prior_tokens = sum(
+            int(item.get("tokens_used") or 0)
+            for item in steps
+            if item is not target and item.get("step") in prior_names
+        )
+        target["prior_step_tokens"] = prior_tokens
+        target["prior_step_tokens_reduce_allowance"] = False
     metadata["decision_budget_steps"] = steps
 
 
@@ -782,6 +856,24 @@ def stamp_budget_on_progress(progress: dict[str, Any], metadata: Mapping[str, An
     if "prior_step_calls" in record:
         progress["prior_step_calls"] = record.get("prior_step_calls")
         progress["prior_step_calls_reduce_allowance"] = record.get("prior_step_calls_reduce_allowance")
+    # A step with no token preflight leaves the caller's token figures alone.
+    # Focused selection records its own required and available tokens before
+    # this stamp. Copying the empty budget fields would replace them.
+    token_account_recorded = (
+        bool(record.get("token_preflight_recorded"))
+        or record.get("token_allowance") is not None
+        or record.get("tokens_used") is not None
+    )
+    if token_account_recorded:
+        progress["token_allowance"] = record.get("token_allowance")
+        progress["starting_tokens"] = record.get("starting_tokens")
+        progress["tokens_required"] = record.get("tokens_required")
+        progress["tokens_available"] = record.get("tokens_available")
+        progress["tokens_used"] = record.get("tokens_used")
+        progress["remaining_tokens"] = record.get("remaining_tokens")
+    if "prior_step_tokens" in record:
+        progress["prior_step_tokens"] = record.get("prior_step_tokens")
+        progress["prior_step_tokens_reduce_allowance"] = record.get("prior_step_tokens_reduce_allowance")
 
 
 def budget_ledger(metadata: Mapping[str, Any] | None) -> list[dict[str, Any]]:
@@ -802,6 +894,14 @@ def budget_ledger(metadata: Mapping[str, Any] | None) -> list[dict[str, Any]]:
                 "stop_reason": item.get("stop_reason"),
                 "prior_step_calls": item.get("prior_step_calls"),
                 "prior_step_calls_reduce_allowance": item.get("prior_step_calls_reduce_allowance"),
+                "token_allowance": item.get("token_allowance"),
+                "starting_tokens": item.get("starting_tokens"),
+                "tokens_required": item.get("tokens_required"),
+                "tokens_available": item.get("tokens_available"),
+                "tokens_used": item.get("tokens_used"),
+                "remaining_tokens": item.get("remaining_tokens"),
+                "prior_step_tokens": item.get("prior_step_tokens"),
+                "prior_step_tokens_reduce_allowance": item.get("prior_step_tokens_reduce_allowance"),
             }
         )
     return rows
@@ -813,10 +913,17 @@ def seal_budget_step(
     step: str,
     *,
     usage: int | None = None,
+    token_usage: int | None = None,
 ) -> None:
     """Close the step from this progress row and copy the account onto it."""
     stops = [str(item) for item in (progress.get("stop_reasons") or []) if str(item)]
-    close_budget_step(metadata, step=step, stop_reason=stops[0] if stops else None, usage=usage)
+    close_budget_step(
+        metadata,
+        step=step,
+        stop_reason=stops[0] if stops else None,
+        usage=usage,
+        token_usage=token_usage,
+    )
     stamp_budget_on_progress(progress, metadata, step)
 
 
@@ -1413,6 +1520,18 @@ def finish_decision_report(progress: Mapping[str, Any]) -> dict[str, Any]:
             if "prior_step_calls_reduce_allowance" in progress
             else None
         ),
+        "token_allowance": progress.get("token_allowance") if "token_allowance" in progress else None,
+        "starting_tokens": progress.get("starting_tokens") if "starting_tokens" in progress else None,
+        "tokens_required": progress.get("tokens_required") if "tokens_required" in progress else None,
+        "tokens_available": progress.get("tokens_available") if "tokens_available" in progress else None,
+        "tokens_used": progress.get("tokens_used") if "tokens_used" in progress else None,
+        "remaining_tokens": progress.get("remaining_tokens") if "remaining_tokens" in progress else None,
+        "prior_step_tokens": progress.get("prior_step_tokens") if "prior_step_tokens" in progress else None,
+        "prior_step_tokens_reduce_allowance": (
+            progress.get("prior_step_tokens_reduce_allowance")
+            if "prior_step_tokens_reduce_allowance" in progress
+            else None
+        ),
         "claim_review_calls_reserved": (
             None
             if progress.get("claim_review_calls_reserved") is None
@@ -1511,6 +1630,9 @@ def same_chunking_fingerprint(saved: Any, current: Any) -> bool:
         "chunk_allowance_rule": CHUNK_ALLOWANCE_RULE,
         "duplicate_assertion_rule": DUPLICATE_ASSERTION_RULE,
         "budget_ledger_rule": BUDGET_LEDGER_RULE,
+        "decision_token_scope": DECISION_TOKEN_SCOPE,
+        "case_count_rule": CASE_COUNT_RULE,
+        "reread_estimate_rule": REREAD_ESTIMATE_RULE,
         "export_assessment_rule": EXPORT_ASSESSMENT_RULE,
         "chunk_review_recovery": CHUNK_REVIEW_RECOVERY,
     }

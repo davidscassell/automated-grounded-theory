@@ -70,8 +70,8 @@ _ASIDE = Path(__file__).resolve().parents[0] / "fixtures" / "discourse_aside_092
 
 
 def test_version_rules_and_unchanged_defaults():
-    assert __version__ == "0.9.31"
-    assert POLICY_VERSION == "0.9.31"
+    assert __version__ == "0.9.32"
+    assert POLICY_VERSION == "0.9.32"
     assert DECISION_REVIEW_CHUNKING == "request_budget_v6"
     assert CONDITIONAL_SCOPE_RULE == "condition_scope_v1"
     assert DUPLICATE_ASSERTION_RULE == "merge_all_evidence_v1"
@@ -1195,12 +1195,17 @@ def test_focused_review_token_allowance_is_in_the_preflight(tmp_path):
         max_decision_tokens=200000,
         output_dir=tmp_path,
     )
-    assert capped.metadata["decision_stop"] == CHUNK_ALLOWANCE_INSUFFICIENT
+    assert capped.metadata.get("decision_stop") != CHUNK_ALLOWANCE_INSUFFICIENT
+    assert capped.metadata["focused_review_tokens_required_worst_case"] > 1
+    assert "every codebook code" in capped.metadata["focused_review_worst_case_note"]
     assert capped.metadata["focused_review_tokens_required"] > 1
     assert capped.metadata["focused_review_tokens_available"] == 1
     assert capped.metadata["focused_review_token_shortfall"] > 0
-    assert capped.metadata["decision_reviews"]["focused_selection"]["chunks_sent"] == 0
-    assert not any(entry.get("kind") == "decision_review" for entry in capped.prompt_log)
+    assert capped.metadata["focused_review_estimate_basis"] == "raised_codes_and_queue"
+    assert capped.metadata["reread_stop"] == "reread_allowance_insufficient"
+    assert capped.metadata["decision_reviews"]["focused_selection"]["chunks_sent"] >= 1
+    assert capped.raised_code_ids == ["c-a"]
+    assert any(entry.get("kind") == "decision_review" for entry in capped.prompt_log)
 
 
 def test_finished_incomplete_selection_resumes_on_a_larger_budget():

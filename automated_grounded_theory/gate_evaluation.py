@@ -367,9 +367,14 @@ def relationship_assessment(row: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def stamp_relationship_assessment(row: dict[str, Any]) -> dict[str, Any]:
-    """Write :func:`relationship_assessment` onto a row. Returns that assessment."""
+    """Write :func:`relationship_assessment` onto a row. Returns that assessment.
+
+    The fields are copied onto the row, and the same object is stored under
+    ``relationship_assessment``.
+    """
     assessment = relationship_assessment(row)
     row.update(assessment)
+    row["relationship_assessment"] = dict(assessment)
     return assessment
 
 
@@ -411,6 +416,7 @@ def export_gate_relationships(relationships: Sequence[Mapping[str, Any]]) -> dic
             "rules": list(rules),
             "withholding_flags": _withholding_flags(row),
             **assessment,
+            "relationship_assessment": dict(assessment),
         }
         flags = {str(flag) for flag in (row.get("flags") or []) if str(flag)}
         counted.append((outcome, flags | set(rules)))

@@ -237,6 +237,8 @@ SELECTION_RULES = ("top_k", "quantile")
 DEFAULT_FOCUSED_BATCH_SIZE = 1
 DEFAULT_FOCUSED_CONCURRENCY = 1
 DEFAULT_FOCUSED_TOKEN_BUDGET = 6000
+REREAD_ALLOWANCE_INSUFFICIENT = "reread_allowance_insufficient"
+REREAD_REQUEST_EXCEEDS_TOKEN_BUDGET = "reread_request_exceeds_token_budget"
 
 _JUDGMENT_OPS = frozenset(
     {"refine_definition", "record_dimension", "link_to_category", "keep_distinct"}
@@ -292,6 +294,9 @@ _PROCEDURE_KEYS = (
     "chunk_allowance_rule",
     "duplicate_assertion_rule",
     "budget_ledger_rule",
+    "decision_token_scope",
+    "case_count_rule",
+    "reread_estimate_rule",
     "export_assessment_rule",
     "chunk_review_recovery",
     "auto_size_decision_calls",
@@ -2048,6 +2053,8 @@ def _allowance_stop(value: str) -> bool:
         "token_allowance",
         "request_budget",
         CHUNK_ALLOWANCE_INSUFFICIENT,
+        REREAD_ALLOWANCE_INSUFFICIENT,
+        REREAD_REQUEST_EXCEEDS_TOKEN_BUDGET,
     }
 
 
@@ -3035,14 +3042,42 @@ def _queued_passage_ids(state: Mapping[str, Any]) -> list[str]:
     return [passage_id for passage_id in _queue_passage_ids(state.get("recode_queue") or []) if passage_id]
 
 
+def _passage_document_id(passage: Mapping[str, Any]) -> str:
+    return str(passage.get("doc_id") or passage.get("document_id") or "")
+
+
+def _documents_for(state: Mapping[str, Any], passage_ids: Sequence[str] | None = None) -> list[str]:
+    """Document ids for corpus passages, optionally limited to ``passage_ids``."""
+    wanted = None if passage_ids is None else {str(item) for item in passage_ids}
+    found: list[str] = []
+    for item in state.get("passages") or []:
+        if not isinstance(item, Mapping) or not item.get("passage_id") or _is_synthetic_passage(item):
+            continue
+        passage_id = str(item.get("passage_id") or "")
+        if wanted is not None and passage_id not in wanted:
+            continue
+        document_id = _passage_document_id(item)
+        if document_id and document_id not in found:
+            found.append(document_id)
+    return found
+
+
 def _coverage_statement(state: Mapping[str, Any], not_reread: Sequence[str]) -> dict[str, Any]:
     corpus = _corpus_passage_ids(state)
+    corpus_set = set(corpus)
     queued = _queued_passage_ids(state)
     queued_set = set(queued)
     reread = [str(item) for item in (state.get("focused_reread") or [])]
+    reread_in_corpus = [passage_id for passage_id in reread if passage_id in corpus_set]
     not_queued = [passage_id for passage_id in corpus if passage_id not in queued_set]
+    documents_in_corpus = _documents_for(state)
+    documents_covered = _documents_for(state, reread_in_corpus)
     return {
         "corpus_passages": len(corpus),
+        "passages_in_corpus": len(corpus),
+        "passages_covered": len(reread_in_corpus),
+        "documents_in_corpus": len(documents_in_corpus),
+        "documents_covered": len(documents_covered),
         "queued": len(queued),
         "reread": len(reread),
         "not_queued": not_queued,
@@ -3051,9 +3086,12 @@ def _coverage_statement(state: Mapping[str, Any], not_reread: Sequence[str]) -> 
         "not_reread_count": len(list(not_reread)),
         "queue_complete": not list(not_reread),
         "corpus_complete": not list(not_reread) and not not_queued,
+        "complete_for_queue_is_corpus_coverage": False,
         "note": (
             "complete means every corpus passage was reread. "
-            "complete_for_queue means the reread queue finished and names passages that were never queued. "
+            "complete_for_queue means the reread queue finished. It is not corpus coverage. "
+            "passages_covered of passages_in_corpus and documents_covered of documents_in_corpus "
+            "were reread. "
             "focused_not_reread lists passages that were queued and not sent. "
             "focused_not_queued lists passages that never entered the queue."
         ),
@@ -3139,7 +3177,10 @@ def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
     not_reread = [str(item) for item in (state.get("focused_not_reread") or [])]
     coverage = _coverage_statement(state, not_reread)
     not_queued = list(coverage["not_queued"])
-    if stop in {"call_allowance", "token_allowance", "no_progress", "timeout", "recursion_limit"}:
+    if stop in {REREAD_ALLOWANCE_INSUFFICIENT, REREAD_REQUEST_EXCEEDS_TOKEN_BUDGET}:
+        status = "incomplete"
+        complete = False
+    elif stop in {"call_allowance", "token_allowance", "no_progress", "timeout", "recursion_limit"}:
         status = "incomplete"
         complete = False
     elif not not_reread and not not_queued:
@@ -3334,7 +3375,9 @@ def _queue_finished_warning(fields: Mapping[str, Any]) -> str:
         shown = f"{shown}, and {len(ids) - 30} more"
     return (
         "Focused coding finished the reread queue "
-        f"({coverage.get('reread', 0)} of {coverage.get('corpus_passages', 0)} corpus passages). "
+        f"({coverage.get('passages_covered', coverage.get('reread', 0))} of "
+        f"{coverage.get('passages_in_corpus', coverage.get('corpus_passages', 0))} corpus passages, "
+        f"{coverage.get('documents_covered', 0)} of {coverage.get('documents_in_corpus', 0)} documents). "
         "Status is complete_for_queue, which is not corpus coverage. "
         "Passages never queued: "
         + (shown or "(none)")
@@ -4345,7 +4388,15 @@ def _prepare_node(state: FocusedState) -> dict:
         updates["focused_not_reread"] = []
         updates["focused_reread"] = list(state.get("focused_reread") or [])
         state = {**state, **updates}
-    if state.get("recode_stop") in {"call_allowance", "token_allowance", "no_progress", "complete", "complete_for_queue"}:
+    if state.get("recode_stop") in {
+        "call_allowance",
+        "token_allowance",
+        "no_progress",
+        "complete",
+        "complete_for_queue",
+        REREAD_ALLOWANCE_INSUFFICIENT,
+        REREAD_REQUEST_EXCEEDS_TOKEN_BUDGET,
+    }:
         updates["round_jobs"] = []
         return updates
     queue = list(state.get("recode_queue") or [])
@@ -4472,10 +4523,47 @@ def _prepare_node(state: FocusedState) -> dict:
         procedure = (state.get("metadata") or {}).get("procedure") or {}
         calls = int(state.get("focused_calls_used") or 0)
         max_calls = int(procedure.get("max_focused_review_calls") or 0)
+        over = [
+            dict(item)
+            for item in ((state.get("metadata") or {}).get("reread_requests_over_budget") or [])
+            if isinstance(item, Mapping)
+        ]
+        over_ids = [str(item.get("passage_id") or "") for item in over if item.get("passage_id")]
         updates["round_jobs"] = []
-        updates["focused_not_reread"] = []
-        updates["recode_stop"] = "call_allowance" if max_calls <= 0 and calls == 0 else "complete"
+        if over_ids:
+            updates["focused_not_reread"] = over_ids
+            updates["recode_stop"] = REREAD_REQUEST_EXCEEDS_TOKEN_BUDGET
+        else:
+            updates["focused_not_reread"] = []
+            updates["recode_stop"] = "call_allowance" if max_calls <= 0 and calls == 0 else "complete"
         return updates
+    if int(state.get("focused_calls_used") or 0) == 0 and cursor < len(queue):
+        post = _reread_estimate_for(state, list(state.get("raised_code_ids") or []), queue[cursor:])
+        if post is not None:
+            metadata = dict(state.get("metadata") or {})
+            metadata["focused_review_tokens_required"] = post["focused_review_tokens_required"]
+            metadata["focused_review_tokens_available"] = post["focused_review_tokens_available"]
+            metadata["focused_review_token_shortfall"] = post["focused_review_token_shortfall"]
+            metadata["focused_review_estimate_basis"] = "raised_codes_and_queue"
+            updates["metadata"] = metadata
+            state = {**state, "metadata": metadata}
+            if post["short"]:
+                note = (
+                    "The reread allowance does not cover the queue estimated after selection. "
+                    f"{post['focused_review_tokens_required']} tokens are required and "
+                    f"{post['focused_review_tokens_available']} are available. "
+                    "Selection was kept. The reread was not started."
+                )
+                warnings = list(updates.get("warnings") or state.get("warnings") or [])
+                if note not in warnings:
+                    warnings.append(note)
+                metadata["reread_stop"] = REREAD_ALLOWANCE_INSUFFICIENT
+                updates["metadata"] = metadata
+                updates["warnings"] = warnings
+                updates["round_jobs"] = []
+                updates["recode_stop"] = REREAD_ALLOWANCE_INSUFFICIENT
+                updates["focused_not_reread"] = _queue_passage_ids(queue[cursor:])
+                return updates
     blocked = _allowance_block(state)
     if blocked is not None:
         reason, remaining = blocked
@@ -4494,6 +4582,12 @@ def _prepare_node(state: FocusedState) -> dict:
     raised, other = _split_codebook(codebook, raised_ids)
     chosen = []
     chosen_items = []
+    skipped: list[str] = []
+    over_budget = [
+        dict(item)
+        for item in ((state.get("metadata") or {}).get("reread_requests_over_budget") or [])
+        if isinstance(item, Mapping)
+    ]
     segments = list(state.get("segments") or [])
     for item in queue[cursor:]:
         passage_id = str(item.get("passage_id") or "") if isinstance(item, Mapping) else str(item)
@@ -4523,12 +4617,50 @@ def _prepare_node(state: FocusedState) -> dict:
             claims=_claims_by_passage(trial_items),
         )
         estimate = request_input_tokens(messages, schema, resolve_tokenizer(None))
-        if chosen and estimate > token_budget:
-            break
+        if estimate > token_budget:
+            if chosen:
+                break
+            over_budget.append(
+                {
+                    "passage_id": passage_id,
+                    "estimate": estimate,
+                    "token_budget": token_budget,
+                    "reason": REREAD_REQUEST_EXCEEDS_TOKEN_BUDGET,
+                }
+            )
+            skipped.append(passage_id)
+            continue
         chosen.append(passage)
         chosen_items.append(trial_items[-1])
         if len(chosen) >= batch_size:
             break
+    if not chosen:
+        updates["round_jobs"] = []
+        updates["recode_cursor"] = cursor + len(skipped)
+        if not skipped:
+            updates["focused_not_reread"] = []
+            updates["recode_stop"] = "complete"
+            return updates
+        metadata = dict(updates.get("metadata") or state.get("metadata") or {})
+        metadata["reread_requests_over_budget"] = over_budget
+        metadata["reread_request_token_budget"] = token_budget
+        metadata["reread_request_bound"] = (
+            "token_budget is the per-request cap for a reread. "
+            "The default stays 6000. A passage that alone exceeds it is not sent."
+        )
+        updates["metadata"] = metadata
+        updates["recode_stop"] = REREAD_REQUEST_EXCEEDS_TOKEN_BUDGET
+        updates["focused_not_reread"] = [str(item.get("passage_id") or "") for item in over_budget if item.get("passage_id")]
+        return updates
+    if skipped:
+        metadata = dict(updates.get("metadata") or state.get("metadata") or {})
+        metadata["reread_requests_over_budget"] = over_budget
+        metadata["reread_request_token_budget"] = token_budget
+        metadata["reread_request_bound"] = (
+            "token_budget is the per-request cap for a reread. "
+            "The default stays 6000. A passage that alone exceeds it is not sent."
+        )
+        updates["metadata"] = metadata
     purposes = {str(item.get("passage_id") or ""): str(item.get("purpose") or "develop") for item in chosen_items}
     initial_codes = {
         str(item.get("passage_id") or ""): _initial_code_rows(str(item.get("passage_id") or ""), segments, codebook)
@@ -4582,7 +4714,7 @@ def _prepare_node(state: FocusedState) -> dict:
             seen_purposes.append(purpose)
             purpose_calls[purpose] = purpose_calls.get(purpose, 0) + 1
             purpose_tokens[purpose] = purpose_tokens.get(purpose, 0) + estimate
-    updates["recode_cursor"] = cursor + len(chosen)
+    updates["recode_cursor"] = cursor + len(skipped) + len(chosen)
     updates["focused_calls_used"] = calls + 1
     updates["focused_tokens_estimated"] = tokens + estimate
     updates["purpose_calls"] = purpose_calls
@@ -5736,7 +5868,15 @@ def _commit_node(runtime: FocusedRuntime):
 
 
 def _route_commit(state: FocusedState) -> str:
-    if state.get("recode_stop") in {"call_allowance", "token_allowance", "no_progress", "complete", "complete_for_queue"}:
+    if state.get("recode_stop") in {
+        "call_allowance",
+        "token_allowance",
+        "no_progress",
+        "complete",
+        "complete_for_queue",
+        REREAD_ALLOWANCE_INSUFFICIENT,
+        REREAD_REQUEST_EXCEEDS_TOKEN_BUDGET,
+    }:
         return "review_recode"
     return "prepare_recode"
 
@@ -6433,30 +6573,42 @@ async def _consolidate_selection_body(
     )
 
 
-def _focused_reread_preflight(state: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Estimate the focused reread against its own token allowance.
-
-    Zero ``max_focused_review_calls`` or ``max_focused_review_tokens`` still
-    runs selection, so this check does not apply. The estimate is input tokens
-    for the planned reread batches. It is not a dollar bound.
-    """
-    meta = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
-    procedure = meta.get("procedure") if isinstance(meta.get("procedure"), Mapping) else {}
-    performance = meta.get("performance") if isinstance(meta.get("performance"), Mapping) else {}
-    max_calls = int(procedure.get("max_focused_review_calls") or 0)
-    max_tokens = int(procedure.get("max_focused_review_tokens") or 0)
-    if max_calls <= 0 or max_tokens <= 0:
-        return None
-    book = state.get("codebook") or {}
+def _codebook_ids(book: Mapping[str, Any] | Sequence[Any]) -> list[str]:
     raised: list[str] = []
-    for key, entry in book.items():
+    items = book.items() if isinstance(book, Mapping) else ()
+    for key, entry in items:
         code_id = str(entry.get("code_id") or key) if isinstance(entry, Mapping) else str(key)
         if code_id and code_id not in raised:
             raised.append(code_id)
+    return raised
+
+
+def _sum_reread_estimates(
+    state: Mapping[str, Any],
+    queue: Sequence[Any],
+    *,
+    max_calls: int,
+    batch_size: int,
+) -> int:
+    total = 0
+    batches = 0
+    cursor = 0
+    while cursor < len(queue) and batches < max_calls:
+        total += _queue_batch_estimate(state, queue[cursor:cursor + batch_size])
+        cursor += batch_size
+        batches += 1
+    return total
+
+
+def _plan_reread_queue(state: Mapping[str, Any], raised: Sequence[str]) -> list[Any]:
+    meta = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
+    procedure = meta.get("procedure") if isinstance(meta.get("procedure"), Mapping) else {}
+    performance = meta.get("performance") if isinstance(meta.get("performance"), Mapping) else {}
+    book = state.get("codebook") or {}
     plan = plan_recode_queue(
         state.get("passages") or [],
         state.get("segments") or [],
-        raised,
+        list(raised),
         list(book.values()) if isinstance(book, Mapping) else [],
         seed=int(procedure.get("seed") or 0),
         neighbor_limit=_stored_limit(procedure.get("focused_neighbor_limit")),
@@ -6465,26 +6617,67 @@ def _focused_reread_preflight(state: Mapping[str, Any]) -> dict[str, Any] | None
         shares=_shares_from_procedure(procedure),
         incidents=meta.get("researcher_incidents") or [],
         claims=list(state.get("properties") or []) + list(state.get("dimensions") or []),
-        max_calls=max_calls,
+        max_calls=int(procedure.get("max_focused_review_calls") or 0),
         batch_size=max(1, int(performance.get("batch_size") or 1)),
         sampling_seed=procedure.get("focused_sampling_seed"),
         memos=state.get("memos") or [],
     )
-    queue = list(plan.get("queue") or [])
+    return list(plan.get("queue") or [])
+
+
+def _reread_estimate_for(
+    state: Mapping[str, Any],
+    raised: Sequence[str],
+    queue: Sequence[Any] | None = None,
+) -> dict[str, Any] | None:
+    """Input-token estimate for a reread. It is not a dollar bound.
+
+    Zero ``max_focused_review_calls`` or ``max_focused_review_tokens`` still
+    runs selection, so this check does not apply and returns None.
+    """
+    meta = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
+    procedure = meta.get("procedure") if isinstance(meta.get("procedure"), Mapping) else {}
+    performance = meta.get("performance") if isinstance(meta.get("performance"), Mapping) else {}
+    max_calls = int(procedure.get("max_focused_review_calls") or 0)
+    max_tokens = int(procedure.get("max_focused_review_tokens") or 0)
+    if max_calls <= 0 or max_tokens <= 0:
+        return None
     batch_size = max(1, int(performance.get("batch_size") or 1))
-    probe = {**state, "raised_code_ids": raised}
-    total = 0
-    batches = 0
-    cursor = 0
-    while cursor < len(queue) and batches < max_calls:
-        total += _queue_batch_estimate(probe, queue[cursor:cursor + batch_size])
-        cursor += batch_size
-        batches += 1
+    planned = list(queue) if queue is not None else _plan_reread_queue(state, raised)
+    probe = {**state, "raised_code_ids": list(raised)}
+    total = _sum_reread_estimates(probe, planned, max_calls=max_calls, batch_size=batch_size)
     return {
         "focused_review_tokens_required": total,
         "focused_review_tokens_available": max_tokens,
         "focused_review_token_shortfall": max(0, total - max_tokens),
-        "blocked": total > max_tokens and total > 0,
+        "short": total > max_tokens and total > 0,
+        "queue_items": len(planned),
+        "raised_codes": len(list(raised)),
+    }
+
+
+def _focused_reread_preflight(state: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Worst-case reread estimate before selection. It does not block selection.
+
+    The figure assumes every codebook code is raised. The allowance check uses
+    a later estimate of the raised codes and the actual queue.
+    """
+    book = state.get("codebook") or {}
+    estimate = _reread_estimate_for(state, _codebook_ids(book))
+    if estimate is None:
+        return None
+    return {
+        "focused_review_tokens_required_worst_case": estimate["focused_review_tokens_required"],
+        "focused_review_tokens_available": estimate["focused_review_tokens_available"],
+        "focused_review_token_shortfall_worst_case": estimate["focused_review_token_shortfall"],
+        "worst_case": True,
+        "worst_case_assumes_all_codes_raised": True,
+        "blocked": False,
+        "note": (
+            "Worst case before selection. It assumes every codebook code is raised. "
+            "It does not block a selection that fits its own budget. "
+            "The reread is estimated again after selection from the raised codes and the queue."
+        ),
     }
 
 
@@ -6868,9 +7061,8 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
     # A zero focused-review ceiling still runs selection, so that allowance
     # is not part of this stop.
     reread_preflight = _focused_reread_preflight(state)
-    reread_blocked = bool(reread_preflight and reread_preflight.get("blocked"))
     call_blocked = reviewer_on and calls_still > calls_available
-    token_blocked = reviewer_on and (tokens_required > tokens_available or reread_blocked)
+    token_blocked = reviewer_on and tokens_required > tokens_available
     can_finish = reviewer_on and not call_blocked and not token_blocked
     fields = preflight_fields(
         calls_required=calls_still,
@@ -6915,15 +7107,22 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         metadata["selection_consolidation_status"] = None
         metadata["selection_consolidation_reason"] = None
     if reread_preflight:
-        metadata["focused_review_tokens_required"] = reread_preflight["focused_review_tokens_required"]
-        metadata["focused_review_tokens_available"] = reread_preflight["focused_review_tokens_available"]
-        metadata["focused_review_token_shortfall"] = reread_preflight["focused_review_token_shortfall"]
-        progress["focused_review_tokens_required"] = reread_preflight["focused_review_tokens_required"]
-        progress["focused_review_tokens_available"] = reread_preflight["focused_review_tokens_available"]
+        metadata["focused_review_tokens_required_worst_case"] = reread_preflight[
+            "focused_review_tokens_required_worst_case"
+        ]
+        metadata["focused_review_tokens_available_worst_case"] = reread_preflight["focused_review_tokens_available"]
+        metadata["focused_review_token_shortfall_worst_case"] = reread_preflight[
+            "focused_review_token_shortfall_worst_case"
+        ]
+        metadata["focused_review_worst_case_note"] = reread_preflight["note"]
+        progress["focused_review_tokens_required_worst_case"] = reread_preflight[
+            "focused_review_tokens_required_worst_case"
+        ]
     else:
-        metadata["focused_review_tokens_required"] = None
-        metadata["focused_review_tokens_available"] = None
-        metadata["focused_review_token_shortfall"] = None
+        metadata["focused_review_tokens_required_worst_case"] = None
+        metadata["focused_review_tokens_available_worst_case"] = None
+        metadata["focused_review_token_shortfall_worst_case"] = None
+        metadata["focused_review_worst_case_note"] = None
     metadata["token_estimate_is_dollar_bound"] = False
     metadata["token_estimate_includes_output_tokens"] = fields["token_estimate_includes_output_tokens"]
     metadata["token_estimate_includes_retry_or_repair_margin"] = fields["token_estimate_includes_retry_or_repair_margin"]
@@ -6961,11 +7160,6 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
             parts.append(
                 f"{consolidation_calls} calls and {consolidation_tokens} tokens are reserved for selection consolidation. "
                 "That reserve is separate from the selection allowance, the claim-review allowance, and later steps."
-            )
-        if reread_blocked and reread_preflight:
-            parts.append(
-                f"The focused review allowance is {reread_preflight['focused_review_tokens_available']} tokens. "
-                f"The reread estimate is {reread_preflight['focused_review_tokens_required']}."
             )
         note = " ".join(parts)
         if note not in warnings:
@@ -7509,6 +7703,13 @@ def _selection_export(state: Mapping[str, Any]) -> dict[str, Any]:
         "focused_review_tokens_required": metadata.get("focused_review_tokens_required"),
         "focused_review_tokens_available": metadata.get("focused_review_tokens_available"),
         "focused_review_token_shortfall": metadata.get("focused_review_token_shortfall"),
+        "focused_review_tokens_required_worst_case": metadata.get("focused_review_tokens_required_worst_case"),
+        "focused_review_token_shortfall_worst_case": metadata.get("focused_review_token_shortfall_worst_case"),
+        "focused_review_worst_case_note": metadata.get("focused_review_worst_case_note"),
+        "focused_review_estimate_basis": metadata.get("focused_review_estimate_basis"),
+        "reread_stop": metadata.get("reread_stop"),
+        "reread_requests_over_budget": metadata.get("reread_requests_over_budget"),
+        "reread_request_bound": metadata.get("reread_request_bound"),
         "chunks_reused": metadata.get("chunks_reused"),
         "selection_consolidation": metadata.get("selection_consolidation"),
     }
@@ -7577,6 +7778,13 @@ def load_focused_export(directory: str | Path) -> dict[str, Any]:
         "focused_review_tokens_required",
         "focused_review_tokens_available",
         "focused_review_token_shortfall",
+        "focused_review_tokens_required_worst_case",
+        "focused_review_token_shortfall_worst_case",
+        "focused_review_worst_case_note",
+        "focused_review_estimate_basis",
+        "reread_stop",
+        "reread_requests_over_budget",
+        "reread_request_bound",
         "chunks_reused",
         "selection_consolidation",
         "selection_consolidation_status",
