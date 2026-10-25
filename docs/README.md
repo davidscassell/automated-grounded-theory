@@ -1,6 +1,6 @@
 # Design notes
 
-Package `policy_version` is `0.9.26`. This index says which notes describe the package now and which notes are the record of an earlier version. A historical note can disagree with the code. The code, the README, and the current notes below win.
+Package `policy_version` is `0.9.27`. This index says which notes describe the package now and which notes are the record of an earlier version. A historical note can disagree with the code. The code, the README, and the current notes below win.
 
 Axial coding, selective coding, and theoretical sampling are experimental. No study adjudication file is included. The discovery example is synthetic. Live evaluation runs through v31, on package 0.9.9, did not measure analytic accuracy.
 
@@ -10,18 +10,18 @@ Axial coding, selective coding, and theoretical sampling are experimental. No st
 | --- | --- |
 | [../README.md](../README.md) | The pipeline, the defaults, the evidence tiers, quiet rounds, timeouts, and gate scoring. |
 | [methodology.md](methodology.md) | How the open-coding default maps onto the sources already named there. |
-| [design.md](design.md) | The open-coding engineering design, plus a version log through `0.9.26`. The early sections are the 0.6 run. |
+| [design.md](design.md) | The open-coding engineering design, plus a version log through `0.9.27`. The early sections are the 0.6 run. |
 | [design-relationship-tiers.md](design-relationship-tiers.md) | Evidence tiers. `pattern_min_cases` is 2. Tier labels are `category_evidence`, `hypothesis`, `pattern_supported`, `attribution`, and `verified`. |
 | [design-negative-cases-092.md](design-negative-cases-092.md) | Negative-case search at respondent level, and a core that needs tier 2. Later search corrections are in the 0.9.3 review note. |
 | [design-gate-evaluation.md](design-gate-evaluation.md) | `export_gate_relationships`, `load_adjudications`, and `score_gate_adjudications`, including `downstream_precision` and `downstream_withheld_supported_recall`. |
 | [design-discovery-evaluation.md](design-discovery-evaluation.md) | `load_discovery_file`, `freeze_discovery_set`, and `score_discovery`. Recall, precision, distortion, and gate false negatives for a frozen human discovery file. |
 | [design-sampling-0900.md](design-sampling-0900.md) | The sampling graph. Later sections through 0.9.18 are part of the current behavior. 0.9.23 does not change that graph. |
 | [focused-evaluation.md](focused-evaluation.md) | The offline focused comparison and its live-cost estimate. It does not call an API. |
-| [design-review-fixes-0926.md](design-review-fixes-0926.md) | Shared quotations count when each endpoint is supported in the located text. Frequency qualifiers are qualified, not denied. An oversized focused-selection item can be compacted, reviewed at a new budget, or excluded by a human. This is the latest review note. |
+| [design-review-fixes-0927.md](design-review-fixes-0927.md) | Focused exports carry the raised ids. Unreviewed endpoints of a withheld selection stay exploratory. Withholding causes partition the withheld rows. The funnel's grounded count matches tier 2. `if` governs the link. The reviewer decision is recorded. A selection that cannot fit the call allowance stops before the first request. This is the latest review note. |
 
 ## Historical
 
-These notes stay so a reader can see what a version changed. They are not the current contract. `design-review-fixes-*` through 0.9.25 are in this list. `design-review-fixes-0926.md` is the latest review note, listed above.
+These notes stay so a reader can see what a version changed. They are not the current contract. `design-review-fixes-*` through 0.9.26 are in this list. `design-review-fixes-0927.md` is the latest review note, listed above.
 
 | Note | Version it records |
 | --- | --- |
@@ -50,8 +50,9 @@ These notes stay so a reader can see what a version changed. They are not the cu
 | [design-review-fixes-0923.md](design-review-fixes-0923.md) | 0.9.23. Discovery matching, claim binding, and the attribution fail-closed rule stay as shipped. 0.9.24 chunks decision-review requests that do not fit the per-request budget. |
 | [design-review-fixes-0924.md](design-review-fixes-0924.md) | 0.9.24. Decision-review requests are chunked to the per-request budget. 0.9.25 withholds an incomplete selection or core choice instead of applying the partial set. |
 | [design-review-fixes-0925.md](design-review-fixes-0925.md) | 0.9.25. An incomplete selection or core choice is withheld. 0.9.26 reverses the shared-quote drop: an identical span is an inspect flag, not a disqualification. |
+| [design-review-fixes-0926.md](design-review-fixes-0926.md) | 0.9.26. Shared spans count, frequency qualifiers are qualified, and an oversized selection item can be recovered. 0.9.27 exports the raised ids and stops a selection that cannot fit the call allowance. |
 
-`design-review-fixes-0925.md` records the 0.9.25 withhold rule. `design-review-fixes-0926.md` is the current review note.
+`design-review-fixes-0926.md` records the 0.9.26 quote and recovery rules. `design-review-fixes-0927.md` is the current review note.
 
 ## Defaults the tests check
 

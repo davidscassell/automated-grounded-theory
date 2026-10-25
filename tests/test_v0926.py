@@ -36,9 +36,9 @@ SENTENCE = "tools for the shift sit beside coworkers on the crew tonight"
 
 
 def test_version_fingerprint_and_defaults():
-    assert __version__ == "0.9.26"
-    assert POLICY_VERSION == "0.9.26"
-    assert DECISION_REVIEW_CHUNKING == "request_budget_v3"
+    assert __version__ == "0.9.27"
+    assert POLICY_VERSION == "0.9.27"
+    assert DECISION_REVIEW_CHUNKING == "request_budget_v4"
     assert PATTERN_QUOTE_RULE == "endpoint_support_in_span_v1"
     assert LINK_DENIAL_RULE == "frequency_before_rejection_v1"
     assert OVERSIZED_RECOVERY == "compact_then_human_v1"

@@ -149,9 +149,20 @@ _FREQUENCY_SCOPE_RE = re.compile(
 )
 _NOTHING_TO_DO_RE = re.compile(r"\bnothing to do with\b")
 READING_BASIS = "deterministic_provisional"
-_HYPOTHETICAL_RE = re.compile(
-    r"\b(?:if|would|someone said|they said|i heard|suppose|supposing|what if|had said)\b"
+# Markers other than bare ``if``. ``if`` is scoped in ``_conditional_governs_link``.
+_OTHER_HYPOTHETICAL_RE = re.compile(
+    r"\b(?:would|someone said|they said|i heard|suppose|supposing|what if|had said)\b"
 )
+# Speaker asides. They do not condition the from-to link.
+_ASIDE_IF_RE = re.compile(
+    r"(?:,|\(|\u2014|—|--)?\s*\bif\s+(?:i|we|you)\s+(?:can|could|may|might)\b"
+    r"|\bif\s+possible\b"
+)
+# A noun phrase can contain ``if`` without making the link conditional.
+_NOUN_EMBED_RE = re.compile(
+    r"\b(?:part of why|the reason|a reason|reason why|question of if|question of whether)\b"
+)
+ENDPOINT_UNREVIEWED_BY_FOCUS = "endpoint_unreviewed_by_focus"
 # Epistemic and existential-negation markers. A hit in the clause text before
 # the first connector is unsupported. This is not a list of the only sentences
 # that can fail: any of these markers fails closed. ``doubt`` also matches
@@ -686,6 +697,36 @@ def _claim_clause(folded: str, from_terms: set[str], to_terms: set[str]) -> str:
     return folded
 
 
+def _conditional_governs_link(clause: str) -> bool:
+    """True when a conditional governs the from-to link in ``clause``.
+
+    ``if`` inside a noun phrase such as ``part of why ... if ...`` does not.
+    An aside such as ``if I can`` does not. ``if`` before the connector, or a
+    condition after the connector that is not inside that noun phrase, does.
+    ``would`` and reported speech stay hypothetical markers. The reading is
+    still provisional: this is a closed pattern, not a parse of the sentence.
+    """
+    folded = _norm(clause)
+    if not folded:
+        return False
+    if _OTHER_HYPOTHETICAL_RE.search(folded):
+        return True
+    stripped = _ASIDE_IF_RE.sub(" ", folded)
+    if not re.search(r"\bif\b", stripped):
+        return False
+    connectors = _connectors(stripped)
+    if not connectors:
+        return False
+    link_pos = min(pos for pos, _phrase, _kind in connectors)
+    for match in re.finditer(r"\bif\b", stripped):
+        if_pos = match.start()
+        before = stripped[:if_pos]
+        if _NOUN_EMBED_RE.search(before) and if_pos > link_pos:
+            continue
+        return True
+    return False
+
+
 def _recognized_affirmative_prefix(prefix: str) -> bool:
     """No affirmative exception is recognized for an epistemic or negation marker.
 
@@ -728,8 +769,10 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
     qualified and never denied. Negation that governs the connector, including
     ``nothing to do with``, denies the link. An epistemic or
     existential-negation marker before that connector is unsupported and does
-    not authorize tier 3. ``if``, ``would``, and ``someone said`` are
-    hypothetical. Anything else that is not one clear pattern stays
+    not authorize tier 3. ``would`` and ``someone said`` are hypothetical.
+    ``if`` is hypothetical only when it governs this from-to link. An ``if``
+    inside a noun phrase, or an aside such as ``if I can``, is not. Anything
+    else that is not one clear pattern stays
     unvalidated. This is not a general reading of the sentence. Every reading
     stays provisional until it is checked on natural-language data.
     """
@@ -744,7 +787,7 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
         or nothing_to_do
     )
     # A denial or a hypothetical with no connector is still a reading. It does not authorize tier 3.
-    if not mentions_link and not _DENIAL_RE.search(padded) and not _HYPOTHETICAL_RE.search(padded):
+    if not mentions_link and not _DENIAL_RE.search(padded) and not _conditional_governs_link(folded):
         return None
     tokens = _distinctive(text)
     if not (tokens & from_terms) or not (tokens & to_terms):
@@ -774,7 +817,7 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
         polarity = "affirmative"
         negation_scope = None
     hedging = "qualified" if frequency_scope else ("hedged" if _HEDGE_RE.search(clause_padded) else "none")
-    hypothetical = bool(_HYPOTHETICAL_RE.search(clause_padded))
+    hypothetical = _conditional_governs_link(clause)
     unsupported = _unsupported_before_connector(clause)
     if unsupported:
         status = "unsupported"
@@ -1207,6 +1250,61 @@ def weak_stem_relationship(row: Mapping[str, Any]) -> bool:
     return False
 
 
+def selection_limits_eligibility(metadata: Mapping[str, Any] | None) -> bool:
+    """True when a focused selection was withheld or left provisional.
+
+    A complete selection does not apply the unreviewed-endpoint limit. A run
+    with no focused selection does not either: missing fields are not the
+    same as "every code was left unreviewed."
+    """
+    if not isinstance(metadata, Mapping):
+        return False
+    if metadata.get("selection_review_complete") is False:
+        return True
+    if metadata.get("selection_withheld") is True:
+        return True
+    return str(metadata.get("selection_status") or "") == "provisional"
+
+
+def stamp_focus_review(row: dict, metadata: Mapping[str, Any] | None) -> None:
+    """Copy a withheld focused selection onto a relationship, when one applies.
+
+    A complete selection, and a run with no focused selection, leave the row
+    unchanged. The stamp is what later eligibility reads, so a refresh does
+    not drop the limit.
+    """
+    if not isinstance(row, dict) or not selection_limits_eligibility(metadata):
+        return
+    reviewed = [str(item) for item in ((metadata or {}).get("selection_reviewed_code_ids") or [])]
+    row["focus_review"] = {
+        "limits_eligibility": True,
+        "reviewed_code_ids": reviewed,
+        "rule": "unreviewed_endpoint_v1",
+    }
+
+
+def _sync_unreviewed_flag(row: dict) -> None:
+    """Mark an endpoint the withheld focused selection never reviewed.
+
+    Both endpoints have to be in ``reviewed_code_ids``. A reviewed pair keeps
+    the other eligibility rules. The flag is removed when the stamp is absent.
+    """
+    flags = [str(item) for item in (row.get("flags") or []) if str(item) != ENDPOINT_UNREVIEWED_BY_FOCUS]
+    review = row.get("focus_review")
+    limited = isinstance(review, Mapping) and review.get("limits_eligibility") is True
+    if limited:
+        reviewed = {str(item) for item in (review.get("reviewed_code_ids") or [])}
+        ends = [str(row.get("from_id") or ""), str(row.get("to_id") or "")]
+        if any(end and end not in reviewed for end in ends):
+            flags.append(ENDPOINT_UNREVIEWED_BY_FOCUS)
+            row["eligibility_reason"] = ENDPOINT_UNREVIEWED_BY_FOCUS
+        elif row.get("eligibility_reason") == ENDPOINT_UNREVIEWED_BY_FOCUS:
+            row.pop("eligibility_reason", None)
+    elif row.get("eligibility_reason") == ENDPOINT_UNREVIEWED_BY_FOCUS:
+        row.pop("eligibility_reason", None)
+    row["flags"] = flags
+
+
 def relationship_evidence_use(row: Mapping[str, Any]) -> str:
     """Classify a relationship for later stages.
 
@@ -1215,7 +1313,9 @@ def relationship_evidence_use(row: Mapping[str, Any]) -> str:
     An analyst-interpretation component does not change this class: the pattern
     component carries eligibility, and the analyst component stays a hypothesis.
     Rejected, empty, synthetic, unanchored, disputed, and causal-wording rows
-    are ``withheld``. A missing tier is not supported evidence.
+    are ``withheld``. A missing tier is not supported evidence. An endpoint
+    the withheld focused selection never reviewed is ``hypothesis_exploration``
+    with reason ``endpoint_unreviewed_by_focus``.
     """
     if not isinstance(row, Mapping) or row.get("synthetic"):
         return WITHHELD_EVIDENCE
@@ -1223,12 +1323,16 @@ def relationship_evidence_use(row: Mapping[str, Any]) -> str:
         return WITHHELD_EVIDENCE
     if not str(row.get("statement") or "").strip():
         return WITHHELD_EVIDENCE
+    flags = {str(item) for item in (row.get("flags") or [])}
+    # An endpoint the focused selection never reviewed stays exploratory.
+    # That holds even when quotes would otherwise support the row.
+    if ENDPOINT_UNREVIEWED_BY_FOCUS in flags:
+        return HYPOTHESIS_EXPLORATION
     disposition = str(row.get("human_disposition") or row.get("disposition") or "").strip().casefold()
     if disposition in {"rejected", "merged"}:
         return WITHHELD_EVIDENCE
     if str(row.get("evidence_condition") or "") in {"unanchored", "disputed"}:
         return WITHHELD_EVIDENCE
-    flags = {str(item) for item in (row.get("flags") or [])}
     if "causal_wording_withheld" in flags or "role_evidence_exceeds_tier" in flags:
         return WITHHELD_EVIDENCE
     tier = row.get("evidence_tier")
@@ -1254,8 +1358,10 @@ def assign_relationship_eligibility(row: dict) -> str:
     A claim component is downstream eligible, and the pattern component can
     support a core, only when the row itself is supported evidence. A
     withheld row clears both flags. Participant and analyst components stay
-    ineligible.
+    ineligible. A stamped withheld focused selection keeps an unreviewed
+    endpoint exploratory.
     """
+    _sync_unreviewed_flag(row)
     use = relationship_evidence_use(row)
     row["evidence_use"] = use
     row_ok = use == SUPPORTED_EVIDENCE

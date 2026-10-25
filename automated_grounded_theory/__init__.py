@@ -33,14 +33,20 @@ from automated_grounded_theory.evaluate import aevaluate, chen_metrics, evaluate
 from automated_grounded_theory.context import PresetCodesError, ResearchContext
 from automated_grounded_theory.category_state import property_stability, proposal_stability
 from automated_grounded_theory.decision_review import (
+    AUTO_SIZE_DECISION_CALLS,
+    CHUNK_ALLOWANCE_INSUFFICIENT,
+    CHUNK_ALLOWANCE_RULE,
+    CONDITIONAL_SCOPE_RULE,
     CORE_CANDIDATE_RULE,
     DECISION_REVIEW_CHUNKING,
     ELIGIBILITY_RULE,
+    FOCUS_ENDPOINT_RULE,
     INCOMPLETE_REVIEW_APPLICATION,
     LINK_DENIAL_RULE,
     OVERSIZED_RECOVERY,
     PAIR_COUNT_RULE,
     PATTERN_QUOTE_RULE,
+    WITHHOLDING_CAUSE_RULE,
     ClaimDecision,
     ClaimDecisions,
     DecisionChunkingCheckpointError,
@@ -62,8 +68,10 @@ from automated_grounded_theory.discovery_evaluation import (
     score_discovery,
 )
 from automated_grounded_theory.gate_evaluation import (
+    WITHHOLDING_CAUSES,
     export_gate_relationships,
     load_adjudications,
+    primary_withholding_cause,
     score_gate_adjudications,
 )
 from automated_grounded_theory.focused import (
@@ -71,6 +79,7 @@ from automated_grounded_theory.focused import (
     FocusedResult,
     afocused_code,
     focused_code,
+    load_focused_export,
     read_focused_interrupt,
 )
 from automated_grounded_theory.graph import CodingError, get_graph
@@ -102,14 +111,21 @@ __all__ = [
     "CodeRetriever",
     "CodingError",
     "DISCOVERY_SCHEMA_VERSION",
+    "AUTO_SIZE_DECISION_CALLS",
+    "CHUNK_ALLOWANCE_INSUFFICIENT",
+    "CHUNK_ALLOWANCE_RULE",
+    "CONDITIONAL_SCOPE_RULE",
     "CORE_CANDIDATE_RULE",
     "DECISION_REVIEW_CHUNKING",
+    "FOCUS_ENDPOINT_RULE",
     "ELIGIBILITY_RULE",
     "INCOMPLETE_REVIEW_APPLICATION",
     "LINK_DENIAL_RULE",
     "OVERSIZED_RECOVERY",
     "PAIR_COUNT_RULE",
     "PATTERN_QUOTE_RULE",
+    "WITHHOLDING_CAUSE_RULE",
+    "WITHHOLDING_CAUSES",
     "DecisionChunkingCheckpointError",
     "DecisionReviewer",
     "DiscoveryEvaluationError",
@@ -154,7 +170,9 @@ __all__ = [
     "score_gate_adjudications",
     "focused_code",
     "get_graph",
+    "load_focused_export",
     "load_run",
+    "primary_withholding_cause",
     "read_axial_interrupt",
     "read_focused_interrupt",
     "read_sampling_interrupt",

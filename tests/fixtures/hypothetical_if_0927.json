@@ -1,0 +1,30 @@
+{
+  "fixture_version": "hypothetical-if-0927",
+  "note": "Synthetic sentences only. Not study data and not a general reading of conditionals. Readings stay provisional.",
+  "cases": [
+    {
+      "id": "noun-phrase-if",
+      "quote": "Part of why tools for the shift lead to coworkers on the crew if the night is long",
+      "status": "validated",
+      "hypothetical": false
+    },
+    {
+      "id": "aside-if-i-can",
+      "quote": "tools for the shift lead to coworkers on the crew, if I can",
+      "status": "validated",
+      "hypothetical": false
+    },
+    {
+      "id": "true-conditional-before",
+      "quote": "if tools for the shift lead to coworkers on the crew",
+      "status": "hypothetical",
+      "hypothetical": true
+    },
+    {
+      "id": "true-conditional-after",
+      "quote": "tools for the shift lead to coworkers on the crew if the night is long",
+      "status": "hypothetical",
+      "hypothetical": true
+    }
+  ]
+}

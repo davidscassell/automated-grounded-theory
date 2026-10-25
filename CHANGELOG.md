@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.27
+
+- The focused export (`focused_run.json` and `focused_selection.json`) includes `raised_code_ids`, the selection completeness fields, and `provisional_raised_code_ids`. `axial_code` and `selective_code` load that directory. A complete selection's core candidates are the raised ids. Provisional ids are not promoted.
+- When a focused selection is withheld or provisional, a relationship whose endpoint was never reviewed stays `hypothesis_exploration` with reason `endpoint_unreviewed_by_focus`. It is not downstream eligible. A reviewed pair, and a run with no focused selection, keep the existing eligibility rules.
+- `export_gate_relationships` records one primary `withholding_cause` per withheld row. `withholding_cause_counts` sums to the withheld rows. `withheld_reason_counts` remains the flag tally. `inspect_flag_counts` stays separate. Both kinds of count are null when there is nothing to count.
+- `attrition.grounded_endpoints` counts rows at evidence tier 2 or higher, the same rows `evidence_tiers` counts at those tiers. `endpoint_anchoring_complete` is the anchoring-list count and is not that stage.
+- `if` is read as hypothetical only when it governs the from-to link. A noun phrase such as `part of why ... if ...` and an aside such as `if I can` are not. True conditionals stay hypothetical. Readings stay `deterministic_provisional`.
+- Each relationship records `reviewer_decided`, and the model decision and rationale when the LLM reviewer decided the row. Reviewer input object keys are sorted. Near-identical runs can still differ because that reviewer is the deciding step. No second model is called.
+- Before a focused selection is sent, the run reports `chunks_required` against the decision-call allowance. If the plan cannot finish, it stops with `chunk_allowance_insufficient` and sends nothing. `auto_size_decision_calls` defaults off. When set, it raises only the call allowance to the chunks required. The token ceiling and the per-request budget still apply. `max_decision_calls` stays 8.
+- The resume fingerprint is `request_budget_v4`, plus the 0.9.26 rules and `focus_endpoint_rule`, `withholding_cause_rule`, `conditional_scope_rule`, and `chunk_allowance_rule`. A 0.9.26 checkpoint raises `DecisionChunkingCheckpointError` even when changes are allowed. `pattern_min_cases` stays 2. The axial token ceiling stays 24000. `batch_size` stays 1. Decision and axial request budgets stay 6000. Tier 4 stays human-only. The review note is [docs/design-review-fixes-0927.md](docs/design-review-fixes-0927.md). `policy_version` is `0.9.27`.
+
 ## 0.9.26
 
 - Reverses the 0.9.25 shared-quote rule. A quotation grounds an endpoint when the located text supports that endpoint, including an overlapping or identical span. Cases are counted by respondent or document, so one case still cannot meet `pattern_min_cases` 2 by itself and cannot be counted twice. An identical span used for both endpoints is the inspect flag `shared_quote_inspect`. It is not a disqualification. Whole-sentence and split-excerpt representations of the same evidence get the same tier and eligibility. The rule is `endpoint_support_in_span_v1`.

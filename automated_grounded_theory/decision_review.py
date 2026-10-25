@@ -50,7 +50,7 @@ class ClaimDecisions(BaseModel):
 
 # Locked on the focused and axial procedure manifests. A checkpoint saved
 # before this value existed cannot resume into a chunked review.
-DECISION_REVIEW_CHUNKING = "request_budget_v3"
+DECISION_REVIEW_CHUNKING = "request_budget_v4"
 INCOMPLETE_REVIEW_APPLICATION = "withhold_incomplete_v1"
 ELIGIBILITY_RULE = "row_gates_components_v1"
 LINK_DENIAL_RULE = "frequency_before_rejection_v1"
@@ -58,6 +58,19 @@ PATTERN_QUOTE_RULE = "endpoint_support_in_span_v1"
 PAIR_COUNT_RULE = "space_and_examined_v1"
 CORE_CANDIDATE_RULE = "focused_categories_v1"
 OVERSIZED_RECOVERY = "compact_then_human_v1"
+# A withheld or provisional focused selection does not make an unreviewed
+# endpoint downstream eligible. The relationship stays exploratory.
+FOCUS_ENDPOINT_RULE = "unreviewed_endpoint_v1"
+# One primary cause per withheld relationship. The counts partition the rows.
+WITHHOLDING_CAUSE_RULE = "primary_cause_v1"
+# ``if`` is hypothetical only when it governs the from-to link.
+CONDITIONAL_SCOPE_RULE = "link_governing_if_v1"
+# A focused selection whose chunk count exceeds the call allowance stops
+# before the first request. The allowance is not raised unless asked.
+CHUNK_ALLOWANCE_RULE = "stop_before_send_v1"
+CHUNK_ALLOWANCE_INSUFFICIENT = "chunk_allowance_insufficient"
+# Off unless the caller sets it. It is a decision, not an analytic default.
+AUTO_SIZE_DECISION_CALLS = False
 # Compaction shortens evidence before a code is omitted. Level 1 keeps one
 # short quote. Level 2 drops quotes. Level 3 also truncates the definition.
 SELECTION_COMPACTION_QUOTE_CHARS = 160
@@ -67,9 +80,10 @@ CHUNKING_CHECKPOINT_MESSAGE = (
     "procedure.decision_review_chunking: this checkpoint was saved before "
     "decision-review requests were chunked to the per-request budget, or before "
     "an incomplete review was withheld instead of applied, or before endpoint "
-    "support, frequency qualification, and oversized-item recovery used the "
-    "0.9.26 rules, or the stored chunk plan does not match this resume. "
-    "Resume cannot continue that review. Start a new run."
+    "support, frequency qualification, oversized-item recovery, unreviewed "
+    "focused endpoints, withholding causes, link-governing conditionals, or "
+    "the chunk-allowance stop used the 0.9.27 rules, or the stored chunk plan "
+    "does not match this resume. Resume cannot continue that review. Start a new run."
 )
 
 
@@ -104,7 +118,12 @@ class DecisionReviewer:
         self.limiter = CallLimiter(1, max_retries=0, request_timeout=timeout, wall_timeout=timeout)
 
     def messages(self, payload):
-        return [SystemMessage(content=SYSTEM), HumanMessage(content=json.dumps(payload, ensure_ascii=False))]
+        # Key order is part of the request. Sorting it keeps two runs on the
+        # same rows from differing only because a dict was built in another order.
+        return [
+            SystemMessage(content=SYSTEM),
+            HumanMessage(content=json.dumps(payload, ensure_ascii=False, sort_keys=True)),
+        ]
 
     def estimate(self, payload, schema):
         return request_input_tokens(self.messages(payload), schema)
@@ -464,10 +483,12 @@ def apply_selection_compaction(
 
 
 def review_procedure_fields() -> dict[str, str]:
-    """Procedure fingerprint for 0.9.26 review rules.
+    """Procedure fingerprint for 0.9.27 review rules.
 
     The chunk partition is separate from the call and token ceilings. A higher
     ceiling can continue the same chunks. A different partition cannot.
+    ``auto_size_decision_calls`` is a caller decision and is not one of these
+    constants. A 0.9.26 checkpoint is missing these values and cannot resume.
     """
     return {
         "decision_review_chunking": DECISION_REVIEW_CHUNKING,
@@ -478,6 +499,10 @@ def review_procedure_fields() -> dict[str, str]:
         "pair_count_rule": PAIR_COUNT_RULE,
         "core_candidate_rule": CORE_CANDIDATE_RULE,
         "oversized_recovery": OVERSIZED_RECOVERY,
+        "focus_endpoint_rule": FOCUS_ENDPOINT_RULE,
+        "withholding_cause_rule": WITHHOLDING_CAUSE_RULE,
+        "conditional_scope_rule": CONDITIONAL_SCOPE_RULE,
+        "chunk_allowance_rule": CHUNK_ALLOWANCE_RULE,
     }
 
 
@@ -682,6 +707,21 @@ def finish_decision_report(progress: Mapping[str, Any]) -> dict[str, Any]:
         },
         "chunk_order_selects_codes": False,
         "stop_reasons": stops or None,
+        "chunks_required": (
+            int(progress["chunks_required"])
+            if progress.get("chunks_required") is not None
+            else len(chunks)
+        ),
+        "decision_call_allowance": (
+            None
+            if progress.get("decision_call_allowance") is None
+            else int(progress.get("decision_call_allowance") or 0)
+        ),
+        "chunk_shortfall": (
+            None
+            if progress.get("chunk_shortfall") is None
+            else int(progress.get("chunk_shortfall") or 0)
+        ),
         "tokens_estimated": int(progress.get("tokens_estimated") or 0) if sent else None,
         "expenditure_complete": (int(progress.get("expenditure_gaps") or 0) == 0) if sent else None,
         "calls": int(progress.get("calls") or 0),
@@ -750,11 +790,11 @@ def merge_core_nominations(
 
 
 def same_chunking_fingerprint(saved: Any, current: Any) -> bool:
-    """True when the resume carries the current chunking and 0.9.26 rules.
+    """True when the resume carries the current chunking and 0.9.27 rules.
 
     A missing key fails. ``allow_changes`` is not consulted here, so an older
-    checkpoint cannot continue by ignoring the new quote, denial, or recovery
-    rule.
+    checkpoint cannot continue by ignoring the new quote, denial, recovery,
+    endpoint, cause, conditional, or chunk-allowance rule.
     """
     if not isinstance(saved, Mapping) or not isinstance(current, Mapping):
         return False
@@ -763,6 +803,10 @@ def same_chunking_fingerprint(saved: Any, current: Any) -> bool:
         "pattern_quote_rule": PATTERN_QUOTE_RULE,
         "link_denial_rule": LINK_DENIAL_RULE,
         "oversized_recovery": OVERSIZED_RECOVERY,
+        "focus_endpoint_rule": FOCUS_ENDPOINT_RULE,
+        "withholding_cause_rule": WITHHOLDING_CAUSE_RULE,
+        "conditional_scope_rule": CONDITIONAL_SCOPE_RULE,
+        "chunk_allowance_rule": CHUNK_ALLOWANCE_RULE,
     }
     for key, required in expected.items():
         saved_value = str(saved.get(key) or "")
