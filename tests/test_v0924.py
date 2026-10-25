@@ -46,9 +46,9 @@ from tests.test_v080 import FakeAxialCoder, _corpus
 
 
 def test_version_and_defaults_stay_put():
-    assert __version__ == "0.9.25"
-    assert POLICY_VERSION == "0.9.25"
-    assert DECISION_REVIEW_CHUNKING == "request_budget_v2"
+    assert __version__ == "0.9.26"
+    assert POLICY_VERSION == "0.9.26"
+    assert DECISION_REVIEW_CHUNKING == "request_budget_v3"
     assert PATTERN_MIN_CASES == 2
     assert DEFAULT_MAX_AXIAL_REVIEW_TOKENS == 24000
     import inspect
@@ -294,26 +294,29 @@ def test_oversized_code_list_makes_focused_selection_calls():
     }
 
 
-def test_one_code_over_the_request_budget_does_not_stop_the_stage():
+def test_one_code_over_the_request_budget_is_compacted_and_reviewed():
+    """A definition that does not fit is shortened and still reviewed.
+
+    0.9.24 omitted it. 0.9.26 compacts the evidence and retries inside the
+    same budget. The code is not dropped, and it is not raised: the
+    truncated definition does not contain the KEEP marker.
+    """
     huge = _code("c-huge", "packing " * 20000)
     keep = _code("c-keep", "KEEP a small code")
     other = _code("c-other", "DROP a small code")
     result = _run_focused([huge, keep, other], _KeepSelector(), max_decision_calls=8, max_decision_tokens=24000)
     report = _selection_report(result)
-    assert report["complete"] is False
-    assert {"id": "c-huge", "reason": "single_code_exceeds_request_budget"} in report["omissions"]
+    assert report["complete"] is True
+    assert report["omissions"] == []
+    assert report["compaction"].get("c-huge", 0) >= 1
     assert report["chunks_sent"] >= 1
-    assert result.raised_code_ids == []
-    assert result.metadata["provisional_raised_code_ids"] == ["c-keep"]
-    assert result.metadata["selection_review_applied"] is False
-    assert "c-huge" in result.metadata["selection_uncovered_code_ids"] or any(
-        item.get("id") == "c-huge" for item in report["omissions"]
-    )
-    assert result.metadata["complete"] is False
-    assert result.metadata.get("decision_stop") != "request_budget"
+    assert result.raised_code_ids == ["c-keep"]
+    assert result.metadata["selection_review_applied"] is True
+    assert "c-huge" not in result.raised_code_ids
     sent = [row for row in result.prompt_log if row.get("checkpoint") == "focused_selection" and row.get("status") == "validated"]
     assert sent
-    assert all("c-huge" not in json.dumps(row.get("messages")) for row in sent)
+    assert any("c-huge" in json.dumps(row.get("messages")) for row in sent)
+    assert any("evidence_compaction" in json.dumps(row.get("messages")) for row in sent)
 
 
 def test_a_review_with_no_sent_chunks_leaves_token_figures_null():

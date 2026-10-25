@@ -27,8 +27,8 @@ from tests.test_v080 import QUOTE, FakeAxialCoder, _corpus
 
 
 def test_version_is_087():
-    assert __version__ == "0.9.25"
-    assert POLICY_VERSION == "0.9.25"
+    assert __version__ == "0.9.26"
+    assert POLICY_VERSION == "0.9.26"
 
 
 def test_generic_stem_does_not_anchor_and_disagreement_is_reported():

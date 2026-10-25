@@ -115,7 +115,24 @@ def _withholding_flags(row: Mapping[str, Any]) -> list[str]:
     return found
 
 
-def export_gate_relationships(relationships: Sequence[Mapping[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+# Reasons a reader can count. Zero is a measured count. A missing export is null.
+_WITHHELD_REASON_KEYS = (
+    "shared_quote_inspect",
+    "frequency_qualified",
+    "frequency_negation",
+    "omitted_oversized",
+    "participant_denies_link",
+    "negation_does_not_reject_link",
+)
+_INSPECT_FLAG_KEYS = (
+    "shared_quote_inspect",
+    "frequency_qualified",
+    "frequency_negation",
+    "negation_does_not_reject_link",
+)
+
+
+def export_gate_relationships(relationships: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """List accepted, withheld, and still-proposed relationships.
 
     A synthetic row is omitted. A row that has not been accepted or withheld
@@ -127,6 +144,7 @@ def export_gate_relationships(relationships: Sequence[Mapping[str, Any]]) -> dic
     accepted: list[dict[str, Any]] = []
     withheld: list[dict[str, Any]] = []
     proposed: list[dict[str, Any]] = []
+    counted: list[tuple[str, set[str]]] = []
     for row in relationships:
         if not isinstance(row, Mapping):
             continue
@@ -143,13 +161,35 @@ def export_gate_relationships(relationships: Sequence[Mapping[str, Any]]) -> dic
         eligible = _downstream_eligible(row)
         if eligible is not None:
             item["downstream_eligible"] = eligible
+        flags = {str(flag) for flag in (row.get("flags") or []) if str(flag)}
+        counted.append((outcome, flags | set(rules)))
         if outcome == "accepted":
             accepted.append(item)
         elif outcome == "withheld":
             withheld.append(item)
         else:
             proposed.append(item)
-    return {"accepted": accepted, "withheld": withheld, "proposed": proposed}
+    if not counted:
+        withheld_reason_counts = None
+        inspect_flag_counts = None
+    else:
+        withheld_reason_counts = {name: 0 for name in _WITHHELD_REASON_KEYS}
+        inspect_flag_counts = {name: 0 for name in _INSPECT_FLAG_KEYS}
+        for outcome, names in counted:
+            if outcome == "withheld":
+                for name in _WITHHELD_REASON_KEYS:
+                    if name in names:
+                        withheld_reason_counts[name] += 1
+            for name in _INSPECT_FLAG_KEYS:
+                if name in names:
+                    inspect_flag_counts[name] += 1
+    return {
+        "accepted": accepted,
+        "withheld": withheld,
+        "proposed": proposed,
+        "withheld_reason_counts": withheld_reason_counts,
+        "inspect_flag_counts": inspect_flag_counts,
+    }
 
 
 def _require_text(row: Mapping[str, Any], field: str) -> str:

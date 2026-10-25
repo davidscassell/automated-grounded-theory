@@ -40,13 +40,13 @@ FIXTURE = Path("tests/fixtures/link_denial_0925.json")
 
 
 def test_version_rules_and_defaults():
-    assert __version__ == "0.9.25"
-    assert POLICY_VERSION == "0.9.25"
-    assert DECISION_REVIEW_CHUNKING == "request_budget_v2"
+    assert __version__ == "0.9.26"
+    assert POLICY_VERSION == "0.9.26"
+    assert DECISION_REVIEW_CHUNKING == "request_budget_v3"
     assert INCOMPLETE_REVIEW_APPLICATION == "withhold_incomplete_v1"
     assert ELIGIBILITY_RULE == "row_gates_components_v1"
-    assert LINK_DENIAL_RULE == "affirmative_rejection_v1"
-    assert PATTERN_QUOTE_RULE == "distinct_endpoint_quotes_v1"
+    assert LINK_DENIAL_RULE == "frequency_before_rejection_v1"
+    assert PATTERN_QUOTE_RULE == "endpoint_support_in_span_v1"
     assert PAIR_COUNT_RULE == "space_and_examined_v1"
     assert CORE_CANDIDATE_RULE == "focused_categories_v1"
     assert PATTERN_MIN_CASES == 2
@@ -135,14 +135,18 @@ def test_denied_means_the_participant_rejects_the_link():
     assert "participant_denies_link" in denied["flags"]
 
 
-def test_one_quote_for_both_endpoints_does_not_meet_pattern_min_cases():
+def test_one_quote_for_both_endpoints_can_meet_pattern_min_cases():
+    """0.9.26 reverses the 0.9.25 drop of a quotation used for both endpoints."""
     shared = "tools for the shift sit beside coworkers on the crew tonight"
     row = _assess(shared)
     assert row["shared_quote_for_both_endpoints"] is True
-    assert row["evidence_tier"] < PATTERN_MIN_CASES
-    assert row["claims"]["pattern"]["supports_core"] is False
-    assert row["claims"]["pattern"]["downstream_eligible"] is False
-    assert row["core_support_component"] is None
+    assert row["shared_quote_inspect"] is True
+    assert "shared_quote_inspect" in row["flags"]
+    assert row["evidence_tier"] == 2
+    assert row["downstream_eligible"] is True
+    assert row["claims"]["pattern"]["supports_core"] is True
+    assert row["claims"]["pattern"]["downstream_eligible"] is True
+    assert row["core_support_component"] == "pattern"
     assert row.get("pattern_quote_rule") == PATTERN_QUOTE_RULE
 
     distinct = _assess(

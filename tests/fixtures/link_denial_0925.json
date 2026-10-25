@@ -1,14 +1,14 @@
 {
   "note": "Synthetic quotes only. They reproduce three readings that were labelled denied. They are not study data.",
-  "link_denial_rule": "affirmative_rejection_v1",
+  "link_denial_rule": "frequency_before_rejection_v1",
   "patterns": [
     {
       "id": "frequency_negation",
-      "pattern": "A frequency negation such as 'not often used by students' is not a rejection of the from-to link.",
+      "pattern": "A frequency qualifier such as 'not often' is qualified, not a rejection of the from-to link. 0.9.26 reads this before categorical rejection.",
       "quote": "tools for the shift are not often used by students when coworkers on the crew are in the room",
-      "expected_status": "unvalidated",
+      "expected_status": "qualified",
       "expected_polarity": "affirmative",
-      "expected_qualification": "frequency_negation",
+      "expected_qualification": "frequency_qualified",
       "denied": false
     },
     {

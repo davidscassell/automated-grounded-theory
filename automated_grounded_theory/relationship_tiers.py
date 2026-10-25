@@ -78,7 +78,9 @@ _CLAIM_FLAGS = frozenset(
         "participant_link_ambiguous",
         "participant_link_unsupported",
         "frequency_negation",
+        "frequency_qualified",
         "negation_does_not_reject_link",
+        "shared_quote_inspect",
     }
 )
 # Longer phrases are listed with the short ones. Matching keeps the longest
@@ -133,11 +135,20 @@ _LINK_REJECTION_RE = re.compile(
     r"not what (?:causes|caused|leads|lead|makes|made)"
     r")"
 )
-_FREQUENCY_NEGATION_RE = re.compile(
-    r"\b(?:not often|not always|not usually|not generally|"
-    r"(?:is|are|was|were)\s+not\s+(?:often|always|usually|generally)|"
-    r"(?:isn't|aren't|wasn't|weren't)\s+(?:often|always|usually|generally))\b"
+# A frequency qualifier, or a softener in that same scope, is resolved before
+# a categorical rejection. Contractions and a few intervening adverbs count.
+_FREQUENCY_WORD = r"(?:always|often|usually|generally|rarely|sometimes)"
+_NEGATION_AUX = (
+    r"(?:do not|does not|don't|doesn't|did not|didn't|"
+    r"is not|are not|isn't|aren't|was not|were not|wasn't|weren't)"
 )
+_INTERVENING_ADVERB = r"(?:really|actually|just|necessarily|typically|quite|very)"
+_FREQUENCY_SCOPE_RE = re.compile(
+    rf"\b(?:{_NEGATION_AUX}(?:\s+{_INTERVENING_ADVERB}){{0,3}}\s+(?:{_FREQUENCY_WORD}|necessarily)"
+    rf"|not\s+{_FREQUENCY_WORD}|rarely|sometimes)\b"
+)
+_NOTHING_TO_DO_RE = re.compile(r"\bnothing to do with\b")
+READING_BASIS = "deterministic_provisional"
 _HYPOTHETICAL_RE = re.compile(
     r"\b(?:if|would|someone said|they said|i heard|suppose|supposing|what if|had said)\b"
 )
@@ -400,32 +411,36 @@ def _quote_identity(item: Mapping[str, Any]) -> tuple[str, str]:
 
 
 def _supporting_cases(found: Mapping[str, Mapping[str, list[dict[str, Any]]]]) -> list[dict[str, Any]]:
-    """Cases whose endpoints are grounded by distinct quotes.
+    """One row per case. Endpoint support may share a span.
 
-    The same quote text in the same passage cannot be the evidence for both
-    endpoints. ``pattern_min_cases`` still counts cases, and a case counts
-    only when each endpoint has its own quote.
+    A case is the respondent when the passage names one, otherwise the
+    document. Distinct quote strings do not add a case, and one case is not
+    counted twice. Each endpoint is supported when the located text grounds
+    it, including an overlapping or identical span. An identical span used
+    for both endpoints is an inspect flag. It is not a disqualification.
+    This reverses the 0.9.25 rule that dropped a shared quotation before
+    deciding whether the case supported both categories.
     """
     case_ids = set(found.get("from") or {}) | set(found.get("to") or {})
     rows = []
     for case_id in sorted(case_ids):
         from_all = list((found.get("from") or {}).get(case_id) or [])
         to_all = list((found.get("to") or {}).get(case_id) or [])
-        shared = {item for item in ({_quote_identity(row) for row in from_all} & {_quote_identity(row) for row in to_all}) if item[0]}
-        from_kept = [row for row in from_all if _quote_identity(row) not in shared]
-        to_kept = [row for row in to_all if _quote_identity(row) not in shared]
+        shared = {
+            item
+            for item in ({_quote_identity(row) for row in from_all} & {_quote_identity(row) for row in to_all})
+            if item[0]
+        }
+        from_grounded = [row for row in from_all if row.get("grounded", True)]
+        to_grounded = [row for row in to_all if row.get("grounded", True)]
         quotes = from_all + to_all
         passage_ids = []
         for item in quotes:
             if item["passage_id"] not in passage_ids:
                 passage_ids.append(item["passage_id"])
-        from_passages = {
-            item["passage_id"] for item in from_kept if item.get("grounded", True)
-        }
-        to_passages = {
-            item["passage_id"] for item in to_kept if item.get("grounded", True)
-        }
-        both = bool(from_passages) and bool(to_passages)
+        from_passages = {item["passage_id"] for item in from_grounded}
+        to_passages = {item["passage_id"] for item in to_grounded}
+        both = bool(from_grounded) and bool(to_grounded)
         same = bool(from_passages & to_passages)
         rows.append(
             {
@@ -436,6 +451,7 @@ def _supporting_cases(found: Mapping[str, Mapping[str, list[dict[str, Any]]]]) -
                 "same_passage": same,
                 "within_case": both,
                 "shared_quote_for_both_endpoints": bool(shared),
+                "shared_quote_inspect": bool(shared),
             }
         )
     return rows
@@ -703,20 +719,30 @@ def _unsupported_before_connector(clause: str) -> bool:
 def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dict[str, Any] | None:
     """Read one candidate quote. A keyword hit is not itself a tier-3 authorization.
 
-    The rule is deterministic. It does not call a model. Tier 3 requires one
-    clause, one recognized connector, affirmative polarity, no hedge, and the
-    from-to direction. Passive voice reverses ``caused by`` and ``led to by``.
-    Negation that governs the connector denies the link. An epistemic or
+    The rule is deterministic and provisional. It does not call a model.
+    Tier 3 requires one clause, one recognized connector, affirmative
+    polarity, no hedge, and the from-to direction. Passive voice reverses
+    ``caused by`` and ``led to by``. A frequency qualifier is resolved before
+    a categorical rejection, so ``not always``, ``doesn't always``, ``rarely``,
+    ``sometimes``, and an intervening softener such as ``necessarily`` are
+    qualified and never denied. Negation that governs the connector, including
+    ``nothing to do with``, denies the link. An epistemic or
     existential-negation marker before that connector is unsupported and does
     not authorize tier 3. ``if``, ``would``, and ``someone said`` are
     hypothetical. Anything else that is not one clear pattern stays
-    unvalidated. This is not a general reading of the sentence.
+    unvalidated. This is not a general reading of the sentence. Every reading
+    stays provisional until it is checked on natural-language data.
     """
     folded = _norm(text)
     if not folded:
         return None
     padded = f" {folded} "
-    mentions_link = bool(_connectors(folded)) or any(marker in padded for marker in _ATTRIBUTION)
+    nothing_to_do = bool(_NOTHING_TO_DO_RE.search(padded))
+    mentions_link = (
+        bool(_connectors(folded))
+        or any(marker in padded for marker in _ATTRIBUTION)
+        or nothing_to_do
+    )
     # A denial or a hypothetical with no connector is still a reading. It does not authorize tier 3.
     if not mentions_link and not _DENIAL_RE.search(padded) and not _HYPOTHETICAL_RE.search(padded):
         return None
@@ -726,22 +752,28 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
     direction = _direction_of(folded, from_terms, to_terms)
     clause = _claim_clause(folded, from_terms, to_terms)
     clause_padded = f" {clause} "
-    rejects_link = bool(_LINK_REJECTION_RE.search(clause_padded))
-    frequency = bool(_FREQUENCY_NEGATION_RE.search(clause_padded))
+    frequency_scope = bool(
+        _FREQUENCY_SCOPE_RE.search(clause_padded) or _FREQUENCY_SCOPE_RE.search(padded)
+    )
+    # Frequency scope wins over the rejection pattern. ``do not always lead``
+    # is qualified. ``do not lead`` and ``nothing to do with`` stay denied.
+    rejects_link = (not frequency_scope) and (
+        bool(_LINK_REJECTION_RE.search(clause_padded)) or nothing_to_do
+    )
     other_negation = bool(_DENIAL_RE.search(clause_padded) or (direction is None and _DENIAL_RE.search(padded)))
-    if rejects_link:
-        polarity = "negative"
-        negation_scope = "link"
-    elif frequency:
+    if frequency_scope:
         polarity = "affirmative"
         negation_scope = "frequency"
+    elif rejects_link:
+        polarity = "negative"
+        negation_scope = "link"
     elif other_negation:
         polarity = "affirmative"
         negation_scope = "not_the_link"
     else:
         polarity = "affirmative"
         negation_scope = None
-    hedging = "hedged" if _HEDGE_RE.search(clause_padded) else "none"
+    hedging = "qualified" if frequency_scope else ("hedged" if _HEDGE_RE.search(clause_padded) else "none")
     hypothetical = bool(_HYPOTHETICAL_RE.search(clause_padded))
     unsupported = _unsupported_before_connector(clause)
     if unsupported:
@@ -753,9 +785,11 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
         direction = None
     elif hypothetical:
         status = "hypothetical"
+    elif frequency_scope:
+        status = "qualified"
     elif rejects_link:
         status = "denied"
-    elif frequency or (other_negation and not rejects_link):
+    elif other_negation and not rejects_link:
         status = "unvalidated"
     elif direction is None:
         status = "not_a_link"
@@ -770,10 +804,10 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
     else:
         status = "unvalidated"
     qualifications = []
-    if status == "denied":
+    if status == "qualified":
+        qualifications.append("frequency_qualified")
+    elif status == "denied":
         qualifications.append("participant_denies_link")
-    elif negation_scope == "frequency":
-        qualifications.append("frequency_negation")
     elif negation_scope == "not_the_link":
         qualifications.append("negation_does_not_reject_link")
     elif status == "reversed":
@@ -798,6 +832,8 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
         "negation_scope": negation_scope,
         "status": status,
         "validated_by": "deterministic_rule",
+        "reading_basis": READING_BASIS,
+        "reading_provisional": True,
         "qualifications": qualifications,
         "authorizes_tier_3": status == "validated",
     }
@@ -859,6 +895,8 @@ def _participant_link(
         chosen = dict(authorizing[0])
         chosen["status"] = "contested"
         chosen["authorizes_tier_3"] = False
+        chosen["reading_basis"] = READING_BASIS
+        chosen["reading_provisional"] = True
         chosen["qualifications"] = ["participant_denies_link", "participant_link_contested"]
     elif authorizing:
         chosen = authorizing[0]
@@ -866,6 +904,7 @@ def _participant_link(
         order = (
             "denied",
             "reversed",
+            "qualified",
             "hedged",
             "hypothetical",
             "ambiguous",
@@ -1050,6 +1089,9 @@ def assess_relationship(
         "core_support_component": "pattern" if pattern_supported else None,
         "shared_quote_for_both_endpoints": any(
             isinstance(case, Mapping) and case.get("shared_quote_for_both_endpoints") for case in cases
+        ),
+        "shared_quote_inspect": any(
+            isinstance(case, Mapping) and case.get("shared_quote_inspect") for case in cases
         ),
         "pattern_quote_rule": PATTERN_QUOTE_RULE,
     }
@@ -1347,6 +1389,8 @@ def _claim_flags(claims: Mapping[str, Any]) -> list[str]:
     qualifications = {str(item) for item in (participant.get("qualifications") or [])}
     if "frequency_negation" in qualifications:
         flags.append("frequency_negation")
+    if "frequency_qualified" in qualifications:
+        flags.append("frequency_qualified")
     if "negation_does_not_reject_link" in qualifications:
         flags.append("negation_does_not_reject_link")
     if status == "contested":
@@ -1439,6 +1483,8 @@ def apply_evidence_tier(relationship: dict, **kwargs: Any) -> dict[str, Any]:
     relationship.update(fields)
     flags = [str(item) for item in (relationship.get("flags") or []) if str(item) not in _CLAIM_FLAGS]
     claim_flags = _claim_flags(fields.get("claims") or {})
+    if fields.get("shared_quote_inspect") and "shared_quote_inspect" not in claim_flags:
+        claim_flags.append("shared_quote_inspect")
     relationship["flags"] = flags + claim_flags
     if claim_flags:
         relationship["needs_review"] = True

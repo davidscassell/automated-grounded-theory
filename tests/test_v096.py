@@ -16,8 +16,8 @@ from tests.test_v090 import FakeSamplingCoder, _kwargs, _payload
 
 
 def test_version_is_096():
-    assert __version__ == "0.9.25"
-    assert POLICY_VERSION == "0.9.25"
+    assert __version__ == "0.9.26"
+    assert POLICY_VERSION == "0.9.26"
 
 
 class _RereadRepairTimeout(FakeSamplingCoder):

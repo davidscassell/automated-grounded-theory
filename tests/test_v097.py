@@ -40,8 +40,8 @@ from tests.test_v090 import FakeSamplingCoder, _kwargs
 
 
 def test_version_is_097():
-    assert __version__ == "0.9.25"
-    assert POLICY_VERSION == "0.9.25"
+    assert __version__ == "0.9.26"
+    assert POLICY_VERSION == "0.9.26"
 
 
 def test_consequence_wording_fails_the_tier_gate_and_the_reviewer_is_checked():
