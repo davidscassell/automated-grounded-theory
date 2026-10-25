@@ -65,8 +65,9 @@ FOCUS_ENDPOINT_RULE = "unreviewed_endpoint_v1"
 # Overlapping diagnostic reasons, plus one documented primary cause.
 WITHHOLDING_CAUSE_RULE = "overlapping_reasons_v1"
 # A discourse aside does not govern the from-to link. A real conditional does.
-# Only a phrase that cannot be a condition is an aside.
-CONDITIONAL_SCOPE_RULE = "unambiguous_hedge_v1"
+# Condition scope stays on the relationship. Only ``question of if/whether``
+# is treated as noun-phrase embedding. ``the reason`` is not.
+CONDITIONAL_SCOPE_RULE = "condition_scope_v1"
 # A focused selection whose plan exceeds the call allowance or the token
 # allowance stops before the first request. Auto-sizing raises only the call
 # allowance. It does not raise the token allowance, and it does not mean the
@@ -134,6 +135,10 @@ CONSOLIDATION_STATUS_ATTEMPTED = "attempted"
 CONSOLIDATION_STATUS_SKIPPED = "skipped"
 CONSOLIDATION_STATUS_FAILED = "failed"
 CONSOLIDATION_STATUS_COMPLETED = "completed"
+# An unreviewed candidate is unresolved. It is not a silent exclusion.
+CONSOLIDATION_STATUS_UNRESOLVED = "unresolved"
+# The retained codes were reviewed, and no synthesis request can name all of them.
+CONSOLIDATION_STATUS_UNRESOLVED_SYNTHESIS = "unresolved-synthesis"
 # Compaction shortens evidence before a code is omitted. Level 1 keeps one
 # short quote. Level 2 drops quotes. Level 3 also truncates the definition.
 SELECTION_COMPACTION_QUOTE_CHARS = 160
@@ -151,6 +156,9 @@ CHUNKING_CHECKPOINT_MESSAGE = (
     "budgeted consolidation, or the 0.9.29 rules, "
     "or before unambiguous hedges, a failed consolidation left open, a separate "
     "consolidation reserve, or the 0.9.30 rules, "
+    "or before condition scope was kept on the relationship, an unreviewed "
+    "consolidation candidate stayed unresolved, consolidation attempts accumulated, "
+    "or the 0.9.31 rules, "
     "or the stored chunk plan does not match this resume. Resume cannot continue "
     "that review. Start a new run."
 )
@@ -641,7 +649,7 @@ def apply_selection_compaction(
 
 
 def review_procedure_fields() -> dict[str, str]:
-    """Procedure fingerprint for the 0.9.30 review rules.
+    """Procedure fingerprint for the 0.9.31 review rules.
 
     The chunk partition is separate from the call and token ceilings. A higher
     ceiling can continue the same chunks. A different partition cannot.
