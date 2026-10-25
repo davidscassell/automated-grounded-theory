@@ -64,8 +64,9 @@ OVERSIZED_RECOVERY = "compact_then_human_v1"
 FOCUS_ENDPOINT_RULE = "unreviewed_endpoint_v1"
 # Overlapping diagnostic reasons, plus one documented primary cause.
 WITHHOLDING_CAUSE_RULE = "overlapping_reasons_v1"
-# A discourse aside does not govern the from-to link. A real conditional does.
-CONDITIONAL_SCOPE_RULE = "closed_hedge_v1"
+# A discourse aside does not govern the from-to link. Ability and permission
+# conditions stay preserved and do not authorize tier 3.
+CONDITIONAL_SCOPE_RULE = "ability_permission_preserved_v1"
 # A focused selection whose plan exceeds the call allowance or the token
 # allowance stops before the first request. Auto-sizing raises only the call
 # allowance. It does not raise the token allowance, and it does not mean the
@@ -131,7 +132,12 @@ AUTO_SIZE_DECISION_CALLS = False
 CONSOLIDATION_NEAR_MISS_CAP = 8
 CONSOLIDATION_STATUS_ATTEMPTED = "attempted"
 CONSOLIDATION_STATUS_SKIPPED = "skipped"
+CONSOLIDATION_STATUS_FAILED = "failed"
 CONSOLIDATION_STATUS_COMPLETED = "completed"
+# Consolidation calls are budgeted apart from the claim-review reserve.
+CONSOLIDATION_BUDGET_RULE = "separate_consolidation_allowance_v1"
+# Conflicting eligibility values are reported. Row order does not pick one.
+ELIGIBILITY_COMPARISON_RULE = "order_invariant_matched_v1"
 # Compaction shortens evidence before a code is omitted. Level 1 keeps one
 # short quote. Level 2 drops quotes. Level 3 also truncates the definition.
 SELECTION_COMPACTION_QUOTE_CHARS = 160
@@ -147,6 +153,8 @@ CHUNKING_CHECKPOINT_MESSAGE = (
     "shared export assessment, validated-chunk recovery, or the chunk-allowance stop used the 0.9.28 rules, "
     "or before duplicate merges kept every row's evidence, closed-list hedges, "
     "budgeted consolidation, or the 0.9.29 rules, "
+    "or before ability and permission conditions, a separate consolidation "
+    "allowance, and order-invariant eligibility comparison revised those rules, "
     "or the stored chunk plan does not match this resume. Resume cannot continue "
     "that review. Start a new run."
 )
@@ -659,6 +667,8 @@ def review_procedure_fields() -> dict[str, str]:
         "budget_ledger_rule": BUDGET_LEDGER_RULE,
         "export_assessment_rule": EXPORT_ASSESSMENT_RULE,
         "chunk_review_recovery": CHUNK_REVIEW_RECOVERY,
+        "consolidation_budget_rule": CONSOLIDATION_BUDGET_RULE,
+        "eligibility_comparison_rule": ELIGIBILITY_COMPARISON_RULE,
     }
 
 
@@ -1499,6 +1509,8 @@ def same_chunking_fingerprint(saved: Any, current: Any) -> bool:
         "budget_ledger_rule": BUDGET_LEDGER_RULE,
         "export_assessment_rule": EXPORT_ASSESSMENT_RULE,
         "chunk_review_recovery": CHUNK_REVIEW_RECOVERY,
+        "consolidation_budget_rule": CONSOLIDATION_BUDGET_RULE,
+        "eligibility_comparison_rule": ELIGIBILITY_COMPARISON_RULE,
     }
     for key, required in expected.items():
         saved_value = str(saved.get(key) or "")

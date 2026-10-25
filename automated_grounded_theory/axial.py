@@ -217,6 +217,8 @@ _PROCEDURE_KEYS = (
     "budget_ledger_rule",
     "export_assessment_rule",
     "chunk_review_recovery",
+    "consolidation_budget_rule",
+    "eligibility_comparison_rule",
 )
 _LOCKED_KEYS = frozenset({"seed", "source_hash"})
 

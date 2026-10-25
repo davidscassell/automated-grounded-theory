@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,16 +26,18 @@ from automated_grounded_theory.decision_review import (
     review_procedure_fields,
     same_chunking_fingerprint,
 )
+from automated_grounded_theory.decision_review import DecisionReviewer
 from automated_grounded_theory.focused import _consolidate_selection_chunks
 from automated_grounded_theory.records import POLICY_VERSION
 from automated_grounded_theory.relationship_tiers import _distinctive, _interpret_quote, apply_evidence_tier
 from automated_grounded_theory.version import __version__
 from tests.test_v080 import FakeAxialCoder
-from tests.test_v0924 import _code, _focused_source, _selection_state
+from tests.test_v0924 import _KeepSelector, _code, _focused_source, _selection_state
 from tests.test_v0926 import SENTENCE, _book, _both, _passages
 from tests.test_v0928 import _ScriptedSelector
 
 _HEDGES = Path(__file__).resolve().parents[0] / "fixtures" / "conditional_hedges_0929.json"
+_HOLDOUT = Path(__file__).resolve().parents[0] / "fixtures" / "false_promotion_holdout_0929.json"
 _STATEMENT = "tools for the shift may be related to coworkers on the crew"
 
 
@@ -42,7 +45,7 @@ def test_version_and_fingerprint():
     assert __version__ == "0.9.29"
     assert POLICY_VERSION == "0.9.29"
     assert DECISION_REVIEW_CHUNKING == "request_budget_v6"
-    assert CONDITIONAL_SCOPE_RULE == "closed_hedge_v1"
+    assert CONDITIONAL_SCOPE_RULE == "ability_permission_preserved_v1"
     assert DUPLICATE_ASSERTION_RULE == "merge_all_evidence_v1"
     current = review_procedure_fields()
     assert same_chunking_fingerprint(current, current) is True
@@ -534,4 +537,370 @@ def test_eligibility_reports_a_flip_when_the_second_run_adds_a_row():
     assert report["additions"][0]["right"] is True
     assert report["removals"] == []
     assert report["unknown_eligibility"] == []
-    assert compared["summary"]["eligibility_changes"] == report["matched"]
+    summary = compared["summary"]["eligibility_changes"]
+    assert summary["matched"] == report["matched"]
+    assert summary["additions"]
+    assert summary["comparisons_attempted"] == 1
+    assert summary["comparisons_available"] == 1
+    assert summary["comparisons_unavailable"] == 0
+
+
+def _tier_for(quote: str) -> dict:
+    passages = _passages(quote, ["r1", "r2"])
+    row = {
+        "relationship_id": "rel-cond",
+        "from_id": "tools",
+        "to_id": "crew",
+        "passage_id": "p1",
+        "quote": quote,
+        "statement": "tools for the shift lead to coworkers on the crew",
+        "disposition": "proposed",
+        "case_quotes": [_both("p1", quote), _both("p2", quote)],
+        "counterexamples": [
+            {
+                "passage_id": "p9",
+                "quote": "the crew met without tools for the shift",
+                "judgment": "contradicts",
+                "valid_test": True,
+            }
+        ],
+    }
+    apply_evidence_tier(row, passages=passages, codebook=_book(), segments=[], memos=[])
+    return row
+
+
+def test_ability_and_permission_conditions_do_not_authorize_tier_3():
+    """Minimal pairs, plus natural wording that is not the rule's phrase list."""
+    from automated_grounded_theory.relationship_tiers import _DISCOURSE_ASIDES
+
+    payload = json.loads(_HEDGES.read_text(encoding="utf-8"))
+    for case_id in ("hedge-if-i-can", "hedge-if-possible"):
+        labelled = next(case for case in payload["cases"] if case["id"] == case_id)
+        assert labelled["expected_status"] == "hypothetical", case_id
+        assert labelled["authorizes_tier_3"] is False, case_id
+
+    clear = _tier_for("tools for the shift lead to coworkers on the crew")
+    ability = _tier_for("tools for the shift lead to coworkers on the crew, if you can.")
+    exact = _tier_for("tools for the shift lead to coworkers on the crew, if I can")
+    possible = _tier_for("tools for the shift lead to coworkers on the crew, if possible")
+    assert clear["participant_link"]["authorizes_tier_3"] is True
+    assert clear["evidence_tier"] == 3
+    assert clear["rule_authorized_attribution"] is True
+    assert clear["human_validated_attribution"] is False
+    assert clear["attribution_source"] == "participant"
+    for row in (ability, exact, possible):
+        link = row["participant_link"]
+        assert link["status"] == "hypothetical", row["quote"]
+        assert link["conditional_scope"] == "preserved", row["quote"]
+        assert link["authorizes_tier_3"] is False, row["quote"]
+        assert row["evidence_tier"] != 3, row["quote"]
+        assert row["rule_authorized_attribution"] is False, row["quote"]
+        assert row["human_validated_attribution"] is False, row["quote"]
+
+    natural = [
+        "If the trainee is allowed to practice on the line, tools for the shift lead to coworkers on the crew.",
+        "tools for the shift lead to coworkers on the crew if she could ask one question during the drill.",
+        "tools for the shift lead to coworkers on the crew, if you are able to stay for the demonstration.",
+        "If we may stop the drill early, tools for the shift lead to coworkers on the crew.",
+        "tools for the shift lead to coworkers on the crew if the night crew might follow the new steps.",
+    ]
+    for quote in natural:
+        folded = " ".join(quote.casefold().split())
+        aside_hits = [phrase for phrase in _DISCOURSE_ASIDES if phrase in folded]
+        assert aside_hits == [], quote
+        row = _tier_for(quote)
+        assert row["participant_link"]["authorizes_tier_3"] is False, quote
+        assert row["evidence_tier"] != 3, quote
+        assert row["rule_authorized_attribution"] is False, quote
+        assert row["human_validated_attribution"] is False, quote
+
+    marked = _tier_for("tools for the shift lead to coworkers on the crew")
+    marked["human_validated_attribution"] = True
+    apply_evidence_tier(
+        marked,
+        passages=_passages(marked["quote"], ["r1", "r2"]),
+        codebook=_book(),
+        segments=[],
+        memos=[],
+    )
+    assert marked["rule_authorized_attribution"] is True
+    assert marked["human_validated_attribution"] is True
+
+
+def test_false_promotions_are_measured_on_a_held_out_set():
+    """Tier 3 authorized against an adjudicated label that says it should not be."""
+    from automated_grounded_theory.relationship_tiers import _DISCOURSE_ASIDES
+
+    payload = json.loads(_HOLDOUT.read_text(encoding="utf-8"))
+    assert "not a study participant" in payload["adjudicator"].casefold()
+    assert "live model" in payload["limits"].casefold()
+    withheld = [case for case in payload["cases"] if case["should_authorize_tier_3"] is False]
+    assert len(withheld) == 8
+    false_promotions = []
+    for case in withheld:
+        folded = " ".join(str(case["quote"]).casefold().split()).strip(" ,;.")
+        assert folded not in _DISCOURSE_ASIDES, case["id"]
+        row = _tier_for(case["quote"])
+        authorized = bool(row["participant_link"]["authorizes_tier_3"]) or row["evidence_tier"] == 3
+        if authorized:
+            false_promotions.append(case["id"])
+    denominator = len(withheld)
+    rate = len(false_promotions) / denominator
+    assert rate == 0
+    assert {
+        "false_promotions": len(false_promotions),
+        "denominator": denominator,
+        "rate": rate,
+        "adjudicator": payload["adjudicator"],
+    }["denominator"] == 8
+
+
+class _FailingConsolidationReviewer(DecisionReviewer):
+    """Records one decision call, then returns an error. No network."""
+
+    async def decide(self, payload, schema, metadata):
+        metadata["decision_calls_used"] = int(metadata.get("decision_calls_used") or 0) + 1
+        metadata["decision_stop"] = "review_error"
+        return None, {"status": "error", "error": "boom"}
+
+
+def test_failed_consolidation_is_not_skipped_and_can_resume():
+    """A request that errors is failed, not skipped, and does not close the pass."""
+    codes = [_code("c-a", "KEEP this"), _code("c-b", "DROP that")]
+    state = _selection_state(codes)
+    reviewer = _FailingConsolidationReviewer(
+        _KeepSelector(), max_calls=8, max_tokens=10**9, token_budget=10**9,
+    )
+    progress = {
+        "raised_ids": ["c-a"],
+        "reviewed_ids": ["c-a", "c-b"],
+        "chunks": [["c-a", "c-b"]],
+        "compaction": {},
+    }
+    metadata = {"decision_calls_used": 0, "decision_tokens_used": 0}
+    run_sync(
+        _consolidate_selection_chunks(
+            SimpleNamespace(reviewer=reviewer),
+            state,
+            progress,
+            metadata,
+            [],
+            [],
+        )
+    )
+    assert metadata["decision_calls_used"] == 1
+    assert metadata["selection_consolidation_status"] == "failed"
+    assert metadata["consolidation_requests_attempted"] == 1
+    assert metadata["consolidation_responses_completed"] == 0
+    assert progress.get("consolidation_closed") is not True
+    assert progress["raised_ids"] == ["c-a"]
+    resume = progress["consolidation_resume"]
+    assert resume["available"] is True
+    assert resume["requests_attempted"] == 1
+    assert resume["responses_completed"] == 0
+
+    assert not progress.get("consolidation_closed")
+    working = DecisionReviewer(_KeepSelector(), max_calls=8, max_tokens=10**9, token_budget=10**9)
+    run_sync(
+        _consolidate_selection_chunks(
+            SimpleNamespace(reviewer=working),
+            state,
+            progress,
+            metadata,
+            [],
+            [],
+        )
+    )
+    assert metadata["selection_consolidation_status"] == "completed"
+    assert progress.get("consolidation_closed") is True
+    assert "c-a" in progress["raised_ids"]
+    assert metadata["consolidation_responses_completed"] >= 1
+
+
+def test_consolidation_allowance_preserves_claim_review_calls():
+    """Multi-call consolidation does not start when it would spend claim-review calls."""
+    codes = [
+        _code("c-a", "KEEP this"),
+        _code("c-b", "DROP that"),
+        _code("c-c", "DROP the other"),
+        _code("c-d", "DROP the rest"),
+    ]
+    state = _selection_state(codes)
+    claim_reserve = 2
+    spent_by_selection = 1
+
+    class _MultiBatch:
+        def __init__(self, max_calls: int):
+            self.max_calls = max_calls
+            self.max_tokens = 10**9
+            self.token_budget = 50
+            self.decide_calls = 0
+
+        def estimate(self, payload, schema):
+            count = len(payload.get("codes") or [])
+            return 40 if count <= 1 else 90
+
+        def refusal_reason(self, payload, schema, metadata):
+            if int(metadata.get("decision_calls_used") or 0) >= self.max_calls:
+                return "call_allowance"
+            if self.estimate(payload, schema) > self.token_budget:
+                return "request_budget"
+            return None
+
+        async def decide(self, payload, schema, metadata):
+            self.decide_calls += 1
+            metadata["decision_calls_used"] = int(metadata.get("decision_calls_used") or 0) + 1
+            ids = [str(row.get("code_id") or "") for row in payload.get("codes") or []]
+            raised = [item for item in ids if item == "c-a"]
+            return {"raised_code_ids": raised, "rationale": "kept"}, {"status": "validated"}
+
+    def progress_for() -> dict:
+        return {
+            "raised_ids": ["c-a"],
+            "reviewed_ids": ["c-a", "c-b", "c-c", "c-d"],
+            "chunks": [["c-a", "c-b", "c-c", "c-d"]],
+            "compaction": {},
+        }
+
+    blocked = _MultiBatch(spent_by_selection + claim_reserve + 1)
+    blocked_progress = progress_for()
+    blocked_meta = {
+        "decision_calls_used": spent_by_selection,
+        "decision_tokens_used": 0,
+        "claim_review_calls_reserved": claim_reserve,
+    }
+    run_sync(
+        _consolidate_selection_chunks(
+            SimpleNamespace(reviewer=blocked),
+            state,
+            blocked_progress,
+            blocked_meta,
+            [],
+            [],
+        )
+    )
+    assert blocked.decide_calls == 0
+    assert blocked_meta["decision_calls_used"] == spent_by_selection
+    assert blocked_meta["consolidation_completion_guaranteed"] is False
+    assert blocked_meta["consolidation_calls_needed"] > blocked_meta["consolidation_call_allowance"]
+    assert blocked_meta["consolidation_batches_required"] > 1
+    assert blocked_meta["consolidation_synthesis_call_budget"] >= 1
+    assert blocked_meta["claim_review_calls_reserved"] == claim_reserve
+    assert blocked.max_calls - blocked_meta["decision_calls_used"] >= claim_reserve
+    assert blocked_meta["selection_consolidation_status"] == "skipped"
+    assert blocked_meta["selection_consolidation_reason"] == "completion_not_guaranteed"
+    assert blocked_progress["raised_ids"] == ["c-a"]
+
+    covered = _MultiBatch(30)
+    covered_progress = progress_for()
+    covered_meta = {
+        "decision_calls_used": spent_by_selection,
+        "decision_tokens_used": 0,
+        "claim_review_calls_reserved": claim_reserve,
+    }
+    run_sync(
+        _consolidate_selection_chunks(
+            SimpleNamespace(reviewer=covered),
+            state,
+            covered_progress,
+            covered_meta,
+            [],
+            [],
+        )
+    )
+    assert covered_meta["consolidation_completion_guaranteed"] is True
+    assert covered_meta["selection_consolidation_status"] == "completed"
+    spent = covered_meta["decision_calls_used"] - spent_by_selection
+    assert spent <= covered_meta["consolidation_call_allowance"]
+    assert spent <= covered_meta["consolidation_calls_needed"]
+    assert covered.max_calls - covered_meta["decision_calls_used"] >= claim_reserve
+    assert covered_meta["claim_review_calls_reserved"] == claim_reserve
+    assert covered.decide_calls == spent
+
+
+def test_conflicting_eligibility_duplicates_are_order_invariant():
+    """Conflicting eligibility on one statement key is reported, and row order does not matter."""
+    base = {
+        "from_id": "tools",
+        "to_id": "crew",
+        "statement": "tools may be related to crew",
+    }
+    true_row = {**base, "downstream_eligible": True}
+    false_row = {**base, "downstream_eligible": False}
+
+    def report_for(rows: list[dict], *, duplicates_on_left: bool) -> str:
+        conflicted = {"relationships": rows}
+        single = {"relationships": [true_row]}
+        runs = [conflicted, single] if duplicates_on_left else [single, conflicted]
+        report = compare_pipeline_runs(runs)["pairwise"][0]["eligibility_changes"]
+        assert report["conflicting_duplicates"]
+        assert report["matched"] == []
+        return json.dumps(report, sort_keys=True)
+
+    for duplicates_on_left in (True, False):
+        forms = {
+            report_for(list(rows), duplicates_on_left=duplicates_on_left)
+            for rows in itertools.permutations((true_row, false_row))
+        }
+        assert len(forms) == 1
+
+    one_sided = []
+    for rows in itertools.permutations((true_row, false_row)):
+        report = compare_pipeline_runs(
+            [
+                {"relationships": []},
+                {"relationships": list(rows)},
+            ]
+        )["pairwise"][0]["eligibility_changes"]
+        assert report["conflicting_duplicates"]
+        assert report["additions"] == []
+        assert report["matched"] == []
+        one_sided.append(json.dumps(report, sort_keys=True))
+    assert len(set(one_sided)) == 1
+
+    clean = compare_pipeline_runs(
+        [
+            {"relationships": [true_row]},
+            {"relationships": [false_row]},
+        ]
+    )["pairwise"][0]["eligibility_changes"]
+    assert clean["matched"]
+    assert clean["matched"][0]["left"] is True
+    assert clean["matched"][0]["right"] is False
+    assert clean["conflicting_duplicates"] == []
+
+
+def test_eligibility_summary_keeps_valid_comparisons_when_a_run_has_no_relationships():
+    """A run with no relationship list is an unavailable comparison. It does not erase a flip."""
+    shared = {
+        "from_id": "tools",
+        "to_id": "crew",
+        "statement": "tools may be related to crew",
+    }
+    runs = [
+        {"relationships": [{**shared, "downstream_eligible": True}], "raised_code_ids": ["a"]},
+        {"relationships": [{**shared, "downstream_eligible": False}], "raised_code_ids": ["a"]},
+        {"raised_code_ids": ["b"]},
+    ]
+    signatures = []
+    for order in itertools.permutations(runs):
+        compared = compare_pipeline_runs(order)
+        unavailable = [item for item in compared["pairwise"] if item["eligibility_changes"] is None]
+        available = [item for item in compared["pairwise"] if item["eligibility_changes"] is not None]
+        assert len(available) == 1
+        assert len(unavailable) == 2
+        assert available[0]["eligibility_changes"]["matched"]
+        summary = compared["summary"]["eligibility_changes"]
+        assert summary is not None
+        assert summary["matched"]
+        signatures.append(
+            (
+                len(summary["matched"]),
+                summary["comparisons_attempted"],
+                summary["comparisons_available"],
+                summary["comparisons_unavailable"],
+            )
+        )
+    assert len(set(signatures)) == 1
+    assert signatures[0] == (1, 3, 1, 2)
+    assert compare_pipeline_runs([{}, {}])["summary"]["eligibility_changes"] is None

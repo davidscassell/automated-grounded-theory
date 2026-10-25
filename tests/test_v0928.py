@@ -73,7 +73,7 @@ def test_version_rules_and_unchanged_defaults():
     assert __version__ == "0.9.29"
     assert POLICY_VERSION == "0.9.29"
     assert DECISION_REVIEW_CHUNKING == "request_budget_v6"
-    assert CONDITIONAL_SCOPE_RULE == "closed_hedge_v1"
+    assert CONDITIONAL_SCOPE_RULE == "ability_permission_preserved_v1"
     assert DUPLICATE_ASSERTION_RULE == "merge_all_evidence_v1"
     assert BUDGET_LEDGER_RULE == "shared_review_ledger_v1"
     assert EXPORT_ASSESSMENT_RULE == "shared_assessment_v1"
@@ -463,7 +463,10 @@ def test_frozen_review_and_pipeline_repeat_stay_distinct():
     assert pair["eligibility_changes"]["matched"]
     assert pair["eligibility_changes"]["additions"] == []
     assert compared["summary"]["selected_code_jaccard"] == pytest.approx(0.5)
-    assert compared["summary"]["eligibility_changes"] == pair["eligibility_changes"]["matched"]
+    summary = compared["summary"]["eligibility_changes"]
+    assert summary["matched"] == pair["eligibility_changes"]["matched"]
+    assert summary["comparisons_attempted"] == 1
+    assert summary["comparisons_unavailable"] == 0
     empty = compare_pipeline_runs([{}, {}])
     assert empty["pairwise"][0]["selected_code_jaccard"] is None
     assert empty["pairwise"][0]["directed_pair_jaccard"] is None

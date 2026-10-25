@@ -145,6 +145,36 @@ def _eligibility_row(key: tuple[str, str, str], left: bool | None, right: bool |
     }
 
 
+def _eligibility_values(rows: Sequence[Mapping[str, Any]]) -> dict[tuple[str, str, str], list[bool | None]]:
+    grouped: dict[tuple[str, str, str], list[bool | None]] = {}
+    for row in rows:
+        grouped.setdefault(_statement_key(row), []).append(_eligibility(row))
+    return grouped
+
+
+def _distinct_eligibility(values: Sequence[bool | None]) -> list[bool | None]:
+    rank = {False: 0, True: 1, None: 2}
+    unique: list[bool | None] = []
+    for item in values:
+        if item not in unique:
+            unique.append(item)
+    return sorted(unique, key=lambda item: rank.get(item, 3))
+
+
+def _conflict_row(
+    key: tuple[str, str, str],
+    left_values: Sequence[bool | None],
+    right_values: Sequence[bool | None],
+) -> dict[str, Any]:
+    return {
+        "from_id": key[0],
+        "to_id": key[1],
+        "statement_hash": key[2],
+        "left_values": list(left_values),
+        "right_values": list(right_values),
+    }
+
+
 def _eligibility_changes(
     left_rows: Sequence[Mapping[str, Any]],
     right_rows: Sequence[Mapping[str, Any]],
@@ -153,36 +183,77 @@ def _eligibility_changes(
 
     A statement missing from one run does not hide a flip on a statement that
     both runs have. A missing boolean is unknown. It is not treated as a flip
-    and it does not discard the rest of the comparison. ``None`` means there
-    are no relationship rows to compare.
+    and it does not discard the rest of the comparison. Duplicate statement
+    keys keep every distinct eligibility value. Conflicting values are reported
+    and are not resolved by row order. ``None`` means there are no relationship
+    rows to compare.
     """
-    left = {_statement_key(row): _eligibility(row) for row in left_rows}
-    right = {_statement_key(row): _eligibility(row) for row in right_rows}
+    left = _eligibility_values(left_rows)
+    right = _eligibility_values(right_rows)
     if not left and not right:
         return None
     matched = []
     unknown = []
+    conflicting = []
     for key in sorted(set(left) & set(right)):
-        left_value = left[key]
-        right_value = right[key]
+        left_values = _distinct_eligibility(left[key])
+        right_values = _distinct_eligibility(right[key])
+        if len(left_values) > 1 or len(right_values) > 1:
+            conflicting.append(_conflict_row(key, left_values, right_values))
+            continue
+        left_value = left_values[0]
+        right_value = right_values[0]
         if left_value is None or right_value is None:
             unknown.append(_eligibility_row(key, left_value, right_value))
         elif left_value != right_value:
             matched.append(_eligibility_row(key, left_value, right_value))
-    additions = [
-        _eligibility_row(key, None, right[key])
-        for key in sorted(set(right) - set(left))
-    ]
-    removals = [
-        _eligibility_row(key, left[key], None)
-        for key in sorted(set(left) - set(right))
-    ]
+    additions = []
+    for key in sorted(set(right) - set(left)):
+        values = _distinct_eligibility(right[key])
+        if len(values) > 1:
+            conflicting.append(_conflict_row(key, [], values))
+        else:
+            additions.append(_eligibility_row(key, None, values[0]))
+    removals = []
+    for key in sorted(set(left) - set(right)):
+        values = _distinct_eligibility(left[key])
+        if len(values) > 1:
+            conflicting.append(_conflict_row(key, values, []))
+        else:
+            removals.append(_eligibility_row(key, values[0], None))
     return {
         "matched": matched,
         "additions": additions,
         "removals": removals,
         "unknown_eligibility": unknown,
+        "conflicting_duplicates": conflicting,
     }
+
+
+def _combine_eligibility(reports: Sequence[dict[str, Any] | None]) -> dict[str, Any] | None:
+    """Aggregate comparisons that have relationship rows.
+
+    A pairwise report of ``None`` is unavailable. It is counted and it does
+    not erase a flip from a comparison that does have rows. The result is null
+    only when every comparison is unavailable.
+    """
+    available = [item for item in reports if isinstance(item, Mapping)]
+    if not available:
+        return None
+    combined: dict[str, Any] = {
+        "matched": [],
+        "additions": [],
+        "removals": [],
+        "unknown_eligibility": [],
+        "conflicting_duplicates": [],
+        "comparisons_attempted": len(reports),
+        "comparisons_available": len(available),
+        "comparisons_unavailable": len(reports) - len(available),
+    }
+    for item in available:
+        for key in ("matched", "additions", "removals", "unknown_eligibility", "conflicting_duplicates"):
+            combined[key].extend(item.get(key) or [])
+    return combined
 
 
 def _mean(values: Sequence[float | None]) -> float | None:
@@ -197,9 +268,11 @@ def compare_pipeline_runs(runs: Sequence[Any]) -> dict[str, Any]:
 
     Selected-code overlap is Jaccard of ``raised_code_ids``. Relationship
     overlap is Jaccard of directed pairs, and of directed pair plus statement
-    hash. Eligibility changes compare matched statements. Additions, removals, and
-    unknown eligibility are separate lists. The field is null when there are
-    no relationship rows to compare.
+    hash. Eligibility changes compare matched statements. Additions, removals,
+    unknown eligibility, and conflicting duplicates are separate lists. A run
+    with no relationship list is an unavailable comparison. The summary keeps
+    the valid comparisons and reports unavailable comparisons against the
+    number attempted. The field is null only when every comparison is unavailable.
     """
     items = list(runs or [])
     pairwise = []
@@ -213,8 +286,8 @@ def compare_pipeline_runs(runs: Sequence[Any]) -> dict[str, Any]:
             "selected_code_jaccard": _mean([item["selected_code_jaccard"] for item in pairwise]),
             "directed_pair_jaccard": _mean([item["directed_pair_jaccard"] for item in pairwise]),
             "statement_jaccard": _mean([item["statement_jaccard"] for item in pairwise]),
-            "eligibility_changes": None
-            if not pairwise or any(item["eligibility_changes"] is None for item in pairwise)
-            else [change for item in pairwise for change in item["eligibility_changes"]["matched"]],
+            "eligibility_changes": _combine_eligibility(
+                [item["eligibility_changes"] for item in pairwise]
+            ),
         },
     }

@@ -1,0 +1,54 @@
+{
+  "fixture_version": "false-promotion-holdout-0929",
+  "adjudicator": "The implementing agent, on 2026-10-25, applying a written criterion. Not a study participant. Not a second human coder. No inter-rater check.",
+  "criterion": "Authorize tier 3 only for a clear from-to link with no governing condition. An if-clause that states ability, permission, or possibility (can, could, able, allowed, may, might, possible, and similar), or any other real or ambiguous condition, must not authorize tier 3. Unambiguous meta-discourse about the utterance may be set aside only when it does not carry ability or permission.",
+  "limits": "Synthetic sentences written for this check. Not study data. Not drawn from the rule's closed aside list. One adjudicator. No inter-rater reliability. Scoring replays the deterministic rule on these sentences. It does not establish the quality of a live model judgment. Offline replay of frozen reviewer outputs checks downstream behavior and does not establish that quality either.",
+  "note": "Held out from rule construction. Not study data and not an end-to-end benchmark. False promotions are cases whose adjudicated label says tier 3 must not be authorized and the rule authorizes it anyway. The denominator is that labelled subset.",
+  "cases": [
+    {
+      "id": "holdout-allowed-to-practice",
+      "should_authorize_tier_3": false,
+      "quote": "If the trainee is allowed to practice on the line, tools for the shift lead to coworkers on the crew."
+    },
+    {
+      "id": "holdout-could-ask",
+      "should_authorize_tier_3": false,
+      "quote": "tools for the shift lead to coworkers on the crew if she could ask one question during the drill."
+    },
+    {
+      "id": "holdout-are-able",
+      "should_authorize_tier_3": false,
+      "quote": "tools for the shift lead to coworkers on the crew, if you are able to stay for the demonstration."
+    },
+    {
+      "id": "holdout-may-stop",
+      "should_authorize_tier_3": false,
+      "quote": "If we may stop the drill early, tools for the shift lead to coworkers on the crew."
+    },
+    {
+      "id": "holdout-might-follow",
+      "should_authorize_tier_3": false,
+      "quote": "tools for the shift lead to coworkers on the crew if the crew might follow the new steps."
+    },
+    {
+      "id": "holdout-rain-on-the-yard",
+      "should_authorize_tier_3": false,
+      "quote": "If it rains on the yard, tools for the shift lead to coworkers on the crew."
+    },
+    {
+      "id": "holdout-night-shift",
+      "should_authorize_tier_3": false,
+      "quote": "tools for the shift lead to coworkers on the crew if the night shift runs long."
+    },
+    {
+      "id": "holdout-help-with-the-drill",
+      "should_authorize_tier_3": false,
+      "quote": "If you help with the drill, tools for the shift lead to coworkers on the crew."
+    },
+    {
+      "id": "holdout-clear-link",
+      "should_authorize_tier_3": true,
+      "quote": "tools for the shift lead to coworkers on the crew."
+    }
+  ]
+}

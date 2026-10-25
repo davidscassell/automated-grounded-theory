@@ -291,6 +291,8 @@ _PROCEDURE_KEYS = (
     "budget_ledger_rule",
     "export_assessment_rule",
     "chunk_review_recovery",
+    "consolidation_budget_rule",
+    "eligibility_comparison_rule",
     "auto_size_decision_calls",
     "selection_chunk_order",
     "selection_chunk_order_seed",
@@ -5932,12 +5934,27 @@ def _consolidation_payload(state, code_ids, raised, near, progress) -> dict:
     return payload
 
 
-def _consolidation_status(metadata, progress, status: str, reason: str | None) -> None:
+def _consolidation_status(metadata, progress, status: str, reason: str | None, *, close: bool | None = None) -> None:
     metadata["selection_consolidation_status"] = status
     metadata["selection_consolidation_reason"] = reason
     progress["consolidation_status"] = status
     progress["consolidation_reason"] = reason
-    progress["consolidation_closed"] = True
+    # A skip that sent nothing is closed. completion_not_guaranteed, a failed
+    # response, and an incomplete attempt stay open so the next selection visit
+    # can resume. This function does not retry inside one visit.
+    if close is None:
+        close = status == "completed" or (status == "skipped" and reason != "completion_not_guaranteed")
+    progress["consolidation_closed"] = close
+    attempted = int(metadata.get("consolidation_requests_attempted") or 0)
+    completed = int(metadata.get("consolidation_responses_completed") or 0)
+    resume = {
+        "available": not close,
+        "reason": reason,
+        "requests_attempted": attempted,
+        "responses_completed": completed,
+    }
+    progress["consolidation_resume"] = resume
+    metadata["consolidation_resume"] = resume
     if status != "completed":
         metadata["selection_consolidation"] = None
         metadata["selection_consolidation_skipped"] = reason
@@ -5950,8 +5967,16 @@ async def _consolidate_selection_chunks(runtime, state, progress, metadata, logs
     reviewed codes that shared a chunk with a raise, ranked and capped. Each
     request fits the per-request ceiling. A larger set is split, then the
     group results are synthesized. The status is ``attempted``, ``skipped``
-    with a reason, or ``completed``. A skip does not discard chunk reviews
-    and is not recorded as done.
+    with a reason, ``failed``, or ``completed``. ``failed`` is an error or
+    invalid response after a request was sent. ``consolidation_requests_attempted``
+    counts requests sent. ``consolidation_responses_completed`` counts accepted
+    parses. A failed or incomplete attempt does not set ``consolidation_closed``.
+    The next selection visit that reaches the end of the chunks calls this
+    again. That visit is the resume path. This function does not retry inside
+    one visit. A skip does not discard chunk reviews and is not recorded as done.
+    Initial batches and the synthesis budget are checked before the first
+    request. When those calls would spend the claim-review reserve, the pass
+    is not started.
     """
     metadata["selection_consolidation_enabled"] = True
     raised = [str(item) for item in (progress.get("raised_ids") or []) if str(item)]
@@ -5982,12 +6007,62 @@ async def _consolidate_selection_chunks(runtime, state, progress, metadata, logs
     if not groups:
         _consolidation_status(metadata, progress, "skipped", "request_budget")
         return
+    batch_calls = len(groups)
+    synthesis_budget = 0
+    if batch_calls > 1:
+        representatives = [group[0] for group in groups if group]
+        synthesis_plan = pack_decision_chunks(
+            representatives,
+            estimate,
+            per_request=int(reviewer.token_budget),
+            omit_reason="single_code_exceeds_request_budget",
+        )
+        synthesis_budget = len([chunk for chunk in (synthesis_plan.get("chunks") or []) if chunk])
+    calls_needed = batch_calls + synthesis_budget
+    stored_claim = metadata.get("claim_review_calls_reserved")
+    claim_reserve = (
+        stored_claim
+        if isinstance(stored_claim, int) and not isinstance(stored_claim, bool) and stored_claim > 0
+        else 0
+    )
+    metadata["claim_review_calls_reserved"] = claim_reserve
+    progress["claim_review_calls_reserved"] = claim_reserve
+    used_calls = int(metadata.get("decision_calls_used") or 0)
+    reviewer_calls = int(getattr(reviewer, "max_calls", 0) or 0)
+    allowance = max(0, (reviewer_calls - used_calls) - claim_reserve)
+    reserved = metadata.get("consolidation_calls_reserved")
+    if isinstance(reserved, int) and not isinstance(reserved, bool) and reserved > 0:
+        allowance = min(allowance, reserved)
+    guaranteed = calls_needed <= allowance
+    metadata["consolidation_batches_required"] = batch_calls
+    metadata["consolidation_synthesis_call_budget"] = synthesis_budget
+    metadata["consolidation_calls_needed"] = calls_needed
+    metadata["consolidation_call_allowance"] = allowance
+    metadata["consolidation_completion_guaranteed"] = guaranteed
+    progress["consolidation_batches_required"] = batch_calls
+    progress["consolidation_synthesis_call_budget"] = synthesis_budget
+    progress["consolidation_calls_needed"] = calls_needed
+    progress["consolidation_call_allowance"] = allowance
+    progress["consolidation_completion_guaranteed"] = guaranteed
+    if not guaranteed:
+        _consolidation_status(metadata, progress, "skipped", "completion_not_guaranteed")
+        return
     reserve = int(metadata.get("consolidation_calls_reserved") or 0)
     sent = 0
     any_sent = False
+    response_failed = False
+    attempted = int(metadata.get("consolidation_requests_attempted") or 0)
+    completed = int(metadata.get("consolidation_responses_completed") or 0)
     incomplete = None
     current = groups
     seen_groups: set[tuple[tuple[str, ...], ...]] = set()
+
+    def _note_attempt() -> None:
+        metadata["consolidation_requests_attempted"] = attempted
+        metadata["consolidation_responses_completed"] = completed
+        progress["consolidation_requests_attempted"] = attempted
+        progress["consolidation_responses_completed"] = completed
+
     while current:
         signature = tuple(tuple(group) for group in current)
         if signature in seen_groups:
@@ -6001,6 +6076,11 @@ async def _consolidate_selection_chunks(runtime, state, progress, metadata, logs
                 incomplete = "call_allowance"
                 failed = True
                 break
+            used_now = int(metadata.get("decision_calls_used") or 0)
+            if max(0, (reviewer_calls - used_now) - claim_reserve) < 1:
+                incomplete = "completion_not_guaranteed"
+                failed = True
+                break
             group_ids = set(group)
             payload = _consolidation_payload(state, group, raised, near, progress)
             stop = reviewer.refusal_reason(payload, SelectionDecision, metadata)
@@ -6012,18 +6092,24 @@ async def _consolidate_selection_chunks(runtime, state, progress, metadata, logs
             parsed, audit = await reviewer.decide(payload, SelectionDecision, metadata)
             sent += 1
             any_sent = True
+            attempted += 1
             progress["consolidation_calls_sent"] = sent
+            _note_attempt()
             if audit:
                 logs.append(audit)
             if parsed is None:
                 incomplete = str(metadata.pop("decision_stop", None) or "review_error")
+                response_failed = True
                 failed = True
                 break
             chosen = [str(item) for item in (parsed.get("raised_code_ids") or [])]
             if len(chosen) != len(set(chosen)) or any(item not in group_ids for item in chosen):
                 incomplete = "invalid_decision"
+                response_failed = True
                 failed = True
                 break
+            completed += 1
+            _note_attempt()
             for item in chosen:
                 if item not in level_raised:
                     level_raised.append(item)
@@ -6052,7 +6138,12 @@ async def _consolidate_selection_chunks(runtime, state, progress, metadata, logs
         if not current:
             incomplete = "request_budget"
             break
-    status = "attempted" if any_sent else "skipped"
+    if response_failed:
+        status = "failed"
+    elif any_sent:
+        status = "attempted"
+    else:
+        status = "skipped"
     _consolidation_status(metadata, progress, status, incomplete or "request_budget")
     if incomplete:
         warnings.append(

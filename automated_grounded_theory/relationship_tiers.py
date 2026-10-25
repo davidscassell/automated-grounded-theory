@@ -154,16 +154,20 @@ _OTHER_HYPOTHETICAL_RE = re.compile(
     r"\b(?:would|someone said|they said|i heard|suppose|supposing|what if|had said)\b"
 )
 # Exact conversational hedges. A span counts only when the whole span is one
-# of these phrases. ``if you help`` and ``if you understand`` are not hedges.
-# ``if it rains`` is not a hedge. This is not a word class.
+# of these phrases and it does not state ability or permission. ``if you can``,
+# ``if I can``, and ``if possible`` can be real conditions or unfinished
+# thoughts, so they are not hedges. ``if you help`` and ``if it rains`` are
+# not hedges either. This is not a word class.
 _DISCOURSE_ASIDES = frozenset({
     "if that makes sense",
-    "if i can",
-    "if possible",
     "if you know what i mean",
     "if i'm honest",
     "if i am honest",
 })
+_ABILITY_PERMISSION_RE = re.compile(
+    r"\b(?:can|could|cannot|can't|able|unable|allow(?:ed|s)?|may|might|"
+    r"permitted|permission|possible|possibly)\b"
+)
 _ASIDE_BOUNDARY_RE = re.compile(r",|;|\u2014|—|--")
 # A noun phrase can contain ``if`` without making the link conditional.
 _NOUN_EMBED_RE = re.compile(
@@ -706,17 +710,24 @@ def _claim_clause(folded: str, from_terms: set[str], to_terms: set[str]) -> str:
     return folded
 
 
+def _ability_or_permission(text: str) -> bool:
+    """True when ``text`` states ability, permission, or possibility."""
+    return bool(_ABILITY_PERMISSION_RE.search(_norm(text)))
+
+
 def _discourse_aside_text(text: str) -> bool:
     """True when ``text`` is one exact conversational hedge.
 
-    The whole span must be on ``_DISCOURSE_ASIDES``. ``if that makes sense``,
-    ``if I can``, ``if possible``, ``if you know what I mean``, and ``if I'm
-    honest`` are hedges. ``if you help``, ``if you understand``, and ``if it
-    rains`` are conditions and stay in the quote.
+    The whole span must be on ``_DISCOURSE_ASIDES`` and must not state ability
+    or permission. ``if that makes sense``, ``if you know what I mean``, and
+    ``if I'm honest`` are hedges. ``if you can``, ``if I can``, ``if possible``,
+    ``if you help``, ``if you understand``, and ``if it rains`` stay in the quote.
     """
     folded = _norm(text).strip(" ,;()—-.").replace("\u2019", "'").replace("`", "'")
     folded = folded.strip(" .,!?;:")
-    return bool(folded) and folded in _DISCOURSE_ASIDES
+    if not folded or _ability_or_permission(folded):
+        return False
+    return folded in _DISCOURSE_ASIDES
 
 
 def _strip_discourse_asides(folded: str) -> str:
@@ -747,10 +758,11 @@ def _conditional_governs_link(clause: str) -> bool:
 
     ``if`` inside a noun phrase such as ``part of why ... if ...`` does not.
     A discourse aside does not: the span is an exact closed-list hedge, such as
-    ``if that makes sense``, ``if I can``, ``if you know what I mean``, or
-    ``if I'm honest``. Stripping that aside does not remove any other
-    conditional. ``if you help``, ``if you understand``, and ``if the night is
-    long`` stay. ``if`` before the connector, or a condition after the
+    ``if that makes sense``, ``if you know what I mean``, or ``if I'm honest``,
+    and it does not state ability or permission. Stripping that aside does not
+    remove any other conditional. ``if you can``, ``if I can``, ``if possible``,
+    ``if you help``, ``if you understand``, and ``if the night is long`` stay.
+    ``if`` before the connector, or a condition after the
     connector that is not inside that noun phrase, does. ``would`` and reported
     speech stay hypothetical markers. The reading is still provisional: this is
     a closed pattern, not a parse of the sentence.
@@ -821,10 +833,12 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
     not authorize tier 3. ``would`` and ``someone said`` are hypothetical.
     ``if`` is hypothetical only when it governs this from-to link. An ``if``
     inside a noun phrase, or an exact hedge such as ``if that makes sense``,
-    is not. Any other condition stays hypothetical or ambiguous. A provisional
-    reading does not authorize tier 3. This is not a general reading of the
-    sentence. Every reading stays provisional until it is checked on
-    natural-language data. Human-adjudicated examples are not in this package.
+    is not. Ability, permission, and possibility conditions stay in the quote.
+    A preserved or ambiguous condition does not authorize tier 3. A validated
+    reading can still authorize tier 3 while ``reading_provisional`` stays
+    true. This is not a general reading of the sentence. Every reading stays
+    provisional until it is checked on natural-language data. Human-adjudicated
+    examples are not in this package.
     """
     folded = _norm(text)
     if not folded:
@@ -867,8 +881,8 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
         polarity = "affirmative"
         negation_scope = None
     stripped_clause = _strip_discourse_asides(clause)
-    # Hedge words count only outside an exact aside. ``if possible`` is an
-    # aside, so ``possible`` there does not hedge the link.
+    # Hedge words count only outside an exact aside. Ability and permission
+    # spans such as ``if possible`` are not asides, so they stay in the clause.
     hedging = "qualified" if frequency_scope else (
         "hedged" if _HEDGE_RE.search(f" {stripped_clause} ") else "none"
     )
@@ -922,6 +936,14 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
         qualifications.append("participant_link_ambiguous")
     elif status == "unsupported":
         qualifications.append("participant_link_unsupported")
+    stripped = _strip_discourse_asides(folded)
+    aside_removed = bool(re.search(r"\bif\b", folded)) and not re.search(r"\bif\b", stripped)
+    if hypothetical or status == "hypothetical":
+        conditional_scope = "preserved"
+    elif aside_removed:
+        conditional_scope = "discourse_aside"
+    else:
+        conditional_scope = None
     return {
         "link_text": str(text).strip(),
         "stated_direction": direction,
@@ -933,9 +955,10 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
         "reading_basis": READING_BASIS,
         "reading_provisional": True,
         "qualifications": qualifications,
-        # Only a validated reading can authorize tier 3. Hypothetical,
-        # ambiguous, and every other provisional status cannot.
-        "authorizes_tier_3": status == "validated",
+        "conditional_scope": conditional_scope,
+        # A preserved condition does not authorize tier 3. A validated reading
+        # whose only ``if`` was an unambiguous aside still can.
+        "authorizes_tier_3": status == "validated" and conditional_scope != "preserved",
     }
 
 
@@ -1063,6 +1086,28 @@ def _analyst_interpretation(
     return False
 
 
+def _attribution_fields(relationship: Mapping[str, Any], *, rule_authorized: bool) -> dict[str, bool]:
+    """Rule authorization and a human validation are separate records.
+
+    The deterministic rule never sets the human field. A true flag already
+    stored on the row is kept. A rule-authorized tier is not a human validation.
+    """
+    return {
+        "rule_authorized_attribution": bool(rule_authorized),
+        "human_validated_attribution": relationship.get("human_validated_attribution") is True,
+    }
+
+
+def _with_attribution(
+    relationship: Mapping[str, Any],
+    fields: dict[str, Any],
+    *,
+    rule_authorized: bool = False,
+) -> dict[str, Any]:
+    fields.update(_attribution_fields(relationship, rule_authorized=rule_authorized))
+    return fields
+
+
 def _undefined_fields(pattern_min_cases: int, cooccurrence: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "evidence_tier": None,
@@ -1111,7 +1156,7 @@ def assess_relationship(
     """
     minimum = max(1, int(pattern_min_cases or PATTERN_MIN_CASES))
     if passages is None:
-        return _undefined_fields(minimum)
+        return _with_attribution(relationship, _undefined_fields(minimum))
     usable = _usable_passages(passages)
     cooccurrence = _cooccurrence(relationship, usable, codebook, segments)
     found = _collect_quotes(relationship, usable, codebook, segments)
@@ -1120,7 +1165,7 @@ def assess_relationship(
     to_cases = {case["case_id"] for case in cases if any(item["endpoint"] == "to" for item in case["quotes"])}
     both_cases = [case for case in cases if case.get("both_endpoints")]
     if not from_cases and not to_cases:
-        return _undefined_fields(minimum, cooccurrence)
+        return _with_attribution(relationship, _undefined_fields(minimum, cooccurrence))
     cross_case = bool(from_cases and to_cases and from_cases != to_cases and not both_cases)
     if any(case.get("same_passage") for case in both_cases):
         strength = "same_passage"
@@ -1169,7 +1214,7 @@ def assess_relationship(
         "validated_by": "deterministic_rule" if analyst_present else None,
     }
     attribution = "participant" if authorizes and tier >= 2 else None
-    return {
+    return _with_attribution(relationship, {
         "evidence_tier": tier,
         "evidence_label": TIER_LABELS[tier],
         "allowed_wording": wording,
@@ -1194,7 +1239,7 @@ def assess_relationship(
             isinstance(case, Mapping) and case.get("shared_quote_inspect") for case in cases
         ),
         "pattern_quote_rule": PATTERN_QUOTE_RULE,
-    }
+    }, rule_authorized=attribution == "participant")
 
 
 def has_causal_wording(text: str) -> bool:
