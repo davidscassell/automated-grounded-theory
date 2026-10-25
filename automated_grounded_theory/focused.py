@@ -177,6 +177,7 @@ from automated_grounded_theory.decision_review import (
     AUTO_SIZE_DECISION_CALLS,
     CHUNK_ALLOWANCE_INSUFFICIENT,
     DECISION_REVIEW_CHUNKING,
+    PARTIAL_SELECTION_BIAS,
     FOCUSED_DECISION_REVIEW,
     FOCUSED_REVIEW_STEPS,
     ClaimDecisions,
@@ -5837,6 +5838,8 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         metadata["selection_uncovered_code_ids"] = ordered
         metadata["provisional_raised_code_ids"] = []
         metadata["selection_chunk_order_selects"] = False
+        metadata["partial_selection_is_code_id_slice"] = True
+        metadata["partial_selection_bias"] = PARTIAL_SELECTION_BIAS
         warnings.append("LLM selection review incomplete: call_allowance.")
         known = list(state.get("known_code_ids") or ordered)
         return {
@@ -5931,6 +5934,9 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         metadata["selection_human_exclusions"] = list(report.get("human_exclusions") or [])
         metadata["selection_items_excluded"] = int(report.get("items_excluded") or 0)
         metadata["selection_chunk_order_selects"] = False
+        partial_selection = not bool(report["complete"])
+        metadata["partial_selection_is_code_id_slice"] = partial_selection
+        metadata["partial_selection_bias"] = PARTIAL_SELECTION_BIAS if partial_selection else None
         metadata["selection_resume"] = {
             "resumable": not bool(report["complete"]),
             "next_index": int(progress_row.get("next_index") or 0),
@@ -6050,13 +6056,14 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         and configured > 0
         and required > configured
     ):
-        # Raises the call allowance only. The token ceiling and the per-request
-        # budget still refuse a chunk that does not fit.
+        # Raises the call allowance only. The token allowance stays as configured.
         reviewer.max_calls = required
     allowance = int(reviewer.max_calls)
     sent = int(progress.get("chunks_sent") or 0)
     validated_now = int(progress.get("chunks_validated") or 0)
     shortfall = max(0, required - allowance)
+    token_allowance = int(reviewer.max_tokens)
+    tokens_used = int(metadata.get("decision_tokens_used") or 0)
     progress["chunks_required"] = required
     progress["decision_call_allowance"] = allowance
     progress["chunk_shortfall"] = shortfall
@@ -6066,6 +6073,21 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
     metadata["selection_chunk_shortfall"] = shortfall
     metadata["auto_size_decision_calls"] = bool(getattr(runtime, "auto_size_decision_calls", False))
     metadata["decision_call_allowance_raised"] = allowance != configured
+    # The token allowance is never raised here, including when calls are.
+    metadata["decision_token_allowance"] = token_allowance
+    if sent == 0 and validated_now == 0:
+        tokens_required = 0
+        for chunk_ids in chunks:
+            ids = [str(item) for item in chunk_ids]
+            if ids:
+                tokens_required += int(estimate(ids))
+        token_room = token_allowance - tokens_used
+        token_shortfall = max(0, tokens_required - token_room) if token_allowance > 0 else 0
+        progress["tokens_required"] = tokens_required
+        progress["decision_token_allowance"] = token_allowance
+        progress["token_shortfall"] = token_shortfall
+        metadata["selection_tokens_required"] = tokens_required
+        metadata["selection_token_shortfall"] = token_shortfall
     open_budget_step(
         metadata,
         step="focused_selection",
@@ -6073,14 +6095,32 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         allowance=allowance,
         shared_with=FOCUSED_REVIEW_STEPS,
     )
-    # Zero still means the reviewer is off. That stop stays call_allowance.
-    # A plan that cannot finish inside a positive allowance is not started.
-    if allowance > 0 and sent == 0 and validated_now == 0 and required > allowance:
+    # Zero calls still means the reviewer is off. That stop stays call_allowance.
+    # A positive allowance that cannot cover the plan, in calls or in tokens,
+    # is not started. Auto-sizing does not raise the token allowance.
+    reviewer_on = allowance > 0
+    call_blocked = reviewer_on and required > allowance
+    token_room = token_allowance - tokens_used
+    token_blocked = (
+        reviewer_on
+        and token_allowance > 0
+        and sent == 0
+        and validated_now == 0
+        and int(progress.get("tokens_required") or 0) > token_room
+    )
+    if sent == 0 and validated_now == 0 and (call_blocked or token_blocked):
         add_stop_reason(progress, CHUNK_ALLOWANCE_INSUFFICIENT)
-        note = (
-            "LLM selection review was not sent. "
-            f"{required} chunks are required and the decision-call allowance is {allowance}."
-        )
+        parts = ["LLM selection review was not sent."]
+        if call_blocked:
+            parts.append(
+                f"{required} chunks are required and the decision-call allowance is {allowance}."
+            )
+        if token_blocked:
+            parts.append(
+                f"{int(progress.get('tokens_required') or 0)} tokens are required "
+                f"and the decision-token allowance is {token_allowance}."
+            )
+        note = " ".join(parts)
         if note not in warnings:
             warnings.append(note)
         return _close(progress)
@@ -6451,9 +6491,12 @@ def _selection_pause_node(state: FocusedState) -> dict:
             "decision_stop": metadata.get("decision_stop"),
             "uncovered_code_ids": list(metadata.get("selection_uncovered_code_ids") or []),
             "provisional_raised_code_ids": list(metadata.get("provisional_raised_code_ids") or []),
+            "partial_selection_is_code_id_slice": metadata.get("partial_selection_is_code_id_slice"),
+            "partial_selection_bias": metadata.get("partial_selection_bias"),
             "instructions": (
                 "This selection is provisional. It is not applied and it is not downstream eligible. "
                 "Chunk order did not promote any code. "
+                "Chunks are reviewed in code-id order. A partial selection is the prefix of that order, not a sample of the codes. "
                 "Resume with {\"continue_selection\": true} to review the uncovered codes, "
                 "or {\"leave_selection\": true} to export without promoting them."
             ),
@@ -6555,6 +6598,8 @@ def _selection_export(state: Mapping[str, Any]) -> dict[str, Any]:
         "selection_source": metadata.get("selection_source") or state.get("selection_source"),
         "selection_reviewed_code_ids": [str(item) for item in (metadata.get("selection_reviewed_code_ids") or [])],
         "selection_uncovered_code_ids": [str(item) for item in (metadata.get("selection_uncovered_code_ids") or [])],
+        "partial_selection_is_code_id_slice": metadata.get("partial_selection_is_code_id_slice"),
+        "partial_selection_bias": metadata.get("partial_selection_bias"),
     }
 
 
@@ -6601,6 +6646,8 @@ def load_focused_export(directory: str | Path) -> dict[str, Any]:
         "selection_source",
         "selection_reviewed_code_ids",
         "selection_uncovered_code_ids",
+        "partial_selection_is_code_id_slice",
+        "partial_selection_bias",
     )
     record = {}
     for key in keys:

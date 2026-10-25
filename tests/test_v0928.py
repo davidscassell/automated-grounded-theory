@@ -41,6 +41,8 @@ from automated_grounded_theory.graph_grounding import graph_snapshot
 from automated_grounded_theory.backends import TEMPERATURE_REPRODUCIBILITY_NOTE
 from automated_grounded_theory.decision_review import (
     CHUNKING_CHECKPOINT_MESSAGE,
+    CHUNK_ALLOWANCE_INSUFFICIENT,
+    PARTIAL_SELECTION_BIAS,
     SHARED_DECISION_REVIEW,
     SHARED_REVIEW_STEPS,
     SelectionDecision,
@@ -48,9 +50,9 @@ from automated_grounded_theory.decision_review import (
 from automated_grounded_theory.records import POLICY_VERSION
 from automated_grounded_theory.version import __version__
 from tests.test_v080 import FakeAxialCoder
-from tests.test_v0924 import _KeepSelector, _focused_source, _rewrite_metadata
+from tests.test_v0924 import _KeepSelector, _code, _focused_source, _rewrite_metadata
 from tests.test_v0926 import SENTENCE, _book, _both, _passages, _row
-from tests.test_v0927 import _large_codes, _tier_two_source
+from tests.test_v0927 import _focused, _large_codes, _tier_two_source
 
 _ASIDE = Path(__file__).resolve().parents[0] / "fixtures" / "discourse_aside_0928.json"
 
@@ -444,3 +446,101 @@ def test_frozen_review_and_pipeline_repeat_stay_distinct():
     )
     assert missing["pairwise"][0]["selected_code_jaccard"] is None
     assert missing["pairwise"][0]["eligibility_changes"] is None
+
+
+def test_token_shortfall_stops_before_the_first_request(tmp_path):
+    """Auto-sizing may raise the call allowance. It must not raise the token allowance."""
+    capped = _focused(
+        _large_codes(),
+        tmp_path,
+        max_decision_calls=1,
+        auto_size_decision_calls=True,
+        max_decision_tokens=1000,
+    )
+    assert capped.metadata["decision_stop"] == CHUNK_ALLOWANCE_INSUFFICIENT
+    assert capped.metadata["decision_token_allowance"] == 1000
+    assert capped.metadata["procedure"]["max_decision_tokens"] == 1000
+    assert capped.metadata["selection_tokens_required"] > 1000
+    assert capped.metadata["selection_token_shortfall"] == capped.metadata["selection_tokens_required"] - 1000
+    assert capped.metadata["decision_call_allowance_raised"] is True
+    assert capped.raised_code_ids == []
+    report = capped.metadata["decision_reviews"]["focused_selection"]
+    assert report["chunks_sent"] == 0
+    assert report["tokens_required"] == capped.metadata["selection_tokens_required"]
+    assert report["decision_token_allowance"] == 1000
+    assert report["token_shortfall"] > 0
+    assert CHUNK_ALLOWANCE_INSUFFICIENT in (report["stop_reasons"] or [])
+    assert report["partial_selection_is_code_id_slice"] is True
+    assert report["partial_selection_bias"] == PARTIAL_SELECTION_BIAS
+    assert not any(entry.get("kind") == "decision_review" for entry in capped.prompt_log)
+    selection = json.loads((tmp_path / "focused_selection.json").read_text(encoding="utf-8"))
+    run = json.loads((tmp_path / "focused_run.json").read_text(encoding="utf-8"))
+    for payload in (selection, run, run["metadata"]):
+        assert payload["partial_selection_is_code_id_slice"] is True
+        assert payload["partial_selection_bias"] == PARTIAL_SELECTION_BIAS
+        assert "code-id order" in payload["partial_selection_bias"]
+        assert "not a sample" in payload["partial_selection_bias"]
+
+    finished = _focused(
+        [
+            _code("c-b", "DROP this code"),
+            _code("c-a", "KEEP this code"),
+        ],
+        tmp_path / "complete",
+        max_decision_calls=8,
+        max_decision_tokens=24000,
+    )
+    assert finished.metadata["selection_review_complete"] is True
+    assert finished.metadata["partial_selection_is_code_id_slice"] is False
+    assert finished.metadata["partial_selection_bias"] is None
+    complete = json.loads((tmp_path / "complete" / "focused_selection.json").read_text(encoding="utf-8"))
+    assert complete["partial_selection_is_code_id_slice"] is False
+    assert complete["partial_selection_bias"] is None
+
+
+def test_proposed_and_unreviewed_ineligible_rows_are_explained():
+    exported = export_gate_relationships(
+        [
+            {
+                "relationship_id": "rel-0005",
+                "disposition": "proposed",
+                "reviewer_decided": False,
+                "reviewer_disposition": None,
+                "evidence_tier": 0,
+                "supporting_cases": [],
+                "cases_with_both_endpoints": 0,
+                "pattern_min_cases": 2,
+            },
+            {
+                "relationship_id": "rel-unreviewed",
+                "disposition": "proposed",
+                "evidence_tier": 2,
+                "supporting_cases": [{"both_endpoints": True}, {"both_endpoints": True}],
+                "cases_with_both_endpoints": 2,
+                "flags": ["endpoint_unreviewed_by_focus"],
+                "eligibility_reason": "endpoint_unreviewed_by_focus",
+            },
+            {
+                "relationship_id": "rel-open",
+                "disposition": "proposed",
+                "evidence_tier": 2,
+                "supporting_cases": [{"both_endpoints": True}, {"both_endpoints": True}],
+                "cases_with_both_endpoints": 2,
+            },
+        ]
+    )
+    by_id = {row["relationship_id"]: row for row in exported["proposed"]}
+    zero = by_id["rel-0005"]
+    assert zero["primary_withholding_cause"] == "insufficient_cases"
+    assert zero["withholding_cause"] == "insufficient_cases"
+    assert zero["reviewer_disposition"] is None
+    assert "llm_reviewer_rejected" not in zero["withholding_reasons"]
+    assert "reviewer_policy_rejection" not in zero["withholding_reasons"]
+    assert by_id["rel-unreviewed"]["primary_withholding_cause"] == "endpoint_unreviewed_by_focus"
+    assert by_id["rel-unreviewed"]["endpoint_review_status"] == "unreviewed"
+    assert by_id["rel-open"]["primary_withholding_cause"] is None
+    assert by_id["rel-open"]["withholding_reasons"] == []
+    ineligible = [by_id["rel-0005"], by_id["rel-unreviewed"]]
+    assert all(row["withholding_reasons"] for row in ineligible)
+    assert sum(exported["withholding_cause_counts"].values()) == exported["explained_rows"] == len(ineligible)
+    assert exported["accepted_downstream"] == []

@@ -154,7 +154,9 @@ PRIMARY_WITHHOLDING_CAUSE = (
     "The first applicable cause in WITHHOLDING_CAUSES wins. "
     "withholding_cause_counts are mutually exclusive and sum to the explained rows. "
     "withholding_reason_counts overlap and do not sum to that total. "
-    "An explained row is disposition-withheld or downstream_eligible false."
+    "An explained row is disposition-withheld, downstream_eligible false, "
+    "unreviewed at an endpoint, or still proposed with a known case or tier shortfall. "
+    "A proposed row with enough cases and unknown eligibility is not explained."
 )
 _WORDING_CAUSE = frozenset({
     "causal_wording_withheld",
@@ -220,13 +222,63 @@ def endpoint_review_status(row: Mapping[str, Any]) -> str:
     return "not_limited"
 
 
+def _pattern_minimum(row: Mapping[str, Any]) -> int:
+    minimum = row.get("pattern_min_cases")
+    if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 1:
+        return 2
+    return minimum
+
+
+def _known_case_count(row: Mapping[str, Any]) -> int | None:
+    """Supporting-case count when the row records one. A missing list stays unknown."""
+    counted = row.get("cases_with_both_endpoints")
+    if isinstance(counted, int) and not isinstance(counted, bool):
+        return counted
+    cases = row.get("supporting_cases")
+    if isinstance(cases, list):
+        return len([item for item in cases if isinstance(item, Mapping)])
+    return None
+
+
+def _case_count_below_minimum(row: Mapping[str, Any]) -> bool:
+    count = _known_case_count(row)
+    if count is None:
+        return False
+    return count < _pattern_minimum(row)
+
+
+def _proposed_case_or_tier_short(row: Mapping[str, Any]) -> bool:
+    """A proposed row whose cases or tier are known to be below the pattern bar."""
+    if _case_count_below_minimum(row):
+        return True
+    tier = _tier_number(row)
+    return tier is not None and tier < 2
+
+
 def _row_explained(row: Mapping[str, Any], rules: Sequence[str]) -> bool:
+    """True when this row is ineligible and the cause counts must include it.
+
+    Withheld rows and rows whose ``downstream_eligible`` is false are explained.
+    So is an unreviewed endpoint, and a proposed row with a known case or tier
+    shortfall, even when eligibility was never stamped false. A proposed row
+    that still has enough cases and unknown eligibility is not explained.
+    ``downstream_eligible`` true is not explained unless the disposition is withheld.
+    """
     outcome = _outcome(row, rules)
     if outcome is None:
         return False
     if outcome == "withheld":
         return True
-    return _downstream_eligible(row) is False
+    eligible = _downstream_eligible(row)
+    if eligible is False:
+        return True
+    if eligible is True:
+        return False
+    if endpoint_review_status(row) == "unreviewed":
+        return True
+    if outcome == "proposed" and _proposed_case_or_tier_short(row):
+        return True
+    return False
 
 
 def withholding_reasons(row: Mapping[str, Any], rules: Sequence[str] | None = None) -> list[str]:
@@ -259,7 +311,7 @@ def withholding_reasons(row: Mapping[str, Any], rules: Sequence[str] | None = No
     if names & _WORDING_CAUSE:
         add("wording_withheld")
     tier_n = _tier_number(row)
-    if tier_n is None or tier_n < 2:
+    if tier_n is None or tier_n < 2 or _case_count_below_minimum(row):
         add("insufficient_cases")
     if "omitted_oversized" in names:
         add("omitted_oversized")
@@ -324,12 +376,14 @@ def export_gate_relationships(relationships: Sequence[Mapping[str, Any]]) -> dic
     ``accepted`` when that is its disposition, and it is not an accepted
     downstream result. ``withheld_reason_counts`` tallies withholding flags
     and rules. Inspect flags such as ``shared_quote_inspect`` are not reasons.
-    ``withholding_cause_counts`` is one primary cause per explained row
-    (disposition withheld, or ``downstream_eligible`` false) and those counts
-    sum to the explained rows. ``withholding_reason_counts`` overlaps and does
-    not sum to that total. ``inspect_flag_counts`` is separate. The maps are
-    null when there is nothing to count, and zeros when rows were counted but
-    none are explained. The input rows are not modified. Fields come from
+    ``withholding_cause_counts`` is one primary cause per explained row.
+    An explained row is disposition-withheld, ``downstream_eligible`` false,
+    unreviewed at an endpoint, or still proposed with a known case or tier
+    shortfall. Those counts sum to the explained rows.
+    ``withholding_reason_counts`` overlaps and does not sum to that total.
+    ``inspect_flag_counts`` is separate. The maps are null when there is
+    nothing to count, and zeros when rows were counted but none are explained.
+    The input rows are not modified. Fields come from
     :func:`relationship_assessment`.
     """
     accepted: list[dict[str, Any]] = []

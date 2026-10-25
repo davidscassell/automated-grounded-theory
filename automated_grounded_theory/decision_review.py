@@ -65,10 +65,16 @@ FOCUS_ENDPOINT_RULE = "unreviewed_endpoint_v1"
 WITHHOLDING_CAUSE_RULE = "overlapping_reasons_v1"
 # A discourse aside does not govern the from-to link. A real conditional does.
 CONDITIONAL_SCOPE_RULE = "discourse_aside_v1"
-# A focused selection whose chunk count exceeds the call allowance stops
-# before the first request. The allowance is not raised unless asked.
+# A focused selection whose plan exceeds the call allowance or the token
+# allowance stops before the first request. Auto-sizing raises only the call
+# allowance. It does not raise the token allowance.
 CHUNK_ALLOWANCE_RULE = "stop_before_send_v1"
 CHUNK_ALLOWANCE_INSUFFICIENT = "chunk_allowance_insufficient"
+# A partial focused selection walks code ids. It is not a sample of the codes.
+PARTIAL_SELECTION_BIAS = (
+    "Chunks are reviewed in code-id order. "
+    "A partial selection is the prefix of that order, not a sample of the codes."
+)
 # Identical statements for one directed pair are one assertion.
 DUPLICATE_ASSERTION_RULE = "merge_identical_statement_v1"
 # Decision-call ceilings are shared by named steps. Each step records its own use.
@@ -869,6 +875,31 @@ def finish_decision_report(progress: Mapping[str, Any]) -> dict[str, Any]:
             None
             if progress.get("chunk_shortfall") is None
             else int(progress.get("chunk_shortfall") or 0)
+        ),
+        "tokens_required": (
+            None
+            if progress.get("tokens_required") is None
+            else int(progress.get("tokens_required") or 0)
+        ),
+        "decision_token_allowance": (
+            None
+            if progress.get("decision_token_allowance") is None
+            else int(progress.get("decision_token_allowance") or 0)
+        ),
+        "token_shortfall": (
+            None
+            if progress.get("token_shortfall") is None
+            else int(progress.get("token_shortfall") or 0)
+        ),
+        "partial_selection_is_code_id_slice": (
+            (not complete)
+            if str(progress.get("kind") or "") == "focused_selection"
+            else None
+        ),
+        "partial_selection_bias": (
+            PARTIAL_SELECTION_BIAS
+            if str(progress.get("kind") or "") == "focused_selection" and not complete
+            else None
         ),
         "tokens_estimated": int(progress.get("tokens_estimated") or 0) if sent else None,
         "expenditure_complete": (int(progress.get("expenditure_gaps") or 0) == 0) if sent else None,

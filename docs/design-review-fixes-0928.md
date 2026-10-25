@@ -6,7 +6,7 @@ Status: current for package 0.9.28. The 0.9.27 note stays the record of the focu
 
 `export_gate_relationships` still buckets by disposition. `accepted` means `accepted` or `verified`. `accepted_downstream` is the accepted rows whose `downstream_eligible` is true. A tier-2 row can be ineligible, including `endpoint_unreviewed_by_focus`, and it stays in `accepted` with that tier. It is not an accepted downstream result. Each row exports `evidence_tier`, `reviewer_disposition`, `endpoint_review_status`, and `downstream_eligible`. A missing eligibility is null. `reviewer_disposition` is copied from the row and is not invented from `disposition`.
 
-An explained row is disposition-withheld or `downstream_eligible` false. Every explained row has at least one withholding reason.
+An explained row is disposition-withheld, `downstream_eligible` false, unreviewed at an endpoint, or still proposed with a known case or tier shortfall. A proposed row with zero supporting cases, or a tier below 2, is explained even when `downstream_eligible` was not stamped false and no reviewer decision was recorded. The cause is `insufficient_cases` unless an earlier cause applies. An unreviewed endpoint is `endpoint_unreviewed_by_focus` in any disposition bucket, including `proposed`. A proposed row that still has enough cases and unknown eligibility is not explained. Cause counts sum to those explained rows, so they match the ineligible rows. Every explained row has at least one withholding reason. A missing reviewer decision is not recorded as `llm_reviewer_rejected`.
 
 ## Shared decision-call allowance
 
@@ -55,3 +55,11 @@ Exports record `model_configuration`: model, temperature and the other sampling 
 ## Resume
 
 The fingerprint is `request_budget_v5`. It also requires `duplicate_assertion_rule` (`merge_identical_statement_v1`), `budget_ledger_rule` (`shared_review_ledger_v1`), and `export_assessment_rule` (`shared_assessment_v1`), plus the updated withholding and conditional rules. A missing key fails. A 0.9.27 `request_budget_v4` checkpoint raises `DecisionChunkingCheckpointError` before `allow_changes` is considered. The plan hash still does not include the call or token ceilings.
+
+## Token allowance before the first request
+
+`auto_size_decision_calls` raises only the call allowance, and only when the caller sets it. It does not raise `max_decision_tokens`. Before the first focused-selection request, the run sums the packed chunk estimates as `tokens_required` and compares that with the decision-token allowance, alongside `chunks_required` and the call allowance. If either allowance cannot cover the plan, the stop is `chunk_allowance_insufficient`, nothing is sent, and the report names `tokens_required`, `decision_token_allowance`, and `token_shortfall`. A zero call allowance stays `call_allowance`. The per-request budget is unchanged.
+
+## Partial selection is a code-id slice
+
+Focused selection reviews chunks in `code_id` order. When the selection is partial, `partial_selection_is_code_id_slice` is true and `partial_selection_bias` says the reviewed codes are the prefix of that order, not a sample. A complete selection leaves the note null. `chunk_order_selects_codes` stays false: an incomplete review is withheld and is not applied.
