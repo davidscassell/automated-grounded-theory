@@ -154,12 +154,12 @@ _OTHER_HYPOTHETICAL_RE = re.compile(
     r"\b(?:would|someone said|they said|i heard|suppose|supposing|what if|had said)\b"
 )
 # Exact conversational hedges. A span counts only when the whole span is one
-# of these phrases. ``if you help`` and ``if you understand`` are not hedges.
-# ``if it rains`` is not a hedge. This is not a word class.
+# of these phrases, and only when the phrase cannot be a real condition.
+# ``if I can`` and ``if possible`` can be genuine conditions, so they stay in
+# the quote. ``if you help``, ``if you understand``, and ``if it rains`` stay
+# too. This is not a word class.
 _DISCOURSE_ASIDES = frozenset({
     "if that makes sense",
-    "if i can",
-    "if possible",
     "if you know what i mean",
     "if i'm honest",
     "if i am honest",
@@ -710,9 +710,10 @@ def _discourse_aside_text(text: str) -> bool:
     """True when ``text`` is one exact conversational hedge.
 
     The whole span must be on ``_DISCOURSE_ASIDES``. ``if that makes sense``,
-    ``if I can``, ``if possible``, ``if you know what I mean``, and ``if I'm
-    honest`` are hedges. ``if you help``, ``if you understand``, and ``if it
-    rains`` are conditions and stay in the quote.
+    ``if you know what I mean``, and ``if I'm honest`` are hedges because the
+    phrase cannot state a condition on the link. ``if I can``, ``if possible``,
+    ``if you help``, ``if you understand``, and ``if it rains`` can be
+    conditions and stay in the quote.
     """
     folded = _norm(text).strip(" ,;()—-.").replace("\u2019", "'").replace("`", "'")
     folded = folded.strip(" .,!?;:")
@@ -746,11 +747,12 @@ def _conditional_governs_link(clause: str) -> bool:
     """True when a conditional governs the from-to link in ``clause``.
 
     ``if`` inside a noun phrase such as ``part of why ... if ...`` does not.
-    A discourse aside does not: the span is an exact closed-list hedge, such as
-    ``if that makes sense``, ``if I can``, ``if you know what I mean``, or
-    ``if I'm honest``. Stripping that aside does not remove any other
-    conditional. ``if you help``, ``if you understand``, and ``if the night is
-    long`` stay. ``if`` before the connector, or a condition after the
+    A discourse aside does not: the span is an exact hedge that cannot be a
+    condition, such as ``if that makes sense``, ``if you know what I mean``,
+    or ``if I'm honest``. Stripping that aside does not remove any other
+    conditional. ``if I can``, ``if possible``, ``if you help``, ``if you
+    understand``, and ``if the night is long`` stay. ``if`` before the
+    connector, or a condition after the
     connector that is not inside that noun phrase, does. ``would`` and reported
     speech stay hypothetical markers. The reading is still provisional: this is
     a closed pattern, not a parse of the sentence.
@@ -820,9 +822,10 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
     existential-negation marker before that connector is unsupported and does
     not authorize tier 3. ``would`` and ``someone said`` are hypothetical.
     ``if`` is hypothetical only when it governs this from-to link. An ``if``
-    inside a noun phrase, or an exact hedge such as ``if that makes sense``,
-    is not. Any other condition stays hypothetical or ambiguous. A provisional
-    reading does not authorize tier 3. This is not a general reading of the
+    inside a noun phrase, or an exact hedge that cannot be a condition, such
+    as ``if that makes sense``, is not. ``if I can`` and ``if possible`` stay
+    in the quote. Any other condition stays hypothetical or ambiguous. A
+    provisional reading does not authorize tier 3. This is not a general reading of the
     sentence. Every reading stays provisional until it is checked on
     natural-language data. Human-adjudicated examples are not in this package.
     """
@@ -867,8 +870,8 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
         polarity = "affirmative"
         negation_scope = None
     stripped_clause = _strip_discourse_asides(clause)
-    # Hedge words count only outside an exact aside. ``if possible`` is an
-    # aside, so ``possible`` there does not hedge the link.
+    # Hedge words count only outside an exact aside. ``if possible`` is not
+    # an aside: it can be a real condition, and ``possible`` still counts.
     hedging = "qualified" if frequency_scope else (
         "hedged" if _HEDGE_RE.search(f" {stripped_clause} ") else "none"
     )

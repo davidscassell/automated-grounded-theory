@@ -1,6 +1,6 @@
 # Design notes
 
-Package `policy_version` is `0.9.29`. This index says which notes describe the package now and which notes are the record of an earlier version. A historical note can disagree with the code. The code, the README, and the current notes below win. A count of every item reviewed, including 355 of 355, and a passing synthetic fixture establish processing coverage only. They do not establish that a selection is valid.
+Package `policy_version` is `0.9.30`. This index says which notes describe the package now and which notes are the record of an earlier version. A historical note can disagree with the code. The code, the README, and the current notes below win. A count of every item reviewed, including 355 of 355, and a passing synthetic fixture establish processing coverage only. They do not establish that a selection is valid.
 
 Axial coding, selective coding, and theoretical sampling are experimental. No study adjudication file is included. The discovery example is synthetic. Live evaluation runs through v31, on package 0.9.9, did not measure analytic accuracy.
 
@@ -10,18 +10,18 @@ Axial coding, selective coding, and theoretical sampling are experimental. No st
 | --- | --- |
 | [../README.md](../README.md) | The pipeline, the defaults, the evidence tiers, quiet rounds, timeouts, and gate scoring. |
 | [methodology.md](methodology.md) | How the open-coding default maps onto the sources already named there. |
-| [design.md](design.md) | The open-coding engineering design, plus a version log through `0.9.29`. The early sections are the 0.6 run. |
+| [design.md](design.md) | The open-coding engineering design, plus a version log through `0.9.30`. The early sections are the 0.6 run. |
 | [design-relationship-tiers.md](design-relationship-tiers.md) | Evidence tiers. `pattern_min_cases` is 2. Tier labels are `category_evidence`, `hypothesis`, `pattern_supported`, `attribution`, and `verified`. |
 | [design-negative-cases-092.md](design-negative-cases-092.md) | Negative-case search at respondent level, and a core that needs tier 2. Later search corrections are in the 0.9.3 review note. |
 | [design-gate-evaluation.md](design-gate-evaluation.md) | `export_gate_relationships`, `load_adjudications`, and `score_gate_adjudications`, including `downstream_precision` and `downstream_withheld_supported_recall`. |
 | [design-discovery-evaluation.md](design-discovery-evaluation.md) | `load_discovery_file`, `freeze_discovery_set`, and `score_discovery`. Recall, precision, distortion, and gate false negatives for a frozen human discovery file. |
 | [design-sampling-0900.md](design-sampling-0900.md) | The sampling graph. Later sections through 0.9.18 are part of the current behavior. 0.9.23 does not change that graph. |
 | [focused-evaluation.md](focused-evaluation.md) | The offline focused comparison and its live-cost estimate. It does not call an API. |
-| [design-review-fixes-0929.md](design-review-fixes-0929.md) | Duplicate merges keep every row's evidence before reassessment. Discourse asides are an exact closed list, and a genuine condition cannot authorize tier 3. Cross-chunk consolidation is budgeted, capped, and reported as attempted, skipped, or completed. It stays off unless set. Chunk-context failures are unknown. Eligibility flips on matched statements stay visible when another run adds a row. Full review coverage and passing synthetic fixtures are processing coverage, not selection validity. This is the latest review note. |
+| [design-review-fixes-0930.md](design-review-fixes-0930.md) | Discourse asides are only phrases that cannot be a condition. `if I can` and `if possible` cannot authorize tier 3. A failed consolidation stays open and is not done. The consolidation reserve is separate from claim review and later steps. Eligibility duplicates match without depending on row order, and summaries keep every valid flip. Full review coverage and passing synthetic fixtures are processing coverage, not selection validity. This is the latest review note. |
 
 ## Historical
 
-These notes stay so a reader can see what a version changed. They are not the current contract. `design-review-fixes-*` through 0.9.28 are in this list. `design-review-fixes-0929.md` is the latest review note, listed above.
+These notes stay so a reader can see what a version changed. They are not the current contract. `design-review-fixes-*` through 0.9.29 are in this list. `design-review-fixes-0930.md` is the latest review note, listed above.
 
 | Note | Version it records |
 | --- | --- |
@@ -53,8 +53,9 @@ These notes stay so a reader can see what a version changed. They are not the cu
 | [design-review-fixes-0926.md](design-review-fixes-0926.md) | 0.9.26. Shared spans count, frequency qualifiers are qualified, and an oversized selection item can be recovered. 0.9.27 exports the raised ids and stops a selection that cannot fit the call allowance. |
 | [design-review-fixes-0927.md](design-review-fixes-0927.md) | 0.9.27. Focused exports carry the raised ids. Unreviewed endpoints stay exploratory. One primary cause partitioned the withheld rows. `if` governs the link. The reviewer decision is recorded. A selection that cannot fit the call allowance stops before the first request. 0.9.28 separates ineligible rows from accepted downstream results, limits a complete selection to raised codes, and gives each decision step its own call ceiling. |
 | [design-review-fixes-0928.md](design-review-fixes-0928.md) | 0.9.28. Ineligible rows stay out of the accepted-downstream count. Each decision step has its own call ceiling. 0.9.29 keeps every row's evidence on a duplicate merge, limits discourse asides to an exact hedge list, and budgets cross-chunk consolidation. |
+| [design-review-fixes-0929.md](design-review-fixes-0929.md) | 0.9.29. Duplicate merges keep every row's evidence. Discourse asides were an exact closed list. Consolidation was attempted, skipped, or completed. 0.9.30 keeps only unambiguous hedges, leaves a failed consolidation open, and reserves consolidation separately from later steps. |
 
-`design-review-fixes-0928.md` records the 0.9.28 export and allowance rules. `design-review-fixes-0929.md` is the current review note.
+`design-review-fixes-0929.md` records the 0.9.29 evidence merge and the first consolidation budget. `design-review-fixes-0930.md` is the current review note.
 
 ## Defaults the tests check
 

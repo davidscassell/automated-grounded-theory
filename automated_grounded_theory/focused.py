@@ -180,6 +180,7 @@ from automated_grounded_theory.decision_review import (
     SELECTION_CHUNK_ORDER_ID,
     SELECTION_CHUNK_ORDER_SHUFFLE,
     SELECTION_CONSOLIDATION,
+    CONSOLIDATION_STATUS_FAILED,
     FOCUSED_DECISION_REVIEW,
     FOCUSED_REVIEW_STEPS,
     ClaimDecisions,
@@ -5933,14 +5934,37 @@ def _consolidation_payload(state, code_ids, raised, near, progress) -> dict:
 
 
 def _consolidation_status(metadata, progress, status: str, reason: str | None) -> None:
+    """Record a skip or a completion. A skip was not attempted.
+
+    Both close the consolidation stage. A skip does not record the stage as
+    done. Completion does. Failures do not use this helper.
+    """
     metadata["selection_consolidation_status"] = status
     metadata["selection_consolidation_reason"] = reason
+    metadata["selection_consolidation_error"] = None
     progress["consolidation_status"] = status
     progress["consolidation_reason"] = reason
+    progress["consolidation_error"] = None
     progress["consolidation_closed"] = True
     if status != "completed":
         metadata["selection_consolidation"] = None
         metadata["selection_consolidation_skipped"] = reason
+    else:
+        metadata["selection_consolidation_skipped"] = None
+
+
+def _consolidation_failure(metadata, progress, error: str) -> None:
+    """Record a failed consolidation. The stage stays open and is not done."""
+    text = str(error or "review_error")
+    metadata["selection_consolidation_status"] = CONSOLIDATION_STATUS_FAILED
+    metadata["selection_consolidation_reason"] = text
+    metadata["selection_consolidation_error"] = text
+    metadata["selection_consolidation"] = None
+    metadata["selection_consolidation_skipped"] = None
+    progress["consolidation_status"] = CONSOLIDATION_STATUS_FAILED
+    progress["consolidation_reason"] = text
+    progress["consolidation_error"] = text
+    progress["consolidation_closed"] = False
 
 
 async def _consolidate_selection_chunks(runtime, state, progress, metadata, logs, warnings) -> None:
@@ -5949,11 +5973,49 @@ async def _consolidate_selection_chunks(runtime, state, progress, metadata, logs
     Off unless the caller sets ``selection_consolidation``. Near misses are
     reviewed codes that shared a chunk with a raise, ranked and capped. Each
     request fits the per-request ceiling. A larger set is split, then the
-    group results are synthesized. The status is ``attempted``, ``skipped``
-    with a reason, or ``completed``. A skip does not discard chunk reviews
-    and is not recorded as done.
+    group results are synthesized. The status is ``failed`` with an error,
+    ``skipped`` with a reason when nothing was attempted, or ``completed``.
+    A failure does not close the stage and does not record it as done. A skip
+    does not discard chunk reviews and is not recorded as done. Calls and
+    tokens spent here are charged to the consolidation reserve, then removed
+    from the shared ledger so claim review and later steps keep their allowance.
     """
     metadata["selection_consolidation_enabled"] = True
+    reviewer = runtime.reviewer
+    reserve_calls = int(metadata.get("consolidation_calls_reserved") or 0)
+    reserve_tokens = int(metadata.get("consolidation_tokens_reserved") or 0)
+    saved_max_calls = int(getattr(reviewer, "max_calls", 0) or 0)
+    saved_max_tokens = int(getattr(reviewer, "max_tokens", 0) or 0)
+    calls_before = int(metadata.get("decision_calls_used") or 0)
+    tokens_before = int(metadata.get("decision_tokens_used") or 0)
+    reviewer.max_calls = saved_max_calls + max(0, reserve_calls)
+    reviewer.max_tokens = saved_max_tokens + max(0, reserve_tokens)
+    try:
+        await _consolidate_selection_body(
+            runtime, state, progress, metadata, logs, warnings,
+            reserve_calls=reserve_calls,
+            reserve_tokens=reserve_tokens,
+            tokens_before=tokens_before,
+        )
+    finally:
+        spent_calls = int(metadata.get("decision_calls_used") or 0) - calls_before
+        spent_tokens = int(metadata.get("decision_tokens_used") or 0) - tokens_before
+        spent_calls = max(0, spent_calls)
+        spent_tokens = max(0, spent_tokens)
+        metadata["decision_calls_used"] = calls_before
+        metadata["decision_tokens_used"] = tokens_before
+        metadata["consolidation_calls_charged"] = spent_calls
+        metadata["consolidation_tokens_charged"] = spent_tokens
+        progress["consolidation_calls_charged"] = spent_calls
+        progress["consolidation_tokens_charged"] = spent_tokens
+        reviewer.max_calls = saved_max_calls
+        reviewer.max_tokens = saved_max_tokens
+
+
+async def _consolidate_selection_body(
+    runtime, state, progress, metadata, logs, warnings, *,
+    reserve_calls: int, reserve_tokens: int, tokens_before: int,
+) -> None:
     raised = [str(item) for item in (progress.get("raised_ids") or []) if str(item)]
     reviewed = [str(item) for item in (progress.get("reviewed_ids") or [])]
     near, omitted_near = rank_near_misses(list(progress.get("chunks") or []), raised, reviewed)
@@ -5982,9 +6044,9 @@ async def _consolidate_selection_chunks(runtime, state, progress, metadata, logs
     if not groups:
         _consolidation_status(metadata, progress, "skipped", "request_budget")
         return
-    reserve = int(metadata.get("consolidation_calls_reserved") or 0)
     sent = 0
     any_sent = False
+    attempted = False
     incomplete = None
     current = groups
     seen_groups: set[tuple[tuple[str, ...], ...]] = set()
@@ -5997,19 +6059,32 @@ async def _consolidate_selection_chunks(runtime, state, progress, metadata, logs
         level_raised: list[str] = []
         failed = False
         for group in current:
-            if reserve and sent >= reserve:
+            if reserve_calls and sent >= reserve_calls:
                 incomplete = "call_allowance"
                 failed = True
                 break
             group_ids = set(group)
             payload = _consolidation_payload(state, group, raised, near, progress)
+            if reserve_tokens:
+                spent_tokens = int(metadata.get("decision_tokens_used") or 0) - tokens_before
+                next_tokens = int(reviewer.estimate(payload, SelectionDecision))
+                if spent_tokens + next_tokens > reserve_tokens:
+                    incomplete = "token_allowance"
+                    failed = True
+                    break
             stop = reviewer.refusal_reason(payload, SelectionDecision, metadata)
             if stop:
                 metadata.pop("decision_stop", None)
                 incomplete = stop
                 failed = True
                 break
-            parsed, audit = await reviewer.decide(payload, SelectionDecision, metadata)
+            attempted = True
+            try:
+                parsed, audit = await reviewer.decide(payload, SelectionDecision, metadata)
+            except Exception as exc:
+                incomplete = f"{type(exc).__name__}: {exc}"
+                failed = True
+                break
             sent += 1
             any_sent = True
             progress["consolidation_calls_sent"] = sent
@@ -6034,13 +6109,11 @@ async def _consolidate_selection_chunks(runtime, state, progress, metadata, logs
             progress["consolidation_raised_code_ids"] = level_raised
             _consolidation_status(metadata, progress, "completed", None)
             metadata["selection_consolidation"] = SELECTION_CONSOLIDATION
-            metadata["selection_consolidation_skipped"] = None
             return
         if not level_raised:
             progress["raised_ids"] = []
             _consolidation_status(metadata, progress, "completed", None)
             metadata["selection_consolidation"] = SELECTION_CONSOLIDATION
-            metadata["selection_consolidation_skipped"] = None
             return
         synthesis = pack_decision_chunks(
             sorted(level_raised),
@@ -6052,11 +6125,18 @@ async def _consolidate_selection_chunks(runtime, state, progress, metadata, logs
         if not current:
             incomplete = "request_budget"
             break
-    status = "attempted" if any_sent else "skipped"
-    _consolidation_status(metadata, progress, status, incomplete or "request_budget")
+    if any_sent or attempted:
+        error = incomplete or "review_error"
+        _consolidation_failure(metadata, progress, error)
+        warnings.append(
+            f"Selection consolidation failed: {error}. Chunk reviews already stored were kept. "
+            "The stage was not closed."
+        )
+        return
+    _consolidation_status(metadata, progress, "skipped", incomplete or "request_budget")
     if incomplete:
         warnings.append(
-            f"Selection consolidation {status}: {incomplete}. Chunk reviews already stored were kept."
+            f"Selection consolidation skipped: {incomplete}. Chunk reviews already stored were kept."
         )
 
 
@@ -6354,6 +6434,63 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         warnings = list(updates.get("warnings") or warnings)
         return {**updates, "metadata": merged_meta, "prompt_log": logs, "warnings": warnings}
 
+    def _hold_failed_consolidation(progress_row: dict) -> dict:
+        """Keep chunk reviews and leave consolidation open. Do not mark it done."""
+        progress_row["open"] = True
+        progress_row["provisional"] = True
+        metadata["decision_chunk_state"] = progress_row
+        error = str(
+            metadata.get("selection_consolidation_error")
+            or metadata.get("selection_consolidation_reason")
+            or "review_error"
+        )
+        metadata["selection_review_complete"] = False
+        metadata["selection_review_applied"] = False
+        metadata["selection_withheld"] = True
+        metadata["selection_downstream_eligible"] = False
+        metadata["selection_status"] = "provisional"
+        metadata["selection_source"] = "provisional"
+        metadata["selection_consolidation"] = None
+        metadata["decision_stop"] = "consolidation_failed"
+        metadata["decision_stop_detail"] = error
+        provisional = merge_selection_ids(
+            metadata.get("selection_code_id_order") or progress_row.get("ordered_ids") or [],
+            progress_row.get("raised_ids") or [],
+        )
+        metadata["provisional_raised_code_ids"] = provisional
+        metadata["selection_reviewed_code_ids"] = [str(item) for item in (progress_row.get("reviewed_ids") or [])]
+        metadata["selection_resume"] = {
+            "resumable": True,
+            "next_index": int(progress_row.get("next_index") or 0),
+            "plan_hash": str(progress_row.get("plan_hash") or ""),
+            "uncovered_code_ids": [],
+        }
+        note = (
+            f"Selection consolidation failed: {error}. "
+            "The stage was not closed and chunk reviews were kept."
+        )
+        if note not in warnings:
+            warnings.append(note)
+        known = list(state.get("known_code_ids") or ordered)
+        return {
+            "raised_code_ids": [],
+            "not_raised_code_ids": known,
+            "selection_source": "provisional",
+            "metadata": metadata,
+            "prompt_log": logs,
+            "warnings": warnings,
+            "focused_not_reread": [passage["passage_id"] for passage in state.get("passages", [])],
+        }
+
+    async def _finish_chunks(progress_row: dict) -> dict:
+        if getattr(runtime, "selection_consolidation", False) and not progress_row.get("consolidation_closed"):
+            await _consolidate_selection_chunks(
+                runtime, state, progress_row, metadata, logs, warnings,
+            )
+        if progress_row.get("consolidation_status") == CONSOLIDATION_STATUS_FAILED:
+            return _hold_failed_consolidation(progress_row)
+        return _close(progress_row)
+
     # The caller's allowance lives on the procedure. A later visit must not
     # read the reviewer's already-raised max_calls as that configured value,
     # or the raised flag disappears after the first chunk.
@@ -6370,9 +6507,11 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
     consolidation_tokens = 0
     if consolidation_on and ordered:
         def consolidation_estimate(ids: Sequence[str]) -> int:
+            # Raised ids and near misses are not known yet. Charging every id
+            # as both keeps this estimate at least as large as the later payload.
             return int(
                 reviewer.estimate(
-                    _consolidation_payload(state, ids, [], [], progress),
+                    _consolidation_payload(state, ids, ordered, ordered, progress),
                     SelectionDecision,
                 )
             )
@@ -6385,11 +6524,13 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         consolidation_tokens = int(reserve["consolidation_tokens_reserved"])
     # The configured allowance is reserved for claim review. Selection is sized
     # to its own chunks, so auto-sizing cannot spend the claim review's calls.
-    # Consolidation, when it is on, has its own reserved calls on top of that.
+    # Consolidation, when it is on, reserves its own calls and tokens. Those
+    # are not added to this ceiling and are not subtracted from it, so a
+    # multi-call consolidation cannot spend the claim review's allowance or a
+    # later step's allowance.
     claim_reserve = configured if auto_size and configured > 0 and required > 0 else 0
-    consolidation_extra = consolidation_calls if auto_size and required > 0 else 0
-    if claim_reserve or consolidation_extra:
-        reviewer.max_calls = required + claim_reserve + consolidation_extra
+    if claim_reserve:
+        reviewer.max_calls = required + claim_reserve
     allowance = int(reviewer.max_calls)
     token_allowance = int(reviewer.max_tokens)
     tokens_used = int(metadata.get("decision_tokens_used") or 0)
@@ -6407,9 +6548,9 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
     reused = {int(item) for item in (progress.get("reused_chunk_indexes") or [])}
     pending_chunks = [chunks[item] for item in range(len(chunks)) if item not in reused]
     calls_still = len(pending_chunks)
-    selection_ceiling = allowance - claim_reserve - consolidation_calls
+    selection_ceiling = allowance - claim_reserve
     calls_available = max(0, selection_ceiling - calls_used)
-    tokens_required = consolidation_tokens
+    tokens_required = 0
     for chunk_ids in pending_chunks:
         ids = [str(item) for item in chunk_ids]
         if ids:
@@ -6462,8 +6603,10 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
     progress["claim_review_calls_reserved"] = claim_reserve
     metadata["consolidation_calls_reserved"] = consolidation_calls if consolidation_on else 0
     metadata["consolidation_tokens_reserved"] = consolidation_tokens if consolidation_on else 0
+    metadata["consolidation_reserve_separate"] = bool(consolidation_on)
     progress["consolidation_calls_reserved"] = metadata["consolidation_calls_reserved"]
     progress["consolidation_tokens_reserved"] = metadata["consolidation_tokens_reserved"]
+    progress["consolidation_reserve_separate"] = metadata["consolidation_reserve_separate"]
     if not consolidation_on:
         metadata["selection_consolidation_status"] = None
         metadata["selection_consolidation_reason"] = None
@@ -6512,7 +6655,8 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
             )
         if consolidation_on and (consolidation_calls or consolidation_tokens):
             parts.append(
-                f"{consolidation_calls} calls and {consolidation_tokens} tokens are reserved for selection consolidation."
+                f"{consolidation_calls} calls and {consolidation_tokens} tokens are reserved for selection consolidation. "
+                "That reserve is separate from the selection allowance, the claim-review allowance, and later steps."
             )
         if reread_blocked and reread_preflight:
             parts.append(
@@ -6526,11 +6670,7 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
 
     index = int(progress.get("next_index") or 0)
     if index >= len(chunks):
-        if getattr(runtime, "selection_consolidation", False) and not progress.get("consolidation_closed"):
-            await _consolidate_selection_chunks(
-                runtime, state, progress, metadata, logs, warnings,
-            )
-        return _close(progress)
+        return await _finish_chunks(progress)
 
     chunk = [str(item) for item in chunks[index]]
     compaction_map = {
@@ -6657,11 +6797,7 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         progress["next_index"] = index + 1
         metadata["decision_chunk_state"] = progress
         if progress["next_index"] >= len(chunks):
-            if getattr(runtime, "selection_consolidation", False) and not progress.get("consolidation_closed"):
-                await _consolidate_selection_chunks(
-                    runtime, state, progress, metadata, logs, warnings,
-                )
-            return _close(progress)
+            return await _finish_chunks(progress)
         progress["open"] = True
         metadata["decision_chunk_state"] = progress
         return {"metadata": metadata, "prompt_log": logs, "warnings": warnings}
@@ -6755,6 +6891,13 @@ def _selection_can_resume(meta: Mapping[str, Any]) -> bool:
     chunks = list(progress.get("chunks") or [])
     validated = int(progress.get("chunks_validated") or 0)
     stops = {str(item) for item in (progress.get("stop_reasons") or [])}
+    if (
+        str(progress.get("consolidation_status") or "") == CONSOLIDATION_STATUS_FAILED
+        and not progress.get("consolidation_closed")
+        and bool(chunks)
+        and validated == len(chunks)
+    ):
+        return True
     # Nothing was sent. A later resume can raise the call allowance and review
     # the same plan. That is the only pause for this stop.
     if (
@@ -7048,8 +7191,12 @@ def _selection_export(state: Mapping[str, Any]) -> dict[str, Any]:
         "claim_review_calls_reserved": metadata.get("claim_review_calls_reserved"),
         "consolidation_calls_reserved": metadata.get("consolidation_calls_reserved"),
         "consolidation_tokens_reserved": metadata.get("consolidation_tokens_reserved"),
+        "consolidation_reserve_separate": metadata.get("consolidation_reserve_separate"),
+        "consolidation_calls_charged": metadata.get("consolidation_calls_charged"),
+        "consolidation_tokens_charged": metadata.get("consolidation_tokens_charged"),
         "selection_consolidation_status": metadata.get("selection_consolidation_status"),
         "selection_consolidation_reason": metadata.get("selection_consolidation_reason"),
+        "selection_consolidation_error": metadata.get("selection_consolidation_error"),
         "focused_review_tokens_required": metadata.get("focused_review_tokens_required"),
         "focused_review_tokens_available": metadata.get("focused_review_tokens_available"),
         "focused_review_token_shortfall": metadata.get("focused_review_token_shortfall"),
@@ -7125,8 +7272,12 @@ def load_focused_export(directory: str | Path) -> dict[str, Any]:
         "selection_consolidation",
         "selection_consolidation_status",
         "selection_consolidation_reason",
+        "selection_consolidation_error",
         "consolidation_calls_reserved",
         "consolidation_tokens_reserved",
+        "consolidation_reserve_separate",
+        "consolidation_calls_charged",
+        "consolidation_tokens_charged",
     )
     record = {}
     for key in keys:

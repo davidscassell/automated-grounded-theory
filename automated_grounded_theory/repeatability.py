@@ -135,14 +135,57 @@ def _pair_report(left: Any, right: Any, left_index: int, right_index: int) -> di
     }
 
 
-def _eligibility_row(key: tuple[str, str, str], left: bool | None, right: bool | None) -> dict[str, Any]:
-    return {
+def _eligibility_row(
+    key: tuple[str, str, str],
+    left: bool | None,
+    right: bool | None,
+    *,
+    ambiguous: bool = False,
+) -> dict[str, Any]:
+    row = {
         "from_id": key[0],
         "to_id": key[1],
         "statement_hash": key[2],
         "left": left,
         "right": right,
     }
+    if ambiguous:
+        row["ambiguous"] = True
+    return row
+
+
+def _consolidate_eligibility(rows: Sequence[Mapping[str, Any]]) -> tuple[bool | None, bool]:
+    """One eligibility for duplicate rows, independent of their order.
+
+    Agreement on one boolean is that value. Disagreement, or a missing boolean
+    beside another row, is ambiguous. All-missing rows stay unknown and are
+    not marked ambiguous.
+    """
+    values = [_eligibility(row) for row in rows]
+    booleans = [item for item in values if isinstance(item, bool)]
+    if any(item is None for item in values) and booleans:
+        return None, True
+    if len(set(booleans)) > 1:
+        return None, True
+    if not booleans:
+        return None, False
+    return booleans[0], False
+
+
+def _eligibility_map(
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[dict[tuple[str, str, str], bool | None], set[tuple[str, str, str]]]:
+    grouped: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(_statement_key(row), []).append(row)
+    resolved: dict[tuple[str, str, str], bool | None] = {}
+    ambiguous: set[tuple[str, str, str]] = set()
+    for key, group in grouped.items():
+        value, flagged = _consolidate_eligibility(group)
+        resolved[key] = value
+        if flagged:
+            ambiguous.add(key)
+    return resolved, ambiguous
 
 
 def _eligibility_changes(
@@ -151,13 +194,15 @@ def _eligibility_changes(
 ) -> dict[str, Any] | None:
     """Matched eligibility flips, plus additions, removals, and unknown rows.
 
-    A statement missing from one run does not hide a flip on a statement that
-    both runs have. A missing boolean is unknown. It is not treated as a flip
-    and it does not discard the rest of the comparison. ``None`` means there
-    are no relationship rows to compare.
+    Duplicate rows for one statement and directed pair are combined without
+    regard to order. When they disagree, the statement is ambiguous and is
+    not a flip. A statement missing from one run does not hide a flip on a
+    statement that both runs have. A missing boolean is unknown. It is not
+    treated as a flip and it does not discard the rest of the comparison.
+    ``None`` means there are no relationship rows to compare.
     """
-    left = {_statement_key(row): _eligibility(row) for row in left_rows}
-    right = {_statement_key(row): _eligibility(row) for row in right_rows}
+    left, left_ambiguous = _eligibility_map(left_rows)
+    right, right_ambiguous = _eligibility_map(right_rows)
     if not left and not right:
         return None
     matched = []
@@ -165,16 +210,17 @@ def _eligibility_changes(
     for key in sorted(set(left) & set(right)):
         left_value = left[key]
         right_value = right[key]
-        if left_value is None or right_value is None:
-            unknown.append(_eligibility_row(key, left_value, right_value))
+        ambiguous = key in left_ambiguous or key in right_ambiguous
+        if ambiguous or left_value is None or right_value is None:
+            unknown.append(_eligibility_row(key, left_value, right_value, ambiguous=ambiguous))
         elif left_value != right_value:
             matched.append(_eligibility_row(key, left_value, right_value))
     additions = [
-        _eligibility_row(key, None, right[key])
+        _eligibility_row(key, None, right[key], ambiguous=key in right_ambiguous)
         for key in sorted(set(right) - set(left))
     ]
     removals = [
-        _eligibility_row(key, left[key], None)
+        _eligibility_row(key, left[key], None, ambiguous=key in left_ambiguous)
         for key in sorted(set(left) - set(right))
     ]
     return {
@@ -198,14 +244,17 @@ def compare_pipeline_runs(runs: Sequence[Any]) -> dict[str, Any]:
     Selected-code overlap is Jaccard of ``raised_code_ids``. Relationship
     overlap is Jaccard of directed pairs, and of directed pair plus statement
     hash. Eligibility changes compare matched statements. Additions, removals, and
-    unknown eligibility are separate lists. The field is null when there are
-    no relationship rows to compare.
+    unknown eligibility are separate lists. The summary lists every matched
+    flip from a comparison that has relationship rows. A comparison with no
+    rows, or an unknown row inside another comparison, does not drop those
+    flips. The field is null only when no comparison has relationship rows.
     """
     items = list(runs or [])
     pairwise = []
     for left_index in range(len(items)):
         for right_index in range(left_index + 1, len(items)):
             pairwise.append(_pair_report(items[left_index], items[right_index], left_index, right_index))
+    defined = [item["eligibility_changes"] for item in pairwise if item["eligibility_changes"] is not None]
     return {
         "run_count": len(items),
         "pairwise": pairwise,
@@ -214,7 +263,7 @@ def compare_pipeline_runs(runs: Sequence[Any]) -> dict[str, Any]:
             "directed_pair_jaccard": _mean([item["directed_pair_jaccard"] for item in pairwise]),
             "statement_jaccard": _mean([item["statement_jaccard"] for item in pairwise]),
             "eligibility_changes": None
-            if not pairwise or any(item["eligibility_changes"] is None for item in pairwise)
-            else [change for item in pairwise for change in item["eligibility_changes"]["matched"]],
+            if not defined
+            else [change for report in defined for change in report["matched"]],
         },
     }

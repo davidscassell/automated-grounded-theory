@@ -65,7 +65,8 @@ FOCUS_ENDPOINT_RULE = "unreviewed_endpoint_v1"
 # Overlapping diagnostic reasons, plus one documented primary cause.
 WITHHOLDING_CAUSE_RULE = "overlapping_reasons_v1"
 # A discourse aside does not govern the from-to link. A real conditional does.
-CONDITIONAL_SCOPE_RULE = "closed_hedge_v1"
+# Only a phrase that cannot be a condition is an aside.
+CONDITIONAL_SCOPE_RULE = "unambiguous_hedge_v1"
 # A focused selection whose plan exceeds the call allowance or the token
 # allowance stops before the first request. Auto-sizing raises only the call
 # allowance. It does not raise the token allowance, and it does not mean the
@@ -131,6 +132,7 @@ AUTO_SIZE_DECISION_CALLS = False
 CONSOLIDATION_NEAR_MISS_CAP = 8
 CONSOLIDATION_STATUS_ATTEMPTED = "attempted"
 CONSOLIDATION_STATUS_SKIPPED = "skipped"
+CONSOLIDATION_STATUS_FAILED = "failed"
 CONSOLIDATION_STATUS_COMPLETED = "completed"
 # Compaction shortens evidence before a code is omitted. Level 1 keeps one
 # short quote. Level 2 drops quotes. Level 3 also truncates the definition.
@@ -147,6 +149,8 @@ CHUNKING_CHECKPOINT_MESSAGE = (
     "shared export assessment, validated-chunk recovery, or the chunk-allowance stop used the 0.9.28 rules, "
     "or before duplicate merges kept every row's evidence, closed-list hedges, "
     "budgeted consolidation, or the 0.9.29 rules, "
+    "or before unambiguous hedges, a failed consolidation left open, a separate "
+    "consolidation reserve, or the 0.9.30 rules, "
     "or the stored chunk plan does not match this resume. Resume cannot continue "
     "that review. Start a new run."
 )
@@ -564,9 +568,12 @@ def consolidation_allowance_reserve(
 ) -> dict[str, int]:
     """Calls and input tokens a budgeted consolidation of ``ids`` would use.
 
-    The plan packs the ids under ``per_request``, then one synthesis pass when
-    that packing takes more than one request. It is an upper bound for the
-    preflight, not a dollar bound.
+    The plan packs the ids under ``per_request``. When that takes more than one
+    request, it also reserves a synthesis of the full id list. One
+    representative from each request undercounts a pass that raises the other
+    ids. The figure is an upper bound for that consolidation. It is not a
+    dollar bound, and it is reserved separately from claim review and later
+    steps.
     """
     packed = pack_decision_chunks(
         ids,
@@ -578,9 +585,8 @@ def consolidation_allowance_reserve(
     tokens = sum(int(estimate(chunk)) for chunk in chunks)
     synthesis_calls = 0
     if len(chunks) > 1:
-        representatives = [chunk[0] for chunk in chunks]
         synthesis = pack_decision_chunks(
-            representatives,
+            list(ids),
             estimate,
             per_request=per_request,
             omit_reason="single_code_exceeds_request_budget",
@@ -635,7 +641,7 @@ def apply_selection_compaction(
 
 
 def review_procedure_fields() -> dict[str, str]:
-    """Procedure fingerprint for the 0.9.29 review rules.
+    """Procedure fingerprint for the 0.9.30 review rules.
 
     The chunk partition is separate from the call and token ceilings. A higher
     ceiling can continue the same chunks. A different partition cannot.
@@ -1477,7 +1483,7 @@ def merge_core_nominations(
 
 
 def same_chunking_fingerprint(saved: Any, current: Any) -> bool:
-    """True when the resume carries the current chunking and 0.9.29 rules.
+    """True when the resume carries the current chunking and 0.9.30 rules.
 
     A missing key fails. ``allow_changes`` is not consulted here, so an older
     checkpoint cannot continue by ignoring the new quote, denial, recovery,

@@ -1,6 +1,6 @@
 # 0.9.29 review fixes
 
-Status: current for package 0.9.29. The 0.9.28 note stays the record of the accepted-downstream split, the per-step decision ceilings, the token preflight, and validated-chunk recovery. This note does not change `pattern_min_cases` (2), the axial token ceiling (24000), `batch_size` (1), or the 6000 request budgets. `auto_size_decision_calls` stays off. `selection_consolidation` stays off. Tier 4 stays human-only. Undefined metrics stay null. Human input still arrives through `interrupt()` and `Command(resume=...)`. No paid call is added.
+Status: record of package 0.9.29. Package 0.9.30 is the current review note. The 0.9.28 note stays the record of the accepted-downstream split, the per-step decision ceilings, the token preflight, and validated-chunk recovery. This note does not change `pattern_min_cases` (2), the axial token ceiling (24000), `batch_size` (1), or the 6000 request budgets. `auto_size_decision_calls` stays off. `selection_consolidation` stays off. Tier 4 stays human-only. Undefined metrics stay null. Human input still arrives through `interrupt()` and `Command(resume=...)`. No paid call is added.
 
 A decision review that reports every item reviewed, including a count such as 355 of 355, establishes processing coverage. A passing synthetic fixture does the same. Neither establishes that a selection is valid.
 
