@@ -205,9 +205,11 @@ def export_gate_relationships(relationships: Sequence[Mapping[str, Any]]) -> dic
     is listed under ``proposed`` and is not scored as either. ``disposition``
     is the reviewer disposition. ``downstream_eligible`` is copied only when
     the row stores a boolean, and the withholding flags are copied beside it.
-    ``withheld_reason_counts`` tallies flags and rules. It is not a partition.
-    ``withholding_cause_counts`` is one primary cause per withheld row, and
-    those counts sum to the withheld rows. ``inspect_flag_counts`` is separate.
+    ``withheld_reason_counts`` tallies withholding flags and rules. Inspect
+    flags such as ``shared_quote_inspect`` are not reasons, even on a withheld
+    row. ``withholding_cause_counts`` is one primary cause per withheld row,
+    and those counts sum to the withheld rows. ``inspect_flag_counts`` is
+    separate.
     All three are null when there is nothing to count. The input rows are not
     modified.
     """
@@ -252,7 +254,7 @@ def export_gate_relationships(relationships: Sequence[Mapping[str, Any]]) -> dic
         for outcome, names in counted:
             if outcome == "withheld":
                 for name in _WITHHELD_REASON_KEYS:
-                    if name in names:
+                    if name in names and name not in _INSPECT_FLAG_KEYS:
                         withheld_reason_counts[name] += 1
             for name in _INSPECT_FLAG_KEYS:
                 if name in names:

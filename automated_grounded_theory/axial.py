@@ -1969,6 +1969,7 @@ def _new_relationship(
         "claim_support": "undefined",
         "actor": "model",
         "reviewer_decided": False,
+        "reviewer_disposition": None,
         "model_rationale": None,
         "provenance": {"actor": "model", "stage": "axial", "model": model_name, "pair_band": band},
         "negative_cases": [],
@@ -2512,6 +2513,9 @@ def _apply_model_relations(
             row["proposal_paradigm_role"] = row.get("paradigm_role")
         reviewer_role = decision.get("paradigm_role")
         row["model_disposition"] = requested
+        # The evidence gate may later rewrite model_disposition. This is the
+        # reviewer's own decision and is not rewritten.
+        row["reviewer_disposition"] = requested
         row["model_paradigm_role"] = reviewer_role
         row["reviewer_paradigm_role"] = reviewer_role
         if not str(row.get("human_paradigm_role") or "").strip() and str(reviewer_role or "").strip():

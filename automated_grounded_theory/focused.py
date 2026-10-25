@@ -6019,7 +6019,15 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         warnings = list(updates.get("warnings") or warnings)
         return {**updates, "metadata": merged_meta, "prompt_log": logs, "warnings": warnings}
 
-    configured = int(reviewer.max_calls)
+    # The caller's allowance lives on the procedure. A later visit must not
+    # read the reviewer's already-raised max_calls as that configured value,
+    # or the raised flag disappears after the first chunk.
+    procedure = metadata.get("procedure") if isinstance(metadata.get("procedure"), Mapping) else {}
+    stored_calls = procedure.get("max_decision_calls")
+    if isinstance(stored_calls, int) and not isinstance(stored_calls, bool) and stored_calls >= 0:
+        configured = stored_calls
+    else:
+        configured = int(reviewer.max_calls)
     required = len(chunks)
     if (
         bool(getattr(runtime, "auto_size_decision_calls", False))

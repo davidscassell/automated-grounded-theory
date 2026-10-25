@@ -16,7 +16,7 @@ The rule is `unreviewed_endpoint_v1`.
 
 ## One withholding cause
 
-`withheld_reason_counts` still tallies flags and rule names. It is not a partition, and `shared_quote_inspect` can sit on an eligible row. `inspect_flag_counts` is that inspect tally.
+`withheld_reason_counts` tallies withholding flags and rule names. It does not tally inspect flags, and it is not a partition. `shared_quote_inspect` can sit on an eligible row. `inspect_flag_counts` is that inspect tally, including on eligible rows.
 
 `withholding_cause` is one primary cause on each withheld row. `withholding_cause_counts` counts those causes. The causes are `endpoint_unreviewed_by_focus`, `llm_reviewer_rejected`, `participant_denies_link`, `partial_endpoint_evidence`, `wording_withheld`, `insufficient_cases`, `omitted_oversized`, and `other_withheld` for a withheld row that matches none of the others. The counts sum to the number of withheld rows, including zeros for causes that did not occur. All three maps are null when the export has no rows. The rule is `primary_cause_v1`.
 
@@ -30,7 +30,7 @@ The rule is `unreviewed_endpoint_v1`.
 
 ## Reviewer variance
 
-The LLM reviewer is the deciding step for a row it sees. The row stores `reviewer_decided` true, `model_disposition`, and `model_rationale`. A row the reviewer did not decide keeps `reviewer_decided` false and a null rationale. Reviewer payloads dump object keys in sorted order so the request text does not depend on dict insertion order. Two runs on near-identical input can still differ, because the model is that deciding step. This package does not add a second paid judge. Temperature 0 does not remove that variance.
+The LLM reviewer is the deciding step for a row it sees. The row stores `reviewer_decided` true, `reviewer_disposition` (the reviewer's own choice), `model_disposition` (that choice after the evidence gate), and `model_rationale`. A row the reviewer did not decide keeps `reviewer_decided` false and a null rationale. Reviewer payloads dump object keys in sorted order so the request text does not depend on dict insertion order. Two runs on near-identical input can still differ, because the model is that deciding step. This package does not add a second paid judge. Temperature 0 does not remove that variance.
 
 ## Chunk allowance
 

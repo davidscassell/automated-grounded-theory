@@ -21,13 +21,17 @@ from automated_grounded_theory import (
     load_focused_export,
     selective_code,
 )
-from automated_grounded_theory.axial import AxialRelationDecision, AxialRelationDecisions
+from automated_grounded_theory.axial import (
+    AxialRelationDecision,
+    AxialRelationDecisions,
+    axial_attrition,
+)
 from automated_grounded_theory.decision_review import CHUNKING_CHECKPOINT_MESSAGE
 from automated_grounded_theory.records import POLICY_VERSION
 from automated_grounded_theory.version import __version__
 from tests.test_v080 import FakeAxialCoder, _corpus
 from tests.test_v0924 import _KeepSelector, _code, _focused_source, _rewrite_metadata
-from tests.test_v0926 import _both, _row
+from tests.test_v0926 import SENTENCE, _book, _both, _passages, _row
 
 _FIXTURE = Path(__file__).resolve().parents[0] / "fixtures" / "hypothetical_if_0927.json"
 
@@ -113,19 +117,37 @@ def test_export_round_trips_raised_ids_into_core_candidates(tmp_path):
     assert load_focused_export(tmp_path)["raised_code_ids"] == []
 
 
-def _eligible_row() -> dict:
-    return {
+def _tier_two_source(reviewed: list[str] | None) -> dict:
+    """A relationship whose quotes support tier 2. Not study data."""
+    passages = _passages(SENTENCE, ["r1", "r2"])
+    row = {
         "relationship_id": "rel-0003",
-        "from_id": "c-prep",
-        "to_id": "c-return",
-        "statement": "preparing to leave leads to returning to work",
+        "from_id": "tools",
+        "to_id": "crew",
+        "passage_id": "p1",
+        "quote": SENTENCE,
+        "statement": "tools for the shift may be related to coworkers on the crew",
         "disposition": "accepted",
-        "evidence_tier": 2,
-        "evidence_condition": "anchored",
-        "endpoint_anchoring": [{"anchored": True, "code_id": "c-prep"}, {"anchored": True, "code_id": "c-return"}],
         "flags": [],
-        "claims": {"pattern": {"present": True, "evidence_tier": 2}},
+        "evidence_condition": "anchored",
+        "paradigm_role": "unspecified",
+        "case_quotes": [_both("p1", SENTENCE), _both("p2", SENTENCE)],
     }
+    data = {
+        "codebook": _book(),
+        "passages": list(passages.values()),
+        "segments": [],
+        "relationships": [row],
+    }
+    if reviewed is not None:
+        data.update(
+            selection_withheld=True,
+            selection_status="provisional",
+            selection_review_complete=False,
+            selection_reviewed_code_ids=reviewed,
+            raised_code_ids=[],
+        )
+    return data
 
 
 def _axial(source):
@@ -141,33 +163,20 @@ def _axial(source):
 
 
 def test_unreviewed_endpoints_stay_exploratory():
-    withheld = _corpus()
-    withheld["selection_withheld"] = True
-    withheld["selection_status"] = "provisional"
-    withheld["selection_review_complete"] = False
-    withheld["selection_reviewed_code_ids"] = []
-    withheld["raised_code_ids"] = []
-    withheld["relationships"] = [_eligible_row()]
-    blocked = _axial(withheld)
+    blocked = _axial(_tier_two_source([]))
     row = blocked.relationships[0]
+    assert row["evidence_tier"] == 2
     assert row["evidence_use"] == "hypothesis_exploration"
     assert row["downstream_eligible"] is False
     assert row["eligibility_reason"] == "endpoint_unreviewed_by_focus"
     assert "endpoint_unreviewed_by_focus" in row["flags"]
 
-    reviewed = _corpus()
-    reviewed["selection_withheld"] = True
-    reviewed["selection_status"] = "provisional"
-    reviewed["selection_review_complete"] = False
-    reviewed["selection_reviewed_code_ids"] = ["c-prep", "c-return"]
-    reviewed["relationships"] = [_eligible_row()]
-    kept = _axial(reviewed)
+    kept = _axial(_tier_two_source(["tools", "crew"]))
+    assert kept.relationships[0]["evidence_tier"] == 2
     assert "endpoint_unreviewed_by_focus" not in (kept.relationships[0].get("flags") or [])
     assert kept.relationships[0]["downstream_eligible"] is True
 
-    direct = _corpus()
-    direct["relationships"] = [_eligible_row()]
-    plain = _axial(direct)
+    plain = _axial(_tier_two_source(None))
     assert "endpoint_unreviewed_by_focus" not in (plain.relationships[0].get("flags") or [])
     assert plain.relationships[0]["downstream_eligible"] is True
 
@@ -230,15 +239,18 @@ def test_withholding_causes_partition_the_withheld_rows():
 
 
 def test_grounded_endpoints_match_tier_two_rows():
-    source = _corpus()
-    source["relationships"] = []
+    rows = []
     for index in range(3):
-        row = _eligible_row()
-        row["relationship_id"] = f"rel-{index:04d}"
-        row["endpoint_anchoring"] = []
-        source["relationships"].append(row)
-    result = _axial(source)
-    attrition = result.metadata["attrition"]
+        rows.append(
+            {
+                "relationship_id": f"rel-{index:04d}",
+                "statement": "tools for the shift may be related to coworkers on the crew",
+                "evidence_tier": 2,
+                "disposition": "accepted",
+                "endpoint_anchoring": [],
+            }
+        )
+    attrition = axial_attrition({"relationships": rows, "metadata": {}})
     assert attrition["evidence_tiers"]["2"] == 3
     assert attrition["grounded_endpoints"] == 3
     assert attrition["endpoint_anchoring_complete"] == 0
@@ -246,6 +258,11 @@ def test_grounded_endpoints_match_tier_two_rows():
         count for key, count in attrition["evidence_tiers"].items() if int(key) >= 2
     )
     assert attrition["grounded_endpoints"] == tier_two_or_higher
+
+    exported = _axial(_tier_two_source(None))
+    live = exported.metadata["attrition"]
+    live_tiers = sum(count for key, count in live["evidence_tiers"].items() if int(key) >= 2)
+    assert live["grounded_endpoints"] == live_tiers == 1
 
 
 def test_if_inside_a_noun_or_an_aside_is_not_hypothetical():
@@ -262,22 +279,9 @@ def test_if_inside_a_noun_or_an_aside_is_not_hypothetical():
 
 
 def test_reviewer_decision_is_recorded_and_order_is_stable():
-    source = _corpus()
-    source["relationships"] = [
-        {
-            "relationship_id": "rel-0002",
-            "from_id": "c-prep",
-            "to_id": "c-return",
-            "statement": "Packing is a condition of returning.",
-            "quote": "Packing the suitcase took all night before the trip.",
-            "passage_id": "p1",
-            "evidence_tier": 2,
-            "disposition": "proposed",
-            "paradigm_role": "context",
-            "reviewer_decided": False,
-            "model_rationale": None,
-        }
-    ]
+    source = _tier_two_source(None)
+    source["relationships"][0]["relationship_id"] = "rel-0002"
+    source["relationships"][0]["disposition"] = "proposed"
     reviewed = axial_code(
         source,
         FakeAxialCoder(),
@@ -291,9 +295,11 @@ def test_reviewer_decision_is_recorded_and_order_is_stable():
     )
     row = reviewed.relationships[0]
     assert row["reviewer_decided"] is True
+    assert row["reviewer_disposition"] == "accepted"
     assert row["model_disposition"] == "accepted"
     assert row["model_rationale"]
     assert row["review_actor"] == "llm"
+    assert row["review_history"][-1]["disposition"] == "accepted"
 
     wide = _corpus()
     wide["relationships"] = [
@@ -369,7 +375,7 @@ def test_chunk_allowance_stops_before_sending_and_auto_size_is_opt_in(tmp_path):
         auto_size_decision_calls=True,
     )
     assert sized.metadata["decision_call_allowance_raised"] is True
-    assert sized.metadata["decision_stop"] != CHUNK_ALLOWANCE_INSUFFICIENT
+    assert sized.metadata.get("decision_stop") != CHUNK_ALLOWANCE_INSUFFICIENT
     assert sized.metadata["decision_reviews"]["focused_selection"]["chunks_sent"] >= 1
     assert sized.raised_code_ids == ["c-a", "c-c"]
 
