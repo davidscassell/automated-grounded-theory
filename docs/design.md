@@ -1,7 +1,7 @@
 # automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, 0.6.14, 0.6.15, and 0.6.16, focused coding in 0.7.0, fixes in 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, 0.7.6, 0.7.7, 0.7.8, and 0.7.9, axial coding and saturation indicators in 0.8.0, fixes in 0.8.1)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
-Status: this file is the open-coding design, beginning with steps 1 and 2 of the v0.6 plan. Focused coding is in 0.7.0 and the 0.7.1 through 0.7.9 fixes. Axial coding, saturation indicators, and selective coding are separate experimental graphs from 0.8.0. Within-corpus theoretical sampling and a saturation decision that leaves `judgment` null are in 0.9.0 and later. Package `policy_version` is `0.9.23`. The current index is [README.md](README.md). The 0.8 axial slice is [design-axial-0800.md](design-axial-0800.md). 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
+Status: this file is the open-coding design, beginning with steps 1 and 2 of the v0.6 plan. Focused coding is in 0.7.0 and the 0.7.1 through 0.7.9 fixes. Axial coding, saturation indicators, and selective coding are separate experimental graphs from 0.8.0. Within-corpus theoretical sampling and a saturation decision that leaves `judgment` null are in 0.9.0 and later. Package `policy_version` is `0.9.24`. The current index is [README.md](README.md). The 0.8 axial slice is [design-axial-0800.md](design-axial-0800.md). 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
 
 The default procedure is Charmaz-informed automated analysis: initial coding against a frozen snapshot, constant comparison with distinct operations, and `build_themes` as a descriptive reporting view. It is not an axial-coding template.
 
@@ -475,7 +475,11 @@ Package 0.9.22 keeps completed axial examinations separate from pairs that were 
 
 Package 0.9.23 keeps a proposal review from erasing a recovered discovery. Independent matching and `system_proposal` binding are separate, and the same proposal can serve both. Every gold item may stay unmatched. The assignment maximizes full-agreement recoveries, then structural matches, then canonical content order, and one full recovery beats any number of distorted matches. Claim reviews are bound to a run, a relationship, and a hash of the reviewed statement. A changed statement or a missing run binding is stale, not correct. The schema is `discovery-eval-3`. `discovery-eval-1` and `discovery-eval-2` files still verify under their old hashes, and an unbound claim judgment loads as stale or unjudged. An epistemic or existential-negation marker before a connector does not authorize tier 3. That rule is closed-pattern regression coverage, not general semantic accuracy. Matching is restricted to candidate-connected components. The axial planner still builds the full pair space in memory. That limit stays open. `pattern_min_cases` stays 2, the axial ceiling stays 24000, `batch_size` stays 1, and tier 4 stays human-only. The design is [design-review-fixes-0923.md](design-review-fixes-0923.md).
 
-`policy_version` is `0.9.23`.
+`policy_version` was `0.9.23`.
+
+Package 0.9.24 packs focused selection, axial relationship review, and selective core selection into requests that each fit the per-request budget. `batch_size` stays 1 and is not that pack size. One item that alone exceeds the budget is omitted and the review continues. A truncated selection is not complete. Models still cannot set verified or authorize attribution wording. A checkpoint from 0.9.23 cannot resume into a chunked review. The axial planner still builds the full pair space in memory. That limit stays open. `pattern_min_cases` stays 2, the axial ceiling stays 24000, `batch_size` stays 1, and tier 4 stays human-only. The design is [design-review-fixes-0924.md](design-review-fixes-0924.md).
+
+`policy_version` is `0.9.24`.
 
 ## 26. Out of scope
 

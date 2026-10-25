@@ -4,9 +4,9 @@
 
 `build_themes` is a descriptive grouping of the open codes for reporting. It does not reread the passages and it does not mint codes. Focused coding is not that report.
 
-## Current package (0.9.23)
+## Current package (0.9.24)
 
-`policy_version` is `0.9.23`. The default entry point is still `open_code`. The later graphs are called on their own. Axial coding, selective coding, and theoretical sampling are experimental. Focused coding is the reread between open coding and those graphs. No study adjudication ships with the package. The discovery file under `examples/` is synthetic example data only. Live evaluation runs through v31, on package 0.9.9, did not measure analytic accuracy. The 0.5.4 comparison stored under [Evaluate](#evaluate) is the last open-coding comparison this README records. It is not a result for 0.9.23. The index of design notes is [docs/README.md](docs/README.md).
+`policy_version` is `0.9.24`. The default entry point is still `open_code`. The later graphs are called on their own. Axial coding, selective coding, and theoretical sampling are experimental. Focused coding is the reread between open coding and those graphs. No study adjudication ships with the package. The discovery file under `examples/` is synthetic example data only. Live evaluation runs through v31, on package 0.9.9, did not measure analytic accuracy. The 0.5.4 comparison stored under [Evaluate](#evaluate) is the last open-coding comparison this README records. It is not a result for 0.9.23. The index of design notes is [docs/README.md](docs/README.md).
 
 An editable install is a valid source layout when `direct_url.json` or an editable finder names the imported checkout. A real version mismatch still raises `InstallationMismatch` before axial or selective work calls a model. `idle_timeout` is recorded and is not enforced. A returned timeout means this process stopped waiting. It does not prove the provider request stopped. A timed-out reread or reread repair stays in the expenditure count with unknown usage, so a later success does not make that spend look complete. Tier 3 requires a participant quote that states the from-to link. A keyword hit does not. An analyst interpretation stays a hypothesis component and does not block a supported pattern. Selective resume fingerprints relationships, memos, properties, and dimensions. Axial planning reserves a slot for later evidence classes and records examined pairs. Oversized rereads that are not sent share one graph visit. A mixed proposal batch is recovered from tool-call arguments and from a repair response. Reread expenditure stays null for a full rate when usage is missing. The 0.9.20 note is [docs/design-review-fixes-0920.md](docs/design-review-fixes-0920.md). The 0.9.21 note is [docs/design-review-fixes-0921.md](docs/design-review-fixes-0921.md). The 0.9.22 note is [docs/design-review-fixes-0922.md](docs/design-review-fixes-0922.md). The 0.9.23 note is [docs/design-review-fixes-0923.md](docs/design-review-fixes-0923.md). `pattern_min_cases` stays 2. The axial token ceiling stays 24000. A metric that was not computed stays null. Tier 4 stays a human `verify`.
 
@@ -142,6 +142,7 @@ graph TD;
 	select_candidates --> researcher_checkpoint;
 	export_focused --> __end__;
 	recode_followup -.-> recode_followup;
+	researcher_checkpoint -.-> researcher_checkpoint;
 	classDef default fill:#f2f0ff,line-height:1.2
 	classDef first fill-opacity:0
 	classDef last fill:#bfb6fc
@@ -230,12 +231,13 @@ graph TD;
 	load_focused --> plan_relations;
 	plan_relations --> propose_relations;
 	propose_relations -.-> relation_checkpoint;
-	relation_checkpoint --> counterexample_worker;
+	relation_checkpoint -.-> counterexample_worker;
 	saturation_checkpoint --> export_axial;
 	saturation_indicators --> saturation_checkpoint;
 	export_axial --> __end__;
 	counterexample_worker -.-> counterexample_worker;
 	propose_relations -.-> propose_relations;
+	relation_checkpoint -.-> relation_checkpoint;
 	classDef default fill:#f2f0ff,line-height:1.2
 	classDef first fill-opacity:0
 	classDef last fill:#bfb6fc
@@ -271,12 +273,13 @@ graph TD;
 	export_selective(export_selective)
 	__end__([<p>__end__</p>]):::last
 	__start__ --> load_category_development;
-	core_checkpoint --> draft_memos;
+	core_checkpoint -.-> draft_memos;
 	draft_memos -.-> draft_storyline;
 	draft_storyline -.-> export_selective;
 	load_category_development --> score_candidates;
 	score_candidates --> core_checkpoint;
 	export_selective --> __end__;
+	core_checkpoint -.-> core_checkpoint;
 	draft_memos -.-> draft_memos;
 	draft_storyline -.-> draft_storyline;
 	classDef default fill:#f2f0ff,line-height:1.2
@@ -344,7 +347,7 @@ The sampling ledger appends one round per run, including directions, new directi
 
 Each LLM decision records `review_actor` (`llm`), `review_model`, `review_rationale`, and appends `review_history`. A human `claim_support` label records `review_actor` `human` and appends that label to `review_history` without copying it into `model_claim_support`.
 
-Decision calls do not retry inside this package. `max_decision_calls` (default 8), `max_decision_tokens` (default 24000), and `decision_token_budget` (default 6000) are independent ceilings. The token allowance counts estimated input tokens. A request larger than `decision_token_budget` is not sent. Claim review packs against the minimum of `decision_token_budget` and the remaining token allowance. A batch that is only too big together is shrunk. One claim larger than the request budget stops as `decision_request_budget` (`decision_stop_detail` `single_claim_exceeds_request_budget`). One claim that fits a request but not what remains stops as `decision_token_allowance`. The reviewer receives the claim's passage and passages cited by negative cases, claim tests, and other citations, deduped, within an evidence-character budget. Passages that do not fit are `omitted_context`. When a ceiling, a request budget, an invalid decision, or a reviewer error stops the review, status is `incomplete`, `stop` is `decision_<reason>` (`decision_call_allowance`, `decision_token_allowance`, `decision_request_budget`, `decision_invalid_decision`, or `decision_review_error`), and `decision_pending_claim_ids` lists claim entry ids that were not reviewed.
+Decision calls do not retry inside this package. `max_decision_calls` (default 8), `max_decision_tokens` (default 24000), and `decision_token_budget` (default 6000) are independent ceilings. The token allowance counts estimated input tokens. Focused selection is packed so each request fits `decision_token_budget`. Axial relationship review and selective core selection are packed the same way against `axial_token_budget` (default 6000). `batch_size` is not that pack size. One code, relationship, or candidate that alone exceeds the per-request budget is omitted and the review continues. A truncated selection is not complete. Claim review packs against the minimum of `decision_token_budget` and the remaining token allowance. A claim request larger than `decision_token_budget` is not sent. A batch that is only too big together is shrunk. One claim larger than the request budget stops as `decision_request_budget` (`decision_stop_detail` `single_claim_exceeds_request_budget`). One claim that fits a request but not what remains stops as `decision_token_allowance`. The reviewer receives the claim's passage and passages cited by negative cases, claim tests, and other citations, deduped, within an evidence-character budget. Passages that do not fit are `omitted_context`. When a ceiling, a request budget, an invalid decision, or a reviewer error stops the review, status is `incomplete`, `stop` is `decision_<reason>` (`decision_call_allowance`, `decision_token_allowance`, `decision_request_budget`, `decision_invalid_decision`, or `decision_review_error`), and `decision_pending_claim_ids` lists claim entry ids that were not reviewed.
 
 An empty `raised_code_ids` list is a selection, not a missing one. It is stored as empty, and the reread is skipped. Resuming a paused run with a different `decision_mode` is a procedure change: pass `allow_changes=True` (or `continuation=True`). Corpus identity and `seed` are still not continuable. `decision_model` on a human run raises `ValueError`.
 

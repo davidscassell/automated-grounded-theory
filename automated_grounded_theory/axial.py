@@ -47,6 +47,18 @@ from automated_grounded_theory.backends import (
     record_model_determinism,
 )
 from automated_grounded_theory.batching import request_input_tokens, shrink_repair_messages
+from automated_grounded_theory.decision_review import (
+    DECISION_REVIEW_CHUNKING,
+    DecisionChunkingCheckpointError,
+    add_stop_reason,
+    build_decision_plan,
+    finish_decision_report,
+    load_chunk_progress,
+    merge_core_nominations,
+    note_chunk_send,
+    same_chunking_fingerprint,
+    store_decision_report,
+)
 from automated_grounded_theory.category_state import plan_relation_pairs, property_stability
 from automated_grounded_theory.focused import _rationale_indicates_irrelevance
 from automated_grounded_theory.retrieval import cosine
@@ -177,6 +189,7 @@ _PROCEDURE_KEYS = (
     "decision_mode",
     "source_hash",
     "max_axial_review_tokens",
+    "decision_review_chunking",
 )
 _LOCKED_KEYS = frozenset({"seed", "source_hash"})
 
@@ -4100,6 +4113,20 @@ def _proposals_continue(metadata: Mapping[str, Any], pending: Sequence[Any], use
     return bool(pending) and used < int(procedure.get("propose_calls") or 0)
 
 
+def _route_after_relations(state: AxialState) -> str:
+    progress = (state.get("metadata") or {}).get("decision_chunk_state") or {}
+    if isinstance(progress, Mapping) and progress.get("open") and progress.get("kind") == "axial_relation_review":
+        return "relation_checkpoint"
+    return "counterexample_worker"
+
+
+def _route_after_core(state: AxialState) -> str:
+    progress = (state.get("metadata") or {}).get("decision_chunk_state") or {}
+    if isinstance(progress, Mapping) and progress.get("open") and progress.get("kind") == "axial_core_review":
+        return "core_checkpoint"
+    return "draft_memos"
+
+
 def _route_proposals(state: AxialState) -> str:
     metadata = state.get("metadata") or {}
     if _proposals_continue(metadata, state.get("relation_round") or [], int(state.get("axial_calls_used") or 0)):
@@ -4523,6 +4550,203 @@ def _propose_node(runtime: AxialRuntime):
     return propose_relations
 
 
+_RELATION_REVIEW_KEYS = (
+    "relationship_id",
+    "from_id",
+    "to_id",
+    "paradigm_role",
+    "statement",
+    "quote",
+    "quote_from",
+    "quote_to",
+    "evidence_condition",
+    "endpoint_anchoring",
+    "quote_locations",
+    "quotes_share_passage",
+    "evidence_scope",
+    "evidence_tier",
+    "evidence_label",
+    "allowed_wording",
+    "cross_case",
+    "within_case_strength",
+    "supporting_cases",
+    "cooccurrence_2x2",
+    "cases_with_both_endpoints",
+    "negative_case_search_report",
+    "variation_search",
+    "rival_explanation_check",
+    "flags",
+    "disposition",
+)
+
+_RELATION_REVIEW_INSTRUCTION = (
+    "evidence_tier 0 is category evidence, not a relationship. "
+    "Tier 1 is a hypothesis: wording is 'may be related', never 'supported'. Do not accept it. "
+    "Accepting tier 2 records pattern_supported. Wording is 'co-occurs in N respondents', not 'leads to'. "
+    "An analyst interpretation stays tier 2. Its wording is 'analyst interprets X as related to Y', not 'participants attribute X to Y'. "
+    "Tier 3 is participant attribution. Only tier 3 or 4 may use causal wording. "
+    "You cannot set verified. disposition verified is refused. "
+    "A missing tier stays undefined. Do not treat it as verified or as supported. "
+    "Do not accept a row whose endpoint_anchoring shows only one anchored endpoint. "
+    "quote_locations says whether each quote is in the cited passage. "
+    "Do not say same passage unless quotes_share_passage is true. "
+    "cooccurrence_2x2 is descriptive only. "
+    "Return one decision for each relationship_id in this request. "
+    "Relationships absent from this request are not rejected; they are reviewed separately or omitted."
+)
+
+
+def _relation_public_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    item = {}
+    for key in _RELATION_REVIEW_KEYS:
+        if key in {"quote_locations", "flags"}:
+            item[key] = list(row.get(key) or [])
+        else:
+            item[key] = row.get(key)
+    return item
+
+
+def _relation_review_payload(rows: Sequence[Mapping[str, Any]], *, chunk_index: int, chunk_count: int) -> dict[str, Any]:
+    return {
+        "kind": "axial_relation_review",
+        "relationships": [_relation_public_row(row) for row in rows],
+        "review_chunk": {
+            "index": int(chunk_index),
+            "count": int(chunk_count),
+            "relationship_ids": [str(row.get("relationship_id") or "") for row in rows],
+        },
+        "instruction": _RELATION_REVIEW_INSTRUCTION,
+    }
+
+
+def _note_chunked_review(metadata: dict[str, Any], name: str, report: Mapping[str, Any], *, required: bool = True) -> None:
+    """A chunked review is complete only when every item was in a validated chunk."""
+    if report.get("complete"):
+        _note_stage(metadata, name, required=required, status="complete")
+        return
+    stops = [str(item) for item in (report.get("stop_reasons") or []) if str(item)]
+    reason = stops[0] if stops else ("request_budget" if int(report.get("items_omitted") or 0) else "review_error")
+    if reason in _BUDGET_STOPS or int(report.get("items_omitted") or 0):
+        _note_stage(metadata, name, required=required, status="budget_limited", reason=reason)
+        return
+    _note_stage(metadata, name, required=required, status="incomplete", reason=reason)
+
+
+async def _advance_relation_review(
+    runtime: AxialRuntime,
+    state: Mapping[str, Any],
+    *,
+    relationships: list[dict],
+    metadata: dict[str, Any],
+    logs: list,
+) -> dict:
+    """Send one relationship-review chunk. Further chunks return to this node.
+
+    Rows are packed in relationship-id order. One row that alone exceeds the
+    per-request budget is omitted and the review continues. Decisions from
+    validated chunks are applied together. A model still cannot verify a row
+    or authorize attribution wording; ``_apply_model_relations`` keeps those
+    limits. The stage is complete only when every row was reviewed.
+    """
+    reviewer = runtime.reviewer
+    by_id = {str(row.get("relationship_id") or ""): row for row in relationships if str(row.get("relationship_id") or "")}
+    ordered_ids = sorted(by_id)
+
+    def estimate(ids: Sequence[str]) -> int:
+        wanted = {str(item) for item in ids}
+        subset = [by_id[item] for item in ordered_ids if item in wanted]
+        payload = _relation_review_payload(subset, chunk_index=10**6, chunk_count=10**6)
+        return reviewer.refusal_reason(payload, AxialRelationDecisions, metadata)[1]
+
+    plan = build_decision_plan(
+        ordered_ids,
+        estimate,
+        kind="axial_relation_review",
+        per_request=int(reviewer.token_budget),
+        max_tokens=int(reviewer.max_tokens),
+        max_calls=int(reviewer.max_calls),
+        omit_reason="single_relationship_exceeds_request_budget",
+    )
+    progress = load_chunk_progress(metadata, plan)
+
+    def _apply(progress_row: dict) -> list[dict]:
+        decisions = [dict(item) for item in (progress_row.get("decisions") or []) if isinstance(item, Mapping)]
+        if not decisions:
+            return relationships
+        updated = _apply_model_relations(
+            relationships,
+            {"relationships": decisions},
+            {"model": describe_model(reviewer.model)},
+            passages=_by_passage(state),
+            codebook=state.get("codebook") if isinstance(state.get("codebook"), Mapping) else {},
+            segments=state.get("segments") or [],
+            memos=state.get("memos") or [],
+            pattern_min_cases=_pattern_minimum(metadata.get("procedure") or {}),
+        )
+        metadata["validated_decision"] = validated_relation_decision(updated, actor="llm")
+        return updated
+
+    def _close(progress_row: dict) -> dict:
+        progress_row["open"] = False
+        metadata["decision_chunk_state"] = progress_row
+        report = finish_decision_report(progress_row)
+        store_decision_report(metadata, report)
+        _note_chunked_review(metadata, "decision_review", report, required=True)
+        _sync_allowance(metadata, runtime)
+        updated = _apply(progress_row)
+        return {"relationships": updated, "metadata": metadata, "prompt_log": logs}
+
+    index = int(progress.get("next_index") or 0)
+    chunks = list(progress.get("chunks") or [])
+    if index >= len(chunks):
+        return _close(progress)
+    chunk_ids = [str(item) for item in chunks[index]]
+    subset = [by_id[item] for item in chunk_ids if item in by_id]
+    payload = _relation_review_payload(subset, chunk_index=index, chunk_count=len(chunks))
+    stop, _estimate = reviewer.refusal_reason(payload, AxialRelationDecisions, metadata)
+    if stop == "request_budget" and len(chunk_ids) == 1:
+        omissions = list(progress.get("omissions") or [])
+        omissions.append({"id": chunk_ids[0], "reason": "single_relationship_exceeds_request_budget"})
+        progress["omissions"] = omissions
+        progress["next_index"] = index + 1
+        metadata["decision_chunk_state"] = progress
+        if progress["next_index"] >= len(chunks):
+            return _close(progress)
+        progress["open"] = True
+        return {"relationships": relationships, "metadata": metadata, "prompt_log": logs}
+    parsed, audit = await reviewer.decide(payload, AxialRelationDecisions, metadata)
+    if audit:
+        logs.append(audit)
+        _record_audit_usage(metadata, audit)
+    if stop or parsed is None:
+        reason = stop or str(metadata.get("decision_stop") or "review_error")
+        add_stop_reason(progress, reason)
+        if parsed is None and audit and str(audit.get("status") or "") not in {"omitted", "refused", "not_sent"}:
+            note_chunk_send(progress, audit, estimate=int((audit or {}).get("estimated_input_tokens") or 0))
+        progress["next_index"] = len(chunks)
+        return _close(progress)
+    note_chunk_send(progress, audit, estimate=int((audit or {}).get("estimated_input_tokens") or 0))
+    returned = list(parsed.get("relationships") or [])
+    got = [str(item.get("relationship_id") or "") for item in returned if isinstance(item, Mapping)]
+    if len(got) != len(set(got)) or set(got) != set(chunk_ids):
+        add_stop_reason(progress, "invalid_decision")
+        progress["invalid_chunks"] = int(progress.get("invalid_chunks") or 0) + 1
+        metadata["decision_stop"] = "invalid_decision"
+        progress["next_index"] = len(chunks)
+        return _close(progress)
+    progress["decisions"] = list(progress.get("decisions") or []) + [dict(item) for item in returned]
+    progress["reviewed_ids"] = list(progress.get("reviewed_ids") or []) + chunk_ids
+    progress["chunks_validated"] = int(progress.get("chunks_validated") or 0) + 1
+    metadata.pop("decision_stop", None)
+    progress["next_index"] = index + 1
+    metadata["decision_chunk_state"] = progress
+    if progress["next_index"] >= len(chunks):
+        return _close(progress)
+    progress["open"] = True
+    metadata["decision_chunk_state"] = progress
+    return {"relationships": relationships, "metadata": metadata, "prompt_log": logs}
+
+
 def _relation_checkpoint(runtime: AxialRuntime):
     async def relation_checkpoint(state: AxialState) -> dict:
         relationships = [dict(row) for row in (state.get("relationships") or [])]
@@ -4535,72 +4759,13 @@ def _relation_checkpoint(runtime: AxialRuntime):
                 metadata["decision_stop"] = "call_allowance"
                 _note_stage(metadata, "decision_review", required=False, status="skipped", reason="call_allowance")
                 return {"relationships": relationships, "metadata": metadata, "prompt_log": logs}
-            payload = {
-                "kind": "axial_relation_review",
-                "relationships": [
-                    {
-                        "relationship_id": row.get("relationship_id"),
-                        "from_id": row.get("from_id"),
-                        "to_id": row.get("to_id"),
-                        "paradigm_role": row.get("paradigm_role"),
-                        "statement": row.get("statement"),
-                        "quote": row.get("quote"),
-                        "quote_from": row.get("quote_from"),
-                        "quote_to": row.get("quote_to"),
-                        "evidence_condition": row.get("evidence_condition"),
-                        "endpoint_anchoring": row.get("endpoint_anchoring"),
-                        "quote_locations": list(row.get("quote_locations") or []),
-                        "quotes_share_passage": row.get("quotes_share_passage"),
-                        "evidence_scope": row.get("evidence_scope"),
-                        "evidence_tier": row.get("evidence_tier"),
-                        "evidence_label": row.get("evidence_label"),
-                        "allowed_wording": row.get("allowed_wording"),
-                        "cross_case": row.get("cross_case"),
-                        "within_case_strength": row.get("within_case_strength"),
-                        "supporting_cases": row.get("supporting_cases"),
-                        "cooccurrence_2x2": row.get("cooccurrence_2x2"),
-                        "cases_with_both_endpoints": row.get("cases_with_both_endpoints"),
-                        "negative_case_search_report": row.get("negative_case_search_report"),
-                        "variation_search": row.get("variation_search"),
-                        "rival_explanation_check": row.get("rival_explanation_check"),
-                        "flags": list(row.get("flags") or []),
-                        "disposition": row.get("disposition"),
-                    }
-                    for row in relationships
-                ],
-                "instruction": (
-                    "evidence_tier 0 is category evidence, not a relationship. "
-                    "Tier 1 is a hypothesis: wording is 'may be related', never 'supported'. Do not accept it. "
-                    "Accepting tier 2 records pattern_supported. Wording is 'co-occurs in N respondents', not 'leads to'. "
-                    "An analyst interpretation stays tier 2. Its wording is 'analyst interprets X as related to Y', not 'participants attribute X to Y'. "
-                    "Tier 3 is participant attribution. Only tier 3 or 4 may use causal wording. "
-                    "You cannot set verified. disposition verified is refused. "
-                    "A missing tier stays undefined. Do not treat it as verified or as supported. "
-                    "Do not accept a row whose endpoint_anchoring shows only one anchored endpoint. "
-                    "quote_locations says whether each quote is in the cited passage. "
-                    "Do not say same passage unless quotes_share_passage is true. "
-                    "cooccurrence_2x2 is descriptive only."
-                ),
-            }
-            parsed, audit = await runtime.reviewer.decide(payload, AxialRelationDecisions, metadata)
-            if audit:
-                logs.append(audit)
-                _record_audit_usage(metadata, audit)
-            _note_review_outcome(metadata, audit=audit, parsed=parsed)
-            _sync_allowance(metadata, runtime)
-            if parsed:
-                relationships = _apply_model_relations(
-                    relationships,
-                    parsed,
-                    audit or {},
-                    passages=_by_passage(state),
-                    codebook=state.get("codebook") if isinstance(state.get("codebook"), Mapping) else {},
-                    segments=state.get("segments") or [],
-                    memos=state.get("memos") or [],
-                    pattern_min_cases=_pattern_minimum(metadata.get("procedure") or {}),
-                )
-                metadata["validated_decision"] = validated_relation_decision(relationships, actor="llm")
-            return {"relationships": relationships, "metadata": metadata, "prompt_log": logs}
+            return await _advance_relation_review(
+                runtime,
+                state,
+                relationships=relationships,
+                metadata=metadata,
+                logs=logs,
+            )
         _note_stage(metadata, "decision_review", required=False, status="skipped")
         if not state.get("interrupt_enabled", True):
             return {"relationships": relationships}
@@ -5318,7 +5483,11 @@ def build_axial_graph(runtime: AxialRuntime | None = None, *, output_dir: str | 
         _route_proposals,
         ["propose_relations", "relation_checkpoint"],
     )
-    builder.add_edge("relation_checkpoint", "counterexample_worker")
+    builder.add_conditional_edges(
+        "relation_checkpoint",
+        _route_after_relations,
+        ["relation_checkpoint", "counterexample_worker"],
+    )
     builder.add_conditional_edges(
         "counterexample_worker",
         _route_counterexamples,
@@ -5357,6 +5526,204 @@ def _load_category(state: AxialState) -> dict:
     return {"core_candidates": _score_candidates(state)}
 
 
+_CORE_REVIEW_INSTRUCTION = (
+    "The numbers on each candidate are the evidence. "
+    "graph_supported is true only for an endpoint of a relationship at tier 2 or higher. "
+    "pattern_supported_centrality, cases_covered, related_category_count, "
+    "contradicted_relationships, and qualified_relationships are counts, not a decision. "
+    "A proposed link or a tier-1 hypothesis does not make a core supported. "
+    "A choice without graph support is kept as model_core_id and flagged "
+    "core_unsupported_by_graph. It is not promoted. "
+    "core_stability is undefined below the recorded minimum n. "
+    "Choose one code_id from this request. "
+    "The final core is merged across requests by evidence tier, not by which request came first. "
+    "You cannot set verified or authorize attribution wording."
+)
+
+
+def _core_review_payload(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    preferred: Sequence[str],
+    snapshot: Mapping[str, Any],
+    chunk_index: int,
+    chunk_count: int,
+) -> dict[str, Any]:
+    present = {str(row.get("code_id") or "") for row in candidates}
+    return {
+        "kind": "axial_core_review",
+        "candidates": [dict(row) for row in candidates],
+        "relationship_preferred_core_ids": [item for item in preferred if item in present],
+        "graph_snapshot": dict(snapshot),
+        "review_chunk": {
+            "index": int(chunk_index),
+            "count": int(chunk_count),
+            "code_ids": [str(row.get("code_id") or "") for row in candidates],
+        },
+        "instruction": _CORE_REVIEW_INSTRUCTION,
+    }
+
+
+async def _advance_core_review(
+    runtime: AxialRuntime,
+    state: Mapping[str, Any],
+    *,
+    candidates: list[dict],
+    metadata: dict[str, Any],
+    logs: list,
+) -> dict:
+    """Send one core-selection chunk. Further chunks return to this node.
+
+    Candidate order is the evidence order from ``_score_candidates``. A
+    candidate that alone exceeds the per-request budget is omitted. Nominations
+    are merged by evidence tier: a graph-supported nomination beats one that
+    is not. The selection is complete only when every candidate was reviewed.
+    """
+    reviewer = runtime.reviewer
+    preferred = [str(row.get("code_id") or "") for row in candidates if row.get("graph_supported")]
+    metadata["relationship_preferred_core_ids"] = preferred
+    snapshot = graph_snapshot(state.get("relationships") or [])
+    metadata["graph_snapshots"] = {
+        **dict(metadata.get("graph_snapshots") or {}),
+        "selective_core": snapshot,
+    }
+    by_id = {str(row.get("code_id") or ""): row for row in candidates if str(row.get("code_id") or "")}
+    ordered_ids = [str(row.get("code_id") or "") for row in candidates if str(row.get("code_id") or "")]
+
+    def estimate(ids: Sequence[str]) -> int:
+        wanted = [str(item) for item in ids]
+        subset = [by_id[item] for item in wanted if item in by_id]
+        payload = _core_review_payload(
+            subset,
+            preferred=preferred,
+            snapshot=snapshot,
+            chunk_index=10**6,
+            chunk_count=10**6,
+        )
+        return reviewer.refusal_reason(payload, ModelCoreDecision, metadata)[1]
+
+    plan = build_decision_plan(
+        ordered_ids,
+        estimate,
+        kind="axial_core_review",
+        per_request=int(reviewer.token_budget),
+        max_tokens=int(reviewer.max_tokens),
+        max_calls=int(reviewer.max_calls),
+        omit_reason="single_candidate_exceeds_request_budget",
+    )
+    progress = load_chunk_progress(metadata, plan)
+
+    def _finish_choice(progress_row: dict, warnings: list[str]) -> dict:
+        progress_row["open"] = False
+        metadata["decision_chunk_state"] = progress_row
+        report = finish_decision_report(progress_row)
+        store_decision_report(metadata, report)
+        metadata["core_selection_complete"] = bool(report["complete"])
+        _note_chunked_review(metadata, "decision_review", report, required=True)
+        _note_chunked_review(metadata, "selective_core", report, required=True)
+        _sync_allowance(metadata, runtime)
+        metadata["researcher_core_id"] = ""
+        unknown = str(progress_row.get("unknown_nomination") or "")
+        nominations = [str(item) for item in (progress_row.get("nominations") or []) if str(item)]
+        if unknown:
+            metadata["model_core_id"] = unknown
+            metadata["model_core_rationale"] = str(progress_row.get("rationale") or "")
+            metadata["model_core_judgment"] = True
+            metadata["model_core_unknown"] = True
+            metadata["core_unsupported_by_graph"] = True
+            metadata["core_graph_support"] = "core_unsupported_by_graph"
+            warnings.append(f"Model core id {unknown!r} is not a candidate. It was kept and flagged.")
+            if not report["complete"]:
+                metadata["core_selection_truncated"] = True
+            return {
+                "core_candidates": candidates,
+                "metadata": metadata,
+                "prompt_log": logs,
+                "warnings": warnings,
+            }
+        merged = merge_core_nominations(candidates, nominations)
+        chosen = str(merged.get("core_id") or "")
+        if chosen:
+            metadata["model_core_id"] = chosen
+            metadata["model_core_rationale"] = str(progress_row.get("rationale") or "Merged from core-review chunks by evidence tier.")
+            metadata["model_core_judgment"] = True
+            _note_core_support(state, metadata, chosen)
+            if metadata.get("core_unsupported_by_graph") and preferred and chosen not in preferred:
+                metadata["relationship_preferred_core_id"] = preferred[0]
+                metadata["core_chooser_preference"] = "graph_supported"
+            for row in candidates:
+                row["model_core"] = row.get("code_id") == chosen
+                if row.get("code_id") == chosen and metadata.get("core_unsupported_by_graph"):
+                    row["core_unsupported_by_graph"] = True
+        if not report["complete"]:
+            metadata["core_selection_truncated"] = True
+        return {"core_candidates": candidates, "metadata": metadata, "prompt_log": logs, "warnings": warnings}
+
+    index = int(progress.get("next_index") or 0)
+    chunks = list(progress.get("chunks") or [])
+    warnings = list(state.get("warnings") or [])
+    if index >= len(chunks):
+        return _finish_choice(progress, warnings)
+    chunk_ids = [str(item) for item in chunks[index]]
+    subset = [by_id[item] for item in chunk_ids if item in by_id]
+    only_full_chunk = len(chunks) == 1 and not progress.get("omissions")
+    payload = _core_review_payload(
+        subset,
+        preferred=preferred,
+        snapshot=snapshot,
+        chunk_index=index,
+        chunk_count=len(chunks),
+    )
+    stop, _estimate = reviewer.refusal_reason(payload, ModelCoreDecision, metadata)
+    if stop == "request_budget" and len(chunk_ids) == 1:
+        omissions = list(progress.get("omissions") or [])
+        omissions.append({"id": chunk_ids[0], "reason": "single_candidate_exceeds_request_budget"})
+        progress["omissions"] = omissions
+        progress["next_index"] = index + 1
+        metadata["decision_chunk_state"] = progress
+        if progress["next_index"] >= len(chunks):
+            return _finish_choice(progress, warnings)
+        progress["open"] = True
+        return {"core_candidates": candidates, "metadata": metadata, "prompt_log": logs, "warnings": warnings}
+    parsed, audit = await reviewer.decide(payload, ModelCoreDecision, metadata)
+    if audit:
+        logs.append(audit)
+        _record_audit_usage(metadata, audit)
+    if stop or parsed is None:
+        reason = stop or str(metadata.get("decision_stop") or "review_error")
+        add_stop_reason(progress, reason)
+        if parsed is None and audit and str(audit.get("status") or "") not in {"omitted", "refused", "not_sent"}:
+            note_chunk_send(progress, audit, estimate=int((audit or {}).get("estimated_input_tokens") or 0))
+        progress["next_index"] = len(chunks)
+        return _finish_choice(progress, warnings)
+    note_chunk_send(progress, audit, estimate=int((audit or {}).get("estimated_input_tokens") or 0))
+    chosen = str(parsed.get("core_id") or "")
+    progress["rationale"] = str(parsed.get("rationale") or progress.get("rationale") or "")
+    if chosen in set(chunk_ids):
+        progress["nominations"] = list(progress.get("nominations") or []) + [chosen]
+        progress["reviewed_ids"] = list(progress.get("reviewed_ids") or []) + chunk_ids
+        progress["chunks_validated"] = int(progress.get("chunks_validated") or 0) + 1
+        metadata.pop("decision_stop", None)
+    elif only_full_chunk:
+        progress["unknown_nomination"] = chosen
+        progress["reviewed_ids"] = list(progress.get("reviewed_ids") or []) + chunk_ids
+        progress["chunks_validated"] = int(progress.get("chunks_validated") or 0) + 1
+        metadata.pop("decision_stop", None)
+    else:
+        add_stop_reason(progress, "invalid_decision")
+        progress["invalid_chunks"] = int(progress.get("invalid_chunks") or 0) + 1
+        metadata["decision_stop"] = "invalid_decision"
+        progress["next_index"] = len(chunks)
+        return _finish_choice(progress, warnings)
+    progress["next_index"] = index + 1
+    metadata["decision_chunk_state"] = progress
+    if progress["next_index"] >= len(chunks):
+        return _finish_choice(progress, warnings)
+    progress["open"] = True
+    metadata["decision_chunk_state"] = progress
+    return {"core_candidates": candidates, "metadata": metadata, "prompt_log": logs, "warnings": warnings}
+
+
 def _core_checkpoint(runtime: AxialRuntime):
     async def core_checkpoint(state: AxialState) -> dict:
         candidates = list(state.get("core_candidates") or _score_candidates(state))
@@ -5370,73 +5737,7 @@ def _core_checkpoint(runtime: AxialRuntime):
                 _note_stage(metadata, "decision_review", required=False, status="skipped", reason="call_allowance")
                 _note_stage(metadata, "selective_core", required=False, status="skipped", reason="call_allowance")
                 return {"core_candidates": candidates, "metadata": metadata, "prompt_log": logs}
-            preferred = [str(row.get("code_id") or "") for row in candidates if row.get("graph_supported")]
-            metadata["relationship_preferred_core_ids"] = preferred
-            metadata["graph_snapshots"] = {
-                **dict(metadata.get("graph_snapshots") or {}),
-                "selective_core": graph_snapshot(state.get("relationships") or []),
-            }
-            parsed, audit = await runtime.reviewer.decide(
-                {
-                    "kind": "axial_core_review",
-                    "candidates": candidates,
-                    "relationship_preferred_core_ids": preferred,
-                    "graph_snapshot": metadata["graph_snapshots"]["selective_core"],
-                    "instruction": (
-                        "The numbers on each candidate are the evidence. "
-                        "graph_supported is true only for an endpoint of a relationship at tier 2 or higher. "
-                        "pattern_supported_centrality, cases_covered, related_category_count, "
-                        "contradicted_relationships, and qualified_relationships are counts, not a decision. "
-                        "A proposed link or a tier-1 hypothesis does not make a core supported. "
-                        "A choice without graph support is kept as model_core_id and flagged "
-                        "core_unsupported_by_graph. It is not promoted. "
-                        "core_stability is undefined below the recorded minimum n."
-                    ),
-                },
-                ModelCoreDecision,
-                metadata,
-            )
-            if audit:
-                logs.append(audit)
-                _record_audit_usage(metadata, audit)
-            _note_review_outcome(metadata, audit=audit, parsed=parsed)
-            _sync_allowance(metadata, runtime)
-            review = (metadata.get("stage_outcomes") or {}).get("decision_review") or {}
-            _note_stage(
-                metadata,
-                "selective_core",
-                required=bool(review.get("required")),
-                status=str(review.get("status") or "incomplete"),
-                reason=str(review.get("reason") or ""),
-            )
-            if parsed:
-                known = {str(row.get("code_id") or "") for row in candidates}
-                chosen = str(parsed.get("core_id") or "")
-                metadata["model_core_id"] = chosen
-                metadata["model_core_rationale"] = parsed.get("rationale")
-                metadata["model_core_judgment"] = True
-                _note_core_support(state, metadata, chosen)
-                if metadata.get("core_unsupported_by_graph") and preferred and chosen not in preferred:
-                    metadata["relationship_preferred_core_id"] = preferred[0]
-                    metadata["core_chooser_preference"] = "graph_supported"
-                if chosen not in known:
-                    warnings = list(state.get("warnings") or [])
-                    warnings.append(f"Model core id {chosen!r} is not a candidate. It was kept and flagged.")
-                    metadata["model_core_unknown"] = True
-                    metadata["core_unsupported_by_graph"] = True
-                    metadata["core_graph_support"] = "core_unsupported_by_graph"
-                    return {
-                        "core_candidates": candidates,
-                        "metadata": metadata,
-                        "prompt_log": logs,
-                        "warnings": warnings,
-                    }
-                for row in candidates:
-                    row["model_core"] = row.get("code_id") == chosen
-                    if row.get("code_id") == chosen and metadata.get("core_unsupported_by_graph"):
-                        row["core_unsupported_by_graph"] = True
-            metadata["researcher_core_id"] = ""
-            return {"core_candidates": candidates, "metadata": metadata, "prompt_log": logs}
+            return await _advance_core_review(runtime, state, candidates=candidates, metadata=metadata, logs=logs)
         _note_stage(metadata, "decision_review", required=False, status="skipped")
         _note_stage(metadata, "selective_core", required=False, status="skipped")
         if not state.get("interrupt_enabled", True):
@@ -6371,7 +6672,11 @@ def build_selective_graph(runtime: AxialRuntime | None = None, *, output_dir: st
     builder.add_edge(START, "load_category_development")
     builder.add_edge("load_category_development", "score_candidates")
     builder.add_edge("score_candidates", "core_checkpoint")
-    builder.add_edge("core_checkpoint", "draft_memos")
+    builder.add_conditional_edges(
+        "core_checkpoint",
+        _route_after_core,
+        ["core_checkpoint", "draft_memos"],
+    )
     builder.add_conditional_edges(
         "draft_memos",
         _route_memos,
@@ -6549,6 +6854,8 @@ async def _record_timeout(graph, config, exc: BaseException, output_dir: str | P
 
 
 def _check_resume(saved: Mapping[str, Any], current: Mapping[str, Any], *, allow_changes: bool) -> None:
+    if not same_chunking_fingerprint(saved, current):
+        raise DecisionChunkingCheckpointError()
     differences = []
     for key in _PROCEDURE_KEYS:
         if saved.get(key) != current.get(key):
@@ -6602,7 +6909,7 @@ def _restore_runtime_budget(runtime: AxialRuntime, metadata: Mapping[str, Any]) 
 _GRAPH_NODE_OVERHEAD = 24
 
 
-def _derived_recursion_limit(procedure: Mapping[str, Any], *, override: int | None = None) -> int:
+def _derived_recursion_limit(procedure: Mapping[str, Any], *, override: int | None = None, decision_calls: int = 0) -> int:
     """Steps for this graph.
 
     Each proposal request returns from the node, and so does a window that is
@@ -6620,7 +6927,9 @@ def _derived_recursion_limit(procedure: Mapping[str, Any], *, override: int | No
     # Each paid call returns so it can be checkpointed, and a schema repair
     # is a second return. Proposal requests were already counted once.
     paid = counter + memo_calls + storyline_calls
-    return propose + pairs + paid + (propose + paid) + _GRAPH_NODE_OVERHEAD
+    # One graph visit per decision-review chunk. The call ceiling is the most
+    # chunks this run can send.
+    return propose + pairs + paid + (propose + paid) + max(0, int(decision_calls)) + _GRAPH_NODE_OVERHEAD
 
 
 def _mark_recursion_limit(state: dict, *, limit: int, exc: BaseException) -> dict:
@@ -6648,9 +6957,9 @@ def _mark_recursion_limit(state: dict, *, limit: int, exc: BaseException) -> dic
     return state
 
 
-async def _invoke(builder, saver, initial: AxialState | None, *, thread_id: str, resume: Any, resuming: bool, output_dir, raise_on_timeout: bool, allow_changes: bool, procedure: Mapping[str, Any], runtime: AxialRuntime | None = None, recursion_limit: int | None = None, durability: str = "async", legacy_source_hash: str = "", legacy_evidence_hash: str = "", legacy_evidence_message: str = "") -> AxialResult:
+async def _invoke(builder, saver, initial: AxialState | None, *, thread_id: str, resume: Any, resuming: bool, output_dir, raise_on_timeout: bool, allow_changes: bool, procedure: Mapping[str, Any], runtime: AxialRuntime | None = None, recursion_limit: int | None = None, durability: str = "async", legacy_source_hash: str = "", legacy_evidence_hash: str = "", legacy_evidence_message: str = "", decision_calls: int = 0) -> AxialResult:
     graph = builder.compile(checkpointer=saver)
-    limit = _derived_recursion_limit(procedure, override=recursion_limit)
+    limit = _derived_recursion_limit(procedure, override=recursion_limit, decision_calls=decision_calls)
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": limit}
     snapshot = await graph.aget_state(config)
     has_state = bool(getattr(snapshot, "values", None))
@@ -6799,6 +7108,7 @@ def _procedure_from_kwargs(data: Mapping[str, Any], **kwargs: Any) -> dict[str, 
         "pattern_min_cases_note": (
             "A design choice for this package. It is not a quotation from the method literature."
         ),
+        "decision_review_chunking": DECISION_REVIEW_CHUNKING,
         "negative_case_search": bool(kwargs.get("negative_case_search", True)),
         "core_stability_min_n": max(2, int(kwargs.get("core_stability_min_n", CORE_STABILITY_MIN_N) or CORE_STABILITY_MIN_N)),
         "core_stability_min_n_note": (
@@ -6851,7 +7161,8 @@ class AxialDecisionReviewer:
             HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
         ]
 
-    async def decide(self, payload, schema, metadata):
+    def refusal_reason(self, payload, schema, metadata) -> tuple[str | None, int]:
+        """Why this payload would not be sent, and its estimate. Does not record the stop."""
         calls = int(metadata.get("decision_calls_used", 0))
         tokens = int(metadata.get("axial_tokens_estimated") or metadata.get("decision_tokens_used") or 0)
         estimate = request_input_tokens(self.messages(payload), schema)
@@ -6869,6 +7180,10 @@ class AxialDecisionReviewer:
         )
         if stop is None and estimate > self.token_budget:
             stop = "request_budget"
+        return stop, estimate
+
+    async def decide(self, payload, schema, metadata):
+        stop, estimate = self.refusal_reason(payload, schema, metadata)
         messages = self.messages(payload)
         checkpoint = str(payload.get("kind") or "")
         audit = {
@@ -6885,6 +7200,9 @@ class AxialDecisionReviewer:
             metadata["decision_stop"] = stop
             audit.update(status="omitted", reason=stop, needs_review=True, flagged=True)
             return None, audit
+        calls = int(metadata.get("decision_calls_used", 0))
+        tokens = int(metadata.get("axial_tokens_estimated") or metadata.get("decision_tokens_used") or 0)
+        shared = getattr(self.limiter, "provider_allowance", None)
         metadata["decision_calls_used"] = calls + 1
         try:
             response = await self.limiter.ainvoke(
@@ -7108,7 +7426,11 @@ async def aaxial_code(
             "axial_request_timeout": axial_request_timeout,
             "axial_evidence_limit": axial_evidence_limit,
             "axial_token_budget": int(axial_token_budget),
-            "recursion_limit": _derived_recursion_limit(procedure, override=recursion_limit),
+            "recursion_limit": _derived_recursion_limit(
+                procedure,
+                override=recursion_limit,
+                decision_calls=int(max_decision_calls) if decision_mode == "llm" else 0,
+            ),
         },
         "comparison_runs": list(comparison_runs or []),
         "output_dir": str(output_dir) if output_dir else "",
@@ -7191,6 +7513,7 @@ async def aaxial_code(
             recursion_limit=recursion_limit,
             durability=mode,
             legacy_source_hash=_source_hash(data),
+            decision_calls=int(max_decision_calls) if decision_mode == "llm" else 0,
         )
         if also_selective and not result.interrupted and result.metadata.get("stop") != "timeout":
             return await aselective_code(
@@ -7312,6 +7635,7 @@ async def aselective_code(
         "core_stability_min_n_note": (
             "A design choice for this package. It is not a quotation from the method literature."
         ),
+        "decision_review_chunking": DECISION_REVIEW_CHUNKING,
     }
     metadata = dict(upstream)
     if upstream.get("stage") == "axial" or data.get("saturation") or upstream.get("model_saturation"):
@@ -7325,7 +7649,11 @@ async def aselective_code(
         "batch_size": batch_size,
         "axial_request_timeout": axial_request_timeout,
         "axial_token_budget": int(axial_token_budget),
-        "recursion_limit": _derived_recursion_limit(procedure, override=recursion_limit),
+        "recursion_limit": _derived_recursion_limit(
+            procedure,
+            override=recursion_limit,
+            decision_calls=int(max_decision_calls) if decision_mode == "llm" else 0,
+        ),
     }
     metadata["output_dir"] = str(output_dir) if output_dir else str(metadata.get("output_dir") or "")
     metadata["decision_mode"] = decision_mode
@@ -7396,6 +7724,7 @@ async def aselective_code(
             legacy_source_hash=_source_hash(data),
             legacy_evidence_hash=_evidence_source_hash(data),
             legacy_evidence_message=_SELECTIVE_LEGACY_FINGERPRINT,
+            decision_calls=int(max_decision_calls) if decision_mode == "llm" else 0,
         )
 
     if checkpoint_path is None:
