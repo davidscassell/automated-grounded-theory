@@ -50,7 +50,7 @@ class ClaimDecisions(BaseModel):
 
 # Locked on the focused and axial procedure manifests. A checkpoint saved
 # before this value existed cannot resume into a chunked review.
-DECISION_REVIEW_CHUNKING = "request_budget_v4"
+DECISION_REVIEW_CHUNKING = "request_budget_v5"
 INCOMPLETE_REVIEW_APPLICATION = "withhold_incomplete_v1"
 ELIGIBILITY_RULE = "row_gates_components_v1"
 LINK_DENIAL_RULE = "frequency_before_rejection_v1"
@@ -61,14 +61,31 @@ OVERSIZED_RECOVERY = "compact_then_human_v1"
 # A withheld or provisional focused selection does not make an unreviewed
 # endpoint downstream eligible. The relationship stays exploratory.
 FOCUS_ENDPOINT_RULE = "unreviewed_endpoint_v1"
-# One primary cause per withheld relationship. The counts partition the rows.
-WITHHOLDING_CAUSE_RULE = "primary_cause_v1"
-# ``if`` is hypothetical only when it governs the from-to link.
-CONDITIONAL_SCOPE_RULE = "link_governing_if_v1"
+# Overlapping diagnostic reasons, plus one documented primary cause.
+WITHHOLDING_CAUSE_RULE = "overlapping_reasons_v1"
+# A discourse aside does not govern the from-to link. A real conditional does.
+CONDITIONAL_SCOPE_RULE = "discourse_aside_v1"
 # A focused selection whose chunk count exceeds the call allowance stops
 # before the first request. The allowance is not raised unless asked.
 CHUNK_ALLOWANCE_RULE = "stop_before_send_v1"
 CHUNK_ALLOWANCE_INSUFFICIENT = "chunk_allowance_insufficient"
+# Identical statements for one directed pair are one assertion.
+DUPLICATE_ASSERTION_RULE = "merge_identical_statement_v1"
+# Decision-call ceilings are shared by named steps. Each step records its own use.
+BUDGET_LEDGER_RULE = "shared_review_ledger_v1"
+# Gate export and run export read one relationship assessment.
+EXPORT_ASSESSMENT_RULE = "shared_assessment_v1"
+SHARED_DECISION_REVIEW = "shared_decision_review"
+FOCUSED_DECISION_REVIEW = "focused_decision_review"
+SHARED_REVIEW_STEPS = (
+    "axial_relation_review",
+    "axial_saturation_review",
+    "axial_core_review",
+)
+FOCUSED_REVIEW_STEPS = (
+    "focused_selection",
+    "focused_claim_review",
+)
 # Off unless the caller sets it. It is a decision, not an analytic default.
 AUTO_SIZE_DECISION_CALLS = False
 # Compaction shortens evidence before a code is omitted. Level 1 keeps one
@@ -81,9 +98,11 @@ CHUNKING_CHECKPOINT_MESSAGE = (
     "decision-review requests were chunked to the per-request budget, or before "
     "an incomplete review was withheld instead of applied, or before endpoint "
     "support, frequency qualification, oversized-item recovery, unreviewed "
-    "focused endpoints, withholding causes, link-governing conditionals, or "
-    "the chunk-allowance stop used the 0.9.27 rules, or the stored chunk plan "
-    "does not match this resume. Resume cannot continue that review. Start a new run."
+    "focused endpoints, overlapping withholding reasons, discourse-aside "
+    "conditionals, duplicate-assertion merge, the shared review ledger, the "
+    "shared export assessment, or the chunk-allowance stop used the 0.9.28 rules, "
+    "or the stored chunk plan does not match this resume. Resume cannot continue "
+    "that review. Start a new run."
 )
 
 
@@ -107,6 +126,21 @@ claims; leave insufficient or indeterminate claims proposed. Accept only claims
 supported by the evidence shown. Explain each decision. Do not invent evidence,
 edit the corpus, impersonate a researcher, or decide theoretical saturation.
 """
+
+
+def prompt_hash(messages: Sequence[Any]) -> str:
+    """Stable hash of the role and content that would be sent."""
+    payload = []
+    for message in messages:
+        if isinstance(message, Mapping):
+            role = str(message.get("role") or message.get("type") or "")
+            content = message.get("content")
+        else:
+            role = str(getattr(message, "type", "") or getattr(message, "role", "") or "")
+            content = getattr(message, "content", "")
+        payload.append({"role": role, "content": content})
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 class DecisionReviewer:
@@ -158,6 +192,7 @@ class DecisionReviewer:
             "actor": "llm", "model": describe_model(self.model),
             "model_settings": chat_model_settings(self.model),
             "estimated_input_tokens": estimate,
+            "prompt_hash": prompt_hash(messages),
             "messages": [{"role": m.type, "content": m.content} for m in messages],
         }
         try:
@@ -483,12 +518,12 @@ def apply_selection_compaction(
 
 
 def review_procedure_fields() -> dict[str, str]:
-    """Procedure fingerprint for 0.9.27 review rules.
+    """Procedure fingerprint for 0.9.28 review rules.
 
     The chunk partition is separate from the call and token ceilings. A higher
     ceiling can continue the same chunks. A different partition cannot.
     ``auto_size_decision_calls`` is a caller decision and is not one of these
-    constants. A 0.9.26 checkpoint is missing these values and cannot resume.
+    constants. A 0.9.27 checkpoint is missing these values and cannot resume.
     """
     return {
         "decision_review_chunking": DECISION_REVIEW_CHUNKING,
@@ -503,7 +538,120 @@ def review_procedure_fields() -> dict[str, str]:
         "withholding_cause_rule": WITHHOLDING_CAUSE_RULE,
         "conditional_scope_rule": CONDITIONAL_SCOPE_RULE,
         "chunk_allowance_rule": CHUNK_ALLOWANCE_RULE,
+        "duplicate_assertion_rule": DUPLICATE_ASSERTION_RULE,
+        "budget_ledger_rule": BUDGET_LEDGER_RULE,
+        "export_assessment_rule": EXPORT_ASSESSMENT_RULE,
     }
+
+
+def open_budget_step(
+    metadata: dict[str, Any],
+    *,
+    step: str,
+    allowance_scope: str,
+    allowance: int | None,
+    shared_with: Sequence[str] = (),
+) -> None:
+    """Record the allowance already spent when a budgeted step starts.
+
+    A step that is already open is left as it is, so a later chunk of the same
+    step does not reset ``starting_usage``.
+    """
+    steps = [dict(item) for item in (metadata.get("decision_budget_steps") or []) if isinstance(item, Mapping)]
+    for item in steps:
+        if item.get("step") == step and item.get("open"):
+            metadata["decision_budget_steps"] = steps
+            return
+    used = int(metadata.get("decision_calls_used") or 0)
+    allowance_n = None if allowance is None else int(allowance)
+    steps.append(
+        {
+            "step": step,
+            "allowance_scope": allowance_scope,
+            "shared_with": [str(item) for item in shared_with],
+            "allowance": allowance_n,
+            "starting_usage": used,
+            "calls_made": 0,
+            "remaining_allowance": None if allowance_n is None else max(0, allowance_n - used),
+            "stop_reason": None,
+            "open": True,
+        }
+    )
+    metadata["decision_budget_steps"] = steps
+
+
+def close_budget_step(metadata: dict[str, Any], *, step: str, stop_reason: str | None = None) -> None:
+    """Close the open step, or refresh its stop after the calls are known."""
+    steps = [dict(item) for item in (metadata.get("decision_budget_steps") or []) if isinstance(item, Mapping)]
+    used_now = int(metadata.get("decision_calls_used") or 0)
+    reason = str(stop_reason or "") or None
+    target = None
+    for item in reversed(steps):
+        if item.get("step") == step and item.get("open"):
+            target = item
+            break
+    if target is None:
+        for item in reversed(steps):
+            if item.get("step") == step:
+                target = item
+                break
+    if target is None:
+        metadata["decision_budget_steps"] = steps
+        return
+    start = int(target.get("starting_usage") or 0)
+    target["calls_made"] = max(0, used_now - start)
+    allowance = target.get("allowance")
+    target["remaining_allowance"] = None if allowance is None else max(0, int(allowance) - used_now)
+    if reason or target.get("open"):
+        target["stop_reason"] = reason
+    target["open"] = False
+    metadata["decision_budget_steps"] = steps
+
+
+def stamp_budget_on_progress(progress: dict[str, Any], metadata: Mapping[str, Any], step: str) -> None:
+    """Copy the closed step onto the chunk report for this review."""
+    record = None
+    for item in reversed(list(metadata.get("decision_budget_steps") or [])):
+        if isinstance(item, Mapping) and item.get("step") == step:
+            record = item
+            break
+    if record is None:
+        return
+    progress["allowance_scope"] = record.get("allowance_scope")
+    progress["allowance"] = record.get("allowance")
+    progress["shared_with"] = list(record.get("shared_with") or [])
+    progress["starting_usage"] = record.get("starting_usage")
+    progress["calls_made"] = record.get("calls_made")
+    progress["remaining_allowance"] = record.get("remaining_allowance")
+    progress["budget_stop_reason"] = record.get("stop_reason")
+
+
+def budget_ledger(metadata: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    """Public per-step allowance account. The open flag is not part of it."""
+    rows = []
+    for item in (metadata or {}).get("decision_budget_steps") or []:
+        if not isinstance(item, Mapping):
+            continue
+        rows.append(
+            {
+                "step": item.get("step"),
+                "allowance_scope": item.get("allowance_scope"),
+                "shared_with": list(item.get("shared_with") or []),
+                "allowance": item.get("allowance"),
+                "starting_usage": item.get("starting_usage"),
+                "calls_made": item.get("calls_made"),
+                "remaining_allowance": item.get("remaining_allowance"),
+                "stop_reason": item.get("stop_reason"),
+            }
+        )
+    return rows
+
+
+def seal_budget_step(metadata: dict[str, Any], progress: dict[str, Any], step: str) -> None:
+    """Close the step from this progress row and copy the account onto it."""
+    stops = [str(item) for item in (progress.get("stop_reasons") or []) if str(item)]
+    close_budget_step(metadata, step=step, stop_reason=stops[0] if stops else None)
+    stamp_budget_on_progress(progress, metadata, step)
 
 
 def decision_plan_hash(
@@ -727,6 +875,13 @@ def finish_decision_report(progress: Mapping[str, Any]) -> dict[str, Any]:
         "calls": int(progress.get("calls") or 0),
         "per_request_budget": int(progress.get("per_request_budget") or 0),
         "sized_by": "per_request_budget",
+        "allowance_scope": progress.get("allowance_scope"),
+        "allowance": progress.get("allowance") if "allowance" in progress else None,
+        "shared_with": list(progress.get("shared_with") or []) or None,
+        "starting_usage": progress.get("starting_usage") if "starting_usage" in progress else None,
+        "calls_made": progress.get("calls_made") if "calls_made" in progress else None,
+        "remaining_allowance": progress.get("remaining_allowance") if "remaining_allowance" in progress else None,
+        "budget_stop_reason": progress.get("budget_stop_reason") if "budget_stop_reason" in progress else None,
     }
 
 
@@ -790,11 +945,12 @@ def merge_core_nominations(
 
 
 def same_chunking_fingerprint(saved: Any, current: Any) -> bool:
-    """True when the resume carries the current chunking and 0.9.27 rules.
+    """True when the resume carries the current chunking and 0.9.28 rules.
 
     A missing key fails. ``allow_changes`` is not consulted here, so an older
     checkpoint cannot continue by ignoring the new quote, denial, recovery,
-    endpoint, cause, conditional, or chunk-allowance rule.
+    endpoint, cause, conditional, duplicate, ledger, assessment, or
+    chunk-allowance rule.
     """
     if not isinstance(saved, Mapping) or not isinstance(current, Mapping):
         return False
@@ -807,6 +963,9 @@ def same_chunking_fingerprint(saved: Any, current: Any) -> bool:
         "withholding_cause_rule": WITHHOLDING_CAUSE_RULE,
         "conditional_scope_rule": CONDITIONAL_SCOPE_RULE,
         "chunk_allowance_rule": CHUNK_ALLOWANCE_RULE,
+        "duplicate_assertion_rule": DUPLICATE_ASSERTION_RULE,
+        "budget_ledger_rule": BUDGET_LEDGER_RULE,
+        "export_assessment_rule": EXPORT_ASSESSMENT_RULE,
     }
     for key, required in expected.items():
         saved_value = str(saved.get(key) or "")

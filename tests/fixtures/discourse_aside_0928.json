@@ -1,0 +1,18 @@
+{
+  "fixture_version": "discourse-aside-0928",
+  "note": "Synthetic sentences only. Not study data and not a general reading of conditionals. Readings stay provisional.",
+  "cases": [
+    {
+      "id": "aside-alone",
+      "quote": "tools for the shift lead to coworkers on the crew, if that makes sense",
+      "status": "validated",
+      "hypothetical": false
+    },
+    {
+      "id": "aside-and-conditional",
+      "quote": "tools for the shift lead to coworkers on the crew, if that makes sense, if the night is long",
+      "status": "hypothetical",
+      "hypothetical": true
+    }
+  ]
+}

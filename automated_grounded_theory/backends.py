@@ -16,7 +16,7 @@ import subprocess
 import sys
 import weakref
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 from urllib.parse import unquote, urlparse
 
 from langchain_core.embeddings import Embeddings
@@ -305,6 +305,49 @@ def generation_parameters(model: BaseChatModel | str | None, *, before: Mapping[
         "temperature": explicit if configured else None,
         "temperature_status": "configured" if configured else "unset",
         "parameters": parameters,
+    }
+
+
+TEMPERATURE_REPRODUCIBILITY_NOTE = (
+    "temperature 0 is configuration control, not a reproducibility guarantee."
+)
+
+
+def model_configuration_record(
+    metadata: Mapping[str, Any] | None,
+    prompt_log: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Model, sampling settings, and prompt hashes for an export.
+
+    Temperature stays null unless the caller configured it. An automatic
+    temperature of 0 is not reported as configured. Temperature 0 does not
+    make a later completion reproducible.
+    """
+    stored = metadata or {}
+    generation = stored.get("generation_parameters") if isinstance(stored.get("generation_parameters"), Mapping) else {}
+    settings = stored.get("chat_model_settings") if isinstance(stored.get("chat_model_settings"), Mapping) else {}
+    parameters = dict(generation.get("parameters") or {})
+    if not parameters and settings:
+        parameters = dict(settings)
+    hashes: list[str] = []
+    seen: set[str] = set()
+    for entry in prompt_log or []:
+        if not isinstance(entry, Mapping):
+            continue
+        digest = str(entry.get("prompt_hash") or "")
+        if digest and digest not in seen:
+            seen.add(digest)
+            hashes.append(digest)
+    temperature = generation.get("temperature") if "temperature" in generation else None
+    configured = isinstance(temperature, (int, float)) and not isinstance(temperature, bool)
+    return {
+        "model": generation.get("model") or settings.get("model") or settings.get("class"),
+        "temperature": temperature if configured else None,
+        "temperature_status": generation.get("temperature_status") or ("configured" if configured else "unset"),
+        "seed": stored.get("model_seed"),
+        "parameters": parameters,
+        "prompt_hashes": hashes,
+        "note": TEMPERATURE_REPRODUCIBILITY_NOTE,
     }
 
 

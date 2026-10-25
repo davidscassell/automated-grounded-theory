@@ -44,24 +44,33 @@ from automated_grounded_theory.backends import (
     chat_model_settings,
     describe_model,
     installation_record,
+    model_configuration_record,
     record_model_determinism,
 )
 from automated_grounded_theory.batching import request_input_tokens, shrink_repair_messages
 from automated_grounded_theory.decision_review import (
     DECISION_REVIEW_CHUNKING,
+    SHARED_DECISION_REVIEW,
+    SHARED_REVIEW_STEPS,
     DecisionChunkingCheckpointError,
     add_stop_reason,
+    budget_ledger,
     build_decision_plan,
     finish_decision_report,
     load_chunk_progress,
     merge_core_nominations,
     note_chunk_send,
+    close_budget_step,
+    open_budget_step,
+    prompt_hash,
     review_procedure_fields,
     same_chunking_fingerprint,
+    seal_budget_step,
     store_decision_report,
 )
 from automated_grounded_theory.category_state import plan_relation_pairs, property_stability
 from automated_grounded_theory.focused import _rationale_indicates_irrelevance, load_focused_export
+from automated_grounded_theory.gate_evaluation import stamp_relationship_assessment
 from automated_grounded_theory.retrieval import cosine
 from automated_grounded_theory.saturation import (
     CODE_FREQUENCY_SHIFT_LABEL,
@@ -203,6 +212,9 @@ _PROCEDURE_KEYS = (
     "withholding_cause_rule",
     "conditional_scope_rule",
     "chunk_allowance_rule",
+    "duplicate_assertion_rule",
+    "budget_ledger_rule",
+    "export_assessment_rule",
 )
 _LOCKED_KEYS = frozenset({"seed", "source_hash"})
 
@@ -2855,6 +2867,9 @@ def export_axial_state(state: Mapping[str, Any], directory: str | Path) -> dict[
     for row in relationships:
         stamp_focus_review(row, metadata)
         assign_relationship_eligibility(row)
+        stamp_relationship_assessment(row)
+    metadata["decision_budget_steps"] = budget_ledger(metadata)
+    metadata["model_configuration"] = model_configuration_record(metadata, state.get("prompt_log") or [])
     if stage != "selective":
         write(
             "category_relationships.json",
@@ -4783,6 +4798,13 @@ async def _advance_relation_review(
     limits. The stage is complete only when every row was reviewed.
     """
     reviewer = runtime.reviewer
+    open_budget_step(
+        metadata,
+        step="axial_relation_review",
+        allowance_scope=SHARED_DECISION_REVIEW,
+        allowance=int(reviewer.max_calls),
+        shared_with=SHARED_REVIEW_STEPS,
+    )
     by_id = {str(row.get("relationship_id") or ""): row for row in relationships if str(row.get("relationship_id") or "")}
     ordered_ids = sorted(by_id)
 
@@ -4823,10 +4845,11 @@ async def _advance_relation_review(
     def _close(progress_row: dict) -> dict:
         progress_row["open"] = False
         metadata["decision_chunk_state"] = progress_row
+        _sync_allowance(metadata, runtime)
+        seal_budget_step(metadata, progress_row, "axial_relation_review")
         report = finish_decision_report(progress_row)
         store_decision_report(metadata, report)
         _note_chunked_review(metadata, "decision_review", report, required=True)
-        _sync_allowance(metadata, runtime)
         updated = _apply(progress_row)
         return {"relationships": updated, "metadata": metadata, "prompt_log": logs}
 
@@ -5329,11 +5352,103 @@ def _counterexample_node(runtime: AxialRuntime):
     return counterexample_worker
 
 
+def _statement_key(row: Mapping[str, Any]) -> str:
+    return " ".join(str(row.get("statement") or "").split()).casefold()
+
+
+def _quote_identity(item: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(item.get("passage_id") or ""),
+        str(item.get("quote") or ""),
+        str(item.get("endpoint") or ""),
+    )
+
+
+def _assertion_provenance(row: Mapping[str, Any]) -> list[dict[str, Any]]:
+    prior = row.get("assertion_provenance")
+    if isinstance(prior, list) and prior:
+        return [dict(item) for item in prior if isinstance(item, Mapping)]
+    return [
+        {
+            "relationship_id": str(row.get("relationship_id") or ""),
+            "evidence_tier": row.get("evidence_tier"),
+            "disposition": row.get("disposition"),
+            "reviewer_disposition": row.get("reviewer_disposition"),
+            "passage_id": row.get("passage_id"),
+            "quote": row.get("quote"),
+        }
+    ]
+
+
+def consolidate_duplicate_assertions(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """One row per identical statement on a directed pair.
+
+    The kept id is the lowest relationship id. Quotes are unioned. The tier is
+    not copied from the highest input: the caller reassesses the merged quotes.
+    ``conflicting_evidence`` is the provenance list when the pre-merge tiers or
+    dispositions differ, and null otherwise. An empty statement is not merged.
+    A different statement, or the opposite direction, stays its own row.
+    """
+    order: list[tuple] = []
+    groups: dict[tuple, list[dict[str, Any]]] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        item = dict(row)
+        statement = _statement_key(item)
+        if not statement:
+            key = ("unique", len(order))
+        else:
+            key = (str(item.get("from_id") or ""), str(item.get("to_id") or ""), statement)
+        if key not in groups:
+            order.append(key)
+            groups[key] = []
+        groups[key].append(item)
+    merged: list[dict[str, Any]] = []
+    for key in order:
+        group = groups[key]
+        if len(group) == 1:
+            only = group[0]
+            only["conflicting_evidence"] = only.get("conflicting_evidence") if only.get("merged_relationship_ids") else None
+            merged.append(only)
+            continue
+        ordered = sorted(group, key=lambda item: str(item.get("relationship_id") or ""))
+        base = dict(ordered[0])
+        provenance: list[dict[str, Any]] = []
+        quotes: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for item in ordered:
+            provenance.extend(_assertion_provenance(item))
+            found = [dict(quote) for quote in (item.get("case_quotes") or []) if isinstance(quote, Mapping)]
+            if not found and (item.get("quote") or item.get("passage_id")):
+                found = [
+                    {
+                        "passage_id": item.get("passage_id"),
+                        "quote": item.get("quote"),
+                        "endpoint": "both",
+                    }
+                ]
+            for quote in found:
+                identity = _quote_identity(quote)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                quotes.append(quote)
+        base["case_quotes"] = quotes
+        base["assertion_provenance"] = provenance
+        base["merged_relationship_ids"] = [str(item.get("relationship_id") or "") for item in provenance]
+        tiers = {item.get("evidence_tier") for item in provenance}
+        dispositions = {str(item.get("disposition") or "") for item in provenance}
+        base["conflicting_evidence"] = list(provenance) if len(tiers) > 1 or len(dispositions) > 1 else None
+        merged.append(base)
+    return merged
+
+
 def _commit_relations(state: AxialState) -> dict:
     metadata = dict(state.get("metadata") or {})
     procedure = metadata.get("procedure") or {}
     passages = _by_passage(state)
-    relationships = [dict(row) for row in (state.get("relationships") or [])]
+    relationships = consolidate_duplicate_assertions(state.get("relationships") or [])
     minimum = int(procedure.get("min_relation_documents") or 2)
     book = state.get("codebook") or {}
     segments = state.get("segments") or []
@@ -5362,6 +5477,7 @@ def _commit_relations(state: AxialState) -> dict:
             row["flags"] = flags
             row["tentative_few_documents"] = True
             row["needs_review"] = True
+        stamp_relationship_assessment(row)
     slots = _empty_slots(relationships, lens=str(procedure.get("coding_lens") or "paradigm"))
     if slots:
         warnings = list(state.get("warnings") or [])
@@ -5404,6 +5520,13 @@ def _saturation_checkpoint(runtime: AxialRuntime):
                 report["judgment"] = None
                 _note_stage(metadata, "decision_review", required=False, status="skipped", reason="call_allowance")
                 return {"saturation": report, "metadata": metadata, "prompt_log": logs}
+            open_budget_step(
+                metadata,
+                step="axial_saturation_review",
+                allowance_scope=SHARED_DECISION_REVIEW,
+                allowance=int(runtime.reviewer.max_calls),
+                shared_with=SHARED_REVIEW_STEPS,
+            )
             parsed, audit = await runtime.reviewer.decide(
                 {
                     "kind": "axial_saturation_review",
@@ -5451,6 +5574,11 @@ def _saturation_checkpoint(runtime: AxialRuntime):
                 _record_audit_usage(metadata, audit)
             _note_review_outcome(metadata, audit=audit, parsed=parsed)
             _sync_allowance(metadata, runtime)
+            close_budget_step(
+                metadata,
+                step="axial_saturation_review",
+                stop_reason=None if parsed else str(metadata.get("decision_stop") or "") or None,
+            )
             if parsed:
                 reading = pair_coverage_reading(
                     report.get("pairs_planned"),
@@ -5714,6 +5842,13 @@ async def _advance_core_review(
     is not. The selection is complete only when every candidate was reviewed.
     """
     reviewer = runtime.reviewer
+    open_budget_step(
+        metadata,
+        step="axial_core_review",
+        allowance_scope=SHARED_DECISION_REVIEW,
+        allowance=int(reviewer.max_calls),
+        shared_with=SHARED_REVIEW_STEPS,
+    )
     preferred = [str(row.get("code_id") or "") for row in candidates if row.get("graph_supported")]
     metadata["relationship_preferred_core_ids"] = preferred
     snapshot = graph_snapshot(state.get("relationships") or [])
@@ -5750,12 +5885,13 @@ async def _advance_core_review(
     def _finish_choice(progress_row: dict, warnings: list[str]) -> dict:
         progress_row["open"] = False
         metadata["decision_chunk_state"] = progress_row
+        _sync_allowance(metadata, runtime)
+        seal_budget_step(metadata, progress_row, "axial_core_review")
         report = finish_decision_report(progress_row)
         store_decision_report(metadata, report)
         metadata["core_selection_complete"] = bool(report["complete"])
         _note_chunked_review(metadata, "decision_review", report, required=True)
         _note_chunked_review(metadata, "selective_core", report, required=True)
-        _sync_allowance(metadata, runtime)
         metadata["researcher_core_id"] = ""
         unknown = str(progress_row.get("unknown_nomination") or "")
         nominations = [str(item) for item in (progress_row.get("nominations") or []) if str(item)]
@@ -6918,6 +7054,8 @@ def _result_from_state(state: Mapping[str, Any], *, interrupted: bool, payload: 
         metadata["stop"] = str((payload or {}).get("kind") or "checkpoint")
     metadata["saturation_judgment"] = None
     metadata["package_version"] = __version__
+    metadata["decision_budget_steps"] = budget_ledger(metadata)
+    metadata["model_configuration"] = model_configuration_record(metadata, state.get("prompt_log") or [])
     metadata["provenance"] = installation_record()
     metadata["attrition"] = axial_attrition({**dict(state), "metadata": metadata})
     metadata["prompt_accounting"] = _prompt_accounting(state.get("prompt_log") or [])
@@ -7295,6 +7433,7 @@ def _procedure_from_kwargs(data: Mapping[str, Any], **kwargs: Any) -> dict[str, 
             "A design choice for this package. It is not a quotation from the method literature."
         ),
         **review_procedure_fields(),
+        "max_decision_calls": int(kwargs.get("max_decision_calls", 4) or 0),
         "negative_case_search": bool(kwargs.get("negative_case_search", True)),
         "core_stability_min_n": max(2, int(kwargs.get("core_stability_min_n", CORE_STABILITY_MIN_N) or CORE_STABILITY_MIN_N)),
         "core_stability_min_n_note": (
@@ -7380,6 +7519,7 @@ class AxialDecisionReviewer:
             "model": describe_model(self.model),
             "model_settings": chat_model_settings(self.model),
             "estimated_input_tokens": estimate,
+            "prompt_hash": prompt_hash(messages),
             "messages": [{"role": message.type, "content": message.content} for message in messages],
         }
         if stop:
@@ -7601,6 +7741,7 @@ async def aaxial_code(
         batch_size=batch_size,
         max_axial_review_tokens=max_axial_review_tokens,
         pattern_min_cases=pattern_min_cases,
+        max_decision_calls=max_decision_calls,
         negative_case_search=negative_case_search,
         core_stability_min_n=core_stability_min_n,
     )
@@ -7817,6 +7958,7 @@ async def aselective_code(
         "storyline_token_reserve": _storyline_token_reserve(
             int(max_axial_review_tokens), include_storyline=bool(include_storyline)
         ),
+        "max_decision_calls": int(max_decision_calls),
         "negative_case_search": bool(axial_procedure.get("negative_case_search", True)),
         "core_stability_min_n": max(2, int(axial_procedure.get("core_stability_min_n") or CORE_STABILITY_MIN_N)),
         "core_stability_min_n_note": (

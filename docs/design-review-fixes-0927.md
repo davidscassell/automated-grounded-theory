@@ -1,6 +1,6 @@
 # 0.9.27 review fixes
 
-Status: current for package 0.9.27. The 0.9.26 note stays the record of shared spans, frequency qualification, and oversized recovery. This note does not change `pattern_min_cases` (2), the axial token ceiling (24000), `batch_size` (1), or the 6000 request budgets. Tier 4 stays human-only. Undefined metrics stay null. Human input still arrives through `interrupt()` and `Command(resume=...)`.
+Status: historical record of package 0.9.27. The current review note is [design-review-fixes-0928.md](design-review-fixes-0928.md). The 0.9.26 note stays the record of shared spans, frequency qualification, and oversized recovery. This note does not change `pattern_min_cases` (2), the axial token ceiling (24000), `batch_size` (1), or the 6000 request budgets. Tier 4 stays human-only. Undefined metrics stay null. Human input still arrives through `interrupt()` and `Command(resume=...)`.
 
 ## Raised ids on the focused export
 

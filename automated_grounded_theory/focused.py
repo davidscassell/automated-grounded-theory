@@ -115,7 +115,12 @@ from automated_grounded_theory.batching import (
     request_input_tokens,
     resolve_tokenizer,
 )
-from automated_grounded_theory.backends import chat_model_settings, describe_model, record_model_determinism
+from automated_grounded_theory.backends import (
+    chat_model_settings,
+    describe_model,
+    model_configuration_record,
+    record_model_determinism,
+)
 from automated_grounded_theory.category_state import (
     ANALYTIC_FEATURES,
     COVERAGE_PURPOSES,
@@ -172,21 +177,27 @@ from automated_grounded_theory.decision_review import (
     AUTO_SIZE_DECISION_CALLS,
     CHUNK_ALLOWANCE_INSUFFICIENT,
     DECISION_REVIEW_CHUNKING,
+    FOCUSED_DECISION_REVIEW,
+    FOCUSED_REVIEW_STEPS,
     ClaimDecisions,
     DecisionChunkingCheckpointError,
     DecisionReviewer,
     SelectionDecision,
     add_stop_reason,
     apply_model_claim_decisions,
+    budget_ledger,
     build_decision_plan,
     claims_payload,
     finish_decision_report,
     load_chunk_progress,
     merge_selection_ids,
     next_claim_batch,
+    close_budget_step,
+    open_budget_step,
     review_procedure_fields,
     note_chunk_send,
     same_chunking_fingerprint,
+    seal_budget_step,
     selection_codes,
     selection_payload,
     store_decision_report,
@@ -263,6 +274,9 @@ _PROCEDURE_KEYS = (
     "withholding_cause_rule",
     "conditional_scope_rule",
     "chunk_allowance_rule",
+    "duplicate_assertion_rule",
+    "budget_ledger_rule",
+    "export_assessment_rule",
     "auto_size_decision_calls",
 )
 _PERFORMANCE_KEYS = (
@@ -5897,6 +5911,7 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         nonlocal warnings
         progress_row["open"] = False
         metadata["decision_chunk_state"] = progress_row
+        seal_budget_step(metadata, progress_row, "focused_selection")
         report = finish_decision_report(progress_row)
         store_decision_report(metadata, report)
         metadata["selection_review_complete"] = bool(report["complete"])
@@ -5948,6 +5963,7 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
                 metadata["decision_stop"] = "oversized_unrecovered"
                 metadata["decision_stop_detail"] = "omitted_oversized"
                 metadata["selection_review_fallback"] = "omitted_oversized"
+                seal_budget_step(metadata, progress_row, "focused_selection")
                 report = finish_decision_report(progress_row)
                 metadata["decision_chunk_state"] = progress_row
                 store_decision_report(metadata, report)
@@ -6050,6 +6066,13 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
     metadata["selection_chunk_shortfall"] = shortfall
     metadata["auto_size_decision_calls"] = bool(getattr(runtime, "auto_size_decision_calls", False))
     metadata["decision_call_allowance_raised"] = allowance != configured
+    open_budget_step(
+        metadata,
+        step="focused_selection",
+        allowance_scope=FOCUSED_DECISION_REVIEW,
+        allowance=allowance,
+        shared_with=FOCUSED_REVIEW_STEPS,
+    )
     # Zero still means the reviewer is off. That stop stays call_allowance.
     # A plan that cannot finish inside a positive allowance is not started.
     if allowance > 0 and sent == 0 and validated_now == 0 and required > allowance:
@@ -6205,6 +6228,14 @@ def _decision_node(runtime: FocusedRuntime, *, claims: bool):
         properties = list(state.get("properties") or [])
         dimensions = list(state.get("dimensions") or [])
         records = properties + dimensions
+        if reviewer is not None and records:
+            open_budget_step(
+                metadata,
+                step="focused_claim_review",
+                allowance_scope=FOCUSED_DECISION_REVIEW,
+                allowance=int(reviewer.max_calls),
+                shared_with=FOCUSED_REVIEW_STEPS,
+            )
         reviewed = {}
         cursor = 0
         while cursor < len(records):
@@ -6231,6 +6262,12 @@ def _decision_node(runtime: FocusedRuntime, *, claims: bool):
             cursor += len(batch)
         metadata["decision_pending_claim_ids"] = [r["entry_id"] for r in records[cursor:]]
         metadata["decision_review_complete"] = cursor == len(records)
+        if reviewer is not None and records:
+            close_budget_step(
+                metadata,
+                step="focused_claim_review",
+                stop_reason=str(metadata.get("decision_stop") or "") or None,
+            )
         if metadata.get("decision_stop"):
             warnings.append(f"LLM claim review incomplete: {metadata['decision_stop']}.")
         return {"properties": [reviewed.get(r["entry_id"], r) for r in properties],
@@ -6667,6 +6704,8 @@ def export_focused_state(state: Mapping[str, Any], directory: str | Path) -> dic
     metadata.update(_status_fields(state))
     metadata.update(selection_record)
     metadata["saturation_judgment"] = None
+    metadata["decision_budget_steps"] = budget_ledger(metadata)
+    metadata["model_configuration"] = model_configuration_record(metadata, state.get("prompt_log") or [])
     records = list(development.get("properties") or []) + list(development.get("dimensions") or [])
     eligible = [row for row in records if row.get("downstream_eligible")]
     book = state.get("codebook") or {}
@@ -7018,6 +7057,8 @@ def _result_from_state(
     metadata["saturation_judgment"] = None
     metadata["policy_version"] = POLICY_VERSION
     metadata["package_version"] = __version__
+    metadata["decision_budget_steps"] = budget_ledger(metadata)
+    metadata["model_configuration"] = model_configuration_record(metadata, state.get("prompt_log") or [])
     development = _category_development(state)
     metadata["property_stability"] = development.get("property_stability") or {}
     metadata["proposal_stability"] = proposal_stability([state])
