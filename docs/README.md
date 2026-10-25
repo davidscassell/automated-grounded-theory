@@ -1,6 +1,6 @@
 # Design notes
 
-Package `policy_version` is `0.9.24`. This index says which notes describe the package now and which notes are the record of an earlier version. A historical note can disagree with the code. The code, the README, and the current notes below win.
+Package `policy_version` is `0.9.25`. This index says which notes describe the package now and which notes are the record of an earlier version. A historical note can disagree with the code. The code, the README, and the current notes below win.
 
 Axial coding, selective coding, and theoretical sampling are experimental. No study adjudication file is included. The discovery example is synthetic. Live evaluation runs through v31, on package 0.9.9, did not measure analytic accuracy.
 
@@ -10,18 +10,18 @@ Axial coding, selective coding, and theoretical sampling are experimental. No st
 | --- | --- |
 | [../README.md](../README.md) | The pipeline, the defaults, the evidence tiers, quiet rounds, timeouts, and gate scoring. |
 | [methodology.md](methodology.md) | How the open-coding default maps onto the sources already named there. |
-| [design.md](design.md) | The open-coding engineering design, plus a version log through `0.9.24`. The early sections are the 0.6 run. |
+| [design.md](design.md) | The open-coding engineering design, plus a version log through `0.9.25`. The early sections are the 0.6 run. |
 | [design-relationship-tiers.md](design-relationship-tiers.md) | Evidence tiers. `pattern_min_cases` is 2. Tier labels are `category_evidence`, `hypothesis`, `pattern_supported`, `attribution`, and `verified`. |
 | [design-negative-cases-092.md](design-negative-cases-092.md) | Negative-case search at respondent level, and a core that needs tier 2. Later search corrections are in the 0.9.3 review note. |
 | [design-gate-evaluation.md](design-gate-evaluation.md) | `export_gate_relationships`, `load_adjudications`, and `score_gate_adjudications`, including `downstream_precision` and `downstream_withheld_supported_recall`. |
 | [design-discovery-evaluation.md](design-discovery-evaluation.md) | `load_discovery_file`, `freeze_discovery_set`, and `score_discovery`. Recall, precision, distortion, and gate false negatives for a frozen human discovery file. |
 | [design-sampling-0900.md](design-sampling-0900.md) | The sampling graph. Later sections through 0.9.18 are part of the current behavior. 0.9.23 does not change that graph. |
 | [focused-evaluation.md](focused-evaluation.md) | The offline focused comparison and its live-cost estimate. It does not call an API. |
-| [design-review-fixes-0924.md](design-review-fixes-0924.md) | Decision-review requests for focused selection, axial relationships, and core selection are chunked to the per-request budget. This is the latest review note. |
+| [design-review-fixes-0925.md](design-review-fixes-0925.md) | An incomplete selection or core choice is withheld. Core candidates are the promoted focused categories. Row eligibility gates components. Denied means an affirmative rejection of the link. This is the latest review note. |
 
 ## Historical
 
-These notes stay so a reader can see what a version changed. They are not the current contract. `design-review-fixes-*` through 0.9.23 are in this list. `design-review-fixes-0924.md` is the latest review note, listed above.
+These notes stay so a reader can see what a version changed. They are not the current contract. `design-review-fixes-*` through 0.9.24 are in this list. `design-review-fixes-0925.md` is the latest review note, listed above.
 
 | Note | Version it records |
 | --- | --- |
@@ -48,8 +48,9 @@ These notes stay so a reader can see what a version changed. They are not the cu
 | [design-review-fixes-0921.md](design-review-fixes-0921.md) | 0.9.21. The frozen discovery evaluation stays beside gate scoring. 0.9.22 separates completed axial examinations from unsent pairs and tightens discovery scoring. |
 | [design-review-fixes-0922.md](design-review-fixes-0922.md) | 0.9.22. Completed axial examinations, the closed quote pattern, and discovery-eval-2 stay as shipped. 0.9.23 keeps proposal reviews off structural recall and binds claim reviews to the statement. |
 | [design-review-fixes-0923.md](design-review-fixes-0923.md) | 0.9.23. Discovery matching, claim binding, and the attribution fail-closed rule stay as shipped. 0.9.24 chunks decision-review requests that do not fit the per-request budget. |
+| [design-review-fixes-0924.md](design-review-fixes-0924.md) | 0.9.24. Decision-review requests are chunked to the per-request budget. 0.9.25 withholds an incomplete selection or core choice instead of applying the partial set. |
 
-`design-review-fixes-0923.md` records the 0.9.23 matching and claim-binding fixes. `design-review-fixes-0924.md` is the current review note.
+`design-review-fixes-0924.md` records the 0.9.24 chunking. `design-review-fixes-0925.md` is the current review note.
 
 ## Defaults the tests check
 

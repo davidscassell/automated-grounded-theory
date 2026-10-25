@@ -46,9 +46,9 @@ from tests.test_v080 import FakeAxialCoder, _corpus
 
 
 def test_version_and_defaults_stay_put():
-    assert __version__ == "0.9.24"
-    assert POLICY_VERSION == "0.9.24"
-    assert DECISION_REVIEW_CHUNKING == "request_budget_v1"
+    assert __version__ == "0.9.25"
+    assert POLICY_VERSION == "0.9.25"
+    assert DECISION_REVIEW_CHUNKING == "request_budget_v2"
     assert PATTERN_MIN_CASES == 2
     assert DEFAULT_MAX_AXIAL_REVIEW_TOKENS == 24000
     import inspect
@@ -279,12 +279,18 @@ def test_oversized_code_list_makes_focused_selection_calls():
     truncated_report = _selection_report(truncated)
     assert truncated_report["chunks_sent"] >= 1
     assert truncated_report["complete"] is False
+    assert truncated_report["items_uncovered"] > 0
+    assert truncated_report["chunk_order_selects_codes"] is False
+    assert truncated.raised_code_ids == []
+    assert truncated.metadata["selection_review_applied"] is False
+    assert truncated.metadata["selection_downstream_eligible"] is False
+    assert truncated.metadata["selection_status"] == "provisional"
     assert truncated.metadata["complete"] is False
     assert truncated.metadata["status"] == "incomplete"
     assert truncated.metadata["stop"] in {
         "decision_token_allowance",
         "decision_call_allowance",
-        "decision_selection_truncated",
+        "decision_selection_incomplete",
     }
 
 
@@ -297,7 +303,12 @@ def test_one_code_over_the_request_budget_does_not_stop_the_stage():
     assert report["complete"] is False
     assert {"id": "c-huge", "reason": "single_code_exceeds_request_budget"} in report["omissions"]
     assert report["chunks_sent"] >= 1
-    assert result.raised_code_ids == ["c-keep"]
+    assert result.raised_code_ids == []
+    assert result.metadata["provisional_raised_code_ids"] == ["c-keep"]
+    assert result.metadata["selection_review_applied"] is False
+    assert "c-huge" in result.metadata["selection_uncovered_code_ids"] or any(
+        item.get("id") == "c-huge" for item in report["omissions"]
+    )
     assert result.metadata["complete"] is False
     assert result.metadata.get("decision_stop") != "request_budget"
     sent = [row for row in result.prompt_log if row.get("checkpoint") == "focused_selection" and row.get("status") == "validated"]
@@ -316,6 +327,8 @@ def test_a_review_with_no_sent_chunks_leaves_token_figures_null():
     assert report["expenditure_complete"] is None
     assert report["items_omitted"] == 2
     assert result.metadata["complete"] is False
+    assert result.raised_code_ids == []
+    assert result.metadata["selection_review_applied"] is False
     assert result.metadata["selection_review_fallback"] == "proposal_unreviewed_over_request_budget"
 
 
@@ -446,8 +459,12 @@ def test_oversized_candidate_list_makes_core_selection_calls():
     truncated_report = truncated.metadata["decision_reviews"]["axial_core_review"]
     assert truncated_report["chunks_sent"] >= 1
     assert truncated_report["complete"] is False
+    assert truncated_report["items_uncovered"] > 0
     assert truncated.metadata["core_selection_complete"] is False
     assert truncated.metadata["core_selection_truncated"] is True
+    assert truncated.metadata["model_core_id"] == ""
+    assert truncated.metadata["core_downstream_eligible"] is False
+    assert truncated.metadata["core_status"] == "provisional"
     assert truncated.metadata["complete"] is False
 
 

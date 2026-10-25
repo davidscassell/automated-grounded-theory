@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from typing import Any, Mapping, Sequence
 
+from automated_grounded_theory.decision_review import PATTERN_QUOTE_RULE
 from automated_grounded_theory.validation import GENERIC_CONTENT_STEMS, locate_quote, meaningful_tokens
 
 PATTERN_MIN_CASES = 2
@@ -76,6 +77,8 @@ _CLAIM_FLAGS = frozenset(
         "participant_link_hypothetical",
         "participant_link_ambiguous",
         "participant_link_unsupported",
+        "frequency_negation",
+        "negation_does_not_reject_link",
     }
 )
 # Longer phrases are listed with the short ones. Matching keeps the longest
@@ -114,6 +117,26 @@ _DENIAL_RE = re.compile(
     r"isn't|aren't|wasn't|weren't|is not(?!\s+only)|are not(?!\s+only)|"
     r"was not(?!\s+only)|were not(?!\s+only)|not what|no relation|unrelated|not related|"
     r"no relationship|no connection|not connected|not a cause|not because)\b"
+)
+# Denied means the participant rejects the from-to link. A negation that does
+# not govern that link is not a denial.
+_LINK_REJECTION_RE = re.compile(
+    r"\b(?:"
+    r"(?:do not|does not|don't|doesn't|did not|didn't|never|cannot|can't)\s+"
+    r"(?:really\s+|always\s+|actually\s+|just\s+)?"
+    r"(?:lead|leads|led|cause|causes|caused|result|results|make|makes|"
+    r"relate|relates|related|connect|connects|connected|associate|associates|associated)\b"
+    r"|(?:is|are|was|were)\s+not\s+(?:related|connected|associated|a cause|because|caused)\b"
+    r"|(?:isn't|aren't|wasn't|weren't)\s+(?:related|connected|associated|a cause|because|caused)\b"
+    r"|not related|no relation|unrelated|not a cause|not because|"
+    r"no relationship|no connection|not connected|"
+    r"not what (?:causes|caused|leads|lead|makes|made)"
+    r")"
+)
+_FREQUENCY_NEGATION_RE = re.compile(
+    r"\b(?:not often|not always|not usually|not generally|"
+    r"(?:is|are|was|were)\s+not\s+(?:often|always|usually|generally)|"
+    r"(?:isn't|aren't|wasn't|weren't)\s+(?:often|always|usually|generally))\b"
 )
 _HYPOTHETICAL_RE = re.compile(
     r"\b(?:if|would|someone said|they said|i heard|suppose|supposing|what if|had said)\b"
@@ -372,20 +395,35 @@ def _collect_quotes(
     return found
 
 
+def _quote_identity(item: Mapping[str, Any]) -> tuple[str, str]:
+    return (_norm(str(item.get("quote") or "")), str(item.get("passage_id") or ""))
+
+
 def _supporting_cases(found: Mapping[str, Mapping[str, list[dict[str, Any]]]]) -> list[dict[str, Any]]:
+    """Cases whose endpoints are grounded by distinct quotes.
+
+    The same quote text in the same passage cannot be the evidence for both
+    endpoints. ``pattern_min_cases`` still counts cases, and a case counts
+    only when each endpoint has its own quote.
+    """
     case_ids = set(found.get("from") or {}) | set(found.get("to") or {})
     rows = []
     for case_id in sorted(case_ids):
-        quotes = list((found.get("from") or {}).get(case_id) or []) + list((found.get("to") or {}).get(case_id) or [])
+        from_all = list((found.get("from") or {}).get(case_id) or [])
+        to_all = list((found.get("to") or {}).get(case_id) or [])
+        shared = {item for item in ({_quote_identity(row) for row in from_all} & {_quote_identity(row) for row in to_all}) if item[0]}
+        from_kept = [row for row in from_all if _quote_identity(row) not in shared]
+        to_kept = [row for row in to_all if _quote_identity(row) not in shared]
+        quotes = from_all + to_all
         passage_ids = []
         for item in quotes:
             if item["passage_id"] not in passage_ids:
                 passage_ids.append(item["passage_id"])
         from_passages = {
-            item["passage_id"] for item in quotes if item["endpoint"] == "from" and item.get("grounded", True)
+            item["passage_id"] for item in from_kept if item.get("grounded", True)
         }
         to_passages = {
-            item["passage_id"] for item in quotes if item["endpoint"] == "to" and item.get("grounded", True)
+            item["passage_id"] for item in to_kept if item.get("grounded", True)
         }
         both = bool(from_passages) and bool(to_passages)
         same = bool(from_passages & to_passages)
@@ -397,6 +435,7 @@ def _supporting_cases(found: Mapping[str, Mapping[str, list[dict[str, Any]]]]) -
                 "both_endpoints": both,
                 "same_passage": same,
                 "within_case": both,
+                "shared_quote_for_both_endpoints": bool(shared),
             }
         )
     return rows
@@ -687,9 +726,21 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
     direction = _direction_of(folded, from_terms, to_terms)
     clause = _claim_clause(folded, from_terms, to_terms)
     clause_padded = f" {clause} "
-    polarity = "negative" if _DENIAL_RE.search(clause_padded) else "affirmative"
-    if direction is None and _DENIAL_RE.search(padded):
+    rejects_link = bool(_LINK_REJECTION_RE.search(clause_padded))
+    frequency = bool(_FREQUENCY_NEGATION_RE.search(clause_padded))
+    other_negation = bool(_DENIAL_RE.search(clause_padded) or (direction is None and _DENIAL_RE.search(padded)))
+    if rejects_link:
         polarity = "negative"
+        negation_scope = "link"
+    elif frequency:
+        polarity = "affirmative"
+        negation_scope = "frequency"
+    elif other_negation:
+        polarity = "affirmative"
+        negation_scope = "not_the_link"
+    else:
+        polarity = "affirmative"
+        negation_scope = None
     hedging = "hedged" if _HEDGE_RE.search(clause_padded) else "none"
     hypothetical = bool(_HYPOTHETICAL_RE.search(clause_padded))
     unsupported = _unsupported_before_connector(clause)
@@ -702,12 +753,12 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
         direction = None
     elif hypothetical:
         status = "hypothetical"
-    elif direction is None and polarity == "negative":
+    elif rejects_link:
         status = "denied"
+    elif frequency or (other_negation and not rejects_link):
+        status = "unvalidated"
     elif direction is None:
         status = "not_a_link"
-    elif polarity == "negative":
-        status = "denied"
     elif direction == "to_from":
         status = "reversed"
     elif direction == "undirected":
@@ -721,6 +772,10 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
     qualifications = []
     if status == "denied":
         qualifications.append("participant_denies_link")
+    elif negation_scope == "frequency":
+        qualifications.append("frequency_negation")
+    elif negation_scope == "not_the_link":
+        qualifications.append("negation_does_not_reject_link")
     elif status == "reversed":
         qualifications.append("participant_direction_reversed")
     elif status == "hedged":
@@ -740,6 +795,7 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
         "stated_direction": direction,
         "polarity": polarity,
         "hedging": hedging,
+        "negation_scope": negation_scope,
         "status": status,
         "validated_by": "deterministic_rule",
         "qualifications": qualifications,
@@ -992,6 +1048,10 @@ def assess_relationship(
         "claims": claims,
         "participant_link": participant if participant.get("present") else None,
         "core_support_component": "pattern" if pattern_supported else None,
+        "shared_quote_for_both_endpoints": any(
+            isinstance(case, Mapping) and case.get("shared_quote_for_both_endpoints") for case in cases
+        ),
+        "pattern_quote_rule": PATTERN_QUOTE_RULE,
     }
 
 
@@ -1147,10 +1207,44 @@ def relationship_evidence_use(row: Mapping[str, Any]) -> str:
 
 
 def assign_relationship_eligibility(row: dict) -> str:
-    """Write ``evidence_use`` and ``downstream_eligible`` from one rule."""
+    """Write row and component eligibility from one rule.
+
+    A claim component is downstream eligible, and the pattern component can
+    support a core, only when the row itself is supported evidence. A
+    withheld row clears both flags. Participant and analyst components stay
+    ineligible.
+    """
     use = relationship_evidence_use(row)
     row["evidence_use"] = use
-    row["downstream_eligible"] = use == SUPPORTED_EVIDENCE
+    row_ok = use == SUPPORTED_EVIDENCE
+    row["downstream_eligible"] = row_ok
+    claims = row.get("claims")
+    pattern = None
+    if isinstance(claims, dict):
+        raw = claims.get("pattern")
+        if isinstance(raw, Mapping):
+            pattern = dict(raw)
+            pattern_ok = (
+                row_ok
+                and bool(pattern.get("present"))
+                and int(pattern.get("evidence_tier") or 0) >= 2
+            )
+            pattern["downstream_eligible"] = pattern_ok
+            pattern["supports_core"] = pattern_ok
+            pattern["evidence_use"] = SUPPORTED_EVIDENCE if pattern_ok else (WITHHELD_EVIDENCE if not row_ok else HYPOTHESIS_EXPLORATION)
+            claims["pattern"] = pattern
+        for key in ("participant_explanation", "analyst_interpretation"):
+            component = claims.get(key)
+            if isinstance(component, Mapping):
+                copied = dict(component)
+                copied["downstream_eligible"] = False
+                copied["supports_core"] = False
+                claims[key] = copied
+        row["claims"] = claims
+    if row_ok and isinstance(pattern, Mapping) and pattern.get("supports_core"):
+        row["core_support_component"] = "pattern"
+    else:
+        row["core_support_component"] = None
     return use
 
 
@@ -1250,6 +1344,11 @@ def _claim_flags(claims: Mapping[str, Any]) -> list[str]:
     flags = []
     if status in {"denied", "contested"}:
         flags.append("participant_denies_link")
+    qualifications = {str(item) for item in (participant.get("qualifications") or [])}
+    if "frequency_negation" in qualifications:
+        flags.append("frequency_negation")
+    if "negation_does_not_reject_link" in qualifications:
+        flags.append("negation_does_not_reject_link")
     if status == "contested":
         flags.append("participant_link_contested")
     if status == "reversed":

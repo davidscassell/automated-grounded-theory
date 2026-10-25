@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.25
+
+- An incomplete focused selection or core choice is withheld. Raised ids and `model_core_id` stay empty. Provisional ids are stored and are not downstream eligible. The uncovered remainder is reported. Chunk order does not decide which codes are selectable. When interrupts are on, the focused graph pauses at `selection_pause` so `{"continue_selection": true}` can review the remainder. `{"leave_selection": true}` exports without promoting. The resume fingerprint is `request_budget_v2`. A 0.9.24 checkpoint raises `DecisionChunkingCheckpointError` even when changes are allowed. The plan hash no longer includes the call or token ceilings.
+- Core candidates are the promoted focused categories. An incomplete focused selection is `focused_selection_incomplete`. A focused source with no promoted ids is `focused_categories_unavailable`. Neither falls back to every open code. A direct selective call with no focused selection still scores the codebook the caller passed.
+- Row eligibility and component eligibility use one rule, `row_gates_components_v1`. A pattern component is downstream eligible and can support a core only when the row is supported evidence. A rejected row clears both flags.
+- Decision: a single quote that is the evidence for both endpoints does not count as a both-endpoint case. It cannot by itself meet `pattern_min_cases` 2. The rule is `distinct_endpoint_quotes_v1`. `pattern_min_cases` stays 2.
+- Denied means the participant affirmatively rejects the from-to link (`affirmative_rejection_v1`), including "do not lead" and "not what causes". A frequency negation such as "not often used by students", an explanation whose negation does not govern the link, and a long quote with no negation word stay unvalidated or validated, with a specific qualification when one applies. The synthetic fixture is `tests/fixtures/link_denial_0925.json`. It is not study data.
+- `attrition.unique_pairs` is `pairs_examined_unique`: distinct pairs with a completed examination. `pair_space_size` is the full unordered pair space. Either is null when it was not recorded. `unique_pairs_explored` is unchanged.
+- Reread `cost_status` is `configured` when both token prices are set and `unset` otherwise. It does not depend on whether a reread was relevant. A complete expenditure with no sent calls is a known zero. Per-relevant dollar amounts stay null when there is no relevant usage to price. The sampling fingerprint records `cost_status_rule` `configuration_v1`.
+- The axial planner still builds the full pair space in memory. That limit is open. The axial token ceiling stays 24000. `batch_size` stays 1. Tier 4 stays human-only. The review note is [docs/design-review-fixes-0925.md](docs/design-review-fixes-0925.md). `policy_version` is `0.9.25`.
+
 ## 0.9.24
 
 - Focused selection, axial relationship review, and selective core selection are packed into requests that each fit the per-request budget. `batch_size` stays 1 and is not that pack size. Codes are ordered by `code_id`, relationships by `relationship_id`, and core candidates stay in evidence order. Chunk index does not change which code or core is selected.

@@ -182,6 +182,7 @@ from automated_grounded_theory.decision_review import (
     load_chunk_progress,
     merge_selection_ids,
     next_claim_batch,
+    review_procedure_fields,
     note_chunk_send,
     same_chunking_fingerprint,
     selection_codes,
@@ -249,6 +250,12 @@ _PROCEDURE_KEYS = (
     "max_decision_tokens",
     "decision_token_budget",
     "decision_review_chunking",
+    "incomplete_review_application",
+    "eligibility_rule",
+    "link_denial_rule",
+    "pattern_quote_rule",
+    "pair_count_rule",
+    "core_candidate_rule",
 )
 _PERFORMANCE_KEYS = (
     "batch_size",
@@ -5786,19 +5793,31 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
     """Send at most one selection chunk. A later chunk is another graph visit.
 
     Codes are ordered by code id before they are packed, so codebook order
-    does not change the chunks. A code that alone exceeds the per-request
-    budget is omitted and the visit continues. The merged raised ids are the
-    model's choices from validated chunks only, in that same code-id order.
+    does not change the chunks. That order does not decide which codes are
+    promoted: an incomplete review is withheld. A code that alone exceeds the
+    per-request budget is omitted and the visit continues. Only a complete
+    review applies raised ids, in code-id order.
     """
     reviewer = runtime.reviewer
     codes = selection_codes(state)
     ordered = [row["code_id"] for row in codes]
     if reviewer is None or not ordered:
         metadata["decision_stop"] = "call_allowance"
-        metadata["selection_source"] = "unreviewed"
+        metadata["selection_source"] = "provisional"
+        metadata["selection_status"] = "provisional"
+        metadata["selection_withheld"] = True
+        metadata["selection_review_applied"] = False
+        metadata["selection_downstream_eligible"] = False
         metadata["selection_review_complete"] = False
+        metadata["selection_uncovered_code_ids"] = ordered
+        metadata["provisional_raised_code_ids"] = []
+        metadata["selection_chunk_order_selects"] = False
         warnings.append("LLM selection review incomplete: call_allowance.")
+        known = list(state.get("known_code_ids") or ordered)
         return {
+            "raised_code_ids": [],
+            "not_raised_code_ids": known,
+            "selection_source": "provisional",
             "metadata": metadata,
             "prompt_log": logs,
             "warnings": warnings,
@@ -5821,6 +5840,15 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         omit_reason="single_code_exceeds_request_budget",
     )
     progress = load_chunk_progress(metadata, plan)
+    if progress.get("provisional") and not metadata.get("decision_stop"):
+        ceilings = {"call_allowance", "token_allowance", "request_budget", "review_error"}
+        progress["stop_reasons"] = [
+            item for item in (progress.get("stop_reasons") or []) if str(item) not in ceilings
+        ]
+        validated = int(progress.get("chunks_validated") or 0)
+        stored_chunks = list(progress.get("chunks") or [])
+        if int(progress.get("next_index") or 0) >= len(stored_chunks) and validated < len(stored_chunks):
+            progress["next_index"] = validated
     index = int(progress.get("next_index") or 0)
     chunks = list(progress.get("chunks") or [])
 
@@ -5836,40 +5864,63 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         ceiling = next((item for item in stops if _selection_ceiling(item)), "")
         failed = ceiling or ("invalid_decision" if "invalid_decision" in stops else "")
         omissions = list(progress_row.get("omissions") or [])
-        if validated == 0 and failed:
-            metadata["decision_stop"] = failed
-            metadata["selection_source"] = "unreviewed"
+        known = list(state.get("known_code_ids") or ordered)
+        provisional = merge_selection_ids(
+            progress_row.get("ordered_ids") or [], progress_row.get("raised_ids") or []
+        )
+        uncovered = list(report.get("uncovered_ids") or [])
+        metadata["selection_reviewed_code_ids"] = [str(item) for item in (progress_row.get("reviewed_ids") or [])]
+        metadata["selection_uncovered_code_ids"] = uncovered
+        metadata["provisional_raised_code_ids"] = provisional
+        metadata["selection_chunk_order_selects"] = False
+        metadata["selection_resume"] = {
+            "resumable": not bool(report["complete"]),
+            "next_index": int(progress_row.get("next_index") or 0),
+            "plan_hash": str(progress_row.get("plan_hash") or ""),
+            "uncovered_code_ids": uncovered,
+        }
+        if not report["complete"]:
+            progress_row["open"] = True
+            progress_row["provisional"] = True
+            metadata["decision_chunk_state"] = progress_row
             metadata["selection_review_applied"] = False
-            if omissions and failed == "request_budget":
-                metadata["decision_stop_detail"] = "single_code_exceeds_request_budget"
-            warnings.append(f"LLM selection review incomplete: {metadata['decision_stop']}.")
+            metadata["selection_status"] = "provisional"
+            metadata["selection_source"] = "provisional"
+            metadata["selection_withheld"] = True
+            metadata["selection_downstream_eligible"] = False
+            metadata["selection_review_complete"] = False
+            if ceiling:
+                metadata["decision_stop"] = ceiling
+                metadata["decision_stop_detail"] = ceiling
+            elif failed:
+                metadata["decision_stop"] = failed
+                metadata["decision_stop_detail"] = failed
+            else:
+                metadata["decision_stop"] = "selection_incomplete"
+                metadata["decision_stop_detail"] = (
+                    "proposal_unreviewed_over_request_budget" if omissions else "selection_incomplete"
+                )
+            if omissions and not ceiling:
+                metadata["selection_review_fallback"] = "proposal_unreviewed_over_request_budget"
+            note = (
+                "LLM selection review is provisional and was not applied. "
+                f"Stop: {metadata['decision_stop']}. "
+                f"{len(uncovered)} codes were not reviewed."
+            )
+            warnings.append(note)
+            store_decision_report(metadata, report)
             return {
+                "raised_code_ids": [],
+                "not_raised_code_ids": known,
+                "selection_source": "provisional",
                 "metadata": metadata,
                 "prompt_log": logs,
                 "warnings": warnings,
                 "focused_not_reread": [passage["passage_id"] for passage in state.get("passages", [])],
             }
-        if validated == 0 and omissions and not ceiling:
-            proposed = list(state.get("proposed_raised_code_ids") or [])
-            known = list(state.get("known_code_ids") or ordered)
-            not_raised = [code_id for code_id in known if code_id not in set(proposed)]
-            metadata["selection_source"] = "proposal"
-            metadata["selection_review_applied"] = True
-            metadata["selection_review_fallback"] = "proposal_unreviewed_over_request_budget"
-            warnings.append(
-                "LLM selection review left codes unreviewed because each one exceeded "
-                "the per-request budget. The deterministic proposal was kept. "
-                "The selection is not complete."
-            )
-            return {
-                "raised_code_ids": proposed,
-                "not_raised_code_ids": not_raised,
-                "selection_source": "proposal",
-                "metadata": metadata,
-                "prompt_log": logs,
-                "warnings": warnings,
-            }
-        raised = merge_selection_ids(progress_row.get("ordered_ids") or [], progress_row.get("raised_ids") or [])
+        progress_row["open"] = False
+        progress_row["provisional"] = False
+        raised = provisional
         decision = {
             "raised_code_ids": raised,
             "rationale": (
@@ -5882,11 +5933,17 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
             updates = _researcher_node(held, model_decision=decision)
         except (ValueError, FocusedError) as exc:
             metadata["decision_stop"] = "invalid_decision"
-            metadata["selection_source"] = "unreviewed"
+            metadata["selection_source"] = "provisional"
             metadata["selection_review_applied"] = False
             metadata["selection_review_complete"] = False
+            metadata["selection_withheld"] = True
+            metadata["selection_downstream_eligible"] = False
+            metadata["selection_status"] = "provisional"
             warnings.append(f"LLM selection review incomplete: invalid_decision. {exc}")
             return {
+                "raised_code_ids": [],
+                "not_raised_code_ids": known,
+                "selection_source": "provisional",
                 "metadata": metadata,
                 "prompt_log": logs,
                 "warnings": warnings,
@@ -5894,30 +5951,14 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
             }
         merged_meta = dict(updates.get("metadata") or metadata)
         merged_meta["decision_chunk_state"] = progress_row
-        merged_meta["selection_review_complete"] = bool(report["complete"])
+        merged_meta["selection_review_complete"] = True
         merged_meta["selection_review_applied"] = True
+        merged_meta["selection_withheld"] = False
+        merged_meta["selection_status"] = "applied"
+        merged_meta["selection_downstream_eligible"] = True
+        merged_meta["selection_resume"] = {**metadata["selection_resume"], "resumable": False}
         store_decision_report(merged_meta, report)
-        if not report["complete"]:
-            note = "LLM selection review is not complete."
-            if ceiling:
-                merged_meta["decision_stop"] = ceiling
-                merged_meta["decision_stop_detail"] = ceiling
-                note = f"LLM selection review incomplete: {ceiling}."
-            elif omissions:
-                merged_meta["decision_stop_detail"] = "selection_truncated"
-                note = (
-                    "LLM selection review omitted codes that alone exceeded the "
-                    "per-request budget. The selection is not complete."
-                )
-            else:
-                merged_meta["decision_stop_detail"] = "selection_truncated"
-            if note not in list(updates.get("warnings") or warnings):
-                warnings = list(updates.get("warnings") or warnings)
-                warnings.append(note)
-            else:
-                warnings = list(updates.get("warnings") or warnings)
-        else:
-            warnings = list(updates.get("warnings") or warnings)
+        warnings = list(updates.get("warnings") or warnings)
         return {**updates, "metadata": merged_meta, "prompt_log": logs, "warnings": warnings}
 
     if index >= len(chunks):
@@ -5939,7 +5980,7 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
     if stop:
         add_stop_reason(progress, stop)
         metadata["decision_stop"] = stop
-        progress["next_index"] = len(chunks)
+        progress["next_index"] = index
         return _close(progress)
 
     parsed, audit = await reviewer.decide(payload, SelectionDecision, metadata)
@@ -5951,7 +5992,7 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         add_stop_reason(progress, reason)
         if audit and str(audit.get("status") or "") != "omitted":
             note_chunk_send(progress, audit, estimate=estimate)
-        progress["next_index"] = len(chunks)
+        progress["next_index"] = index
         return _close(progress)
 
     note_chunk_send(progress, audit, estimate=estimate)
@@ -6035,9 +6076,25 @@ def _decision_node(runtime: FocusedRuntime, *, claims: bool):
     return review
 
 
+def _selection_can_resume(meta: Mapping[str, Any]) -> bool:
+    """True when a later visit can review a chunk this run did not validate."""
+    progress = meta.get("decision_chunk_state") or {}
+    if not isinstance(progress, Mapping) or progress.get("kind") != "focused_selection":
+        return False
+    if not progress.get("open") and not progress.get("provisional"):
+        return False
+    chunks = list(progress.get("chunks") or [])
+    validated = int(progress.get("chunks_validated") or 0)
+    return bool(chunks) and 0 < validated < len(chunks)
+
+
 def _route_decision(state: FocusedState) -> str:
     meta = state.get("metadata") or {}
     progress = meta.get("decision_chunk_state") or {}
+    if meta.get("selection_withheld"):
+        if state.get("interrupt_enabled", True) and _selection_can_resume(meta):
+            return "selection_pause"
+        return "export_focused"
     if isinstance(progress, Mapping) and progress.get("open") and progress.get("kind") == "focused_selection":
         return "researcher_checkpoint"
     if meta.get("decision_stop") and not meta.get("selection_review_applied"):
@@ -6045,6 +6102,55 @@ def _route_decision(state: FocusedState) -> str:
     if not state.get("raised_code_ids"):
         return "review_recode"
     return "prepare_recode"
+
+
+def _route_after_selection_pause(state: FocusedState) -> str:
+    meta = state.get("metadata") or {}
+    progress = meta.get("decision_chunk_state") or {}
+    if (
+        not meta.get("selection_withheld")
+        and isinstance(progress, Mapping)
+        and progress.get("open")
+        and progress.get("kind") == "focused_selection"
+    ):
+        return "researcher_checkpoint"
+    return "export_focused"
+
+
+def _selection_pause_node(state: FocusedState) -> dict:
+    """Pause a withheld selection so a later resume can review the remainder."""
+    metadata = dict(state.get("metadata") or {})
+    decision = interrupt(
+        {
+            "kind": "focused_selection_incomplete",
+            "decision_stop": metadata.get("decision_stop"),
+            "uncovered_code_ids": list(metadata.get("selection_uncovered_code_ids") or []),
+            "provisional_raised_code_ids": list(metadata.get("provisional_raised_code_ids") or []),
+            "instructions": (
+                "This selection is provisional. It is not applied and it is not downstream eligible. "
+                "Chunk order did not promote any code. "
+                "Resume with {\"continue_selection\": true} to review the uncovered codes, "
+                "or {\"leave_selection\": true} to export without promoting them."
+            ),
+        }
+    )
+    if isinstance(decision, Mapping) and decision.get("continue_selection") is True:
+        metadata.pop("decision_stop", None)
+        metadata["selection_withheld"] = False
+        metadata["selection_status"] = "provisional"
+        return {"metadata": metadata}
+    if not isinstance(decision, Mapping) or decision.get("leave_selection") is not True:
+        raise FocusedError(
+            "Resume an incomplete selection with {'continue_selection': true} or {'leave_selection': true}."
+        )
+    metadata["selection_withheld"] = True
+    progress = dict(metadata.get("decision_chunk_state") or {})
+    progress["open"] = False
+    metadata["decision_chunk_state"] = progress
+    resume_row = dict(metadata.get("selection_resume") or {})
+    resume_row["resumable"] = False
+    metadata["selection_resume"] = resume_row
+    return {"metadata": metadata}
 
 
 def _export_node(runtime: FocusedRuntime):
@@ -6336,6 +6442,8 @@ def build_focused_graph(runtime: FocusedRuntime | None = None):
 
     ``researcher_checkpoint`` and ``claim_checkpoint`` call
     :func:`langgraph.types.interrupt` when interrupts are enabled.
+    An incomplete LLM selection goes to ``selection_pause`` instead of
+    promoting the codes it has already seen.
 
     When a request timeout is set, ``recode_worker`` and an LLM decision node
     get a step watchdog. The node names and edges stay the same. A human
@@ -6369,12 +6477,18 @@ def build_focused_graph(runtime: FocusedRuntime | None = None):
         _decision_node(runtime, claims=True),
         **_watched_node_kwargs(runtime.decision_step_timeout),
     )
+    builder.add_node("selection_pause", _selection_pause_node)
     builder.add_node("export_focused", _export_node(runtime))
     builder.add_edge(START, "load_open_coding")
     builder.add_edge("load_open_coding", "select_candidates")
     builder.add_edge("select_candidates", "researcher_checkpoint")
     builder.add_conditional_edges("researcher_checkpoint", _route_decision,
-        ["researcher_checkpoint", "export_focused", "prepare_recode", "review_recode"])
+        ["researcher_checkpoint", "selection_pause", "export_focused", "prepare_recode", "review_recode"])
+    builder.add_conditional_edges(
+        "selection_pause",
+        _route_after_selection_pause,
+        ["researcher_checkpoint", "export_focused"],
+    )
     builder.add_conditional_edges(
         "prepare_recode",
         _route_prepare,
@@ -6698,7 +6812,9 @@ async def afocused_code(
 
     ``decision_mode='human'`` preserves the two human interrupts. With
     ``decision_mode='llm'``, a bounded LLM reviewer decides selection and claim
-    dispositions without interrupts. ``decision_model`` defaults to ``model``.
+    dispositions. An incomplete selection is not applied. When ``interrupt`` is
+    true it pauses so a later resume can review the uncovered codes.
+    ``decision_model`` defaults to ``model``.
     Model support is stored separately as ``model_claim_support``; human
     ``claim_support`` and the saturation judgment are not fabricated.
     Decision calls and estimated input tokens have independent allowances;
@@ -6709,11 +6825,14 @@ async def afocused_code(
     retains the legacy behavior: accept the selection and skip claim review.
 
     ``interrupt`` defaults to true. The graph pauses inside
-    ``researcher_checkpoint`` with :func:`langgraph.types.interrupt`. Resume by
-    calling this function again with ``resuming=True`` and ``resume`` set to the
-    value for :class:`~langgraph.types.Command`. The same checkpointer and
-    ``thread_id`` are required. Corpus, context, model settings, and the
-    analytic procedure are checked against the manifest stored at the start.
+    ``researcher_checkpoint`` with :func:`langgraph.types.interrupt`. An
+    incomplete LLM selection pauses at ``selection_pause`` instead. Resume that
+    pause with ``{"continue_selection": true}`` or ``{"leave_selection": true}``.
+    Resume a human checkpoint by calling this function again with
+    ``resuming=True`` and ``resume`` set to the value for
+    :class:`~langgraph.types.Command`. The same checkpointer and ``thread_id``
+    are required. Corpus, context, model settings, and the analytic procedure
+    are checked against the manifest stored at the start.
     ``batch_size`` (default 1), ``concurrency``, and ``token_budget`` are
     performance settings and are stored separately. Changing them, or the
     context or model, needs ``allow_changes`` or ``continuation``. Changing the
@@ -6778,7 +6897,7 @@ async def afocused_code(
         {"model": describe_model(reviewer_model), "model_settings": chat_model_settings(reviewer_model)}
         if reviewer_model is not None else None), max_decision_calls=max_decision_calls,
         max_decision_tokens=max_decision_tokens, decision_token_budget=decision_token_budget,
-        decision_review_chunking=DECISION_REVIEW_CHUNKING)
+        **review_procedure_fields())
     coder = (
         _resolve_model(model, timeout=focused_request_timeout)
         if isinstance(model, str)
@@ -7147,8 +7266,18 @@ async def _invoke(
                 await graph.aupdate_state(config, {"metadata": {**saved_meta, **metadata}})
             await graph.aupdate_state(config, {"interrupt_enabled": interrupt_enabled})
             if getattr(snapshot, "interrupts", ()):
+                # LLM review normally resumes itself. An incomplete selection
+                # is the exception: the caller says whether to continue it.
+                choosing_selection = isinstance(resume, Mapping) and (
+                    resume.get("continue_selection") is True or resume.get("leave_selection") is True
+                )
+                command_resume = (
+                    resume
+                    if choosing_selection or runtime.decision_mode != "llm"
+                    else {"automated_review": True}
+                )
                 await graph.ainvoke(
-                    Command(resume=({"automated_review": True} if runtime.decision_mode == "llm" else resume)),
+                    Command(resume=command_resume),
                     config,
                     durability=durability,
                 )

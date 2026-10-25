@@ -56,6 +56,7 @@ from automated_grounded_theory.decision_review import (
     load_chunk_progress,
     merge_core_nominations,
     note_chunk_send,
+    review_procedure_fields,
     same_chunking_fingerprint,
     store_decision_report,
 )
@@ -190,6 +191,12 @@ _PROCEDURE_KEYS = (
     "source_hash",
     "max_axial_review_tokens",
     "decision_review_chunking",
+    "incomplete_review_application",
+    "eligibility_rule",
+    "link_denial_rule",
+    "pattern_quote_rule",
+    "pair_count_rule",
+    "core_candidate_rule",
 )
 _LOCKED_KEYS = frozenset({"seed", "source_hash"})
 
@@ -564,6 +571,8 @@ def _source_mapping(source: Any) -> dict[str, Any]:
             value = getattr(source, name, None)
             if value:
                 data[name] = value
+    if not isinstance(source, Mapping) and hasattr(source, "raised_code_ids"):
+        data["raised_code_ids"] = [str(item) for item in (getattr(source, "raised_code_ids") or [])]
     data["codebook"] = _book(data.get("codebook"))
     refreshed = []
     for row in data.get("relationships") or []:
@@ -2531,12 +2540,72 @@ def _apply_model_relations(
     return relationships
 
 
+def _focus_selection_fields(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Promoted focused categories carried on a source, when the source has them."""
+    incoming = data.get("metadata") if isinstance(data.get("metadata"), Mapping) else {}
+    fields: dict[str, Any] = {}
+    if "raised_code_ids" in data:
+        fields["raised_code_ids"] = [str(item) for item in (data.get("raised_code_ids") or [])]
+    elif "raised_code_ids" in incoming:
+        fields["raised_code_ids"] = [str(item) for item in (incoming.get("raised_code_ids") or [])]
+    for key in (
+        "selection_review_complete",
+        "selection_status",
+        "selection_withheld",
+        "selection_source",
+        "selection_downstream_eligible",
+    ):
+        if key in data:
+            fields[key] = data.get(key)
+        elif key in incoming:
+            fields[key] = incoming.get(key)
+    return fields
+
+
+def _core_candidate_request(
+    metadata: Mapping[str, Any],
+    *,
+    incoming_stage: str = "",
+) -> tuple[str, list[str] | None]:
+    """The categories core selection may score.
+
+    A direct selective call with no focused selection uses the codebook the
+    caller passed. A focused selection that is present and complete limits
+    the candidates to the promoted ids. An incomplete or missing focused
+    selection does not fall back to every open code. ``incoming_stage`` is
+    the stage before this graph sets its own, because that overwrite would
+    hide a focused source that never recorded promoted ids.
+    """
+    incomplete = (
+        metadata.get("selection_review_complete") is False
+        or metadata.get("selection_withheld") is True
+        or str(metadata.get("selection_status") or "") == "provisional"
+    )
+    if incomplete:
+        return "focused_selection_incomplete", []
+    if "raised_code_ids" in metadata:
+        return "focused_categories", [str(item) for item in (metadata.get("raised_code_ids") or [])]
+    focused_source = (
+        bool(metadata.get("selection_source"))
+        or str(metadata.get("stage") or "") == "focused"
+        or str(incoming_stage or "") == "focused"
+    )
+    if focused_source:
+        return "focused_categories_unavailable", []
+    return "caller_codebook", None
+
+
 def _score_candidates(state: Mapping[str, Any]) -> list[dict[str, Any]]:
     book = state.get("codebook") or {}
+    metadata = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
+    allowed = metadata.get("focused_category_ids")
+    allowed_ids = None if allowed is None else {str(item) for item in allowed}
     relationships = [row for row in (state.get("relationships") or []) if isinstance(row, Mapping)]
     passages = _by_passage(state)
     rows = []
     for code_id, entry in book.items():
+        if allowed_ids is not None and str(code_id) not in allowed_ids:
+            continue
         proposed = [
             row
             for row in relationships
@@ -2654,15 +2723,27 @@ def _run_relationships(run: Any) -> list[Mapping[str, Any]]:
 def axial_attrition(state: Mapping[str, Any]) -> dict[str, Any]:
     """Counts from one axial run. A comparison set deduplicates repeated relationships.
 
-    ``unique_pairs`` is null when pair accounting was not recorded.
+    ``unique_pairs`` is ``pairs_examined_unique``: distinct pairs with a
+    completed examination. It is null when that history was not recorded.
+    ``pair_space_size`` is the full unordered pair space. It is null when
+    planning did not record it. Neither field is the materialized plan list.
     ``evidence_tiers`` is null when no row has a numeric tier.
     ``deduplicated_relationships`` is null unless ``comparison_runs`` is present.
     """
     metadata = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
     relationships = _public_relationships(state.get("relationships") or [])
-    accounting = metadata.get("pair_accounting") if isinstance(metadata.get("pair_accounting"), Mapping) else {}
-    planned = accounting.get("planned") if isinstance(accounting, Mapping) else None
-    unique_pairs = len(planned) if isinstance(planned, list) else None
+    coverage = metadata.get("pair_coverage") if isinstance(metadata.get("pair_coverage"), Mapping) else {}
+    procedure = metadata.get("procedure") if isinstance(metadata.get("procedure"), Mapping) else {}
+    pair_space = coverage.get("pair_count")
+    if pair_space is None:
+        pair_space = procedure.get("planned_pair_count")
+    try:
+        pair_space_size = None if pair_space is None else int(pair_space)
+    except (TypeError, ValueError):
+        pair_space_size = None
+    examined = metadata.get("examined_pairs")
+    pairs_examined_unique = len(examined) if isinstance(examined, list) else None
+    unique_pairs = pairs_examined_unique
     diagnostics = metadata.get("proposal_diagnostics") if isinstance(metadata.get("proposal_diagnostics"), Mapping) else None
     reasons = {}
     if isinstance(diagnostics, Mapping) and isinstance(diagnostics.get("rejection_reasons"), Mapping):
@@ -2698,6 +2779,8 @@ def axial_attrition(state: Mapping[str, Any]) -> dict[str, Any]:
         deduplicated = len(identities)
     return {
         "unique_pairs": unique_pairs,
+        "pair_space_size": pair_space_size,
+        "pairs_examined_unique": pairs_examined_unique,
         "proposals": proposals,
         "valid_statements": valid_statements,
         "grounded_endpoints": grounded,
@@ -4121,7 +4204,10 @@ def _route_after_relations(state: AxialState) -> str:
 
 
 def _route_after_core(state: AxialState) -> str:
-    progress = (state.get("metadata") or {}).get("decision_chunk_state") or {}
+    metadata = state.get("metadata") or {}
+    progress = metadata.get("decision_chunk_state") or {}
+    if metadata.get("core_selection_withheld"):
+        return "draft_memos"
     if isinstance(progress, Mapping) and progress.get("open") and progress.get("kind") == "axial_core_review":
         return "core_checkpoint"
     return "draft_memos"
@@ -5625,6 +5711,49 @@ async def _advance_core_review(
         metadata["researcher_core_id"] = ""
         unknown = str(progress_row.get("unknown_nomination") or "")
         nominations = [str(item) for item in (progress_row.get("nominations") or []) if str(item)]
+        uncovered = list(report.get("uncovered_ids") or [])
+        metadata["core_uncovered_code_ids"] = uncovered
+        metadata["core_chunk_order_selects"] = False
+        if not report["complete"]:
+            progress_row["open"] = True
+            progress_row["provisional"] = True
+            metadata["decision_chunk_state"] = progress_row
+            merged = merge_core_nominations(candidates, nominations)
+            metadata["model_core_id"] = ""
+            metadata["model_core_judgment"] = False
+            metadata["provisional_core_id"] = str(merged.get("core_id") or unknown or "")
+            metadata["core_selection_truncated"] = True
+            metadata["core_selection_withheld"] = True
+            metadata["core_status"] = "provisional"
+            metadata["core_downstream_eligible"] = False
+            metadata["core_resume"] = {
+                "resumable": True,
+                "next_index": int(progress_row.get("next_index") or 0),
+                "plan_hash": str(progress_row.get("plan_hash") or ""),
+                "uncovered_code_ids": uncovered,
+            }
+            for row in candidates:
+                row["model_core"] = False
+            warnings.append(
+                "Core selection is provisional and was not applied. "
+                f"{len(uncovered)} candidates were not reviewed."
+            )
+            return {
+                "core_candidates": candidates,
+                "metadata": metadata,
+                "prompt_log": logs,
+                "warnings": warnings,
+            }
+        progress_row["open"] = False
+        progress_row["provisional"] = False
+        metadata["core_selection_withheld"] = False
+        metadata["core_status"] = "applied"
+        metadata["core_resume"] = {
+            "resumable": False,
+            "next_index": int(progress_row.get("next_index") or 0),
+            "plan_hash": str(progress_row.get("plan_hash") or ""),
+            "uncovered_code_ids": [],
+        }
         if unknown:
             metadata["model_core_id"] = unknown
             metadata["model_core_rationale"] = str(progress_row.get("rationale") or "")
@@ -5633,8 +5762,7 @@ async def _advance_core_review(
             metadata["core_unsupported_by_graph"] = True
             metadata["core_graph_support"] = "core_unsupported_by_graph"
             warnings.append(f"Model core id {unknown!r} is not a candidate. It was kept and flagged.")
-            if not report["complete"]:
-                metadata["core_selection_truncated"] = True
+            metadata["core_downstream_eligible"] = False
             return {
                 "core_candidates": candidates,
                 "metadata": metadata,
@@ -5655,8 +5783,9 @@ async def _advance_core_review(
                 row["model_core"] = row.get("code_id") == chosen
                 if row.get("code_id") == chosen and metadata.get("core_unsupported_by_graph"):
                     row["core_unsupported_by_graph"] = True
-        if not report["complete"]:
-            metadata["core_selection_truncated"] = True
+        metadata["core_downstream_eligible"] = bool(metadata.get("model_core_id")) and not metadata.get(
+            "core_unsupported_by_graph"
+        )
         return {"core_candidates": candidates, "metadata": metadata, "prompt_log": logs, "warnings": warnings}
 
     index = int(progress.get("next_index") or 0)
@@ -5694,7 +5823,7 @@ async def _advance_core_review(
         add_stop_reason(progress, reason)
         if parsed is None and audit and str(audit.get("status") or "") not in {"omitted", "refused", "not_sent"}:
             note_chunk_send(progress, audit, estimate=int((audit or {}).get("estimated_input_tokens") or 0))
-        progress["next_index"] = len(chunks)
+        progress["next_index"] = index
         return _finish_choice(progress, warnings)
     note_chunk_send(progress, audit, estimate=int((audit or {}).get("estimated_input_tokens") or 0))
     chosen = str(parsed.get("core_id") or "")
@@ -5730,7 +5859,16 @@ def _core_checkpoint(runtime: AxialRuntime):
         metadata = dict(state.get("metadata") or {})
         logs = list(state.get("prompt_log") or [])
         if not candidates:
-            return {"core_candidates": candidates}
+            reason = str(metadata.get("core_candidate_source") or "")
+            if reason and reason != "caller_codebook":
+                metadata["model_core_id"] = ""
+                metadata["core_selection_complete"] = False
+                metadata["core_selection_withheld"] = True
+                metadata["core_status"] = "provisional"
+                metadata["core_downstream_eligible"] = False
+                metadata["core_candidate_reason"] = reason
+                _note_stage(metadata, "selective_core", required=True, status="incomplete", reason=reason)
+            return {"core_candidates": candidates, "metadata": metadata, "prompt_log": logs}
         if runtime.decision_mode == "llm":
             if runtime.reviewer is None:
                 metadata["decision_stop"] = "call_allowance"
@@ -7108,7 +7246,7 @@ def _procedure_from_kwargs(data: Mapping[str, Any], **kwargs: Any) -> dict[str, 
         "pattern_min_cases_note": (
             "A design choice for this package. It is not a quotation from the method literature."
         ),
-        "decision_review_chunking": DECISION_REVIEW_CHUNKING,
+        **review_procedure_fields(),
         "negative_case_search": bool(kwargs.get("negative_case_search", True)),
         "core_stability_min_n": max(2, int(kwargs.get("core_stability_min_n", CORE_STABILITY_MIN_N) or CORE_STABILITY_MIN_N)),
         "core_stability_min_n_note": (
@@ -7451,6 +7589,7 @@ async def aaxial_code(
         },
         **record_model_determinism(model, seed=int(procedure["seed"])),
     }
+    metadata.update(_focus_selection_fields(data))
     try:
         runtime = _runtime(
             model,
@@ -7635,9 +7774,10 @@ async def aselective_code(
         "core_stability_min_n_note": (
             "A design choice for this package. It is not a quotation from the method literature."
         ),
-        "decision_review_chunking": DECISION_REVIEW_CHUNKING,
+        **review_procedure_fields(),
     }
     metadata = dict(upstream)
+    incoming_stage = str(metadata.get("stage") or "")
     if upstream.get("stage") == "axial" or data.get("saturation") or upstream.get("model_saturation"):
         if axial_procedure:
             metadata["axial_procedure"] = axial_procedure
@@ -7660,6 +7800,13 @@ async def aselective_code(
     metadata["saturation_judgment"] = None
     metadata["seed"] = resolved_seed
     metadata["seed_source"] = seed_source
+    metadata.update(_focus_selection_fields(data))
+    candidate_source, category_ids = _core_candidate_request(metadata, incoming_stage=incoming_stage)
+    metadata["core_candidate_source"] = candidate_source
+    if category_ids is None:
+        metadata.pop("focused_category_ids", None)
+    else:
+        metadata["focused_category_ids"] = category_ids
     metadata.update(record_model_determinism(model, seed=resolved_seed))
     metadata.setdefault("researcher_core_id", "")
     try:
