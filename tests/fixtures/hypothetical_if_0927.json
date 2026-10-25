@@ -11,8 +11,8 @@
     {
       "id": "aside-if-i-can",
       "quote": "tools for the shift lead to coworkers on the crew, if I can",
-      "status": "validated",
-      "hypothetical": false
+      "status": "hypothetical",
+      "hypothetical": true
     },
     {
       "id": "true-conditional-before",

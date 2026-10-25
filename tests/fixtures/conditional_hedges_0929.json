@@ -63,16 +63,16 @@
       "quote": "training leads to confidence, if I can",
       "from_terms": ["training"],
       "to_terms": ["confidence"],
-      "expected_status": "validated",
-      "authorizes_tier_3": true
+      "expected_status": "hypothetical",
+      "authorizes_tier_3": false
     },
     {
       "id": "hedge-if-possible",
       "quote": "training leads to confidence, if possible",
       "from_terms": ["training"],
       "to_terms": ["confidence"],
-      "expected_status": "validated",
-      "authorizes_tier_3": true
+      "expected_status": "hypothetical",
+      "authorizes_tier_3": false
     }
   ]
 }
