@@ -2245,6 +2245,7 @@ def _refresh_evidence(
         memos=memos,
         pattern_min_cases=pattern_min_cases,
     )
+    _keep_qualification(target)
 
 
 def _keep_qualification(target: dict) -> None:
@@ -5445,6 +5446,34 @@ def _quote_identity(item: Mapping[str, Any]) -> tuple[str, str, str]:
     )
 
 
+def _record_list(row: Mapping[str, Any], key: str) -> list[dict[str, Any]]:
+    return [dict(item) for item in (row.get(key) or []) if isinstance(item, Mapping)]
+
+
+def _union_records(rows: Sequence[Mapping[str, Any]], key: str) -> list[dict[str, Any]]:
+    """Stable union. Input order and relationship id order do not change the set."""
+    found: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        for item in _record_list(row, key):
+            blob = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+            found.setdefault(blob, item)
+    return [found[blob] for blob in sorted(found)]
+
+
+def _evidence_signature(row: Mapping[str, Any]) -> str:
+    payload = {
+        "evidence_tier": row.get("evidence_tier"),
+        "disposition": str(row.get("disposition") or ""),
+        "counterexamples": _union_records([row], "counterexamples"),
+        "variation_cases": _union_records([row], "variation_cases"),
+        "negative_cases": _union_records([row], "negative_cases"),
+        "qualification_reason": str(row.get("qualification_reason") or ""),
+        "qualifications": [str(item) for item in (row.get("qualifications") or [])],
+        "conflicting_evidence": row.get("conflicting_evidence"),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+
+
 def _assertion_provenance(row: Mapping[str, Any]) -> list[dict[str, Any]]:
     prior = row.get("assertion_provenance")
     if isinstance(prior, list) and prior:
@@ -5457,6 +5486,14 @@ def _assertion_provenance(row: Mapping[str, Any]) -> list[dict[str, Any]]:
             "reviewer_disposition": row.get("reviewer_disposition"),
             "passage_id": row.get("passage_id"),
             "quote": row.get("quote"),
+            "case_quotes": _record_list(row, "case_quotes"),
+            "counterexamples": _record_list(row, "counterexamples"),
+            "variation_cases": _record_list(row, "variation_cases"),
+            "negative_cases": _record_list(row, "negative_cases"),
+            "qualification_reason": row.get("qualification_reason"),
+            "qualifications": [str(item) for item in (row.get("qualifications") or [])],
+            "review_history": _record_list(row, "review_history"),
+            "conflicting_evidence": row.get("conflicting_evidence"),
         }
     ]
 
@@ -5464,11 +5501,15 @@ def _assertion_provenance(row: Mapping[str, Any]) -> list[dict[str, Any]]:
 def consolidate_duplicate_assertions(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """One row per identical statement on a directed pair.
 
-    The kept id is the lowest relationship id. Quotes are unioned. The tier is
-    not copied from the highest input: the caller reassesses the merged quotes.
-    ``conflicting_evidence`` is the provenance list when the pre-merge tiers or
-    dispositions differ, and null otherwise. An empty statement is not merged.
-    A different statement, or the opposite direction, stays its own row.
+    The kept id is the lowest relationship id. Supporting quotes,
+    counterexamples, variation cases, qualifications, and review history are
+    copied into provenance before anything is reassessed, then unioned onto
+    the kept row. The tier is not copied from the highest input: the caller
+    reassesses the combined evidence. ``conflicting_evidence`` is that
+    provenance when the rows disagree on tier, disposition, counterexamples,
+    variation, or qualification, and null when they do not. An empty statement
+    is not merged. A different statement, or the opposite direction, stays its
+    own row.
     """
     order: list[tuple] = []
     groups: dict[tuple, list[dict[str, Any]]] = {}
@@ -5496,31 +5537,60 @@ def consolidate_duplicate_assertions(rows: Sequence[Mapping[str, Any]]) -> list[
         ordered = sorted(group, key=lambda item: str(item.get("relationship_id") or ""))
         base = dict(ordered[0])
         provenance: list[dict[str, Any]] = []
-        quotes: list[dict[str, Any]] = []
-        seen: set[tuple[str, str, str]] = set()
+        history: list[dict[str, Any]] = []
+        reasons: list[str] = []
+        flags: list[str] = []
+        seen_flags: set[str] = set()
         for item in ordered:
             provenance.extend(_assertion_provenance(item))
-            found = [dict(quote) for quote in (item.get("case_quotes") or []) if isinstance(quote, Mapping)]
-            if not found and (item.get("quote") or item.get("passage_id")):
-                found = [
+            for event in _record_list(item, "review_history"):
+                history.append(event)
+            reason = str(item.get("qualification_reason") or "")
+            if reason and reason not in reasons:
+                reasons.append(reason)
+            for flag in item.get("flags") or []:
+                text = str(flag)
+                if text and text not in seen_flags:
+                    seen_flags.add(text)
+                    flags.append(text)
+        reasons.sort()
+        base["case_quotes"] = _union_records(ordered, "case_quotes")
+        if not base["case_quotes"]:
+            base["case_quotes"] = _union_records(
+                [
                     {
-                        "passage_id": item.get("passage_id"),
-                        "quote": item.get("quote"),
-                        "endpoint": "both",
+                        "case_quotes": [
+                            {
+                                "passage_id": item.get("passage_id"),
+                                "quote": item.get("quote"),
+                                "endpoint": "both",
+                            }
+                        ]
                     }
-                ]
-            for quote in found:
-                identity = _quote_identity(quote)
-                if identity in seen:
-                    continue
-                seen.add(identity)
-                quotes.append(quote)
-        base["case_quotes"] = quotes
+                    for item in ordered
+                    if item.get("quote") or item.get("passage_id")
+                ],
+                "case_quotes",
+            )
+        base["counterexamples"] = _union_records(ordered, "counterexamples")
+        base["variation_cases"] = _union_records(ordered, "variation_cases")
+        base["negative_cases"] = _union_records(ordered, "negative_cases")
+        base["qualifications"] = sorted(
+            {
+                str(item)
+                for row in ordered
+                for item in (row.get("qualifications") or [])
+                if str(item)
+            }
+        )
+        base["qualification_reason"] = reasons[0] if len(reasons) == 1 else ("; ".join(reasons) if reasons else None)
+        base["qualification_reasons"] = reasons
+        base["flags"] = flags
+        base["review_history"] = history
         base["assertion_provenance"] = provenance
         base["merged_relationship_ids"] = [str(item.get("relationship_id") or "") for item in provenance]
-        tiers = {item.get("evidence_tier") for item in provenance}
-        dispositions = {str(item.get("disposition") or "") for item in provenance}
-        base["conflicting_evidence"] = list(provenance) if len(tiers) > 1 or len(dispositions) > 1 else None
+        signatures = {_evidence_signature(item) for item in ordered}
+        base["conflicting_evidence"] = list(provenance) if len(signatures) > 1 else None
         merged.append(base)
     return merged
 

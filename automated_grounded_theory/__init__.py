@@ -113,7 +113,10 @@ from automated_grounded_theory.saturation import stopping_criteria_report, thema
 from automated_grounded_theory.segment import plan_coding
 from automated_grounded_theory.stability import StabilityReport
 from automated_grounded_theory.themes import ThemeError, ThemeResult, abuild_themes, build_themes
-from automated_grounded_theory.relationship_tiers import score_attribution_accuracy
+from automated_grounded_theory.relationship_tiers import (
+    score_attribution_accuracy,
+    score_conditional_readings,
+)
 from automated_grounded_theory.version import __version__
 
 __all__ = [
@@ -186,6 +189,7 @@ __all__ = [
     "load_adjudications",
     "load_discovery_file",
     "score_attribution_accuracy",
+    "score_conditional_readings",
     "score_discovery",
     "score_gate_adjudications",
     "stamp_relationship_assessment",

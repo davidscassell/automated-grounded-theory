@@ -153,21 +153,16 @@ READING_BASIS = "deterministic_provisional"
 _OTHER_HYPOTHETICAL_RE = re.compile(
     r"\b(?:would|someone said|they said|i heard|suppose|supposing|what if|had said)\b"
 )
-# Discourse pronouns and function words. A bounded ``if`` whose subject is one
-# of these pronouns, and whose other words stay inside this closed class, is a
-# hedge about the utterance. It is not a list of sentence exceptions. A lexical
-# word such as ``night`` or ``rains`` is outside the class, so that ``if`` stays.
-_DISCOURSE_PRONOUNS = frozenset({"i", "we", "you", "that", "this", "it"})
-_DISCOURSE_FUNCTION = _DISCOURSE_PRONOUNS | frozenset({
-    "can", "could", "may", "might", "possible", "possibly",
-    "make", "makes", "made", "sense",
-    "know", "knew", "see", "saw", "help", "helps", "helped",
-    "want", "wanted", "like", "liked", "follow", "follows",
-    "understand", "understands", "okay", "ok", "right", "please",
-    "mean", "means", "meant", "what", "me", "my", "your", "our",
-    "just", "really", "actually", "so", "then", "a", "an", "the",
-    "to", "of", "is", "are", "am", "be", "been", "was", "were",
-    "get", "got", "do", "does", "did",
+# Exact conversational hedges. A span counts only when the whole span is one
+# of these phrases. ``if you help`` and ``if you understand`` are not hedges.
+# ``if it rains`` is not a hedge. This is not a word class.
+_DISCOURSE_ASIDES = frozenset({
+    "if that makes sense",
+    "if i can",
+    "if possible",
+    "if you know what i mean",
+    "if i'm honest",
+    "if i am honest",
 })
 _ASIDE_BOUNDARY_RE = re.compile(r",|;|\u2014|—|--")
 # A noun phrase can contain ``if`` without making the link conditional.
@@ -712,28 +707,16 @@ def _claim_clause(folded: str, from_terms: set[str], to_terms: set[str]) -> str:
 
 
 def _discourse_aside_text(text: str) -> bool:
-    """True when ``text`` is only a discourse hedge, not a condition on the link.
+    """True when ``text`` is one exact conversational hedge.
 
-    The span must not contain a link connector. ``if possible`` is a hedge.
-    Otherwise the subject is a discourse pronoun and every following word is in
-    the discourse class. ``if the night is long`` and ``if it rains`` are not.
+    The whole span must be on ``_DISCOURSE_ASIDES``. ``if that makes sense``,
+    ``if I can``, ``if possible``, ``if you know what I mean``, and ``if I'm
+    honest`` are hedges. ``if you help``, ``if you understand``, and ``if it
+    rains`` are conditions and stay in the quote.
     """
-    folded = _norm(text).strip(" ,;()—-.")
-    # Membership in the discourse class is the test. A link verb such as
-    # ``makes`` can also be a connector, and ``makes sense`` is still a hedge.
-    # A lexical conditional has a word outside the class, so it is not stripped.
-    if not folded:
-        return False
-    match = re.search(r"\bif\b", folded)
-    if not match or folded[: match.start()].strip():
-        return False
-    after = folded[match.end() :].strip(" .!?")
-    if after == "possible":
-        return True
-    tokens = [token.strip(".,!?") for token in after.split() if token.strip(".,!?")]
-    if not tokens or tokens[0] not in _DISCOURSE_PRONOUNS:
-        return False
-    return all(token in _DISCOURSE_FUNCTION for token in tokens)
+    folded = _norm(text).strip(" ,;()—-.").replace("\u2019", "'").replace("`", "'")
+    folded = folded.strip(" .,!?;:")
+    return bool(folded) and folded in _DISCOURSE_ASIDES
 
 
 def _strip_discourse_asides(folded: str) -> str:
@@ -763,11 +746,11 @@ def _conditional_governs_link(clause: str) -> bool:
     """True when a conditional governs the from-to link in ``clause``.
 
     ``if`` inside a noun phrase such as ``part of why ... if ...`` does not.
-    A discourse aside does not: a parenthetical or comma-bounded hedge whose
-    subject is a discourse pronoun and whose words stay in that class, such as
-    ``if that makes sense`` or ``if I can``. Stripping that aside does not
-    remove a lexical conditional elsewhere in the sentence. ``if the night is
-    long`` stays. ``if`` before the connector, or a condition after the
+    A discourse aside does not: the span is an exact closed-list hedge, such as
+    ``if that makes sense``, ``if I can``, ``if you know what I mean``, or
+    ``if I'm honest``. Stripping that aside does not remove any other
+    conditional. ``if you help``, ``if you understand``, and ``if the night is
+    long`` stay. ``if`` before the connector, or a condition after the
     connector that is not inside that noun phrase, does. ``would`` and reported
     speech stay hypothetical markers. The reading is still provisional: this is
     a closed pattern, not a parse of the sentence.
@@ -837,11 +820,11 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
     existential-negation marker before that connector is unsupported and does
     not authorize tier 3. ``would`` and ``someone said`` are hypothetical.
     ``if`` is hypothetical only when it governs this from-to link. An ``if``
-    inside a noun phrase, or a discourse aside such as ``if that makes sense``
-    or ``if I can``, is not. A lexical conditional in the same sentence stays.
-    Anything else that is not one clear pattern stays
-    unvalidated. This is not a general reading of the sentence. Every reading
-    stays provisional until it is checked on natural-language data.
+    inside a noun phrase, or an exact hedge such as ``if that makes sense``,
+    is not. Any other condition stays hypothetical or ambiguous. A provisional
+    reading does not authorize tier 3. This is not a general reading of the
+    sentence. Every reading stays provisional until it is checked on
+    natural-language data. Human-adjudicated examples are not in this package.
     """
     folded = _norm(text)
     if not folded:
@@ -883,7 +866,12 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
     else:
         polarity = "affirmative"
         negation_scope = None
-    hedging = "qualified" if frequency_scope else ("hedged" if _HEDGE_RE.search(clause_padded) else "none")
+    stripped_clause = _strip_discourse_asides(clause)
+    # Hedge words count only outside an exact aside. ``if possible`` is an
+    # aside, so ``possible`` there does not hedge the link.
+    hedging = "qualified" if frequency_scope else (
+        "hedged" if _HEDGE_RE.search(f" {stripped_clause} ") else "none"
+    )
     hypothetical = _conditional_governs_link(clause)
     unsupported = _unsupported_before_connector(clause)
     if unsupported:
@@ -945,6 +933,8 @@ def _interpret_quote(text: str, from_terms: set[str], to_terms: set[str]) -> dic
         "reading_basis": READING_BASIS,
         "reading_provisional": True,
         "qualifications": qualifications,
+        # Only a validated reading can authorize tier 3. Hypothetical,
+        # ambiguous, and every other provisional status cannot.
         "authorizes_tier_3": status == "validated",
     }
 
@@ -2133,5 +2123,77 @@ def score_attribution_accuracy(cases: Sequence[Mapping[str, Any]] | None = None)
         "correct_count": correct,
         "model_judgments_used": False,
         "note": "Scored only the quotes passed in. The packaged fixtures were not loaded.",
+        "cases": rows,
+    }
+
+
+def score_conditional_readings(cases: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+    """Score exact-hedge conditionals on labeled examples the caller supplies.
+
+    ``None`` or an empty list leaves ``accuracy`` null. This function does not
+    load the packaged fixture. Passing synthetic examples is a processing
+    check. It is not adjudication, and it does not establish that a selection
+    is valid. No model is called. Each case needs ``quote``, ``from_terms``,
+    ``to_terms``, and ``expected_status``. ``authorizes_tier_3`` is checked
+    when the case includes it. A non-validated reading must not authorize tier 3.
+    """
+    note = (
+        "No labeled examples were supplied. Synthetic fixtures are processing checks, "
+        "not adjudication and not selection validity. Human-adjudicated examples are not included."
+    )
+    empty = {
+        "accuracy": None,
+        "denominator": 0,
+        "correct_count": None,
+        "model_judgments_used": False,
+        "adjudication_data_included": False,
+        "selection_validity": False,
+        "note": note,
+    }
+    if not cases:
+        return empty
+    correct = 0
+    rows: list[dict[str, Any]] = []
+    for case in cases:
+        if not isinstance(case, Mapping):
+            raise ValueError("A conditional example must be an object.")
+        quote = str(case.get("quote") or "")
+        from_terms = _distinctive(" ".join(str(item) for item in (case.get("from_terms") or [])))
+        to_terms = _distinctive(" ".join(str(item) for item in (case.get("to_terms") or [])))
+        expected = case.get("expected_status", case.get("status"))
+        expected_status = None if expected is None else str(expected)
+        reading = _interpret_quote(quote, from_terms, to_terms) or {}
+        status = reading.get("status")
+        authorizes = bool(reading.get("authorizes_tier_3"))
+        status_ok = expected_status is not None and status == expected_status
+        auth_ok = True
+        if "authorizes_tier_3" in case:
+            auth_ok = authorizes is bool(case.get("authorizes_tier_3"))
+        if status != "validated" and authorizes:
+            auth_ok = False
+        ok = status_ok and auth_ok
+        correct += int(ok)
+        rows.append(
+            {
+                "quote": quote,
+                "expected_status": expected_status,
+                "status": status,
+                "authorizes_tier_3": authorizes,
+                "reading_provisional": True if reading else None,
+                "correct": ok,
+            }
+        )
+    total = len(rows)
+    return {
+        "accuracy": round(correct / total, 4) if total else None,
+        "denominator": total,
+        "correct_count": correct,
+        "model_judgments_used": False,
+        "adjudication_data_included": False,
+        "selection_validity": False,
+        "note": (
+            "Scored only the synthetic examples passed in. "
+            "That is processing coverage, not adjudication and not selection validity."
+        ),
         "cases": rows,
     }

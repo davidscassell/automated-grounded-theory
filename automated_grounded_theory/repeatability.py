@@ -135,31 +135,54 @@ def _pair_report(left: Any, right: Any, left_index: int, right_index: int) -> di
     }
 
 
+def _eligibility_row(key: tuple[str, str, str], left: bool | None, right: bool | None) -> dict[str, Any]:
+    return {
+        "from_id": key[0],
+        "to_id": key[1],
+        "statement_hash": key[2],
+        "left": left,
+        "right": right,
+    }
+
+
 def _eligibility_changes(
     left_rows: Sequence[Mapping[str, Any]],
     right_rows: Sequence[Mapping[str, Any]],
-) -> list[dict[str, Any]] | None:
+) -> dict[str, Any] | None:
+    """Matched eligibility flips, plus additions, removals, and unknown rows.
+
+    A statement missing from one run does not hide a flip on a statement that
+    both runs have. A missing boolean is unknown. It is not treated as a flip
+    and it does not discard the rest of the comparison. ``None`` means there
+    are no relationship rows to compare.
+    """
     left = {_statement_key(row): _eligibility(row) for row in left_rows}
     right = {_statement_key(row): _eligibility(row) for row in right_rows}
-    keys = set(left) | set(right)
-    if not keys:
+    if not left and not right:
         return None
-    if any(left.get(key) is None or right.get(key) is None for key in keys):
-        return None
-    changes = []
-    for key in sorted(keys):
-        if left.get(key) == right.get(key):
-            continue
-        changes.append(
-            {
-                "from_id": key[0],
-                "to_id": key[1],
-                "statement_hash": key[2],
-                "left": left.get(key),
-                "right": right.get(key),
-            }
-        )
-    return changes
+    matched = []
+    unknown = []
+    for key in sorted(set(left) & set(right)):
+        left_value = left[key]
+        right_value = right[key]
+        if left_value is None or right_value is None:
+            unknown.append(_eligibility_row(key, left_value, right_value))
+        elif left_value != right_value:
+            matched.append(_eligibility_row(key, left_value, right_value))
+    additions = [
+        _eligibility_row(key, None, right[key])
+        for key in sorted(set(right) - set(left))
+    ]
+    removals = [
+        _eligibility_row(key, left[key], None)
+        for key in sorted(set(left) - set(right))
+    ]
+    return {
+        "matched": matched,
+        "additions": additions,
+        "removals": removals,
+        "unknown_eligibility": unknown,
+    }
 
 
 def _mean(values: Sequence[float | None]) -> float | None:
@@ -174,9 +197,9 @@ def compare_pipeline_runs(runs: Sequence[Any]) -> dict[str, Any]:
 
     Selected-code overlap is Jaccard of ``raised_code_ids``. Relationship
     overlap is Jaccard of directed pairs, and of directed pair plus statement
-    hash. Eligibility changes list statement keys whose ``downstream_eligible``
-    boolean differs. The field is null when a boolean is missing or there is
-    nothing to compare.
+    hash. Eligibility changes compare matched statements. Additions, removals, and
+    unknown eligibility are separate lists. The field is null when there are
+    no relationship rows to compare.
     """
     items = list(runs or [])
     pairwise = []
@@ -192,6 +215,6 @@ def compare_pipeline_runs(runs: Sequence[Any]) -> dict[str, Any]:
             "statement_jaccard": _mean([item["statement_jaccard"] for item in pairwise]),
             "eligibility_changes": None
             if not pairwise or any(item["eligibility_changes"] is None for item in pairwise)
-            else [change for item in pairwise for change in item["eligibility_changes"]],
+            else [change for item in pairwise for change in item["eligibility_changes"]["matched"]],
         },
     }

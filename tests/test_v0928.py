@@ -70,11 +70,11 @@ _ASIDE = Path(__file__).resolve().parents[0] / "fixtures" / "discourse_aside_092
 
 
 def test_version_rules_and_unchanged_defaults():
-    assert __version__ == "0.9.28"
-    assert POLICY_VERSION == "0.9.28"
-    assert DECISION_REVIEW_CHUNKING == "request_budget_v5"
-    assert CONDITIONAL_SCOPE_RULE == "discourse_aside_v1"
-    assert DUPLICATE_ASSERTION_RULE == "merge_identical_statement_v1"
+    assert __version__ == "0.9.29"
+    assert POLICY_VERSION == "0.9.29"
+    assert DECISION_REVIEW_CHUNKING == "request_budget_v6"
+    assert CONDITIONAL_SCOPE_RULE == "closed_hedge_v1"
+    assert DUPLICATE_ASSERTION_RULE == "merge_all_evidence_v1"
     assert BUDGET_LEDGER_RULE == "shared_review_ledger_v1"
     assert EXPORT_ASSESSMENT_RULE == "shared_assessment_v1"
     assert CHUNK_REVIEW_RECOVERY == "reuse_validated_v1"
@@ -460,8 +460,10 @@ def test_frozen_review_and_pipeline_repeat_stay_distinct():
     assert pair["selected_code_jaccard"] == pytest.approx(0.5)
     assert pair["directed_pair_jaccard"] == 1.0
     assert pair["statement_jaccard"] == 1.0
-    assert pair["eligibility_changes"]
+    assert pair["eligibility_changes"]["matched"]
+    assert pair["eligibility_changes"]["additions"] == []
     assert compared["summary"]["selected_code_jaccard"] == pytest.approx(0.5)
+    assert compared["summary"]["eligibility_changes"] == pair["eligibility_changes"]["matched"]
     empty = compare_pipeline_runs([{}, {}])
     assert empty["pairwise"][0]["selected_code_jaccard"] is None
     assert empty["pairwise"][0]["directed_pair_jaccard"] is None
@@ -473,7 +475,12 @@ def test_frozen_review_and_pipeline_repeat_stay_distinct():
         ]
     )
     assert missing["pairwise"][0]["selected_code_jaccard"] is None
-    assert missing["pairwise"][0]["eligibility_changes"] is None
+    unknown = missing["pairwise"][0]["eligibility_changes"]
+    assert unknown["matched"] == []
+    assert unknown["additions"] == []
+    assert unknown["removals"] == []
+    assert unknown["unknown_eligibility"][0]["left"] is None
+    assert unknown["unknown_eligibility"][0]["right"] is True
 
 
 def test_token_shortfall_stops_before_the_first_request(tmp_path):

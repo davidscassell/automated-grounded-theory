@@ -1,0 +1,78 @@
+{
+  "fixture_version": "conditional-hedges-0929",
+  "note": "Synthetic sentences only. Not study data, not adjudication, and not selection validity. Human-adjudicated examples are not included. Readings stay provisional.",
+  "cases": [
+    {
+      "id": "genuine-if-you-help",
+      "quote": "If you help, training leads to confidence.",
+      "from_terms": ["training"],
+      "to_terms": ["confidence"],
+      "expected_status": "hypothetical",
+      "authorizes_tier_3": false
+    },
+    {
+      "id": "genuine-if-you-understand",
+      "quote": "If you understand, training leads to confidence.",
+      "from_terms": ["training"],
+      "to_terms": ["confidence"],
+      "expected_status": "hypothetical",
+      "authorizes_tier_3": false
+    },
+    {
+      "id": "genuine-if-it-rains",
+      "quote": "If it rains, training leads to confidence.",
+      "from_terms": ["training"],
+      "to_terms": ["confidence"],
+      "expected_status": "hypothetical",
+      "authorizes_tier_3": false
+    },
+    {
+      "id": "hedge-if-that-makes-sense",
+      "quote": "If that makes sense, training leads to confidence.",
+      "from_terms": ["training"],
+      "to_terms": ["confidence"],
+      "expected_status": "validated",
+      "authorizes_tier_3": true
+    },
+    {
+      "id": "hedge-if-you-know-what-i-mean",
+      "quote": "If you know what I mean, training leads to confidence.",
+      "from_terms": ["training"],
+      "to_terms": ["confidence"],
+      "expected_status": "validated",
+      "authorizes_tier_3": true
+    },
+    {
+      "id": "hedge-if-im-honest",
+      "quote": "If I'm honest, training leads to confidence.",
+      "from_terms": ["training"],
+      "to_terms": ["confidence"],
+      "expected_status": "validated",
+      "authorizes_tier_3": true
+    },
+    {
+      "id": "hedge-if-i-am-honest",
+      "quote": "If I am honest, training leads to confidence.",
+      "from_terms": ["training"],
+      "to_terms": ["confidence"],
+      "expected_status": "validated",
+      "authorizes_tier_3": true
+    },
+    {
+      "id": "hedge-if-i-can",
+      "quote": "training leads to confidence, if I can",
+      "from_terms": ["training"],
+      "to_terms": ["confidence"],
+      "expected_status": "validated",
+      "authorizes_tier_3": true
+    },
+    {
+      "id": "hedge-if-possible",
+      "quote": "training leads to confidence, if possible",
+      "from_terms": ["training"],
+      "to_terms": ["confidence"],
+      "expected_status": "validated",
+      "authorizes_tier_3": true
+    }
+  ]
+}
