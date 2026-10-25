@@ -1,7 +1,7 @@
 # automated-grounded-theory — Technical Design (0.6.0, corrections in 0.6.1, 0.6.2, 0.6.3, 0.6.4, 0.6.5, 0.6.6, 0.6.7, 0.6.8, 0.6.9, 0.6.10, 0.6.11, 0.6.12, 0.6.13, 0.6.14, 0.6.15, and 0.6.16, focused coding in 0.7.0, fixes in 0.7.1, 0.7.2, 0.7.3, 0.7.4, 0.7.5, 0.7.6, 0.7.7, 0.7.8, and 0.7.9, axial coding and saturation indicators in 0.8.0, fixes in 0.8.1)
 
 Repo: https://github.com/davidscassell/automated-grounded-theory
-Status: this file is the open-coding design, beginning with steps 1 and 2 of the v0.6 plan. Focused coding is in 0.7.0 and the 0.7.1 through 0.7.9 fixes. Axial coding, saturation indicators, and selective coding are separate experimental graphs from 0.8.0. Within-corpus theoretical sampling and a saturation decision that leaves `judgment` null are in 0.9.0 and later. Package `policy_version` is `0.9.24`. The current index is [README.md](README.md). The 0.8 axial slice is [design-axial-0800.md](design-axial-0800.md). 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
+Status: this file is the open-coding design, beginning with steps 1 and 2 of the v0.6 plan. Focused coding is in 0.7.0 and the 0.7.1 through 0.7.9 fixes. Axial coding, saturation indicators, and selective coding are separate experimental graphs from 0.8.0. Within-corpus theoretical sampling and a saturation decision that leaves `judgment` null are in 0.9.0 and later. Package `policy_version` is `0.9.25`. The current index is [README.md](README.md). The 0.8 axial slice is [design-axial-0800.md](design-axial-0800.md). 0.6.1 corrects measurement, batching, the alias gate, idle waits, and the shared client loop. It does not add those later steps.
 
 The default procedure is Charmaz-informed automated analysis: initial coding against a frozen snapshot, constant comparison with distinct operations, and `build_themes` as a descriptive reporting view. It is not an axial-coding template.
 
@@ -479,7 +479,11 @@ Package 0.9.23 keeps a proposal review from erasing a recovered discovery. Indep
 
 Package 0.9.24 packs focused selection, axial relationship review, and selective core selection into requests that each fit the per-request budget. `batch_size` stays 1 and is not that pack size. One item that alone exceeds the budget is omitted and the review continues. A truncated selection is not complete. Models still cannot set verified or authorize attribution wording. A checkpoint from 0.9.23 cannot resume into a chunked review. The axial planner still builds the full pair space in memory. That limit stays open. `pattern_min_cases` stays 2, the axial ceiling stays 24000, `batch_size` stays 1, and tier 4 stays human-only. The design is [design-review-fixes-0924.md](design-review-fixes-0924.md).
 
-`policy_version` is `0.9.24`.
+`policy_version` was `0.9.24`.
+
+Package 0.9.25 withholds an incomplete focused selection and an incomplete core choice. Neither is applied, neither is downstream eligible, and the uncovered ids are reported. Chunk order does not decide which codes can be selected. Core candidates are the promoted focused categories. A missing or incomplete focused selection is reported and is not replaced by every open code. A direct selective call with no focused selection still scores the codebook the caller passed. A claim component is eligible only when the row is supported evidence. One quote serving both endpoints does not count as a both-endpoint case under `pattern_min_cases` 2. Denied means the participant rejects the from-to link. `unique_pairs` is the count of completed examinations, and `pair_space_size` is the full pair space. Reread `cost_status` follows whether both token prices are configured. A 0.9.24 decision-review checkpoint cannot resume. The axial planner still builds the full pair space in memory. That limit stays open. `pattern_min_cases` stays 2, the axial ceiling stays 24000, `batch_size` stays 1, and tier 4 stays human-only. The design is [design-review-fixes-0925.md](design-review-fixes-0925.md).
+
+`policy_version` is `0.9.25`.
 
 ## 26. Out of scope
 

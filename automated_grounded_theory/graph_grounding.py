@@ -73,19 +73,23 @@ def _usable(row: Mapping[str, Any]) -> bool:
 def graph_supported(row: Mapping[str, Any]) -> bool:
     """Tier 2 or higher, excluding a weak-stem hypothesis.
 
-    ``downstream_eligible`` is not read. A row that was marked eligible and
-    also carries ``weak_stem_anchor`` does not support a core. When the row
-    has claim components, only the pattern component supports a core. An
-    analyst interpretation does not. A 0.9.19 export that still stores the
-    analyst reading as a row flag, and has no ``claims``, stays unsupported
-    until it is reassessed.
+    The row and the pattern component use one rule. When the row has claim
+    components, a withheld row is not graph-supported, even when an older
+    pattern component still says it can support a core. A row with no claim
+    components does not trust a stale ``downstream_eligible`` flag: the tier
+    and the weak-stem check decide. Only the pattern component supports a
+    core. An analyst interpretation does not. A 0.9.19 export that still
+    stores the analyst reading as a row flag, and has no ``claims``, stays
+    unsupported until it is reassessed.
     """
+    claims = row.get("claims") if isinstance(row.get("claims"), Mapping) else None
+    if claims is not None and row.get("downstream_eligible") is not True:
+        return False
     tier = tier_of(row)
     if not (_usable(row) and tier is not None and tier >= 2):
         return False
     if weak_stem_relationship(row):
         return False
-    claims = row.get("claims") if isinstance(row.get("claims"), Mapping) else None
     if claims is not None:
         pattern = claims.get("pattern") if isinstance(claims.get("pattern"), Mapping) else {}
         return bool(pattern.get("supports_core")) and str(row.get("core_support_component") or "") == "pattern"

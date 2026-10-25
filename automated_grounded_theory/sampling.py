@@ -110,8 +110,9 @@ _PROCEDURE_KEYS = (
     "quiet_rounds",
     "min_documents",
     "min_relation_documents",
+    "cost_status_rule",
 )
-_LOCKED_KEYS = frozenset({"seed", "source_hash"})
+_LOCKED_KEYS = frozenset({"seed", "source_hash", "cost_status_rule"})
 _NEW_DATA_NOTE = (
     "The existing corpus has no suitable unsampled passage for this direction. "
     "Collecting new data is a researcher action. This package did not collect any."
@@ -4035,9 +4036,12 @@ def reread_interpretation_report(state: Mapping[str, Any]) -> dict[str, Any]:
     is a sent call without usage. Coverage is null when there were no reread
     calls. ``expenditure_tokens_per_relevant_reread``
     and the expenditure cost rate stay null when usage is incomplete or when
-    the relevant count is zero. Cost stays null unless the run records both
-    token prices and the usage is complete. ``human_confirmed_useful_rereads``
-    is not computed.
+    the relevant count is zero.     A complete expenditure with no sent calls is a known zero when both
+    token prices are set. Per-relevant dollar amounts stay null when there
+    is no relevant usage to price. ``cost_status`` is ``configured`` when
+    both token prices are set and ``unset`` otherwise. It follows that
+    configuration, not whether a reread was relevant.
+    ``human_confirmed_useful_rereads`` is not computed.
     """
     metadata = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
     directions = [row for row in (state.get("directions") or []) if isinstance(row, Mapping)]
@@ -4117,6 +4121,7 @@ def reread_interpretation_report(state: Mapping[str, Any]) -> dict[str, Any]:
         relevant_n = overall["relevant"]
         tokens["cost_per_relevant_reread_usd"] = None if relevant_n <= 0 else round(cost / relevant_n, 6)
         tokens["cost_status"] = "configured"
+    tokens["cost_status"] = "configured" if prices_set else "unset"
     if prices_set and expenditure.get("reread_expenditure_complete"):
         spent = (expenditure["reread_expenditure_input_tokens"] / 1_000_000) * float(in_rate) + (
             expenditure["reread_expenditure_output_tokens"] / 1_000_000
@@ -4481,6 +4486,7 @@ def _procedure(data: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
         "quiet_rounds": int(kwargs["quiet_rounds"]),
         "min_documents": int(kwargs["min_documents"]),
         "min_relation_documents": int(kwargs["category_documents"]),
+        "cost_status_rule": "configuration_v1",
     }
 
 

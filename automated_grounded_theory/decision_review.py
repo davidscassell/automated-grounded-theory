@@ -6,8 +6,8 @@ Provider SDK retries, if enabled on the supplied model, remain provider-owned.
 
 Selection review is packed into chunks that each fit the per-request token
 budget. ``batch_size`` is not that pack size. A code that alone exceeds the
-budget is omitted and the review continues. The merged raised set is the
-union of chunk decisions, in canonical code-id order.
+budget is omitted and the review continues. A complete review merges raised
+ids in canonical code-id order. An incomplete review is not applied.
 """
 from __future__ import annotations
 
@@ -46,13 +46,20 @@ class ClaimDecisions(BaseModel):
 
 # Locked on the focused and axial procedure manifests. A checkpoint saved
 # before this value existed cannot resume into a chunked review.
-DECISION_REVIEW_CHUNKING = "request_budget_v1"
+DECISION_REVIEW_CHUNKING = "request_budget_v2"
+INCOMPLETE_REVIEW_APPLICATION = "withhold_incomplete_v1"
+ELIGIBILITY_RULE = "row_gates_components_v1"
+LINK_DENIAL_RULE = "affirmative_rejection_v1"
+PATTERN_QUOTE_RULE = "distinct_endpoint_quotes_v1"
+PAIR_COUNT_RULE = "space_and_examined_v1"
+CORE_CANDIDATE_RULE = "focused_categories_v1"
 
 CHUNKING_CHECKPOINT_MESSAGE = (
     "procedure.decision_review_chunking: this checkpoint was saved before "
-    "decision-review requests were chunked to the per-request budget, or the "
-    "stored chunk plan does not match this resume. Resume cannot continue that "
-    "review. Start a new run."
+    "decision-review requests were chunked to the per-request budget, or before "
+    "an incomplete review was withheld instead of applied, or the stored chunk "
+    "plan does not match this resume. Resume cannot continue that review. "
+    "Start a new run."
 )
 
 
@@ -398,6 +405,23 @@ def pack_decision_chunks(
     return {"chunks": chunks, "omissions": omissions, "ordered_ids": ordered}
 
 
+def review_procedure_fields() -> dict[str, str]:
+    """Procedure fingerprint for 0.9.25 review rules.
+
+    The chunk partition is separate from the call and token ceilings. A higher
+    ceiling can continue the same chunks. A different partition cannot.
+    """
+    return {
+        "decision_review_chunking": DECISION_REVIEW_CHUNKING,
+        "incomplete_review_application": INCOMPLETE_REVIEW_APPLICATION,
+        "eligibility_rule": ELIGIBILITY_RULE,
+        "link_denial_rule": LINK_DENIAL_RULE,
+        "pattern_quote_rule": PATTERN_QUOTE_RULE,
+        "pair_count_rule": PAIR_COUNT_RULE,
+        "core_candidate_rule": CORE_CANDIDATE_RULE,
+    }
+
+
 def decision_plan_hash(
     *,
     kind: str,
@@ -408,13 +432,17 @@ def decision_plan_hash(
     chunks: Sequence[Sequence[str]],
     omissions: Sequence[Mapping[str, Any]],
 ) -> str:
-    """Fingerprint the chunk plan a resume has to match."""
+    """Fingerprint the chunk partition a resume has to match.
+
+    ``max_tokens`` and ``max_calls`` are accepted so callers stay stable, and
+    they are not part of the hash. They limit how far a run gets. They do not
+    change which ids share a chunk.
+    """
+    del max_tokens, max_calls
     payload = {
         "version": DECISION_REVIEW_CHUNKING,
         "kind": str(kind),
         "per_request_budget": int(per_request),
-        "max_tokens": int(max_tokens),
-        "max_calls": int(max_calls),
         "ordered_ids": [str(item) for item in ordered_ids],
         "chunks": [[str(item) for item in chunk] for chunk in chunks],
         "omissions": [
@@ -530,10 +558,18 @@ def finish_decision_report(progress: Mapping[str, Any]) -> dict[str, Any]:
     sent = int(progress.get("chunks_sent") or 0)
     validated = int(progress.get("chunks_validated") or 0)
     invalid = int(progress.get("invalid_chunks") or 0)
+    omitted_ids = {str(item.get("id") or "") for item in omissions}
+    reviewed_set = set(reviewed)
+    uncovered = [
+        str(item)
+        for item in (progress.get("ordered_ids") or [])
+        if str(item) not in reviewed_set and str(item) not in omitted_ids
+    ]
     complete = (
         item_count == len(reviewed)
         and not omissions
         and not stops
+        and not uncovered
         and invalid == 0
         and validated == len(chunks)
     )
@@ -548,7 +584,10 @@ def finish_decision_report(progress: Mapping[str, Any]) -> dict[str, Any]:
         "item_count": item_count,
         "items_reviewed": len(reviewed),
         "items_omitted": len(omissions),
+        "items_uncovered": len(uncovered),
+        "uncovered_ids": uncovered,
         "omissions": omissions,
+        "chunk_order_selects_codes": False,
         "stop_reasons": stops or None,
         "tokens_estimated": int(progress.get("tokens_estimated") or 0) if sent else None,
         "expenditure_complete": (int(progress.get("expenditure_gaps") or 0) == 0) if sent else None,

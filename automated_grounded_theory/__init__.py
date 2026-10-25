@@ -33,7 +33,13 @@ from automated_grounded_theory.evaluate import aevaluate, chen_metrics, evaluate
 from automated_grounded_theory.context import PresetCodesError, ResearchContext
 from automated_grounded_theory.category_state import property_stability, proposal_stability
 from automated_grounded_theory.decision_review import (
+    CORE_CANDIDATE_RULE,
     DECISION_REVIEW_CHUNKING,
+    ELIGIBILITY_RULE,
+    INCOMPLETE_REVIEW_APPLICATION,
+    LINK_DENIAL_RULE,
+    PAIR_COUNT_RULE,
+    PATTERN_QUOTE_RULE,
     ClaimDecision,
     ClaimDecisions,
     DecisionChunkingCheckpointError,
@@ -95,7 +101,13 @@ __all__ = [
     "CodeRetriever",
     "CodingError",
     "DISCOVERY_SCHEMA_VERSION",
+    "CORE_CANDIDATE_RULE",
     "DECISION_REVIEW_CHUNKING",
+    "ELIGIBILITY_RULE",
+    "INCOMPLETE_REVIEW_APPLICATION",
+    "LINK_DENIAL_RULE",
+    "PAIR_COUNT_RULE",
+    "PATTERN_QUOTE_RULE",
     "DecisionChunkingCheckpointError",
     "DecisionReviewer",
     "DiscoveryEvaluationError",

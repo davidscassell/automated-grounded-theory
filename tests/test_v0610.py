@@ -19,8 +19,8 @@ from automated_grounded_theory.version import __version__
 
 
 def test_version_is_0_6_10():
-    assert __version__ == "0.9.24"
-    assert POLICY_VERSION == "0.9.24"
+    assert __version__ == "0.9.25"
+    assert POLICY_VERSION == "0.9.25"
 
 
 def _limiter() -> CallLimiter:

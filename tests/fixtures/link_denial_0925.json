@@ -1,0 +1,34 @@
+{
+  "note": "Synthetic quotes only. They reproduce three readings that were labelled denied. They are not study data.",
+  "link_denial_rule": "affirmative_rejection_v1",
+  "patterns": [
+    {
+      "id": "frequency_negation",
+      "pattern": "A frequency negation such as 'not often used by students' is not a rejection of the from-to link.",
+      "quote": "tools for the shift are not often used by students when coworkers on the crew are in the room",
+      "expected_status": "unvalidated",
+      "expected_polarity": "affirmative",
+      "expected_qualification": "frequency_negation",
+      "denied": false
+    },
+    {
+      "id": "because_explanation",
+      "pattern": "An explanation that contains 'because' and a negation that does not govern the link is not denied.",
+      "quote": "tools for the shift are used because the lab is not far from coworkers on the crew",
+      "expected_status": "unvalidated",
+      "expected_polarity": "affirmative",
+      "expected_qualification": "negation_does_not_reject_link",
+      "denied": false
+    },
+    {
+      "id": "long_quote_without_negation",
+      "pattern": "A long quote with an affirmative link and no negation word is not denied.",
+      "quote": "tools for the shift lead to coworkers on the crew and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the room stayed quiet and the hall stayed l",
+      "quote_characters": 721,
+      "expected_status": "validated",
+      "expected_polarity": "affirmative",
+      "expected_qualification": null,
+      "denied": false
+    }
+  ]
+}
