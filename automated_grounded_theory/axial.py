@@ -44,24 +44,33 @@ from automated_grounded_theory.backends import (
     chat_model_settings,
     describe_model,
     installation_record,
+    model_configuration_record,
     record_model_determinism,
 )
 from automated_grounded_theory.batching import request_input_tokens, shrink_repair_messages
 from automated_grounded_theory.decision_review import (
     DECISION_REVIEW_CHUNKING,
+    SHARED_DECISION_REVIEW,
+    SHARED_REVIEW_STEPS,
     DecisionChunkingCheckpointError,
     add_stop_reason,
+    budget_ledger,
     build_decision_plan,
     finish_decision_report,
     load_chunk_progress,
     merge_core_nominations,
     note_chunk_send,
+    close_budget_step,
+    open_budget_step,
+    prompt_hash,
     review_procedure_fields,
     same_chunking_fingerprint,
+    seal_budget_step,
     store_decision_report,
 )
 from automated_grounded_theory.category_state import plan_relation_pairs, property_stability
 from automated_grounded_theory.focused import _rationale_indicates_irrelevance, load_focused_export
+from automated_grounded_theory.gate_evaluation import stamp_relationship_assessment
 from automated_grounded_theory.retrieval import cosine
 from automated_grounded_theory.saturation import (
     CODE_FREQUENCY_SHIFT_LABEL,
@@ -85,6 +94,7 @@ from automated_grounded_theory.relationship_tiers import (
     TIER_LABELS,
     apply_evidence_tier,
     assign_relationship_eligibility,
+    selection_restricts_to_raised,
     stamp_focus_review,
     candidate_cross_case_passages,
     case_id_of,
@@ -203,6 +213,10 @@ _PROCEDURE_KEYS = (
     "withholding_cause_rule",
     "conditional_scope_rule",
     "chunk_allowance_rule",
+    "duplicate_assertion_rule",
+    "budget_ledger_rule",
+    "export_assessment_rule",
+    "chunk_review_recovery",
 )
 _LOCKED_KEYS = frozenset({"seed", "source_hash"})
 
@@ -2855,6 +2869,9 @@ def export_axial_state(state: Mapping[str, Any], directory: str | Path) -> dict[
     for row in relationships:
         stamp_focus_review(row, metadata)
         assign_relationship_eligibility(row)
+        stamp_relationship_assessment(row)
+    metadata["decision_budget_steps"] = budget_ledger(metadata)
+    metadata["model_configuration"] = model_configuration_record(metadata, state.get("prompt_log") or [])
     if stage != "selective":
         write(
             "category_relationships.json",
@@ -2978,6 +2995,14 @@ def _plan_node(state: AxialState) -> dict:
         return {"relation_round": [], "unexamined_pairs": [], "relationships": list(state.get("relationships") or [])}
     book = state.get("codebook") or {}
     ids = list(book.keys())
+    if selection_restricts_to_raised(metadata):
+        raised = {str(item) for item in (metadata.get("raised_code_ids") or [])}
+        metadata["axial_pair_pool"] = "raised_focused_categories"
+        metadata["axial_pair_pool_excluded_code_ids"] = [item for item in ids if item not in raised]
+        ids = [item for item in ids if item in raised]
+    else:
+        metadata["axial_pair_pool"] = "codebook"
+        metadata["axial_pair_pool_excluded_code_ids"] = []
     calls = int(procedure.get("propose_calls") or 0)
     batch = max(1, int((metadata.get("performance") or {}).get("batch_size") or 1))
     # Classification walks the full pair space. Skip it when this round will
@@ -3212,6 +3237,50 @@ def _pair_record(pair: Mapping[str, Any]) -> dict[str, str]:
     return {"from_id": left, "to_id": right}
 
 
+def _decision_step_calls(runtime: AxialRuntime, step: str) -> int:
+    """Calls already charged to this decision step."""
+    allowance = getattr(getattr(runtime, "limiter", None), "provider_allowance", None)
+    if allowance is None:
+        return 0
+    return int(allowance.stage_used.get(step, 0))
+
+
+def _align_step_calls(runtime: AxialRuntime, metadata: Mapping[str, Any], step: str) -> int:
+    """Count chunks already sent on this step, without charging them again.
+
+    A carried ``review`` total from an older shared pool is not this step's usage.
+    Chunks this step already sent still count, so a resume does not get a second
+    full allowance on top of work that was kept.
+    """
+    allowance = getattr(getattr(runtime, "limiter", None), "provider_allowance", None)
+    if allowance is None or step not in allowance.stage_ceilings:
+        return _decision_step_calls(runtime, step)
+    progress = metadata.get("decision_chunk_state") if isinstance(metadata.get("decision_chunk_state"), Mapping) else {}
+    sent = int(progress.get("chunks_sent") or 0) if progress.get("kind") == step else 0
+    current = int(allowance.stage_used.get(step, 0))
+    if sent > current:
+        allowance.stage_used[step] = sent
+    return int(allowance.stage_used.get(step, 0))
+
+
+_RESUMED_ALLOWANCE_STOPS = frozenset({"call_allowance", "token_allowance", "request_budget"})
+
+
+def _drop_cleared_allowance_stops(metadata: Mapping[str, Any], progress: dict[str, Any]) -> None:
+    """Drop an allowance stop once a larger budget has reopened a provisional plan.
+
+    A review stays incomplete while any stop reason remains. The continuation
+    clears ``decision_stop`` and marks the plan provisional before re-entry.
+    """
+    if metadata.get("decision_stop") or not progress.get("provisional"):
+        return
+    progress["stop_reasons"] = [
+        item
+        for item in (progress.get("stop_reasons") or [])
+        if str(item) not in _RESUMED_ALLOWANCE_STOPS
+    ]
+
+
 def _pair_key(pair: Mapping[str, Any]) -> tuple[str, str]:
     row = _pair_record(pair)
     return row["from_id"], row["to_id"]
@@ -3237,7 +3306,26 @@ def _sync_allowance(metadata: dict[str, Any], runtime: AxialRuntime) -> None:
             "or a ratio above 3, stays at the raw heuristic. The 1.28 adjusted reading is not the stopper."
         ),
     }
-    if allowance.stage_used.get("review"):
+    step_names = ("axial_relation_review", "axial_saturation_review", "axial_core_review")
+    if any(name in allowance.stage_ceilings for name in step_names):
+        # Each decision step has its own call ceiling. The total is the sum of
+        # those steps. It is not one pool that an earlier step can exhaust.
+        metadata["decision_calls_used"] = sum(int(allowance.stage_used.get(name, 0)) for name in step_names)
+        metadata["decision_tokens_used"] = allowance.tokens_estimated
+        budget = metadata.get("provider_budget") if isinstance(metadata.get("provider_budget"), dict) else None
+        if budget is not None:
+            stages = dict(budget.get("stages") or {})
+            stages["review"] = {
+                "calls_used": metadata["decision_calls_used"],
+                "max_calls": None,
+                "note": (
+                    "Sum of the per-step decision allowances. "
+                    "It is not a shared ceiling, and it does not reduce a later step."
+                ),
+            }
+            budget["stages"] = stages
+            metadata["provider_budget"] = budget
+    elif allowance.stage_used.get("review"):
         metadata["decision_calls_used"] = allowance.stage_used["review"]
         metadata["decision_tokens_used"] = allowance.tokens_estimated
 
@@ -4783,6 +4871,15 @@ async def _advance_relation_review(
     limits. The stage is complete only when every row was reviewed.
     """
     reviewer = runtime.reviewer
+    relation_used = _align_step_calls(runtime, metadata, "axial_relation_review")
+    open_budget_step(
+        metadata,
+        step="axial_relation_review",
+        allowance_scope=SHARED_DECISION_REVIEW,
+        allowance=int(reviewer.max_calls),
+        shared_with=SHARED_REVIEW_STEPS,
+        usage=relation_used,
+    )
     by_id = {str(row.get("relationship_id") or ""): row for row in relationships if str(row.get("relationship_id") or "")}
     ordered_ids = sorted(by_id)
 
@@ -4802,6 +4899,7 @@ async def _advance_relation_review(
         omit_reason="single_relationship_exceeds_request_budget",
     )
     progress = load_chunk_progress(metadata, plan)
+    _drop_cleared_allowance_stops(metadata, progress)
 
     def _apply(progress_row: dict) -> list[dict]:
         decisions = [dict(item) for item in (progress_row.get("decisions") or []) if isinstance(item, Mapping)]
@@ -4823,10 +4921,16 @@ async def _advance_relation_review(
     def _close(progress_row: dict) -> dict:
         progress_row["open"] = False
         metadata["decision_chunk_state"] = progress_row
+        _sync_allowance(metadata, runtime)
+        seal_budget_step(
+            metadata,
+            progress_row,
+            "axial_relation_review",
+            usage=_decision_step_calls(runtime, "axial_relation_review"),
+        )
         report = finish_decision_report(progress_row)
         store_decision_report(metadata, report)
         _note_chunked_review(metadata, "decision_review", report, required=True)
-        _sync_allowance(metadata, runtime)
         updated = _apply(progress_row)
         return {"relationships": updated, "metadata": metadata, "prompt_log": logs}
 
@@ -5329,11 +5433,103 @@ def _counterexample_node(runtime: AxialRuntime):
     return counterexample_worker
 
 
+def _statement_key(row: Mapping[str, Any]) -> str:
+    return " ".join(str(row.get("statement") or "").split()).casefold()
+
+
+def _quote_identity(item: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(item.get("passage_id") or ""),
+        str(item.get("quote") or ""),
+        str(item.get("endpoint") or ""),
+    )
+
+
+def _assertion_provenance(row: Mapping[str, Any]) -> list[dict[str, Any]]:
+    prior = row.get("assertion_provenance")
+    if isinstance(prior, list) and prior:
+        return [dict(item) for item in prior if isinstance(item, Mapping)]
+    return [
+        {
+            "relationship_id": str(row.get("relationship_id") or ""),
+            "evidence_tier": row.get("evidence_tier"),
+            "disposition": row.get("disposition"),
+            "reviewer_disposition": row.get("reviewer_disposition"),
+            "passage_id": row.get("passage_id"),
+            "quote": row.get("quote"),
+        }
+    ]
+
+
+def consolidate_duplicate_assertions(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """One row per identical statement on a directed pair.
+
+    The kept id is the lowest relationship id. Quotes are unioned. The tier is
+    not copied from the highest input: the caller reassesses the merged quotes.
+    ``conflicting_evidence`` is the provenance list when the pre-merge tiers or
+    dispositions differ, and null otherwise. An empty statement is not merged.
+    A different statement, or the opposite direction, stays its own row.
+    """
+    order: list[tuple] = []
+    groups: dict[tuple, list[dict[str, Any]]] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        item = dict(row)
+        statement = _statement_key(item)
+        if not statement:
+            key = ("unique", len(order))
+        else:
+            key = (str(item.get("from_id") or ""), str(item.get("to_id") or ""), statement)
+        if key not in groups:
+            order.append(key)
+            groups[key] = []
+        groups[key].append(item)
+    merged: list[dict[str, Any]] = []
+    for key in order:
+        group = groups[key]
+        if len(group) == 1:
+            only = group[0]
+            only["conflicting_evidence"] = only.get("conflicting_evidence") if only.get("merged_relationship_ids") else None
+            merged.append(only)
+            continue
+        ordered = sorted(group, key=lambda item: str(item.get("relationship_id") or ""))
+        base = dict(ordered[0])
+        provenance: list[dict[str, Any]] = []
+        quotes: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for item in ordered:
+            provenance.extend(_assertion_provenance(item))
+            found = [dict(quote) for quote in (item.get("case_quotes") or []) if isinstance(quote, Mapping)]
+            if not found and (item.get("quote") or item.get("passage_id")):
+                found = [
+                    {
+                        "passage_id": item.get("passage_id"),
+                        "quote": item.get("quote"),
+                        "endpoint": "both",
+                    }
+                ]
+            for quote in found:
+                identity = _quote_identity(quote)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                quotes.append(quote)
+        base["case_quotes"] = quotes
+        base["assertion_provenance"] = provenance
+        base["merged_relationship_ids"] = [str(item.get("relationship_id") or "") for item in provenance]
+        tiers = {item.get("evidence_tier") for item in provenance}
+        dispositions = {str(item.get("disposition") or "") for item in provenance}
+        base["conflicting_evidence"] = list(provenance) if len(tiers) > 1 or len(dispositions) > 1 else None
+        merged.append(base)
+    return merged
+
+
 def _commit_relations(state: AxialState) -> dict:
     metadata = dict(state.get("metadata") or {})
     procedure = metadata.get("procedure") or {}
     passages = _by_passage(state)
-    relationships = [dict(row) for row in (state.get("relationships") or [])]
+    relationships = consolidate_duplicate_assertions(state.get("relationships") or [])
     minimum = int(procedure.get("min_relation_documents") or 2)
     book = state.get("codebook") or {}
     segments = state.get("segments") or []
@@ -5362,6 +5558,7 @@ def _commit_relations(state: AxialState) -> dict:
             row["flags"] = flags
             row["tentative_few_documents"] = True
             row["needs_review"] = True
+        stamp_relationship_assessment(row)
     slots = _empty_slots(relationships, lens=str(procedure.get("coding_lens") or "paradigm"))
     if slots:
         warnings = list(state.get("warnings") or [])
@@ -5404,6 +5601,15 @@ def _saturation_checkpoint(runtime: AxialRuntime):
                 report["judgment"] = None
                 _note_stage(metadata, "decision_review", required=False, status="skipped", reason="call_allowance")
                 return {"saturation": report, "metadata": metadata, "prompt_log": logs}
+            saturation_used = _align_step_calls(runtime, metadata, "axial_saturation_review")
+            open_budget_step(
+                metadata,
+                step="axial_saturation_review",
+                allowance_scope=SHARED_DECISION_REVIEW,
+                allowance=int(runtime.reviewer.max_calls),
+                shared_with=SHARED_REVIEW_STEPS,
+                usage=saturation_used,
+            )
             parsed, audit = await runtime.reviewer.decide(
                 {
                     "kind": "axial_saturation_review",
@@ -5451,6 +5657,12 @@ def _saturation_checkpoint(runtime: AxialRuntime):
                 _record_audit_usage(metadata, audit)
             _note_review_outcome(metadata, audit=audit, parsed=parsed)
             _sync_allowance(metadata, runtime)
+            close_budget_step(
+                metadata,
+                step="axial_saturation_review",
+                stop_reason=None if parsed else str(metadata.get("decision_stop") or "") or None,
+                usage=_decision_step_calls(runtime, "axial_saturation_review"),
+            )
             if parsed:
                 reading = pair_coverage_reading(
                     report.get("pairs_planned"),
@@ -5714,6 +5926,15 @@ async def _advance_core_review(
     is not. The selection is complete only when every candidate was reviewed.
     """
     reviewer = runtime.reviewer
+    core_used = _align_step_calls(runtime, metadata, "axial_core_review")
+    open_budget_step(
+        metadata,
+        step="axial_core_review",
+        allowance_scope=SHARED_DECISION_REVIEW,
+        allowance=int(reviewer.max_calls),
+        shared_with=SHARED_REVIEW_STEPS,
+        usage=core_used,
+    )
     preferred = [str(row.get("code_id") or "") for row in candidates if row.get("graph_supported")]
     metadata["relationship_preferred_core_ids"] = preferred
     snapshot = graph_snapshot(state.get("relationships") or [])
@@ -5746,16 +5967,23 @@ async def _advance_core_review(
         omit_reason="single_candidate_exceeds_request_budget",
     )
     progress = load_chunk_progress(metadata, plan)
+    _drop_cleared_allowance_stops(metadata, progress)
 
     def _finish_choice(progress_row: dict, warnings: list[str]) -> dict:
         progress_row["open"] = False
         metadata["decision_chunk_state"] = progress_row
+        _sync_allowance(metadata, runtime)
+        seal_budget_step(
+            metadata,
+            progress_row,
+            "axial_core_review",
+            usage=_decision_step_calls(runtime, "axial_core_review"),
+        )
         report = finish_decision_report(progress_row)
         store_decision_report(metadata, report)
         metadata["core_selection_complete"] = bool(report["complete"])
         _note_chunked_review(metadata, "decision_review", report, required=True)
         _note_chunked_review(metadata, "selective_core", report, required=True)
-        _sync_allowance(metadata, runtime)
         metadata["researcher_core_id"] = ""
         unknown = str(progress_row.get("unknown_nomination") or "")
         nominations = [str(item) for item in (progress_row.get("nominations") or []) if str(item)]
@@ -6918,6 +7146,8 @@ def _result_from_state(state: Mapping[str, Any], *, interrupted: bool, payload: 
         metadata["stop"] = str((payload or {}).get("kind") or "checkpoint")
     metadata["saturation_judgment"] = None
     metadata["package_version"] = __version__
+    metadata["decision_budget_steps"] = budget_ledger(metadata)
+    metadata["model_configuration"] = model_configuration_record(metadata, state.get("prompt_log") or [])
     metadata["provenance"] = installation_record()
     metadata["attrition"] = axial_attrition({**dict(state), "metadata": metadata})
     metadata["prompt_accounting"] = _prompt_accounting(state.get("prompt_log") or [])
@@ -7049,7 +7279,12 @@ def _check_resume(saved: Mapping[str, Any], current: Mapping[str, Any], *, allow
     if not differences:
         return
     locked = [item for item in differences if item.split(".", 1)[-1] in _LOCKED_KEYS]
-    if locked or not allow_changes:
+    if locked:
+        raise AxialCheckpointMismatch(differences)
+    names = {item.split(".", 1)[-1] for item in differences}
+    if names <= {"max_decision_calls", "max_axial_review_tokens", "max_selective_review_calls"}:
+        return
+    if not allow_changes:
         raise AxialCheckpointMismatch(differences)
 
 
@@ -7079,6 +7314,30 @@ def _initial(data: Mapping[str, Any], metadata: dict, *, interrupt_enabled: bool
         "axial_calls_used": 0,
         "selective_calls_used": 0,
     }
+
+
+def _axial_budget_resume_entry(state: Mapping[str, Any]) -> str | None:
+    """Node that already ran when a finished axial or selective stage can continue.
+
+    A finished complete run returns None. The caller still rejects a resume
+    that changes more than the budget.
+    """
+    meta = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
+    progress = meta.get("decision_chunk_state") if isinstance(meta.get("decision_chunk_state"), Mapping) else {}
+    names = {"call_allowance", "token_allowance", "request_budget"}
+    stop = str(meta.get("decision_stop") or "")
+    stops = {str(item) for item in (progress.get("stop_reasons") or [])}
+    allowance = stop in names or bool(stops & names)
+    kind = str(progress.get("kind") or "")
+    if kind == "axial_core_review" and meta.get("core_selection_complete") is not True and (
+        allowance or meta.get("core_selection_withheld") is True
+    ):
+        return "score_candidates"
+    if kind == "axial_relation_review" and allowance:
+        return "propose_relations"
+    if allowance and str(meta.get("stage") or "") == "axial" and kind != "axial_relation_review":
+        return "saturation_indicators"
+    return None
 
 
 def _restore_runtime_budget(runtime: AxialRuntime, metadata: Mapping[str, Any]) -> None:
@@ -7153,11 +7412,15 @@ async def _invoke(builder, saver, initial: AxialState | None, *, thread_id: str,
         if resuming:
             if not has_state:
                 raise AxialError(f"No checkpoint was found for thread {thread_id!r}.")
+            saved_values = dict(snapshot.values or {})
+            finished_entry = None
             if not (getattr(snapshot, "interrupts", ()) or getattr(snapshot, "next", ())):
-                raise AxialError(f"Thread {thread_id!r} is not waiting on a checkpoint.")
-            if resume == {}:
+                finished_entry = _axial_budget_resume_entry(saved_values)
+                if finished_entry is None:
+                    raise AxialError(f"Thread {thread_id!r} is not waiting on a checkpoint.")
+            if resume == {} and finished_entry is None:
                 raise AxialError("An empty object is not a resume value.")
-            saved_meta = dict((snapshot.values or {}).get("metadata") or {})
+            saved_meta = dict(saved_values.get("metadata") or {})
             saved_procedure = saved_meta.get("procedure") or {}
             saved_hash = str(saved_procedure.get("source_hash") or "")
             current_hash = str(procedure.get("source_hash") or "")
@@ -7170,6 +7433,18 @@ async def _invoke(builder, saver, initial: AxialState | None, *, thread_id: str,
                 _restore_runtime_budget(runtime, saved_meta)
             if getattr(snapshot, "interrupts", ()):
                 await graph.ainvoke(Command(resume=resume), config, durability=durability)
+            elif finished_entry:
+                merged = dict(saved_meta)
+                merged["procedure"] = {**dict(saved_meta.get("procedure") or {}), **dict(procedure)}
+                progress = dict(merged.get("decision_chunk_state") or {})
+                if progress:
+                    progress["open"] = True
+                    progress["provisional"] = True
+                    merged["decision_chunk_state"] = progress
+                merged.pop("decision_stop", None)
+                merged["core_selection_withheld"] = False
+                await graph.aupdate_state(config, {"metadata": merged}, as_node=finished_entry)
+                await graph.ainvoke(None, config, durability=durability)
             else:
                 # The node failed before it returned. Retry it from the last
                 # checkpoint. Command(resume=...) is only for interrupt().
@@ -7295,6 +7570,7 @@ def _procedure_from_kwargs(data: Mapping[str, Any], **kwargs: Any) -> dict[str, 
             "A design choice for this package. It is not a quotation from the method literature."
         ),
         **review_procedure_fields(),
+        "max_decision_calls": int(kwargs.get("max_decision_calls", 4) or 0),
         "negative_case_search": bool(kwargs.get("negative_case_search", True)),
         "core_stability_min_n": max(2, int(kwargs.get("core_stability_min_n", CORE_STABILITY_MIN_N) or CORE_STABILITY_MIN_N)),
         "core_stability_min_n_note": (
@@ -7347,15 +7623,40 @@ class AxialDecisionReviewer:
             HumanMessage(content=json.dumps(payload, ensure_ascii=False, sort_keys=True)),
         ]
 
+    def _call_stage(self, payload) -> str:
+        """The allowance bucket for this request.
+
+        A runtime that gives each decision step its own ceiling charges that
+        step. A caller that only configured ``review`` keeps the older bucket.
+        """
+        kind = str((payload or {}).get("kind") or "")
+        shared = getattr(self.limiter, "provider_allowance", None)
+        ceilings = getattr(shared, "stage_ceilings", None) or {}
+        if kind and kind in ceilings:
+            return kind
+        return "review"
+
+    def _step_calls(self, payload, metadata) -> int:
+        """Calls already spent on this step, not on earlier steps."""
+        stage = self._call_stage(payload)
+        shared = getattr(self.limiter, "provider_allowance", None)
+        if shared is not None and stage in (getattr(shared, "stage_ceilings", None) or {}):
+            return int(shared.stage_used.get(stage, 0))
+        if stage == "review":
+            return int(metadata.get("decision_calls_used", 0))
+        by_step = metadata.get("decision_calls_by_step") if isinstance(metadata.get("decision_calls_by_step"), Mapping) else {}
+        return int(by_step.get(stage, 0) or 0)
+
     def refusal_reason(self, payload, schema, metadata) -> tuple[str | None, int]:
         """Why this payload would not be sent, and its estimate. Does not record the stop."""
-        calls = int(metadata.get("decision_calls_used", 0))
+        calls = self._step_calls(payload, metadata)
         tokens = int(metadata.get("axial_tokens_estimated") or metadata.get("decision_tokens_used") or 0)
         estimate = request_input_tokens(self.messages(payload), schema)
         shared = getattr(self.limiter, "provider_allowance", None)
+        stage = self._call_stage(payload)
         shared_stop = None
-        if shared is not None and shared.would_refuse(estimate, stage="review"):
-            shared_stop = shared.preview(estimate, stage="review")["reason"]
+        if shared is not None and shared.would_refuse(estimate, stage=stage):
+            shared_stop = shared.preview(estimate, stage=stage)["reason"]
         stop = (
             "call_allowance" if calls >= self.max_calls
             else shared_stop if shared_stop
@@ -7380,6 +7681,7 @@ class AxialDecisionReviewer:
             "model": describe_model(self.model),
             "model_settings": chat_model_settings(self.model),
             "estimated_input_tokens": estimate,
+            "prompt_hash": prompt_hash(messages),
             "messages": [{"role": message.type, "content": message.content} for message in messages],
         }
         if stop:
@@ -7389,7 +7691,11 @@ class AxialDecisionReviewer:
         calls = int(metadata.get("decision_calls_used", 0))
         tokens = int(metadata.get("axial_tokens_estimated") or metadata.get("decision_tokens_used") or 0)
         shared = getattr(self.limiter, "provider_allowance", None)
+        stage = self._call_stage(payload)
         metadata["decision_calls_used"] = calls + 1
+        by_step = dict(metadata.get("decision_calls_by_step") or {})
+        by_step[stage] = int(by_step.get(stage, 0) or 0) + 1
+        metadata["decision_calls_by_step"] = by_step
         try:
             response = await self.limiter.ainvoke(
                 structured_runnable(self.model, schema),
@@ -7397,7 +7703,7 @@ class AxialDecisionReviewer:
                 use_cache=False,
                 allowance_estimate=estimate,
                 allowance_kind="decision_review",
-                allowance_stage="review",
+                allowance_stage=stage,
             )
             audit["usage"] = usage_from_result(response)
             raw = response.get("raw") if isinstance(response, dict) else None
@@ -7494,7 +7800,10 @@ def _runtime(
     if coding_calls is not None:
         stages["coding"] = max(0, int(coding_calls))
     if review_calls is not None:
-        stages["review"] = max(0, int(review_calls))
+        # One ceiling per decision step. Relation review does not spend the
+        # calls reserved for saturation review or core selection.
+        for name in ("axial_relation_review", "axial_saturation_review", "axial_core_review"):
+            stages[name] = max(0, int(review_calls))
     if selective_call_ceiling is not None:
         stages["selective"] = max(0, int(selective_call_ceiling))
     allowance = ProviderAllowance(
@@ -7601,6 +7910,7 @@ async def aaxial_code(
         batch_size=batch_size,
         max_axial_review_tokens=max_axial_review_tokens,
         pattern_min_cases=pattern_min_cases,
+        max_decision_calls=max_decision_calls,
         negative_case_search=negative_case_search,
         core_stability_min_n=core_stability_min_n,
     )
@@ -7817,6 +8127,7 @@ async def aselective_code(
         "storyline_token_reserve": _storyline_token_reserve(
             int(max_axial_review_tokens), include_storyline=bool(include_storyline)
         ),
+        "max_decision_calls": int(max_decision_calls),
         "negative_case_search": bool(axial_procedure.get("negative_case_search", True)),
         "core_stability_min_n": max(2, int(axial_procedure.get("core_stability_min_n") or CORE_STABILITY_MIN_N)),
         "core_stability_min_n_note": (
@@ -7897,6 +8208,10 @@ async def aselective_code(
         durability=mode,
     )
     _carry_budget(runtime.limiter.provider_allowance, metadata.get("provider_budget"))
+    incoming_budget = metadata.get("provider_budget") if isinstance(metadata.get("provider_budget"), Mapping) else {}
+    incoming_review = (incoming_budget.get("stages") or {}).get("review") if isinstance(incoming_budget, Mapping) else None
+    if isinstance(incoming_review, Mapping) and incoming_review.get("max_calls") is not None:
+        metadata["decision_calls_carried"] = int(incoming_review.get("calls_used") or 0)
     from langgraph.checkpoint.memory import InMemorySaver
 
     thread = thread_id or uuid.uuid4().hex

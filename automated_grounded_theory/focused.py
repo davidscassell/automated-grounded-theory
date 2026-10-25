@@ -115,7 +115,12 @@ from automated_grounded_theory.batching import (
     request_input_tokens,
     resolve_tokenizer,
 )
-from automated_grounded_theory.backends import chat_model_settings, describe_model, record_model_determinism
+from automated_grounded_theory.backends import (
+    chat_model_settings,
+    describe_model,
+    model_configuration_record,
+    record_model_determinism,
+)
 from automated_grounded_theory.category_state import (
     ANALYTIC_FEATURES,
     COVERAGE_PURPOSES,
@@ -172,21 +177,37 @@ from automated_grounded_theory.decision_review import (
     AUTO_SIZE_DECISION_CALLS,
     CHUNK_ALLOWANCE_INSUFFICIENT,
     DECISION_REVIEW_CHUNKING,
+    SELECTION_CHUNK_ORDER_ID,
+    SELECTION_CHUNK_ORDER_SHUFFLE,
+    SELECTION_CONSOLIDATION,
+    FOCUSED_DECISION_REVIEW,
+    FOCUSED_REVIEW_STEPS,
     ClaimDecisions,
     DecisionChunkingCheckpointError,
     DecisionReviewer,
     SelectionDecision,
     add_stop_reason,
     apply_model_claim_decisions,
+    apply_validated_reuse,
+    chunk_input_fingerprint,
+    order_selection_ids,
+    partial_selection_note,
+    preflight_fields,
+    record_validated_chunk,
+    selection_policy_fingerprint,
+    budget_ledger,
     build_decision_plan,
     claims_payload,
     finish_decision_report,
     load_chunk_progress,
     merge_selection_ids,
     next_claim_batch,
+    close_budget_step,
+    open_budget_step,
     review_procedure_fields,
     note_chunk_send,
     same_chunking_fingerprint,
+    seal_budget_step,
     selection_codes,
     selection_payload,
     store_decision_report,
@@ -263,7 +284,14 @@ _PROCEDURE_KEYS = (
     "withholding_cause_rule",
     "conditional_scope_rule",
     "chunk_allowance_rule",
+    "duplicate_assertion_rule",
+    "budget_ledger_rule",
+    "export_assessment_rule",
+    "chunk_review_recovery",
     "auto_size_decision_calls",
+    "selection_chunk_order",
+    "selection_chunk_order_seed",
+    "selection_consolidation",
 )
 _PERFORMANCE_KEYS = (
     "batch_size",
@@ -411,6 +439,9 @@ class FocusedRuntime:
     step_timeout: float = 0.0
     decision_step_timeout: float = 0.0
     auto_size_decision_calls: bool = False
+    selection_chunk_order: str = "id"
+    selection_chunk_order_seed: int | None = None
+    selection_consolidation: bool = False
 
     def __post_init__(self) -> None:
         if self.limiter is None:
@@ -1989,9 +2020,76 @@ def _check_resume_manifest(saved: Mapping[str, Any], current: Mapping[str, Any],
     structural = {path: change for path, change in differences.items() if path in _STRUCTURAL_PATHS}
     if structural:
         raise CheckpointMigrationRequired(structural)
+    # A higher call or token allowance continues the same review. It is not a
+    # general procedure change, and it does not by itself invalidate a chunk.
+    budget_only = set(differences) <= {
+        "procedure.max_decision_calls",
+        "procedure.max_decision_tokens",
+        "procedure.max_focused_review_calls",
+        "procedure.max_focused_review_tokens",
+    }
+    if budget_only:
+        return [{"event": "budget_resume", "differences": differences}]
     if not allow_changes:
         raise CheckpointMismatch(differences)
     return [{"event": "continuation", "differences": differences}]
+
+
+def _allowance_stop(value: str) -> bool:
+    text = str(value or "")
+    return text in {
+        "call_allowance",
+        "token_allowance",
+        "request_budget",
+        CHUNK_ALLOWANCE_INSUFFICIENT,
+    }
+
+
+def _budget_resume_entry(state: Mapping[str, Any]) -> str | None:
+    """Node that already ran when a finished stage can continue on a larger budget.
+
+    The graph has reached the end, so there is no open interrupt. Returning the
+    node to rewind to lets that stage run again. A finished complete stage
+    returns None.
+    """
+    meta = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
+    progress = meta.get("decision_chunk_state") if isinstance(meta.get("decision_chunk_state"), Mapping) else {}
+    stops = {str(item) for item in (progress.get("stop_reasons") or [])}
+    decision_stop = str(meta.get("decision_stop") or "")
+    selection_open = progress.get("kind") == "focused_selection" and (
+        meta.get("selection_review_complete") is not True or meta.get("selection_withheld") is True
+    )
+    if selection_open and (
+        _allowance_stop(decision_stop) or any(_allowance_stop(item) for item in stops) or progress.get("provisional")
+    ):
+        return "select_candidates"
+    if meta.get("decision_review_complete") is False and _allowance_stop(decision_stop):
+        return "review_recode"
+    if _allowance_stop(str(state.get("recode_stop") or "")) or _allowance_stop(str(meta.get("stop") or "")):
+        if meta.get("selection_review_applied") is True or state.get("raised_code_ids"):
+            return "researcher_checkpoint"
+    return None
+
+
+def _prepare_budget_continuation(state: Mapping[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
+    """Clear an allowance stop so the re-entered stage can spend the new budget."""
+    merged = dict(metadata)
+    progress = dict(merged.get("decision_chunk_state") or {})
+    if progress.get("kind") == "focused_selection" and merged.get("selection_review_complete") is not True:
+        progress["open"] = True
+        progress["provisional"] = True
+        merged["decision_chunk_state"] = progress
+        merged.pop("decision_stop", None)
+        # The route treats a withheld selection as finished. Continuing the
+        # chunks has to clear that until the visit closes again.
+        merged["selection_withheld"] = False
+        merged["selection_status"] = "provisional"
+    elif merged.get("decision_review_complete") is False:
+        merged.pop("decision_stop", None)
+    updates: dict[str, Any] = {"metadata": merged}
+    if _allowance_stop(str(state.get("recode_stop") or "")):
+        updates["recode_stop"] = ""
+    return updates
 
 
 def _decision_to_coding(decision: Mapping[str, Any], book: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
@@ -5798,6 +5896,137 @@ def _selection_ceiling(reason: str) -> bool:
     return reason in {"call_allowance", "token_allowance", "request_budget", "review_error"}
 
 
+def _chunk_order_settings(runtime: FocusedRuntime, metadata: Mapping[str, Any]) -> tuple[str, int | None]:
+    """Chunk order and the seed a shuffle would use. ``id`` does not shuffle."""
+    order = str(getattr(runtime, "selection_chunk_order", None) or SELECTION_CHUNK_ORDER_ID)
+    if order not in {SELECTION_CHUNK_ORDER_ID, SELECTION_CHUNK_ORDER_SHUFFLE}:
+        order = SELECTION_CHUNK_ORDER_ID
+    if order != SELECTION_CHUNK_ORDER_SHUFFLE:
+        return order, None
+    seed = getattr(runtime, "selection_chunk_order_seed", None)
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        procedure = metadata.get("procedure") if isinstance(metadata.get("procedure"), Mapping) else {}
+        stored = procedure.get("selection_chunk_order_seed") if isinstance(procedure, Mapping) else None
+        if isinstance(stored, int) and not isinstance(stored, bool):
+            seed = stored
+        else:
+            procedure_seed = procedure.get("seed") if isinstance(procedure, Mapping) else None
+            seed = procedure_seed if isinstance(procedure_seed, int) and not isinstance(procedure_seed, bool) else 0
+    return order, int(seed)
+
+
+async def _consolidate_selection_chunks(runtime, state, progress, metadata, logs, warnings) -> None:
+    """One optional pass over provisionally raised codes and near misses.
+
+    Off unless the caller sets ``selection_consolidation``. A pass that does
+    not fit the remaining allowance is recorded and skipped. It does not
+    discard the chunk reviews already stored.
+    """
+    progress["consolidation_done"] = True
+    metadata["selection_consolidation_enabled"] = True
+    raised = [str(item) for item in (progress.get("raised_ids") or [])]
+    reviewed = [str(item) for item in (progress.get("reviewed_ids") or [])]
+    near = [item for item in reviewed if item not in set(raised)]
+    targets: list[str] = []
+    for item in raised + near:
+        if item and item not in targets:
+            targets.append(item)
+    metadata["selection_consolidation_targets"] = targets
+    metadata["selection_near_miss_code_ids"] = near
+    if not targets:
+        metadata["selection_consolidation"] = None
+        metadata["selection_consolidation_skipped"] = "nothing_to_consolidate"
+        return
+    reviewer = runtime.reviewer
+    payload = selection_payload(
+        state,
+        targets,
+        chunk_index=0,
+        chunk_count=1,
+        compaction=progress.get("compaction") or {},
+    )
+    payload["review_pass"] = SELECTION_CONSOLIDATION
+    payload["provisional_raised_code_ids"] = raised
+    payload["near_miss_code_ids"] = near
+    stop = reviewer.refusal_reason(payload, SelectionDecision, metadata)
+    if stop:
+        metadata["selection_consolidation"] = None
+        metadata["selection_consolidation_skipped"] = stop
+        return
+    parsed, audit = await reviewer.decide(payload, SelectionDecision, metadata)
+    if audit:
+        logs.append(audit)
+    if parsed is None:
+        metadata["selection_consolidation"] = None
+        metadata["selection_consolidation_skipped"] = str(metadata.get("decision_stop") or "review_error")
+        metadata.pop("decision_stop", None)
+        return
+    chosen = [str(item) for item in (parsed.get("raised_code_ids") or [])]
+    if len(chosen) != len(set(chosen)) or any(item not in set(targets) for item in chosen):
+        metadata["selection_consolidation"] = None
+        metadata["selection_consolidation_skipped"] = "invalid_decision"
+        return
+    progress["raised_ids"] = chosen
+    metadata["selection_consolidation"] = SELECTION_CONSOLIDATION
+    metadata["selection_consolidation_skipped"] = None
+    progress["consolidation_raised_code_ids"] = chosen
+
+
+def _focused_reread_preflight(state: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Estimate the focused reread against its own token allowance.
+
+    Zero ``max_focused_review_calls`` or ``max_focused_review_tokens`` still
+    runs selection, so this check does not apply. The estimate is input tokens
+    for the planned reread batches. It is not a dollar bound.
+    """
+    meta = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
+    procedure = meta.get("procedure") if isinstance(meta.get("procedure"), Mapping) else {}
+    performance = meta.get("performance") if isinstance(meta.get("performance"), Mapping) else {}
+    max_calls = int(procedure.get("max_focused_review_calls") or 0)
+    max_tokens = int(procedure.get("max_focused_review_tokens") or 0)
+    if max_calls <= 0 or max_tokens <= 0:
+        return None
+    book = state.get("codebook") or {}
+    raised: list[str] = []
+    for key, entry in book.items():
+        code_id = str(entry.get("code_id") or key) if isinstance(entry, Mapping) else str(key)
+        if code_id and code_id not in raised:
+            raised.append(code_id)
+    plan = plan_recode_queue(
+        state.get("passages") or [],
+        state.get("segments") or [],
+        raised,
+        list(book.values()) if isinstance(book, Mapping) else [],
+        seed=int(procedure.get("seed") or 0),
+        neighbor_limit=_stored_limit(procedure.get("focused_neighbor_limit")),
+        outside_limit=_stored_limit(procedure.get("focused_outside_limit")),
+        negative_case_limit=_stored_limit(procedure.get("focused_negative_case_limit")),
+        shares=_shares_from_procedure(procedure),
+        incidents=meta.get("researcher_incidents") or [],
+        claims=list(state.get("properties") or []) + list(state.get("dimensions") or []),
+        max_calls=max_calls,
+        batch_size=max(1, int(performance.get("batch_size") or 1)),
+        sampling_seed=procedure.get("focused_sampling_seed"),
+        memos=state.get("memos") or [],
+    )
+    queue = list(plan.get("queue") or [])
+    batch_size = max(1, int(performance.get("batch_size") or 1))
+    probe = {**state, "raised_code_ids": raised}
+    total = 0
+    batches = 0
+    cursor = 0
+    while cursor < len(queue) and batches < max_calls:
+        total += _queue_batch_estimate(probe, queue[cursor:cursor + batch_size])
+        cursor += batch_size
+        batches += 1
+    return {
+        "focused_review_tokens_required": total,
+        "focused_review_tokens_available": max_tokens,
+        "focused_review_token_shortfall": max(0, total - max_tokens),
+        "blocked": total > max_tokens and total > 0,
+    }
+
+
 async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, *, metadata, logs, warnings) -> dict:
     """Send at most one selection chunk. A later chunk is another graph visit.
 
@@ -5811,7 +6040,15 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
     """
     reviewer = runtime.reviewer
     codes = selection_codes(state)
-    ordered = [row["code_id"] for row in codes]
+    canonical = [row["code_id"] for row in codes]
+    ordered = list(canonical)
+    chunk_order, chunk_seed = _chunk_order_settings(runtime, metadata)
+    if chunk_order == SELECTION_CHUNK_ORDER_SHUFFLE:
+        ordered = order_selection_ids(ordered, chunk_order=chunk_order, seed=chunk_seed)
+    metadata["selection_code_id_order"] = canonical
+    metadata["selection_chunk_order"] = chunk_order
+    metadata["selection_chunk_order_seed"] = chunk_seed
+    metadata["selection_consolidation_enabled"] = bool(getattr(runtime, "selection_consolidation", False))
     if reviewer is None or not ordered:
         metadata["decision_stop"] = "call_allowance"
         metadata["selection_source"] = "provisional"
@@ -5823,6 +6060,8 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         metadata["selection_uncovered_code_ids"] = ordered
         metadata["provisional_raised_code_ids"] = []
         metadata["selection_chunk_order_selects"] = False
+        metadata["partial_selection_is_code_id_slice"] = chunk_order != SELECTION_CHUNK_ORDER_SHUFFLE
+        metadata["partial_selection_bias"] = partial_selection_note(chunk_order)
         warnings.append("LLM selection review incomplete: call_allowance.")
         known = list(state.get("known_code_ids") or ordered)
         return {
@@ -5897,6 +6136,8 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         nonlocal warnings
         progress_row["open"] = False
         metadata["decision_chunk_state"] = progress_row
+        seal_budget_step(metadata, progress_row, "focused_selection")
+        progress_row["selection_chunk_order"] = metadata.get("selection_chunk_order") or SELECTION_CHUNK_ORDER_ID
         report = finish_decision_report(progress_row)
         store_decision_report(metadata, report)
         metadata["selection_review_complete"] = bool(report["complete"])
@@ -5907,7 +6148,8 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         omissions = list(progress_row.get("omissions") or [])
         known = list(state.get("known_code_ids") or ordered)
         provisional = merge_selection_ids(
-            progress_row.get("ordered_ids") or [], progress_row.get("raised_ids") or []
+            metadata.get("selection_code_id_order") or progress_row.get("ordered_ids") or [],
+            progress_row.get("raised_ids") or [],
         )
         uncovered = list(report.get("uncovered_ids") or [])
         metadata["selection_reviewed_code_ids"] = [str(item) for item in (progress_row.get("reviewed_ids") or [])]
@@ -5916,6 +6158,8 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         metadata["selection_human_exclusions"] = list(report.get("human_exclusions") or [])
         metadata["selection_items_excluded"] = int(report.get("items_excluded") or 0)
         metadata["selection_chunk_order_selects"] = False
+        metadata["partial_selection_is_code_id_slice"] = report.get("partial_selection_is_code_id_slice")
+        metadata["partial_selection_bias"] = report.get("partial_selection_bias")
         metadata["selection_resume"] = {
             "resumable": not bool(report["complete"]),
             "next_index": int(progress_row.get("next_index") or 0),
@@ -5948,7 +6192,10 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
                 metadata["decision_stop"] = "oversized_unrecovered"
                 metadata["decision_stop_detail"] = "omitted_oversized"
                 metadata["selection_review_fallback"] = "omitted_oversized"
+                seal_budget_step(metadata, progress_row, "focused_selection")
                 report = finish_decision_report(progress_row)
+                metadata["partial_selection_is_code_id_slice"] = report.get("partial_selection_is_code_id_slice")
+                metadata["partial_selection_bias"] = report.get("partial_selection_bias")
                 metadata["decision_chunk_state"] = progress_row
                 store_decision_report(metadata, report)
             else:
@@ -6029,40 +6276,141 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
     else:
         configured = int(reviewer.max_calls)
     required = len(chunks)
-    if (
-        bool(getattr(runtime, "auto_size_decision_calls", False))
-        and configured > 0
-        and required > configured
-    ):
-        # Raises the call allowance only. The token ceiling and the per-request
-        # budget still refuse a chunk that does not fit.
-        reviewer.max_calls = required
+    auto_size = bool(getattr(runtime, "auto_size_decision_calls", False))
+    # The configured allowance is reserved for claim review. Selection is sized
+    # to its own chunks, so auto-sizing cannot spend the claim review's calls.
+    claim_reserve = configured if auto_size and configured > 0 and required > 0 else 0
+    if claim_reserve:
+        reviewer.max_calls = required + claim_reserve
     allowance = int(reviewer.max_calls)
-    sent = int(progress.get("chunks_sent") or 0)
-    validated_now = int(progress.get("chunks_validated") or 0)
-    shortfall = max(0, required - allowance)
+    token_allowance = int(reviewer.max_tokens)
+    tokens_used = int(metadata.get("decision_tokens_used") or 0)
+    calls_used = int(metadata.get("decision_calls_used") or 0)
+    policy_fingerprint = selection_policy_fingerprint(
+        chunk_order=chunk_order, chunk_order_seed=chunk_seed,
+    )
+    apply_validated_reuse(
+        progress,
+        state,
+        reviewer,
+        policy_fingerprint=policy_fingerprint,
+        compaction=compaction,
+    )
+    reused = {int(item) for item in (progress.get("reused_chunk_indexes") or [])}
+    pending_chunks = [chunks[item] for item in range(len(chunks)) if item not in reused]
+    calls_still = len(pending_chunks)
+    selection_ceiling = allowance - claim_reserve if claim_reserve else allowance
+    calls_available = max(0, selection_ceiling - calls_used)
+    tokens_required = 0
+    for chunk_ids in pending_chunks:
+        ids = [str(item) for item in chunk_ids]
+        if ids:
+            tokens_required += int(estimate(ids))
+    tokens_available = max(0, token_allowance - tokens_used)
+    shortfall = max(0, calls_still - calls_available)
+    token_shortfall = max(0, tokens_required - tokens_available)
+    reviewer_on = allowance > 0
+    # calls_still is what this visit still has to send. A zero token ceiling
+    # cannot cover a positive estimate, so that check fails here too.
+    # A zero focused-review ceiling still runs selection, so that allowance
+    # is not part of this stop.
+    reread_preflight = _focused_reread_preflight(state)
+    reread_blocked = bool(reread_preflight and reread_preflight.get("blocked"))
+    call_blocked = reviewer_on and calls_still > calls_available
+    token_blocked = reviewer_on and (tokens_required > tokens_available or reread_blocked)
+    can_finish = reviewer_on and not call_blocked and not token_blocked
+    fields = preflight_fields(
+        calls_required=calls_still,
+        calls_available=calls_available,
+        tokens_required=tokens_required,
+        tokens_available=tokens_available,
+        auto_size=auto_size,
+        can_finish=can_finish,
+    )
+    progress.update(fields)
     progress["chunks_required"] = required
     progress["decision_call_allowance"] = allowance
     progress["chunk_shortfall"] = shortfall
+    progress["decision_token_allowance"] = token_allowance
+    progress["token_shortfall"] = token_shortfall
+    progress["selection_chunk_order"] = chunk_order
     metadata["selection_chunks_required"] = required
     metadata["decision_call_allowance"] = allowance
     metadata["decision_call_allowance_configured"] = configured
     metadata["selection_chunk_shortfall"] = shortfall
-    metadata["auto_size_decision_calls"] = bool(getattr(runtime, "auto_size_decision_calls", False))
+    metadata["auto_size_decision_calls"] = auto_size
     metadata["decision_call_allowance_raised"] = allowance != configured
-    # Zero still means the reviewer is off. That stop stays call_allowance.
-    # A plan that cannot finish inside a positive allowance is not started.
-    if allowance > 0 and sent == 0 and validated_now == 0 and required > allowance:
+    metadata["decision_token_allowance"] = token_allowance
+    metadata["selection_tokens_required"] = tokens_required
+    metadata["tokens_required"] = tokens_required
+    metadata["selection_token_shortfall"] = token_shortfall
+    metadata["calls_required"] = calls_still
+    metadata["calls_available"] = calls_available
+    metadata["tokens_available"] = tokens_available
+    metadata["preflight_can_finish"] = can_finish
+    metadata["auto_size_covers_calls_only"] = auto_size
+    metadata["auto_size_raised_tokens"] = False
+    metadata["claim_review_calls_reserved"] = claim_reserve
+    progress["claim_review_calls_reserved"] = claim_reserve
+    if reread_preflight:
+        metadata["focused_review_tokens_required"] = reread_preflight["focused_review_tokens_required"]
+        metadata["focused_review_tokens_available"] = reread_preflight["focused_review_tokens_available"]
+        metadata["focused_review_token_shortfall"] = reread_preflight["focused_review_token_shortfall"]
+        progress["focused_review_tokens_required"] = reread_preflight["focused_review_tokens_required"]
+        progress["focused_review_tokens_available"] = reread_preflight["focused_review_tokens_available"]
+    else:
+        metadata["focused_review_tokens_required"] = None
+        metadata["focused_review_tokens_available"] = None
+        metadata["focused_review_token_shortfall"] = None
+    metadata["token_estimate_is_dollar_bound"] = False
+    metadata["token_estimate_includes_output_tokens"] = fields["token_estimate_includes_output_tokens"]
+    metadata["token_estimate_includes_retry_or_repair_margin"] = fields["token_estimate_includes_retry_or_repair_margin"]
+    metadata["token_estimate_includes_fixed_prompt_overhead"] = fields["token_estimate_includes_fixed_prompt_overhead"]
+    metadata["token_estimate_scope"] = fields["token_estimate_scope"]
+    metadata["chunks_reused"] = int(progress.get("chunks_reused") or 0)
+    open_budget_step(
+        metadata,
+        step="focused_selection",
+        allowance_scope=FOCUSED_DECISION_REVIEW,
+        allowance=allowance,
+        shared_with=FOCUSED_REVIEW_STEPS,
+    )
+    # Zero calls still means the reviewer is off. That stop stays call_allowance.
+    # A positive allowance that cannot cover the chunks still to send, in calls
+    # or in tokens, does not send the next request. Raising only the call
+    # allowance does not mean the review can finish.
+    if calls_still > 0 and (call_blocked or token_blocked):
         add_stop_reason(progress, CHUNK_ALLOWANCE_INSUFFICIENT)
-        note = (
-            "LLM selection review was not sent. "
-            f"{required} chunks are required and the decision-call allowance is {allowance}."
+        parts = ["LLM selection review was not sent."]
+        parts.append(
+            f"{required} chunks require {calls_still} more calls. "
+            f"{calls_available} calls are available."
         )
+        parts.append(
+            f"{tokens_required} tokens are required and {tokens_available} tokens are available."
+        )
+        if auto_size:
+            parts.append("Raising the call allowance does not mean this review can finish.")
+        if claim_reserve:
+            parts.append(
+                f"{claim_reserve} calls are reserved for claim review and are not part of the selection allowance."
+            )
+        if reread_blocked and reread_preflight:
+            parts.append(
+                f"The focused review allowance is {reread_preflight['focused_review_tokens_available']} tokens. "
+                f"The reread estimate is {reread_preflight['focused_review_tokens_required']}."
+            )
+        note = " ".join(parts)
         if note not in warnings:
             warnings.append(note)
         return _close(progress)
 
+    index = int(progress.get("next_index") or 0)
     if index >= len(chunks):
+        if getattr(runtime, "selection_consolidation", False) and not progress.get("consolidation_done"):
+            await _consolidate_selection_chunks(
+                runtime, state, progress, metadata, logs, warnings,
+            )
         return _close(progress)
 
     chunk = [str(item) for item in chunks[index]]
@@ -6172,6 +6520,16 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         progress["raised_ids"] = list(progress.get("raised_ids") or []) + ids
         progress["reviewed_ids"] = list(progress.get("reviewed_ids") or []) + chunk
         progress["chunks_validated"] = int(progress.get("chunks_validated") or 0) + 1
+        record_validated_chunk(
+            progress,
+            code_ids=chunk,
+            input_fingerprint=chunk_input_fingerprint(state, chunk, compaction_map),
+            prompt_hash_value=str((audit or {}).get("prompt_hash") or ""),
+            policy_fingerprint=str(progress.get("policy_fingerprint") or ""),
+            raised_code_ids=ids,
+            chunk_index=index,
+            chunk_count=len(chunks),
+        )
         # A recovered item was reviewed. Drop the named stop so a later close can apply.
         progress["stop_reasons"] = [
             item for item in (progress.get("stop_reasons") or []) if str(item) != "oversized_unrecovered"
@@ -6180,6 +6538,10 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         progress["next_index"] = index + 1
         metadata["decision_chunk_state"] = progress
         if progress["next_index"] >= len(chunks):
+            if getattr(runtime, "selection_consolidation", False) and not progress.get("consolidation_done"):
+                await _consolidate_selection_chunks(
+                    runtime, state, progress, metadata, logs, warnings,
+                )
             return _close(progress)
         progress["open"] = True
         metadata["decision_chunk_state"] = progress
@@ -6205,6 +6567,14 @@ def _decision_node(runtime: FocusedRuntime, *, claims: bool):
         properties = list(state.get("properties") or [])
         dimensions = list(state.get("dimensions") or [])
         records = properties + dimensions
+        if reviewer is not None and records:
+            open_budget_step(
+                metadata,
+                step="focused_claim_review",
+                allowance_scope=FOCUSED_DECISION_REVIEW,
+                allowance=int(reviewer.max_calls),
+                shared_with=FOCUSED_REVIEW_STEPS,
+            )
         reviewed = {}
         cursor = 0
         while cursor < len(records):
@@ -6231,6 +6601,12 @@ def _decision_node(runtime: FocusedRuntime, *, claims: bool):
             cursor += len(batch)
         metadata["decision_pending_claim_ids"] = [r["entry_id"] for r in records[cursor:]]
         metadata["decision_review_complete"] = cursor == len(records)
+        if reviewer is not None and records:
+            close_budget_step(
+                metadata,
+                step="focused_claim_review",
+                stop_reason=str(metadata.get("decision_stop") or "") or None,
+            )
         if metadata.get("decision_stop"):
             warnings.append(f"LLM claim review incomplete: {metadata['decision_stop']}.")
         return {"properties": [reviewed.get(r["entry_id"], r) for r in properties],
@@ -6414,10 +6790,22 @@ def _selection_pause_node(state: FocusedState) -> dict:
             "decision_stop": metadata.get("decision_stop"),
             "uncovered_code_ids": list(metadata.get("selection_uncovered_code_ids") or []),
             "provisional_raised_code_ids": list(metadata.get("provisional_raised_code_ids") or []),
+            "partial_selection_is_code_id_slice": metadata.get("partial_selection_is_code_id_slice"),
+            "partial_selection_bias": metadata.get("partial_selection_bias"),
+            "calls_required": metadata.get("calls_required"),
+            "calls_available": metadata.get("calls_available"),
+            "tokens_required": metadata.get("tokens_required"),
+            "tokens_available": metadata.get("tokens_available"),
+            "preflight_can_finish": metadata.get("preflight_can_finish"),
             "instructions": (
                 "This selection is provisional. It is not applied and it is not downstream eligible. "
                 "Chunk order did not promote any code. "
-                "Resume with {\"continue_selection\": true} to review the uncovered codes, "
+                + (
+                    str(metadata.get("partial_selection_bias")) + " "
+                    if metadata.get("partial_selection_bias")
+                    else ""
+                )
+                + "Resume with {\"continue_selection\": true} to review the uncovered codes, "
                 "or {\"leave_selection\": true} to export without promoting them."
             ),
         }
@@ -6518,6 +6906,32 @@ def _selection_export(state: Mapping[str, Any]) -> dict[str, Any]:
         "selection_source": metadata.get("selection_source") or state.get("selection_source"),
         "selection_reviewed_code_ids": [str(item) for item in (metadata.get("selection_reviewed_code_ids") or [])],
         "selection_uncovered_code_ids": [str(item) for item in (metadata.get("selection_uncovered_code_ids") or [])],
+        "partial_selection_is_code_id_slice": metadata.get("partial_selection_is_code_id_slice"),
+        "partial_selection_bias": metadata.get("partial_selection_bias"),
+        "selection_chunk_order": metadata.get("selection_chunk_order"),
+        "selection_chunk_order_seed": metadata.get("selection_chunk_order_seed"),
+        "calls_required": metadata.get("calls_required"),
+        "calls_available": metadata.get("calls_available"),
+        "tokens_required": metadata.get("tokens_required"),
+        "tokens_available": metadata.get("tokens_available"),
+        "preflight_can_finish": metadata.get("preflight_can_finish"),
+        "auto_size_covers_calls_only": metadata.get("auto_size_covers_calls_only"),
+        "auto_size_raised_tokens": metadata.get("auto_size_raised_tokens"),
+        "token_estimate_includes_output_tokens": metadata.get("token_estimate_includes_output_tokens"),
+        "token_estimate_includes_retry_or_repair_margin": metadata.get(
+            "token_estimate_includes_retry_or_repair_margin"
+        ),
+        "token_estimate_includes_fixed_prompt_overhead": metadata.get(
+            "token_estimate_includes_fixed_prompt_overhead"
+        ),
+        "token_estimate_scope": metadata.get("token_estimate_scope"),
+        "token_estimate_is_dollar_bound": metadata.get("token_estimate_is_dollar_bound"),
+        "claim_review_calls_reserved": metadata.get("claim_review_calls_reserved"),
+        "focused_review_tokens_required": metadata.get("focused_review_tokens_required"),
+        "focused_review_tokens_available": metadata.get("focused_review_tokens_available"),
+        "focused_review_token_shortfall": metadata.get("focused_review_token_shortfall"),
+        "chunks_reused": metadata.get("chunks_reused"),
+        "selection_consolidation": metadata.get("selection_consolidation"),
     }
 
 
@@ -6564,6 +6978,28 @@ def load_focused_export(directory: str | Path) -> dict[str, Any]:
         "selection_source",
         "selection_reviewed_code_ids",
         "selection_uncovered_code_ids",
+        "partial_selection_is_code_id_slice",
+        "partial_selection_bias",
+        "selection_chunk_order",
+        "selection_chunk_order_seed",
+        "calls_required",
+        "calls_available",
+        "tokens_required",
+        "tokens_available",
+        "preflight_can_finish",
+        "auto_size_covers_calls_only",
+        "auto_size_raised_tokens",
+        "token_estimate_includes_output_tokens",
+        "token_estimate_includes_retry_or_repair_margin",
+        "token_estimate_includes_fixed_prompt_overhead",
+        "token_estimate_scope",
+        "token_estimate_is_dollar_bound",
+        "claim_review_calls_reserved",
+        "focused_review_tokens_required",
+        "focused_review_tokens_available",
+        "focused_review_token_shortfall",
+        "chunks_reused",
+        "selection_consolidation",
     )
     record = {}
     for key in keys:
@@ -6667,6 +7103,8 @@ def export_focused_state(state: Mapping[str, Any], directory: str | Path) -> dic
     metadata.update(_status_fields(state))
     metadata.update(selection_record)
     metadata["saturation_judgment"] = None
+    metadata["decision_budget_steps"] = budget_ledger(metadata)
+    metadata["model_configuration"] = model_configuration_record(metadata, state.get("prompt_log") or [])
     records = list(development.get("properties") or []) + list(development.get("dimensions") or [])
     eligible = [row for row in records if row.get("downstream_eligible")]
     book = state.get("codebook") or {}
@@ -7018,6 +7456,8 @@ def _result_from_state(
     metadata["saturation_judgment"] = None
     metadata["policy_version"] = POLICY_VERSION
     metadata["package_version"] = __version__
+    metadata["decision_budget_steps"] = budget_ledger(metadata)
+    metadata["model_configuration"] = model_configuration_record(metadata, state.get("prompt_log") or [])
     development = _category_development(state)
     metadata["property_stability"] = development.get("property_stability") or {}
     metadata["proposal_stability"] = proposal_stability([state])
@@ -7211,6 +7651,9 @@ async def afocused_code(
     max_decision_tokens: int = 24000,
     decision_token_budget: int = 6000,
     auto_size_decision_calls: bool = AUTO_SIZE_DECISION_CALLS,
+    selection_chunk_order: str = SELECTION_CHUNK_ORDER_ID,
+    selection_chunk_order_seed: int | None = None,
+    selection_consolidation: bool = False,
     interrupt: bool = True,
     resume: Any = None,
     resuming: bool = False,
@@ -7273,6 +7716,14 @@ async def afocused_code(
             raise ValueError(f"{name} must be a non-negative integer.")
     if not isinstance(auto_size_decision_calls, bool):
         raise ValueError("auto_size_decision_calls must be true or false. The default is false.")
+    if selection_chunk_order not in {SELECTION_CHUNK_ORDER_ID, SELECTION_CHUNK_ORDER_SHUFFLE}:
+        raise ValueError("selection_chunk_order must be 'id' or 'seeded_shuffle'. The default is 'id'.")
+    if selection_chunk_order_seed is not None and (
+        isinstance(selection_chunk_order_seed, bool) or not isinstance(selection_chunk_order_seed, int)
+    ):
+        raise ValueError("selection_chunk_order_seed must be an integer or null.")
+    if not isinstance(selection_consolidation, bool):
+        raise ValueError("selection_consolidation must be true or false. The default is false.")
     if decision_mode == "human" and decision_model is not None:
         raise ValueError("decision_model requires decision_mode='llm'.")
     source = _as_result(open_coding_result)
@@ -7322,6 +7773,9 @@ async def afocused_code(
         if reviewer_model is not None else None), max_decision_calls=max_decision_calls,
         max_decision_tokens=max_decision_tokens, decision_token_budget=decision_token_budget,
         auto_size_decision_calls=bool(auto_size_decision_calls),
+        selection_chunk_order=selection_chunk_order,
+        selection_chunk_order_seed=selection_chunk_order_seed,
+        selection_consolidation=bool(selection_consolidation),
         **review_procedure_fields())
     coder = (
         _resolve_model(model, timeout=focused_request_timeout)
@@ -7393,6 +7847,9 @@ async def afocused_code(
             else 0.0
         ),
         auto_size_decision_calls=bool(auto_size_decision_calls),
+        selection_chunk_order=selection_chunk_order,
+        selection_chunk_order_seed=selection_chunk_order_seed,
+        selection_consolidation=bool(selection_consolidation),
     )
     metadata["timeout_policy"] = timeout_policy(
         run_timeout_seconds=float(procedure["focused_request_timeout"]),
@@ -7674,9 +8131,13 @@ async def _invoke(
                     f"No focused-coding checkpoint was found for thread {thread_id!r}. "
                     "Start a run before resuming."
                 )
+            saved_values = dict(snapshot.values or {})
+            saved_meta = dict(saved_values.get("metadata") or {})
+            finished_entry = None
             if not (getattr(snapshot, "interrupts", ()) or getattr(snapshot, "next", ())):
-                raise FocusedError(f"Thread {thread_id!r} is not waiting on a researcher checkpoint.")
-            saved_meta = dict((snapshot.values or {}).get("metadata") or {})
+                finished_entry = _budget_resume_entry(saved_values)
+                if finished_entry is None:
+                    raise FocusedError(f"Thread {thread_id!r} is not waiting on a researcher checkpoint.")
             continuation = _check_resume_manifest(
                 saved_meta.get("checkpoint_manifest") or {},
                 metadata.get("checkpoint_manifest") or {},
@@ -7710,6 +8171,15 @@ async def _invoke(
                     config,
                     durability=durability,
                 )
+            elif finished_entry:
+                # The graph already exported. A larger budget continues the
+                # stage that stopped, and validated chunks are reused.
+                merged = {**saved_meta, **metadata}
+                if continuation:
+                    merged["continuations"] = list(saved_meta.get("continuations") or []) + continuation
+                prepared = _prepare_budget_continuation(saved_values, merged)
+                await graph.aupdate_state(config, prepared, as_node=finished_entry)
+                await graph.ainvoke(None, config, durability=durability)
             else:
                 # An execution error left the node unfinished. Retry from the
                 # last checkpoint. Command(resume=...) is only for interrupt().

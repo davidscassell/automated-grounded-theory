@@ -19,8 +19,8 @@ from tests.test_v090 import FakeSamplingCoder, _kwargs
 
 
 def test_version_is_0914():
-    assert __version__ == "0.9.27"
-    assert POLICY_VERSION == "0.9.27"
+    assert __version__ == "0.9.28"
+    assert POLICY_VERSION == "0.9.28"
     assert PATTERN_MIN_CASES == 2
     assert DEFAULT_MAX_AXIAL_REVIEW_TOKENS == 24000
 
@@ -60,7 +60,7 @@ def test_partial_eligibility_does_not_publish_a_full_population_recall():
             },
         ]
     )
-    assert "downstream_eligible" not in exported["accepted"][1]
+    assert exported["accepted"][1]["downstream_eligible"] is None
     scored = score_gate_adjudications(exported, load_adjudications([_verdict("A"), _verdict("B")]))
     assert scored["supported_adjudicated"] == 2
     assert scored["downstream_withheld_supported_recall"] is None

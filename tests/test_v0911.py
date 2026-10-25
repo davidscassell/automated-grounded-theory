@@ -32,8 +32,8 @@ from tests.test_v080 import FakeAxialCoder, _corpus
 
 
 def test_version_is_0911():
-    assert __version__ == "0.9.27"
-    assert POLICY_VERSION == "0.9.27"
+    assert __version__ == "0.9.28"
+    assert POLICY_VERSION == "0.9.28"
     assert PATTERN_MIN_CASES == 2
     assert DEFAULT_AXIAL_TOKEN_BUDGET == 6000
     assert DEFAULT_MAX_AXIAL_REVIEW_TOKENS == 24000

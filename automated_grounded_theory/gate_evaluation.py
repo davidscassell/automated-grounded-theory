@@ -131,17 +131,33 @@ _INSPECT_FLAG_KEYS = (
     "frequency_negation",
     "negation_does_not_reject_link",
 )
-# One primary cause per withheld row. The counts sum to the withheld rows.
-# ``other_withheld`` is the residual so a row is never left uncounted.
+# Reporting convention for ``primary_withholding_cause``. The first applicable
+# name wins, so the primary counts are mutually exclusive. Substantive limits
+# outrank a reviewer decision. ``reviewer_policy_rejection`` is a policy-only
+# rejection of tier-1 evidence, not an independent judgment of correctness.
+# ``other_withheld`` is the residual so an explained row is never left uncounted.
+# ``withholding_reasons`` is the overlapping diagnostic list and does not sum
+# to the explained rows. The primary counts do.
 WITHHOLDING_CAUSES = (
     "endpoint_unreviewed_by_focus",
-    "llm_reviewer_rejected",
+    "endpoint_not_selected_by_focus",
     "participant_denies_link",
     "partial_endpoint_evidence",
     "wording_withheld",
     "insufficient_cases",
     "omitted_oversized",
+    "llm_reviewer_rejected",
+    "reviewer_policy_rejection",
     "other_withheld",
+)
+PRIMARY_WITHHOLDING_CAUSE = (
+    "primary_withholding_cause is a reporting convention. "
+    "The first applicable cause in WITHHOLDING_CAUSES wins. "
+    "withholding_cause_counts are mutually exclusive and sum to the explained rows. "
+    "withholding_reason_counts overlap and do not sum to that total. "
+    "An explained row is disposition-withheld, downstream_eligible false, "
+    "unreviewed at an endpoint, or still proposed with a known case or tier shortfall. "
+    "A proposed row with enough cases and unknown eligibility is not explained."
 )
 _WORDING_CAUSE = frozenset({
     "causal_wording_withheld",
@@ -158,65 +174,229 @@ _PARTIAL_CAUSE = frozenset({
 })
 
 
-def primary_withholding_cause(row: Mapping[str, Any], rules: Sequence[str] | None = None) -> str:
-    """The one cause that withheld this row.
+def _tier_number(row: Mapping[str, Any]) -> int | None:
+    tier = row.get("evidence_tier")
+    if isinstance(tier, bool) or not isinstance(tier, int):
+        return None
+    return tier
 
-    Priority is fixed so the causes partition the withheld rows. An inspect
-    flag such as ``shared_quote_inspect`` is not a cause. ``other_withheld``
-    is used only when none of the named causes match, so the counts still
-    sum to the withheld rows.
-    """
+
+def _reviewer_rejected(row: Mapping[str, Any]) -> bool:
+    disposition = str(row.get("disposition") or "").strip().casefold()
+    model_disposition = str(row.get("model_disposition") or "").strip().casefold()
+    reviewer_disposition = str(row.get("reviewer_disposition") or "").strip().casefold()
+    rejected = "rejected" in {disposition, model_disposition, reviewer_disposition}
+    decided = (
+        str(row.get("review_actor") or "") == "llm"
+        or row.get("reviewer_decided") is True
+        or model_disposition == "rejected"
+        or reviewer_disposition == "rejected"
+    )
+    return rejected and decided
+
+
+def _cause_names(row: Mapping[str, Any], rules: Sequence[str] | None) -> set[str]:
     flags = {str(item) for item in (row.get("flags") or []) if str(item)}
-    names = flags | {str(item) for item in (rules or []) if str(item)}
+    return flags | {str(item) for item in (rules or []) if str(item)}
+
+
+def endpoint_review_status(row: Mapping[str, Any]) -> str:
+    """Whether focused review limited the endpoints of this row.
+
+    ``unreviewed`` is a flag, an eligibility reason, or a limited selection
+    whose endpoint is missing from the reviewed ids. ``reviewed`` is a limited
+    selection whose endpoints were both reviewed. Anything else is
+    ``not_limited``.
+    """
+    names = _cause_names(row, ())
+    reason = str(row.get("eligibility_reason") or "")
+    focus = row.get("focus_review") if isinstance(row.get("focus_review"), Mapping) else {}
+    limits = bool(focus.get("limits_eligibility"))
+    reviewed = {str(item) for item in (focus.get("reviewed_code_ids") or []) if str(item)}
+    endpoints = [str(row.get("from_id") or ""), str(row.get("to_id") or "")]
+    endpoints = [item for item in endpoints if item]
+    flagged = "endpoint_unreviewed_by_focus" in names or reason == "endpoint_unreviewed_by_focus"
+    if limits and endpoints and reviewed and all(item in reviewed for item in endpoints):
+        return "reviewed"
+    if flagged or (limits and any(item not in reviewed for item in endpoints)):
+        return "unreviewed"
+    return "not_limited"
+
+
+def _pattern_minimum(row: Mapping[str, Any]) -> int:
+    minimum = row.get("pattern_min_cases")
+    if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 1:
+        return 2
+    return minimum
+
+
+def _known_case_count(row: Mapping[str, Any]) -> int | None:
+    """Supporting-case count when the row records one. A missing list stays unknown."""
+    counted = row.get("cases_with_both_endpoints")
+    if isinstance(counted, int) and not isinstance(counted, bool):
+        return counted
+    cases = row.get("supporting_cases")
+    if isinstance(cases, list):
+        return len([item for item in cases if isinstance(item, Mapping)])
+    return None
+
+
+def _case_count_below_minimum(row: Mapping[str, Any]) -> bool:
+    count = _known_case_count(row)
+    if count is None:
+        return False
+    return count < _pattern_minimum(row)
+
+
+def _proposed_case_or_tier_short(row: Mapping[str, Any]) -> bool:
+    """A proposed row whose cases or tier are known to be below the pattern bar."""
+    if _case_count_below_minimum(row):
+        return True
+    tier = _tier_number(row)
+    return tier is not None and tier < 2
+
+
+def _row_explained(row: Mapping[str, Any], rules: Sequence[str]) -> bool:
+    """True when this row is ineligible and the cause counts must include it.
+
+    Withheld rows and rows whose ``downstream_eligible`` is false are explained.
+    So is an unreviewed endpoint, and a proposed row with a known case or tier
+    shortfall, even when eligibility was never stamped false. A proposed row
+    that still has enough cases and unknown eligibility is not explained.
+    ``downstream_eligible`` true is not explained unless the disposition is withheld.
+    """
+    outcome = _outcome(row, rules)
+    if outcome is None:
+        return False
+    if outcome == "withheld":
+        return True
+    eligible = _downstream_eligible(row)
+    if eligible is False:
+        return True
+    if eligible is True:
+        return False
+    if endpoint_review_status(row) == "unreviewed":
+        return True
+    if outcome == "proposed" and _proposed_case_or_tier_short(row):
+        return True
+    return False
+
+
+def withholding_reasons(row: Mapping[str, Any], rules: Sequence[str] | None = None) -> list[str]:
+    """Every applicable diagnostic reason. Empty when the row is not explained.
+
+    A policy-only rejection of evidence below tier 2 is
+    ``reviewer_policy_rejection`` and is not also ``llm_reviewer_rejected``.
+    A tier-2 rejection is ``llm_reviewer_rejected``. Inspect flags are not reasons.
+    """
+    names = _cause_names(row, rules)
+    if not _row_explained(row, rules or ()):
+        return []
+    found: list[str] = []
+
+    def add(name: str) -> None:
+        if name not in found:
+            found.append(name)
+
     if (
         "endpoint_unreviewed_by_focus" in names
         or str(row.get("eligibility_reason") or "") == "endpoint_unreviewed_by_focus"
     ):
-        return "endpoint_unreviewed_by_focus"
-    disposition = str(row.get("disposition") or "").strip().casefold()
-    model_disposition = str(row.get("model_disposition") or "").strip().casefold()
-    if disposition == "rejected" and (
-        str(row.get("review_actor") or "") == "llm"
-        or model_disposition == "rejected"
-        or row.get("reviewer_decided") is True
+        add("endpoint_unreviewed_by_focus")
+    if (
+        "endpoint_not_selected_by_focus" in names
+        or str(row.get("eligibility_reason") or "") == "endpoint_not_selected_by_focus"
     ):
-        return "llm_reviewer_rejected"
+        add("endpoint_not_selected_by_focus")
     if "participant_denies_link" in names:
-        return "participant_denies_link"
+        add("participant_denies_link")
     ends = [item for item in (row.get("endpoint_anchoring") or []) if isinstance(item, Mapping)]
     unanchored = bool(ends) and any(not item.get("anchored") for item in ends)
     if names & _PARTIAL_CAUSE or unanchored or "acceptance_withheld" in names:
-        return "partial_endpoint_evidence"
+        add("partial_endpoint_evidence")
     if names & _WORDING_CAUSE:
-        return "wording_withheld"
-    tier = row.get("evidence_tier")
-    tier_n = tier if isinstance(tier, int) and not isinstance(tier, bool) else None
-    if tier_n is None or tier_n < 2:
-        return "insufficient_cases"
+        add("wording_withheld")
+    tier_n = _tier_number(row)
+    if tier_n is None or tier_n < 2 or _case_count_below_minimum(row):
+        add("insufficient_cases")
     if "omitted_oversized" in names:
-        return "omitted_oversized"
-    return "other_withheld"
+        add("omitted_oversized")
+    if _reviewer_rejected(row):
+        if tier_n is not None and tier_n >= 2:
+            add("llm_reviewer_rejected")
+        else:
+            add("reviewer_policy_rejection")
+    ordered = [name for name in WITHHOLDING_CAUSES if name in found and name != "other_withheld"]
+    if not ordered:
+        ordered = ["other_withheld"]
+    return ordered
+
+
+def primary_withholding_cause(row: Mapping[str, Any], rules: Sequence[str] | None = None) -> str | None:
+    """The documented primary cause, or null when the row is not explained.
+
+    See ``PRIMARY_WITHHOLDING_CAUSE``. The overlapping list is
+    ``withholding_reasons``.
+    """
+    reasons = withholding_reasons(row, rules)
+    if not reasons:
+        return None
+    return reasons[0]
+
+
+def relationship_assessment(row: Mapping[str, Any]) -> dict[str, Any]:
+    """One assessment for the gate export and the run export.
+
+    ``evidence_tier`` is the stored tier. Tier 2 can coexist with
+    ineligibility. ``reviewer_disposition`` is copied and is not invented from
+    ``disposition``. ``downstream_eligible`` is copied only when it is a boolean.
+    """
+    rules = _rules_for(row)
+    reasons = withholding_reasons(row, rules)
+    primary = reasons[0] if reasons else None
+    reviewer = row.get("reviewer_disposition")
+    return {
+        "evidence_tier": _tier_number(row),
+        "reviewer_disposition": None if reviewer in (None, "") else reviewer,
+        "endpoint_review_status": endpoint_review_status(row),
+        "downstream_eligible": _downstream_eligible(row),
+        "withholding_reasons": reasons,
+        "primary_withholding_cause": primary,
+        "withholding_cause": primary,
+    }
+
+
+def stamp_relationship_assessment(row: dict[str, Any]) -> dict[str, Any]:
+    """Write :func:`relationship_assessment` onto a row. Returns that assessment."""
+    assessment = relationship_assessment(row)
+    row.update(assessment)
+    return assessment
 
 
 def export_gate_relationships(relationships: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """List accepted, withheld, and still-proposed relationships.
 
-    A synthetic row is omitted. A row that has not been accepted or withheld
-    is listed under ``proposed`` and is not scored as either. ``disposition``
-    is the reviewer disposition. ``downstream_eligible`` is copied only when
-    the row stores a boolean, and the withholding flags are copied beside it.
-    ``withheld_reason_counts`` tallies withholding flags and rules. Inspect
-    flags such as ``shared_quote_inspect`` are not reasons, even on a withheld
-    row. ``withholding_cause_counts`` is one primary cause per withheld row,
-    and those counts sum to the withheld rows. ``inspect_flag_counts`` is
-    separate.
-    All three are null when there is nothing to count. The input rows are not
-    modified.
+    A synthetic row is omitted. ``accepted`` follows disposition
+    (``accepted`` or ``verified``). ``accepted_downstream`` is the accepted
+    rows whose ``downstream_eligible`` is true. An ineligible row stays in
+    ``accepted`` when that is its disposition, and it is not an accepted
+    downstream result. ``withheld_reason_counts`` tallies withholding flags
+    and rules. Inspect flags such as ``shared_quote_inspect`` are not reasons.
+    ``withholding_cause_counts`` is one primary cause per explained row.
+    An explained row is disposition-withheld, ``downstream_eligible`` false,
+    unreviewed at an endpoint, or still proposed with a known case or tier
+    shortfall. Those counts sum to the explained rows.
+    ``withholding_reason_counts`` overlaps and does not sum to that total.
+    ``inspect_flag_counts`` is separate. The maps are null when there is
+    nothing to count, and zeros when rows were counted but none are explained.
+    The input rows are not modified. Fields come from
+    :func:`relationship_assessment`.
     """
     accepted: list[dict[str, Any]] = []
     withheld: list[dict[str, Any]] = []
     proposed: list[dict[str, Any]] = []
     counted: list[tuple[str, set[str]]] = []
+    explained: list[dict[str, Any]] = []
     for row in relationships:
         if not isinstance(row, Mapping):
             continue
@@ -224,33 +404,35 @@ def export_gate_relationships(relationships: Sequence[Mapping[str, Any]]) -> dic
         outcome = _outcome(row, rules)
         if outcome is None:
             continue
+        assessment = relationship_assessment(row)
         item = {
             "relationship_id": str(row.get("relationship_id") or ""),
             "disposition": str(row.get("disposition") or ""),
             "rules": list(rules),
             "withholding_flags": _withholding_flags(row),
+            **assessment,
         }
-        eligible = _downstream_eligible(row)
-        if eligible is not None:
-            item["downstream_eligible"] = eligible
         flags = {str(flag) for flag in (row.get("flags") or []) if str(flag)}
         counted.append((outcome, flags | set(rules)))
+        if assessment.get("primary_withholding_cause"):
+            explained.append(item)
         if outcome == "accepted":
             accepted.append(item)
         elif outcome == "withheld":
-            cause = primary_withholding_cause(row, rules)
-            item["withholding_cause"] = cause
             withheld.append(item)
         else:
             proposed.append(item)
+    accepted_downstream = [item for item in accepted if item.get("downstream_eligible") is True]
     if not counted:
         withheld_reason_counts = None
         inspect_flag_counts = None
         withholding_cause_counts = None
+        withholding_reason_counts = None
     else:
         withheld_reason_counts = {name: 0 for name in _WITHHELD_REASON_KEYS}
         inspect_flag_counts = {name: 0 for name in _INSPECT_FLAG_KEYS}
         withholding_cause_counts = {name: 0 for name in WITHHOLDING_CAUSES}
+        withholding_reason_counts = {name: 0 for name in WITHHOLDING_CAUSES}
         for outcome, names in counted:
             if outcome == "withheld":
                 for name in _WITHHELD_REASON_KEYS:
@@ -259,14 +441,21 @@ def export_gate_relationships(relationships: Sequence[Mapping[str, Any]]) -> dic
             for name in _INSPECT_FLAG_KEYS:
                 if name in names:
                     inspect_flag_counts[name] += 1
-        for item in withheld:
-            withholding_cause_counts[str(item.get("withholding_cause") or "other_withheld")] += 1
+        for item in explained:
+            cause = str(item.get("primary_withholding_cause") or "other_withheld")
+            withholding_cause_counts[cause] = withholding_cause_counts.get(cause, 0) + 1
+            for reason in item.get("withholding_reasons") or []:
+                withholding_reason_counts[str(reason)] = withholding_reason_counts.get(str(reason), 0) + 1
     return {
         "accepted": accepted,
+        "accepted_downstream": accepted_downstream,
         "withheld": withheld,
         "proposed": proposed,
+        "explained_rows": len(explained) if counted else None,
+        "primary_withholding_convention": PRIMARY_WITHHOLDING_CAUSE if counted else None,
         "withheld_reason_counts": withheld_reason_counts,
         "withholding_cause_counts": withholding_cause_counts,
+        "withholding_reason_counts": withholding_reason_counts,
         "inspect_flag_counts": inspect_flag_counts,
     }
 
