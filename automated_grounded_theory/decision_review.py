@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 from typing import Any, Callable, Literal, Mapping, Sequence
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -67,13 +68,43 @@ WITHHOLDING_CAUSE_RULE = "overlapping_reasons_v1"
 CONDITIONAL_SCOPE_RULE = "discourse_aside_v1"
 # A focused selection whose plan exceeds the call allowance or the token
 # allowance stops before the first request. Auto-sizing raises only the call
-# allowance. It does not raise the token allowance.
+# allowance. It does not raise the token allowance, and it does not mean the
+# review can finish.
 CHUNK_ALLOWANCE_RULE = "stop_before_send_v1"
 CHUNK_ALLOWANCE_INSUFFICIENT = "chunk_allowance_insufficient"
-# A partial focused selection walks code ids. It is not a sample of the codes.
+# A validated chunk can be reused on a later budget. A changed input or policy
+# drops that chunk only.
+CHUNK_REVIEW_RECOVERY = "reuse_validated_v1"
+SELECTION_CHUNK_ORDER_ID = "id"
+SELECTION_CHUNK_ORDER_SHUFFLE = "seeded_shuffle"
+SELECTION_CHUNK_ORDERS = (SELECTION_CHUNK_ORDER_ID, SELECTION_CHUNK_ORDER_SHUFFLE)
+# Optional pass over provisionally raised and near-miss codes. Off unless set.
+SELECTION_CONSOLIDATION = "cross_chunk_v1"
+# tokens_required is input-only. Output tokens and a retry margin are not added.
+TOKEN_ESTIMATE_INCLUDES_OUTPUT_TOKENS = False
+TOKEN_ESTIMATE_INCLUDES_RETRY_OR_REPAIR_MARGIN = False
+TOKEN_ESTIMATE_INCLUDES_FIXED_PROMPT_OVERHEAD = True
+TOKEN_ESTIMATE_SCOPE_NOTE = (
+    "tokens_required sums estimated input tokens for each chunk that still has to be sent. "
+    "Each estimate includes the fixed system prompt, the chunk payload, and the response schema. "
+    "It does not include output tokens. "
+    "It does not include a retry or repair margin. Decision review does not retry or schema-repair."
+)
+# A partial focused selection walks code ids unless the caller asks for a shuffle.
 PARTIAL_SELECTION_BIAS = (
     "Chunks are reviewed in code-id order. "
     "A partial selection is the prefix of that order, not a sample of the codes."
+)
+PARTIAL_SELECTION_SHUFFLE_BIAS = (
+    "Chunks are reviewed in seeded-shuffle order. "
+    "Shuffling removes the code-id preference. "
+    "A partial selection is the prefix of that shuffled order, not a complete selection."
+)
+CHUNK_CONTEXT_NOTE = (
+    "A code can be raised beside one set of companions and not beside another. "
+    "A chunk only sees its own codes, so a category that becomes significant across the corpus "
+    "can be missed. selection_consolidation is an optional later pass over provisionally raised "
+    "and near-miss codes. It is off unless the caller sets it, and setting it is a decision."
 )
 # Identical statements for one directed pair are one assertion.
 DUPLICATE_ASSERTION_RULE = "merge_identical_statement_v1"
@@ -106,7 +137,7 @@ CHUNKING_CHECKPOINT_MESSAGE = (
     "support, frequency qualification, oversized-item recovery, unreviewed "
     "focused endpoints, overlapping withholding reasons, discourse-aside "
     "conditionals, duplicate-assertion merge, the shared review ledger, the "
-    "shared export assessment, or the chunk-allowance stop used the 0.9.28 rules, "
+    "shared export assessment, validated-chunk recovery, or the chunk-allowance stop used the 0.9.28 rules, "
     "or the stored chunk plan does not match this resume. Resume cannot continue "
     "that review. Start a new run."
 )
@@ -547,6 +578,7 @@ def review_procedure_fields() -> dict[str, str]:
         "duplicate_assertion_rule": DUPLICATE_ASSERTION_RULE,
         "budget_ledger_rule": BUDGET_LEDGER_RULE,
         "export_assessment_rule": EXPORT_ASSESSMENT_RULE,
+        "chunk_review_recovery": CHUNK_REVIEW_RECOVERY,
     }
 
 
@@ -801,6 +833,271 @@ def add_stop_reason(progress: dict[str, Any], reason: str) -> None:
     progress["stop_reasons"] = stops
 
 
+def partial_selection_note(chunk_order: str) -> str:
+    """Bias note for a partial selection. Shuffle is still not a complete review."""
+    if str(chunk_order or "") == SELECTION_CHUNK_ORDER_SHUFFLE:
+        return PARTIAL_SELECTION_SHUFFLE_BIAS
+    return PARTIAL_SELECTION_BIAS
+
+
+def order_selection_ids(ids: Sequence[str], *, chunk_order: str, seed: int | None) -> list[str]:
+    """Return chunk order. ``id`` keeps the list. ``seeded_shuffle`` uses ``seed``."""
+    ordered = [str(item) for item in ids if str(item)]
+    mode = str(chunk_order or SELECTION_CHUNK_ORDER_ID)
+    if mode == SELECTION_CHUNK_ORDER_ID:
+        return ordered
+    if mode != SELECTION_CHUNK_ORDER_SHUFFLE:
+        raise ValueError("selection_chunk_order must be 'id' or 'seeded_shuffle'.")
+    rng = random.Random(0 if seed is None else int(seed))
+    rng.shuffle(ordered)
+    return ordered
+
+
+def selection_policy_fingerprint(
+    *,
+    chunk_order: str,
+    chunk_order_seed: int | None,
+) -> str:
+    """Fingerprint of the review policy, not of the call or token ceilings."""
+    payload = {
+        "rules": review_procedure_fields(),
+        "chunk_order": str(chunk_order or SELECTION_CHUNK_ORDER_ID),
+        "chunk_order_seed": (
+            None
+            if str(chunk_order or "") != SELECTION_CHUNK_ORDER_SHUFFLE
+            else (None if chunk_order_seed is None else int(chunk_order_seed))
+        ),
+        "system_prompt": SYSTEM,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def chunk_input_fingerprint(
+    state: Mapping[str, Any],
+    code_ids: Sequence[str],
+    compaction: Mapping[str, int] | None = None,
+) -> str:
+    """Hash of the code ids, definitions, and quotes this chunk would send."""
+    payload = selection_payload(state, code_ids, compaction=compaction)
+    material = []
+    for row in payload.get("codes") or []:
+        if not isinstance(row, Mapping):
+            continue
+        quotes = []
+        for sample in row.get("evidence_sample") or []:
+            if isinstance(sample, Mapping):
+                quotes.append({
+                    "passage_id": sample.get("passage_id"),
+                    "quote": sample.get("quote"),
+                })
+        material.append({
+            "code_id": str(row.get("code_id") or ""),
+            "definition": str(row.get("definition") or ""),
+            "quotes": quotes,
+        })
+    raw = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def chunk_prompt_hash(
+    reviewer: Any,
+    state: Mapping[str, Any],
+    code_ids: Sequence[str],
+    *,
+    index: int,
+    count: int,
+    compaction: Mapping[str, int] | None = None,
+) -> str:
+    """Prompt hash of the selection request this chunk would send now."""
+    payload = selection_payload(
+        state,
+        code_ids,
+        chunk_index=index,
+        chunk_count=count,
+        compaction=compaction,
+    )
+    return prompt_hash(reviewer.messages(payload))
+
+
+def apply_validated_reuse(
+    progress: dict[str, Any],
+    state: Mapping[str, Any],
+    reviewer: Any,
+    *,
+    policy_fingerprint: str,
+    compaction: Mapping[str, int] | None = None,
+) -> dict[str, Any]:
+    """Keep validated chunks whose inputs and policy still match. Drop the rest.
+
+    A match reuses the stored decision and is not sent again. A changed
+    definition, quote, prompt, or policy invalidates that chunk only.
+    """
+    chunks = [list(chunk) for chunk in (progress.get("chunks") or [])]
+    stored = [
+        dict(item)
+        for item in (progress.get("validated_reviews") or [])
+        if isinstance(item, Mapping)
+    ]
+    by_ids = {tuple(str(item) for item in (row.get("code_ids") or [])): row for row in stored}
+    kept: list[dict[str, Any]] = []
+    invalidated: list[dict[str, Any]] = []
+    reused_indexes: list[int] = []
+    raised: list[str] = []
+    reviewed: list[str] = []
+    count = len(chunks)
+    current_keys = set()
+    for index, chunk in enumerate(chunks):
+        ids = [str(item) for item in chunk]
+        key = tuple(ids)
+        current_keys.add(key)
+        prior = by_ids.get(key)
+        current_input = chunk_input_fingerprint(state, ids, compaction)
+        # A later recovery can append a chunk. That changes the live chunk
+        # count, not this chunk's codes. Compare the prompt as it was sent.
+        stored_index = prior.get("chunk_index") if prior is not None else None
+        stored_count = prior.get("chunk_count") if prior is not None else None
+        prompt_index = int(stored_index) if isinstance(stored_index, int) and not isinstance(stored_index, bool) else index
+        prompt_count = int(stored_count) if isinstance(stored_count, int) and not isinstance(stored_count, bool) else count
+        current_prompt = chunk_prompt_hash(
+            reviewer,
+            state,
+            ids,
+            index=prompt_index,
+            count=prompt_count,
+            compaction=compaction,
+        )
+        matches = (
+            prior is not None
+            and str(prior.get("input_fingerprint") or "") == current_input
+            and str(prior.get("prompt_hash") or "") == current_prompt
+            and str(prior.get("policy_fingerprint") or "") == str(policy_fingerprint)
+        )
+        if matches and prior is not None:
+            reused_indexes.append(index)
+            kept.append(prior)
+            raised.extend(str(item) for item in (prior.get("raised_code_ids") or []))
+            reviewed.extend(ids)
+        elif prior is not None:
+            invalidated.append({"code_ids": ids, "reason": "input_or_policy_changed"})
+    for key, prior in by_ids.items():
+        if key not in current_keys:
+            invalidated.append({"code_ids": list(key), "reason": "chunk_membership_changed"})
+    logged = [
+        dict(item)
+        for item in (progress.get("invalidated_reviews") or [])
+        if isinstance(item, Mapping)
+    ]
+    seen = {tuple(str(code) for code in (item.get("code_ids") or [])) for item in logged}
+    for item in invalidated:
+        key = tuple(str(code) for code in (item.get("code_ids") or []))
+        if key not in seen:
+            logged.append(item)
+            seen.add(key)
+    progress["validated_reviews"] = kept
+    progress["invalidated_reviews"] = logged
+    progress["reused_chunk_indexes"] = reused_indexes
+    progress["chunks_reused"] = len(reused_indexes)
+    progress["raised_ids"] = raised
+    progress["reviewed_ids"] = reviewed
+    progress["chunks_validated"] = len(reused_indexes)
+    pending = [index for index in range(count) if index not in set(reused_indexes)]
+    progress["next_index"] = pending[0] if pending else count
+    progress["policy_fingerprint"] = str(policy_fingerprint)
+    return progress
+
+
+def record_validated_chunk(
+    progress: dict[str, Any],
+    *,
+    code_ids: Sequence[str],
+    input_fingerprint: str,
+    prompt_hash_value: str,
+    policy_fingerprint: str,
+    raised_code_ids: Sequence[str],
+    chunk_index: int | None = None,
+    chunk_count: int | None = None,
+) -> None:
+    """Store one validated chunk so a later budget resume can reuse it."""
+    ids = [str(item) for item in code_ids]
+    key = tuple(ids)
+    reviews = [
+        dict(item)
+        for item in (progress.get("validated_reviews") or [])
+        if isinstance(item, Mapping) and tuple(str(code) for code in (item.get("code_ids") or [])) != key
+    ]
+    reviews.append({
+        "code_ids": ids,
+        "input_fingerprint": str(input_fingerprint),
+        "prompt_hash": str(prompt_hash_value),
+        "policy_fingerprint": str(policy_fingerprint),
+        "raised_code_ids": [str(item) for item in raised_code_ids],
+        "chunk_index": None if chunk_index is None else int(chunk_index),
+        "chunk_count": None if chunk_count is None else int(chunk_count),
+    })
+    progress["validated_reviews"] = reviews
+
+
+def preflight_fields(
+    *,
+    calls_required: int,
+    calls_available: int,
+    tokens_required: int,
+    tokens_available: int,
+    auto_size: bool,
+    can_finish: bool,
+) -> dict[str, Any]:
+    """Required versus available for calls and tokens, and what the estimate includes."""
+    return {
+        "calls_required": int(calls_required),
+        "calls_available": int(calls_available),
+        "tokens_required": int(tokens_required),
+        "tokens_available": int(tokens_available),
+        "preflight_can_finish": bool(can_finish),
+        "auto_size_covers_calls_only": bool(auto_size),
+        "auto_size_raised_tokens": False,
+        "token_estimate_includes_output_tokens": TOKEN_ESTIMATE_INCLUDES_OUTPUT_TOKENS,
+        "token_estimate_includes_retry_or_repair_margin": TOKEN_ESTIMATE_INCLUDES_RETRY_OR_REPAIR_MARGIN,
+        "token_estimate_includes_fixed_prompt_overhead": TOKEN_ESTIMATE_INCLUDES_FIXED_PROMPT_OVERHEAD,
+        "token_estimate_scope": TOKEN_ESTIMATE_SCOPE_NOTE,
+    }
+
+
+async def measure_chunk_context_sensitivity(
+    reviewer: Any,
+    state: Mapping[str, Any],
+    code_id: str,
+    companion_groups: Sequence[Sequence[str]],
+) -> dict[str, Any]:
+    """Review one code beside each companion group and report if its selection changes.
+
+    The caller supplies the reviewer. This helper does not choose a paid model.
+    """
+    target = str(code_id)
+    outcomes = []
+    for companions in companion_groups:
+        ids: list[str] = []
+        for item in (target, *[str(code) for code in companions]):
+            if item and item not in ids:
+                ids.append(item)
+        payload = selection_payload(state, ids, chunk_index=0, chunk_count=1)
+        parsed, audit = await reviewer.decide(payload, SelectionDecision, {})
+        raised = [str(item) for item in ((parsed or {}).get("raised_code_ids") or [])]
+        outcomes.append({
+            "companions": [str(item) for item in companions],
+            "code_raised": target in set(raised),
+            "raised_code_ids": raised,
+            "prompt_hash": None if not isinstance(audit, Mapping) else audit.get("prompt_hash"),
+        })
+    flags = [bool(row["code_raised"]) for row in outcomes]
+    return {
+        "code_id": target,
+        "outcomes": outcomes,
+        "selection_changed": len(set(flags)) > 1,
+        "chunk_context_note": CHUNK_CONTEXT_NOTE,
+    }
+
+
 def finish_decision_report(progress: Mapping[str, Any]) -> dict[str, Any]:
     """Public accounting for one chunked review. Null where the figure is undefined."""
     omissions = [dict(item) for item in (progress.get("omissions") or [])]
@@ -891,13 +1188,50 @@ def finish_decision_report(progress: Mapping[str, Any]) -> dict[str, Any]:
             if progress.get("token_shortfall") is None
             else int(progress.get("token_shortfall") or 0)
         ),
+        "calls_required": (
+            None if progress.get("calls_required") is None else int(progress.get("calls_required") or 0)
+        ),
+        "calls_available": (
+            None if progress.get("calls_available") is None else int(progress.get("calls_available") or 0)
+        ),
+        "tokens_available": (
+            None if progress.get("tokens_available") is None else int(progress.get("tokens_available") or 0)
+        ),
+        "preflight_can_finish": progress.get("preflight_can_finish") if "preflight_can_finish" in progress else None,
+        "auto_size_covers_calls_only": (
+            progress.get("auto_size_covers_calls_only") if "auto_size_covers_calls_only" in progress else None
+        ),
+        "auto_size_raised_tokens": False if "auto_size_raised_tokens" in progress else None,
+        "token_estimate_includes_output_tokens": (
+            False if "token_estimate_includes_output_tokens" in progress else None
+        ),
+        "token_estimate_includes_retry_or_repair_margin": (
+            False if "token_estimate_includes_retry_or_repair_margin" in progress else None
+        ),
+        "token_estimate_includes_fixed_prompt_overhead": (
+            True if "token_estimate_includes_fixed_prompt_overhead" in progress else None
+        ),
+        "token_estimate_scope": progress.get("token_estimate_scope"),
+        "chunks_reused": (
+            None if progress.get("chunks_reused") is None else int(progress.get("chunks_reused") or 0)
+        ),
+        "invalidated_reviews": (
+            [dict(item) for item in (progress.get("invalidated_reviews") or []) if isinstance(item, Mapping)]
+            if progress.get("invalidated_reviews") is not None
+            else None
+        ),
         "partial_selection_is_code_id_slice": (
-            (not complete)
+            (
+                False
+                if complete
+                else str(progress.get("selection_chunk_order") or SELECTION_CHUNK_ORDER_ID)
+                != SELECTION_CHUNK_ORDER_SHUFFLE
+            )
             if str(progress.get("kind") or "") == "focused_selection"
             else None
         ),
         "partial_selection_bias": (
-            PARTIAL_SELECTION_BIAS
+            partial_selection_note(str(progress.get("selection_chunk_order") or SELECTION_CHUNK_ORDER_ID))
             if str(progress.get("kind") or "") == "focused_selection" and not complete
             else None
         ),
@@ -997,6 +1331,7 @@ def same_chunking_fingerprint(saved: Any, current: Any) -> bool:
         "duplicate_assertion_rule": DUPLICATE_ASSERTION_RULE,
         "budget_ledger_rule": BUDGET_LEDGER_RULE,
         "export_assessment_rule": EXPORT_ASSESSMENT_RULE,
+        "chunk_review_recovery": CHUNK_REVIEW_RECOVERY,
     }
     for key, required in expected.items():
         saved_value = str(saved.get(key) or "")

@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 
 import pytest
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableLambda
 from langgraph.checkpoint.memory import InMemorySaver
 
 from automated_grounded_theory import (
     AUTO_SIZE_DECISION_CALLS,
     BUDGET_LEDGER_RULE,
+    CHUNK_REVIEW_RECOVERY,
     CONDITIONAL_SCOPE_RULE,
     DECISION_REVIEW_CHUNKING,
     DUPLICATE_ASSERTION_RULE,
@@ -21,12 +25,14 @@ from automated_grounded_theory import (
     compare_pipeline_runs,
     export_gate_relationships,
     focused_code,
+    measure_chunk_context_sensitivity,
     relationship_assessment,
     repeat_frozen_review,
     repeat_pipeline,
     selective_code,
 )
 from automated_grounded_theory.async_support import ProviderAllowance, run_sync
+from automated_grounded_theory.prompts import message_text
 from automated_grounded_theory.axial import (
     AxialDecisionReviewer,
     ModelCoreDecision,
@@ -43,14 +49,19 @@ from automated_grounded_theory.decision_review import (
     CHUNKING_CHECKPOINT_MESSAGE,
     CHUNK_ALLOWANCE_INSUFFICIENT,
     PARTIAL_SELECTION_BIAS,
+    PARTIAL_SELECTION_SHUFFLE_BIAS,
+    SELECTION_CONSOLIDATION,
     SHARED_DECISION_REVIEW,
     SHARED_REVIEW_STEPS,
+    SYSTEM,
     SelectionDecision,
+    chunk_input_fingerprint,
+    selection_policy_fingerprint,
 )
 from automated_grounded_theory.records import POLICY_VERSION
 from automated_grounded_theory.version import __version__
 from tests.test_v080 import FakeAxialCoder
-from tests.test_v0924 import _KeepSelector, _code, _focused_source, _rewrite_metadata
+from tests.test_v0924 import _KeepSelector, _code, _focused_source, _rewrite_metadata, _selection_state
 from tests.test_v0926 import SENTENCE, _book, _both, _passages, _row
 from tests.test_v0927 import _focused, _large_codes, _tier_two_source
 
@@ -65,9 +76,15 @@ def test_version_rules_and_unchanged_defaults():
     assert DUPLICATE_ASSERTION_RULE == "merge_identical_statement_v1"
     assert BUDGET_LEDGER_RULE == "shared_review_ledger_v1"
     assert EXPORT_ASSESSMENT_RULE == "shared_assessment_v1"
+    assert CHUNK_REVIEW_RECOVERY == "reuse_validated_v1"
+    assert "validated-chunk recovery" in CHUNKING_CHECKPOINT_MESSAGE
     assert AUTO_SIZE_DECISION_CALLS is False
     import inspect
 
+    focused = inspect.signature(focused_code).parameters
+    assert focused["selection_chunk_order"].default == "id"
+    assert focused["selection_chunk_order_seed"].default is None
+    assert focused["selection_consolidation"].default is False
     assert inspect.signature(focused_code).parameters["max_decision_calls"].default == 8
     assert inspect.signature(focused_code).parameters["decision_token_budget"].default == 6000
     assert inspect.signature(aaxial_code).parameters["max_axial_review_tokens"].default == 24000
@@ -365,7 +382,12 @@ def test_a_0927_checkpoint_cannot_resume():
         procedure["decision_review_chunking"] = "request_budget_v4"
         procedure["withholding_cause_rule"] = "primary_cause_v1"
         procedure["conditional_scope_rule"] = "link_governing_if_v1"
-        for key in ("duplicate_assertion_rule", "budget_ledger_rule", "export_assessment_rule"):
+        for key in (
+            "duplicate_assertion_rule",
+            "budget_ledger_rule",
+            "export_assessment_rule",
+            "chunk_review_recovery",
+        ):
             procedure.pop(key, None)
         manifest = metadata.get("checkpoint_manifest") or {}
         stored = dict(manifest.get("procedure") or {})
@@ -467,6 +489,19 @@ def test_token_shortfall_stops_before_the_first_request(tmp_path):
     report = capped.metadata["decision_reviews"]["focused_selection"]
     assert report["chunks_sent"] == 0
     assert report["tokens_required"] == capped.metadata["selection_tokens_required"]
+    assert report["tokens_required"] == report["tokens_available"] + report["token_shortfall"]
+    assert report["calls_required"] == report["chunks_required"]
+    assert report["calls_available"] == report["decision_call_allowance"]
+    assert report["calls_required"] <= report["calls_available"]
+    assert report["preflight_can_finish"] is False
+    assert report["auto_size_covers_calls_only"] is True
+    assert report["auto_size_raised_tokens"] is False
+    assert report["token_estimate_includes_output_tokens"] is False
+    assert report["token_estimate_includes_retry_or_repair_margin"] is False
+    assert report["token_estimate_includes_fixed_prompt_overhead"] is True
+    assert "output tokens" in report["token_estimate_scope"]
+    assert "fixed system prompt" in report["token_estimate_scope"]
+    assert "retry" in report["token_estimate_scope"]
     assert report["decision_token_allowance"] == 1000
     assert report["token_shortfall"] > 0
     assert CHUNK_ALLOWANCE_INSUFFICIENT in (report["stop_reasons"] or [])
@@ -480,6 +515,12 @@ def test_token_shortfall_stops_before_the_first_request(tmp_path):
         assert payload["partial_selection_bias"] == PARTIAL_SELECTION_BIAS
         assert "code-id order" in payload["partial_selection_bias"]
         assert "not a sample" in payload["partial_selection_bias"]
+        assert payload["preflight_can_finish"] is False
+        assert payload["auto_size_covers_calls_only"] is True
+        assert payload["auto_size_raised_tokens"] is False
+        assert payload["token_estimate_includes_output_tokens"] is False
+        assert payload["token_estimate_includes_fixed_prompt_overhead"] is True
+        assert payload["tokens_required"] > payload["tokens_available"]
 
     finished = _focused(
         [
@@ -544,3 +585,488 @@ def test_proposed_and_unreviewed_ineligible_rows_are_explained():
     assert all(row["withholding_reasons"] for row in ineligible)
     assert sum(exported["withholding_cause_counts"].values()) == exported["explained_rows"] == len(ineligible)
     assert exported["accepted_downstream"] == []
+
+
+class _ScriptedSelector(_KeepSelector):
+    """Fake reviewer. Fails on one call, or narrows a consolidation pass."""
+
+    def __init__(self, *, fail_at: int | None = None, consolidate_to: list[str] | None = None):
+        super().__init__()
+        object.__setattr__(self, "fail_at", fail_at)
+        object.__setattr__(self, "consolidate_to", consolidate_to)
+        object.__setattr__(self, "payloads", [])
+        self.calls = 0
+
+    def with_structured_output(self, schema, **kwargs):
+        include_raw = bool(kwargs.get("include_raw"))
+
+        def _call(messages):
+            self.calls += 1
+            name = getattr(schema, "__name__", "")
+            text = "\n".join(message_text(message) for message in messages)
+            payload = json.loads(text[text.find("{"):])
+            self.payloads.append(payload)
+            if self.fail_at is not None and self.calls == self.fail_at and name == "SelectionDecision":
+                raise RuntimeError("scripted review failure")
+            if name == "SelectionDecision":
+                if payload.get("review_pass") == SELECTION_CONSOLIDATION and self.consolidate_to is not None:
+                    raised = list(self.consolidate_to)
+                else:
+                    raised = [
+                        str(row.get("code_id") or "")
+                        for row in payload.get("codes") or []
+                        if "KEEP" in str(row.get("definition") or "")
+                    ]
+                parsed = schema(raised_code_ids=raised, rationale="Kept the marked codes in this request.")
+            elif name == "ClaimDecisions":
+                parsed = schema(
+                    claims=[
+                        {
+                            "entry_id": claim["entry_id"],
+                            "disposition": "proposed",
+                            "support": "indeterminate",
+                            "rationale": "Left proposed.",
+                        }
+                        for claim in payload.get("claims") or []
+                    ]
+                )
+            else:
+                raise AssertionError(name)
+            if not include_raw:
+                return parsed
+            raw = AIMessage(
+                content="{}",
+                usage_metadata={"input_tokens": 20, "output_tokens": 8, "total_tokens": 28},
+            )
+            return {"raw": raw, "parsed": parsed, "parsing_error": None}
+
+        return RunnableLambda(_call)
+
+
+def _selection_requests(model: _ScriptedSelector) -> list[dict]:
+    return [
+        payload
+        for payload in model.payloads
+        if payload.get("kind") == "focused_selection" and not payload.get("review_pass")
+    ]
+
+
+def _focused_common(saver, thread_id, decision_model, **extra):
+    return dict(
+        model=FakeAxialCoder(),
+        decision_model=decision_model,
+        decision_mode="llm",
+        seed=3,
+        batch_size=1,
+        max_focused_review_calls=0,
+        focused_neighbor_limit=0,
+        focused_outside_limit=0,
+        focused_negative_case_limit=0,
+        max_decision_tokens=extra.pop("max_decision_tokens", 200000),
+        checkpointer=saver,
+        thread_id=thread_id,
+        **extra,
+    )
+
+
+def _rewrite_channel(saver: InMemorySaver, thread_id: str, channel: str, mutate) -> None:
+    config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+    saved = saver.get_tuple(config)
+    assert saved is not None
+    version = saved.checkpoint["channel_versions"][channel]
+    namespace = saved.config["configurable"].get("checkpoint_ns", "")
+    key = (thread_id, namespace, channel, version)
+    type_tag, blob = saver.blobs[key]
+    value = saver.serde.loads_typed((type_tag, blob))
+    mutate(value)
+    saver.blobs[key] = saver.serde.dumps_typed(value)
+
+
+def test_budget_only_resume_sends_after_a_token_raise(tmp_path):
+    saver = InMemorySaver()
+    source = _focused_source(_large_codes())
+    first = _ScriptedSelector()
+    paused = focused_code(
+        source,
+        **_focused_common(
+            saver,
+            "budget-only",
+            first,
+            interrupt=True,
+            max_decision_calls=1,
+            auto_size_decision_calls=True,
+            max_decision_tokens=1000,
+        ),
+    )
+    assert paused.interrupted
+    assert paused.metadata["preflight_can_finish"] is False
+    assert paused.metadata["auto_size_raised_tokens"] is False
+    assert first.calls == 0
+    second = _ScriptedSelector()
+    resumed = focused_code(
+        source,
+        **_focused_common(
+            saver,
+            "budget-only",
+            second,
+            interrupt=True,
+            resuming=True,
+            resume={"continue_selection": True},
+            allow_changes=False,
+            max_decision_calls=1,
+            auto_size_decision_calls=True,
+            max_decision_tokens=200000,
+        ),
+    )
+    assert resumed.metadata["continuations"][0]["event"] == "budget_resume"
+    assert resumed.raised_code_ids == ["c-a", "c-c"]
+    assert resumed.metadata["preflight_can_finish"] is True
+    assert second.calls >= 1
+    assert resumed.metadata["decision_reviews"]["focused_selection"]["chunks_sent"] == len(_selection_requests(second))
+
+
+def test_validated_chunks_are_reused_when_only_the_allowance_changes(tmp_path):
+    saver = InMemorySaver()
+    source = _focused_source(_large_codes())
+    failing = _ScriptedSelector(fail_at=3)
+    paused = focused_code(
+        source,
+        **_focused_common(
+            saver,
+            "reuse-chunks",
+            failing,
+            interrupt=True,
+            max_decision_calls=4,
+        ),
+    )
+    assert paused.interrupted
+    assert paused.metadata["decision_stop"] == "review_error"
+    stored = paused.metadata["decision_chunk_state"]["validated_reviews"]
+    assert len(stored) == 2
+    for review in stored:
+        assert review["input_fingerprint"]
+        assert review["prompt_hash"]
+        assert review["policy_fingerprint"]
+        assert len(review["code_ids"]) == 1
+    kept = {tuple(review["code_ids"]) for review in stored}
+    healthy = _ScriptedSelector()
+    resumed = focused_code(
+        source,
+        **_focused_common(
+            saver,
+            "reuse-chunks",
+            healthy,
+            interrupt=True,
+            resuming=True,
+            resume={"continue_selection": True},
+            allow_changes=False,
+            max_decision_calls=8,
+        ),
+    )
+    assert resumed.metadata["continuations"][0]["event"] == "budget_resume"
+    resent = [tuple(payload["review_chunk"]["code_ids"]) for payload in _selection_requests(healthy)]
+    assert kept.isdisjoint(resent)
+    assert len(resent) == 2
+    assert resumed.raised_code_ids == ["c-a", "c-c"]
+    report = resumed.metadata["decision_reviews"]["focused_selection"]
+    assert report["chunks_reused"] >= 2
+    assert report["invalidated_reviews"] in ([], None)
+
+
+def test_a_changed_definition_invalidates_only_that_chunk(tmp_path):
+    saver = InMemorySaver()
+    source = _focused_source(_large_codes())
+    failing = _ScriptedSelector(fail_at=3)
+    paused = focused_code(
+        source,
+        **_focused_common(saver, "invalidate-one", failing, interrupt=True, max_decision_calls=4),
+    )
+    assert len(paused.metadata["decision_chunk_state"]["validated_reviews"]) == 2
+
+    def rewrite(book):
+        for entry in book.values():
+            if str(entry.get("code_id") or "") == "c-a":
+                definition = str(entry.get("definition") or "")
+                entry["definition"] = "packed  " + definition[len("packed  "):]
+
+    _rewrite_channel(saver, "invalidate-one", "codebook", rewrite)
+    healthy = _ScriptedSelector()
+    resumed = focused_code(
+        source,
+        **_focused_common(
+            saver,
+            "invalidate-one",
+            healthy,
+            interrupt=True,
+            resuming=True,
+            resume={"continue_selection": True},
+            allow_changes=False,
+            max_decision_calls=8,
+        ),
+    )
+    report = resumed.metadata["decision_reviews"]["focused_selection"]
+    invalidated = {tuple(item["code_ids"]) for item in (report["invalidated_reviews"] or [])}
+    assert ("c-a",) in invalidated
+    assert ("c-b",) not in invalidated
+    resent = [tuple(payload["review_chunk"]["code_ids"]) for payload in _selection_requests(healthy)]
+    assert ("c-a",) in resent
+    assert ("c-b",) not in resent
+    assert resumed.raised_code_ids == ["c-a", "c-c"]
+
+
+def test_a_changed_policy_invalidates_the_validated_chunks(tmp_path, monkeypatch):
+    saver = InMemorySaver()
+    source = _focused_source(_large_codes())
+    failing = _ScriptedSelector(fail_at=3)
+    paused = focused_code(
+        source,
+        **_focused_common(saver, "invalidate-policy", failing, interrupt=True, max_decision_calls=4),
+    )
+    kept = {tuple(row["code_ids"]) for row in paused.metadata["decision_chunk_state"]["validated_reviews"]}
+    assert kept == {("c-a",), ("c-b",)}
+    monkeypatch.setattr(
+        "automated_grounded_theory.decision_review.SYSTEM",
+        SYSTEM + "\nApply the revised review policy.",
+    )
+    healthy = _ScriptedSelector()
+    resumed = focused_code(
+        source,
+        **_focused_common(
+            saver,
+            "invalidate-policy",
+            healthy,
+            interrupt=True,
+            resuming=True,
+            resume={"continue_selection": True},
+            allow_changes=False,
+            max_decision_calls=8,
+        ),
+    )
+    report = resumed.metadata["decision_reviews"]["focused_selection"]
+    invalidated = {tuple(item["code_ids"]) for item in (report["invalidated_reviews"] or [])}
+    assert invalidated == kept
+    resent = {tuple(payload["review_chunk"]["code_ids"]) for payload in _selection_requests(healthy)}
+    assert resent == {("c-a",), ("c-b",), ("c-c",), ("c-d",)}
+
+
+def test_chunk_fingerprint_tracks_definition_quote_and_policy():
+    state = _selection_state([_code("c-a", "KEEP one"), _code("c-b", "DROP two")])
+    state["segments"] = [{"code_id": "c-a", "passage_id": "p1", "quote": "alpha"}]
+    original = chunk_input_fingerprint(state, ["c-a"])
+    redefined = _selection_state([_code("c-a", "KEEP one more"), _code("c-b", "DROP two")])
+    redefined["segments"] = state["segments"]
+    assert chunk_input_fingerprint(redefined, ["c-a"]) != original
+    requoted = _selection_state([_code("c-a", "KEEP one"), _code("c-b", "DROP two")])
+    requoted["segments"] = [{"code_id": "c-a", "passage_id": "p1", "quote": "beta"}]
+    assert chunk_input_fingerprint(requoted, ["c-a"]) != original
+    other = _selection_state([_code("c-a", "KEEP one"), _code("c-b", "DROP two changed")])
+    other["segments"] = state["segments"]
+    assert chunk_input_fingerprint(other, ["c-a"]) == original
+    assert selection_policy_fingerprint(chunk_order="id", chunk_order_seed=4) == selection_policy_fingerprint(
+        chunk_order="id", chunk_order_seed=9
+    )
+    assert selection_policy_fingerprint(chunk_order="seeded_shuffle", chunk_order_seed=4) != selection_policy_fingerprint(
+        chunk_order="seeded_shuffle", chunk_order_seed=9
+    )
+
+
+def test_seeded_shuffle_is_recorded_and_a_partial_selection_stays_incomplete(tmp_path):
+    ids = ["c-a", "c-b", "c-c", "c-d"]
+    seed = 1
+    shuffled = list(ids)
+    while shuffled == ids:
+        shuffled = list(ids)
+        random.Random(seed).shuffle(shuffled)
+        if shuffled == ids:
+            seed += 1
+    stopped = _focused(
+        _large_codes(),
+        tmp_path,
+        max_decision_calls=1,
+        selection_chunk_order="seeded_shuffle",
+        selection_chunk_order_seed=seed,
+    )
+    assert stopped.metadata["selection_chunk_order"] == "seeded_shuffle"
+    assert stopped.metadata["selection_chunk_order_seed"] == seed
+    assert stopped.metadata["decision_chunk_state"]["ordered_ids"] == shuffled
+    assert stopped.metadata["selection_review_complete"] is False
+    assert stopped.metadata["partial_selection_is_code_id_slice"] is False
+    assert stopped.metadata["partial_selection_bias"] == PARTIAL_SELECTION_SHUFFLE_BIAS
+    assert stopped.raised_code_ids == []
+    report = stopped.metadata["decision_reviews"]["focused_selection"]
+    assert report["partial_selection_bias"] == PARTIAL_SELECTION_SHUFFLE_BIAS
+    assert report["chunk_order_selects_codes"] is False
+    plain = _focused(_large_codes(), tmp_path / "id-order", max_decision_calls=1)
+    assert plain.metadata["decision_chunk_state"]["ordered_ids"] == ids
+    assert plain.metadata["partial_selection_is_code_id_slice"] is True
+    assert plain.metadata["partial_selection_bias"] == PARTIAL_SELECTION_BIAS
+    with pytest.raises(ValueError, match="selection_chunk_order"):
+        _focused(_large_codes(), tmp_path / "bad-order", selection_chunk_order="random")
+
+
+def test_consolidation_is_off_unless_requested_and_reviews_raised_and_near_miss(tmp_path):
+    codes = [_code("c-b", "DROP this code"), _code("c-a", "KEEP this code")]
+    plain_model = _ScriptedSelector()
+    plain = focused_code(
+        _focused_source(codes),
+        model=FakeAxialCoder(),
+        decision_model=plain_model,
+        decision_mode="llm",
+        seed=3,
+        batch_size=1,
+        interrupt=False,
+        max_focused_review_calls=0,
+        focused_neighbor_limit=0,
+        focused_outside_limit=0,
+        focused_negative_case_limit=0,
+        max_decision_tokens=200000,
+        output_dir=tmp_path / "off",
+    )
+    assert len(_selection_requests(plain_model)) == 1
+    assert plain.metadata.get("selection_consolidation") in (None, False)
+    assert plain.raised_code_ids == ["c-a"]
+
+    consolidating = _ScriptedSelector(consolidate_to=["c-a"])
+    finished = focused_code(
+        _focused_source(codes),
+        model=FakeAxialCoder(),
+        decision_model=consolidating,
+        decision_mode="llm",
+        seed=3,
+        batch_size=1,
+        interrupt=False,
+        max_focused_review_calls=0,
+        focused_neighbor_limit=0,
+        focused_outside_limit=0,
+        focused_negative_case_limit=0,
+        max_decision_tokens=200000,
+        selection_consolidation=True,
+        output_dir=tmp_path / "on",
+    )
+    passes = [payload for payload in consolidating.payloads if payload.get("review_pass") == SELECTION_CONSOLIDATION]
+    assert len(passes) == 1
+    assert passes[0]["provisional_raised_code_ids"] == ["c-a"]
+    assert "c-b" in passes[0]["near_miss_code_ids"]
+    assert finished.metadata["selection_consolidation"] == SELECTION_CONSOLIDATION
+    assert finished.raised_code_ids == ["c-a"]
+    assert finished.metadata["selection_consolidation_enabled"] is True
+
+
+def test_chunk_context_sensitivity_reports_a_changed_selection():
+    state = _selection_state([
+        _code("target", "the code under test"),
+        _code("friend", "a companion"),
+        _code("other", "another companion"),
+    ])
+
+    class _CompanionReviewer:
+        async def decide(self, payload, schema, metadata):
+            ids = [str(row.get("code_id") or "") for row in payload.get("codes") or []]
+            raised = ["target"] if "friend" in ids else []
+            return {"raised_code_ids": raised, "rationale": "scripted"}, {"prompt_hash": "hash-" + ",".join(ids)}
+
+    changed = run_sync(
+        measure_chunk_context_sensitivity(_CompanionReviewer(), state, "target", [["friend"], ["other"]])
+    )
+    assert changed["selection_changed"] is True
+    assert [row["code_raised"] for row in changed["outcomes"]] == [True, False]
+    assert "across the corpus" in changed["chunk_context_note"]
+    assert "selection_consolidation" in changed["chunk_context_note"]
+
+    class _StableReviewer:
+        async def decide(self, payload, schema, metadata):
+            return {"raised_code_ids": ["target"], "rationale": "same"}, {"prompt_hash": "stable"}
+
+    stable = run_sync(
+        measure_chunk_context_sensitivity(_StableReviewer(), state, "target", [["friend"], ["other"]])
+    )
+    assert stable["selection_changed"] is False
+
+
+def test_every_export_bucket_explains_ineligible_rows():
+    exported = export_gate_relationships(
+        [
+            {
+                "relationship_id": "rel-accepted-ineligible",
+                "disposition": "accepted",
+                "reviewer_disposition": "accepted",
+                "downstream_eligible": False,
+                "evidence_tier": 2,
+                "cases_with_both_endpoints": 2,
+                "flags": ["endpoint_unreviewed_by_focus"],
+                "eligibility_reason": "endpoint_unreviewed_by_focus",
+            },
+            {
+                "relationship_id": "rel-accepted-ok",
+                "disposition": "accepted",
+                "reviewer_disposition": "accepted",
+                "downstream_eligible": True,
+                "evidence_tier": 2,
+                "cases_with_both_endpoints": 2,
+            },
+            {
+                "relationship_id": "rel-rejected",
+                "disposition": "rejected",
+                "reviewer_disposition": "rejected",
+                "reviewer_decided": True,
+                "downstream_eligible": False,
+                "evidence_tier": 2,
+                "cases_with_both_endpoints": 2,
+            },
+            {
+                "relationship_id": "rel-0005",
+                "disposition": "proposed",
+                "reviewer_decided": False,
+                "reviewer_disposition": None,
+                "evidence_tier": 0,
+                "supporting_cases": [],
+                "cases_with_both_endpoints": 0,
+            },
+            {
+                "relationship_id": "rel-unreviewed",
+                "disposition": "proposed",
+                "evidence_tier": 2,
+                "cases_with_both_endpoints": 2,
+                "flags": ["endpoint_unreviewed_by_focus"],
+                "eligibility_reason": "endpoint_unreviewed_by_focus",
+            },
+            {
+                "relationship_id": "rel-open",
+                "disposition": "proposed",
+                "evidence_tier": 2,
+                "cases_with_both_endpoints": 2,
+            },
+        ]
+    )
+    buckets = {
+        "accepted": {row["relationship_id"] for row in exported["accepted"]},
+        "withheld": {row["relationship_id"] for row in exported["withheld"]},
+        "proposed": {row["relationship_id"] for row in exported["proposed"]},
+    }
+    assert "rel-accepted-ineligible" in buckets["accepted"]
+    assert "rel-accepted-ok" in buckets["accepted"]
+    assert "rel-rejected" in buckets["withheld"]
+    assert {"rel-0005", "rel-unreviewed", "rel-open"} <= buckets["proposed"]
+    ineligible_ids = {"rel-accepted-ineligible", "rel-rejected", "rel-0005", "rel-unreviewed"}
+    open_ids = {"rel-accepted-ok", "rel-open"}
+    seen = []
+    for name in ("accepted", "withheld", "proposed"):
+        assert exported[name]
+        for row in exported[name]:
+            seen.append(row["relationship_id"])
+            if row["relationship_id"] in ineligible_ids:
+                assert row["withholding_reasons"], row["relationship_id"]
+                assert row["primary_withholding_cause"], row["relationship_id"]
+            if row["relationship_id"] in open_ids:
+                assert row["withholding_reasons"] == []
+                assert row["primary_withholding_cause"] is None
+    assert set(seen) == ineligible_ids | open_ids
+    accepted = {row["relationship_id"]: row for row in exported["accepted"]}
+    held = accepted["rel-accepted-ineligible"]
+    assert held["reviewer_disposition"] == "accepted"
+    assert held["downstream_eligible"] is False
+    assert held["reviewer_disposition"] != str(held["downstream_eligible"]).casefold()
+    downstream_ids = {row["relationship_id"] for row in exported["accepted_downstream"]}
+    assert downstream_ids == {"rel-accepted-ok"}
+    assert "rel-accepted-ineligible" not in downstream_ids
+    assert sum(exported["withholding_cause_counts"].values()) == exported["explained_rows"] == len(ineligible_ids)

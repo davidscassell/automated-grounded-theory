@@ -177,7 +177,9 @@ from automated_grounded_theory.decision_review import (
     AUTO_SIZE_DECISION_CALLS,
     CHUNK_ALLOWANCE_INSUFFICIENT,
     DECISION_REVIEW_CHUNKING,
-    PARTIAL_SELECTION_BIAS,
+    SELECTION_CHUNK_ORDER_ID,
+    SELECTION_CHUNK_ORDER_SHUFFLE,
+    SELECTION_CONSOLIDATION,
     FOCUSED_DECISION_REVIEW,
     FOCUSED_REVIEW_STEPS,
     ClaimDecisions,
@@ -186,6 +188,13 @@ from automated_grounded_theory.decision_review import (
     SelectionDecision,
     add_stop_reason,
     apply_model_claim_decisions,
+    apply_validated_reuse,
+    chunk_input_fingerprint,
+    order_selection_ids,
+    partial_selection_note,
+    preflight_fields,
+    record_validated_chunk,
+    selection_policy_fingerprint,
     budget_ledger,
     build_decision_plan,
     claims_payload,
@@ -278,7 +287,11 @@ _PROCEDURE_KEYS = (
     "duplicate_assertion_rule",
     "budget_ledger_rule",
     "export_assessment_rule",
+    "chunk_review_recovery",
     "auto_size_decision_calls",
+    "selection_chunk_order",
+    "selection_chunk_order_seed",
+    "selection_consolidation",
 )
 _PERFORMANCE_KEYS = (
     "batch_size",
@@ -426,6 +439,9 @@ class FocusedRuntime:
     step_timeout: float = 0.0
     decision_step_timeout: float = 0.0
     auto_size_decision_calls: bool = False
+    selection_chunk_order: str = "id"
+    selection_chunk_order_seed: int | None = None
+    selection_consolidation: bool = False
 
     def __post_init__(self) -> None:
         if self.limiter is None:
@@ -2004,6 +2020,11 @@ def _check_resume_manifest(saved: Mapping[str, Any], current: Mapping[str, Any],
     structural = {path: change for path, change in differences.items() if path in _STRUCTURAL_PATHS}
     if structural:
         raise CheckpointMigrationRequired(structural)
+    # A higher call or token allowance continues the same review. It is not a
+    # general procedure change, and it does not by itself invalidate a chunk.
+    budget_only = set(differences) <= {"procedure.max_decision_calls", "procedure.max_decision_tokens"}
+    if budget_only:
+        return [{"event": "budget_resume", "differences": differences}]
     if not allow_changes:
         raise CheckpointMismatch(differences)
     return [{"event": "continuation", "differences": differences}]
@@ -5813,6 +5834,82 @@ def _selection_ceiling(reason: str) -> bool:
     return reason in {"call_allowance", "token_allowance", "request_budget", "review_error"}
 
 
+def _chunk_order_settings(runtime: FocusedRuntime, metadata: Mapping[str, Any]) -> tuple[str, int | None]:
+    """Chunk order and the seed a shuffle would use. ``id`` does not shuffle."""
+    order = str(getattr(runtime, "selection_chunk_order", None) or SELECTION_CHUNK_ORDER_ID)
+    if order not in {SELECTION_CHUNK_ORDER_ID, SELECTION_CHUNK_ORDER_SHUFFLE}:
+        order = SELECTION_CHUNK_ORDER_ID
+    if order != SELECTION_CHUNK_ORDER_SHUFFLE:
+        return order, None
+    seed = getattr(runtime, "selection_chunk_order_seed", None)
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        procedure = metadata.get("procedure") if isinstance(metadata.get("procedure"), Mapping) else {}
+        stored = procedure.get("selection_chunk_order_seed") if isinstance(procedure, Mapping) else None
+        if isinstance(stored, int) and not isinstance(stored, bool):
+            seed = stored
+        else:
+            procedure_seed = procedure.get("seed") if isinstance(procedure, Mapping) else None
+            seed = procedure_seed if isinstance(procedure_seed, int) and not isinstance(procedure_seed, bool) else 0
+    return order, int(seed)
+
+
+async def _consolidate_selection_chunks(runtime, state, progress, metadata, logs, warnings) -> None:
+    """One optional pass over provisionally raised codes and near misses.
+
+    Off unless the caller sets ``selection_consolidation``. A pass that does
+    not fit the remaining allowance is recorded and skipped. It does not
+    discard the chunk reviews already stored.
+    """
+    progress["consolidation_done"] = True
+    metadata["selection_consolidation_enabled"] = True
+    raised = [str(item) for item in (progress.get("raised_ids") or [])]
+    reviewed = [str(item) for item in (progress.get("reviewed_ids") or [])]
+    near = [item for item in reviewed if item not in set(raised)]
+    targets: list[str] = []
+    for item in raised + near:
+        if item and item not in targets:
+            targets.append(item)
+    metadata["selection_consolidation_targets"] = targets
+    metadata["selection_near_miss_code_ids"] = near
+    if not targets:
+        metadata["selection_consolidation"] = None
+        metadata["selection_consolidation_skipped"] = "nothing_to_consolidate"
+        return
+    reviewer = runtime.reviewer
+    payload = selection_payload(
+        state,
+        targets,
+        chunk_index=0,
+        chunk_count=1,
+        compaction=progress.get("compaction") or {},
+    )
+    payload["review_pass"] = SELECTION_CONSOLIDATION
+    payload["provisional_raised_code_ids"] = raised
+    payload["near_miss_code_ids"] = near
+    stop = reviewer.refusal_reason(payload, SelectionDecision, metadata)
+    if stop:
+        metadata["selection_consolidation"] = None
+        metadata["selection_consolidation_skipped"] = stop
+        return
+    parsed, audit = await reviewer.decide(payload, SelectionDecision, metadata)
+    if audit:
+        logs.append(audit)
+    if parsed is None:
+        metadata["selection_consolidation"] = None
+        metadata["selection_consolidation_skipped"] = str(metadata.get("decision_stop") or "review_error")
+        metadata.pop("decision_stop", None)
+        return
+    chosen = [str(item) for item in (parsed.get("raised_code_ids") or [])]
+    if len(chosen) != len(set(chosen)) or any(item not in set(targets) for item in chosen):
+        metadata["selection_consolidation"] = None
+        metadata["selection_consolidation_skipped"] = "invalid_decision"
+        return
+    progress["raised_ids"] = chosen
+    metadata["selection_consolidation"] = SELECTION_CONSOLIDATION
+    metadata["selection_consolidation_skipped"] = None
+    progress["consolidation_raised_code_ids"] = chosen
+
+
 async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, *, metadata, logs, warnings) -> dict:
     """Send at most one selection chunk. A later chunk is another graph visit.
 
@@ -5826,7 +5923,15 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
     """
     reviewer = runtime.reviewer
     codes = selection_codes(state)
-    ordered = [row["code_id"] for row in codes]
+    canonical = [row["code_id"] for row in codes]
+    ordered = list(canonical)
+    chunk_order, chunk_seed = _chunk_order_settings(runtime, metadata)
+    if chunk_order == SELECTION_CHUNK_ORDER_SHUFFLE:
+        ordered = order_selection_ids(ordered, chunk_order=chunk_order, seed=chunk_seed)
+    metadata["selection_code_id_order"] = canonical
+    metadata["selection_chunk_order"] = chunk_order
+    metadata["selection_chunk_order_seed"] = chunk_seed
+    metadata["selection_consolidation_enabled"] = bool(getattr(runtime, "selection_consolidation", False))
     if reviewer is None or not ordered:
         metadata["decision_stop"] = "call_allowance"
         metadata["selection_source"] = "provisional"
@@ -5838,8 +5943,8 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         metadata["selection_uncovered_code_ids"] = ordered
         metadata["provisional_raised_code_ids"] = []
         metadata["selection_chunk_order_selects"] = False
-        metadata["partial_selection_is_code_id_slice"] = True
-        metadata["partial_selection_bias"] = PARTIAL_SELECTION_BIAS
+        metadata["partial_selection_is_code_id_slice"] = chunk_order != SELECTION_CHUNK_ORDER_SHUFFLE
+        metadata["partial_selection_bias"] = partial_selection_note(chunk_order)
         warnings.append("LLM selection review incomplete: call_allowance.")
         known = list(state.get("known_code_ids") or ordered)
         return {
@@ -5915,6 +6020,7 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         progress_row["open"] = False
         metadata["decision_chunk_state"] = progress_row
         seal_budget_step(metadata, progress_row, "focused_selection")
+        progress_row["selection_chunk_order"] = metadata.get("selection_chunk_order") or SELECTION_CHUNK_ORDER_ID
         report = finish_decision_report(progress_row)
         store_decision_report(metadata, report)
         metadata["selection_review_complete"] = bool(report["complete"])
@@ -5925,7 +6031,8 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         omissions = list(progress_row.get("omissions") or [])
         known = list(state.get("known_code_ids") or ordered)
         provisional = merge_selection_ids(
-            progress_row.get("ordered_ids") or [], progress_row.get("raised_ids") or []
+            metadata.get("selection_code_id_order") or progress_row.get("ordered_ids") or [],
+            progress_row.get("raised_ids") or [],
         )
         uncovered = list(report.get("uncovered_ids") or [])
         metadata["selection_reviewed_code_ids"] = [str(item) for item in (progress_row.get("reviewed_ids") or [])]
@@ -5934,9 +6041,8 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         metadata["selection_human_exclusions"] = list(report.get("human_exclusions") or [])
         metadata["selection_items_excluded"] = int(report.get("items_excluded") or 0)
         metadata["selection_chunk_order_selects"] = False
-        partial_selection = not bool(report["complete"])
-        metadata["partial_selection_is_code_id_slice"] = partial_selection
-        metadata["partial_selection_bias"] = PARTIAL_SELECTION_BIAS if partial_selection else None
+        metadata["partial_selection_is_code_id_slice"] = report.get("partial_selection_is_code_id_slice")
+        metadata["partial_selection_bias"] = report.get("partial_selection_bias")
         metadata["selection_resume"] = {
             "resumable": not bool(report["complete"]),
             "next_index": int(progress_row.get("next_index") or 0),
@@ -5971,6 +6077,8 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
                 metadata["selection_review_fallback"] = "omitted_oversized"
                 seal_budget_step(metadata, progress_row, "focused_selection")
                 report = finish_decision_report(progress_row)
+                metadata["partial_selection_is_code_id_slice"] = report.get("partial_selection_is_code_id_slice")
+                metadata["partial_selection_bias"] = report.get("partial_selection_bias")
                 metadata["decision_chunk_state"] = progress_row
                 store_decision_report(metadata, report)
             else:
@@ -6059,35 +6167,74 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         # Raises the call allowance only. The token allowance stays as configured.
         reviewer.max_calls = required
     allowance = int(reviewer.max_calls)
-    sent = int(progress.get("chunks_sent") or 0)
-    validated_now = int(progress.get("chunks_validated") or 0)
-    shortfall = max(0, required - allowance)
     token_allowance = int(reviewer.max_tokens)
     tokens_used = int(metadata.get("decision_tokens_used") or 0)
+    calls_used = int(metadata.get("decision_calls_used") or 0)
+    policy_fingerprint = selection_policy_fingerprint(
+        chunk_order=chunk_order, chunk_order_seed=chunk_seed,
+    )
+    apply_validated_reuse(
+        progress,
+        state,
+        reviewer,
+        policy_fingerprint=policy_fingerprint,
+        compaction=compaction,
+    )
+    reused = {int(item) for item in (progress.get("reused_chunk_indexes") or [])}
+    pending_chunks = [chunks[item] for item in range(len(chunks)) if item not in reused]
+    calls_still = len(pending_chunks)
+    calls_available = max(0, allowance - calls_used)
+    tokens_required = 0
+    for chunk_ids in pending_chunks:
+        ids = [str(item) for item in chunk_ids]
+        if ids:
+            tokens_required += int(estimate(ids))
+    tokens_available = max(0, token_allowance - tokens_used)
+    shortfall = max(0, calls_still - calls_available)
+    token_shortfall = max(0, tokens_required - tokens_available)
+    auto_size = bool(getattr(runtime, "auto_size_decision_calls", False))
+    reviewer_on = allowance > 0
+    # calls_still is what this visit still has to send. A zero token ceiling
+    # cannot cover a positive estimate, so that check fails here too.
+    call_blocked = reviewer_on and calls_still > calls_available
+    token_blocked = reviewer_on and tokens_required > tokens_available
+    can_finish = reviewer_on and not call_blocked and not token_blocked
+    fields = preflight_fields(
+        calls_required=calls_still,
+        calls_available=calls_available,
+        tokens_required=tokens_required,
+        tokens_available=tokens_available,
+        auto_size=auto_size,
+        can_finish=can_finish,
+    )
+    progress.update(fields)
     progress["chunks_required"] = required
     progress["decision_call_allowance"] = allowance
     progress["chunk_shortfall"] = shortfall
+    progress["decision_token_allowance"] = token_allowance
+    progress["token_shortfall"] = token_shortfall
+    progress["selection_chunk_order"] = chunk_order
     metadata["selection_chunks_required"] = required
     metadata["decision_call_allowance"] = allowance
     metadata["decision_call_allowance_configured"] = configured
     metadata["selection_chunk_shortfall"] = shortfall
-    metadata["auto_size_decision_calls"] = bool(getattr(runtime, "auto_size_decision_calls", False))
+    metadata["auto_size_decision_calls"] = auto_size
     metadata["decision_call_allowance_raised"] = allowance != configured
-    # The token allowance is never raised here, including when calls are.
     metadata["decision_token_allowance"] = token_allowance
-    if sent == 0 and validated_now == 0:
-        tokens_required = 0
-        for chunk_ids in chunks:
-            ids = [str(item) for item in chunk_ids]
-            if ids:
-                tokens_required += int(estimate(ids))
-        token_room = token_allowance - tokens_used
-        token_shortfall = max(0, tokens_required - token_room) if token_allowance > 0 else 0
-        progress["tokens_required"] = tokens_required
-        progress["decision_token_allowance"] = token_allowance
-        progress["token_shortfall"] = token_shortfall
-        metadata["selection_tokens_required"] = tokens_required
-        metadata["selection_token_shortfall"] = token_shortfall
+    metadata["selection_tokens_required"] = tokens_required
+    metadata["tokens_required"] = tokens_required
+    metadata["selection_token_shortfall"] = token_shortfall
+    metadata["calls_required"] = calls_still
+    metadata["calls_available"] = calls_available
+    metadata["tokens_available"] = tokens_available
+    metadata["preflight_can_finish"] = can_finish
+    metadata["auto_size_covers_calls_only"] = auto_size
+    metadata["auto_size_raised_tokens"] = False
+    metadata["token_estimate_includes_output_tokens"] = fields["token_estimate_includes_output_tokens"]
+    metadata["token_estimate_includes_retry_or_repair_margin"] = fields["token_estimate_includes_retry_or_repair_margin"]
+    metadata["token_estimate_includes_fixed_prompt_overhead"] = fields["token_estimate_includes_fixed_prompt_overhead"]
+    metadata["token_estimate_scope"] = fields["token_estimate_scope"]
+    metadata["chunks_reused"] = int(progress.get("chunks_reused") or 0)
     open_budget_step(
         metadata,
         step="focused_selection",
@@ -6096,36 +6243,32 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         shared_with=FOCUSED_REVIEW_STEPS,
     )
     # Zero calls still means the reviewer is off. That stop stays call_allowance.
-    # A positive allowance that cannot cover the plan, in calls or in tokens,
-    # is not started. Auto-sizing does not raise the token allowance.
-    reviewer_on = allowance > 0
-    call_blocked = reviewer_on and required > allowance
-    token_room = token_allowance - tokens_used
-    token_blocked = (
-        reviewer_on
-        and token_allowance > 0
-        and sent == 0
-        and validated_now == 0
-        and int(progress.get("tokens_required") or 0) > token_room
-    )
-    if sent == 0 and validated_now == 0 and (call_blocked or token_blocked):
+    # A positive allowance that cannot cover the chunks still to send, in calls
+    # or in tokens, does not send the next request. Raising only the call
+    # allowance does not mean the review can finish.
+    if calls_still > 0 and (call_blocked or token_blocked):
         add_stop_reason(progress, CHUNK_ALLOWANCE_INSUFFICIENT)
         parts = ["LLM selection review was not sent."]
-        if call_blocked:
-            parts.append(
-                f"{required} chunks are required and the decision-call allowance is {allowance}."
-            )
-        if token_blocked:
-            parts.append(
-                f"{int(progress.get('tokens_required') or 0)} tokens are required "
-                f"and the decision-token allowance is {token_allowance}."
-            )
+        parts.append(
+            f"{required} chunks require {calls_still} more calls. "
+            f"{calls_available} calls are available."
+        )
+        parts.append(
+            f"{tokens_required} tokens are required and {tokens_available} tokens are available."
+        )
+        if auto_size:
+            parts.append("Raising the call allowance does not mean this review can finish.")
         note = " ".join(parts)
         if note not in warnings:
             warnings.append(note)
         return _close(progress)
 
+    index = int(progress.get("next_index") or 0)
     if index >= len(chunks):
+        if getattr(runtime, "selection_consolidation", False) and not progress.get("consolidation_done"):
+            await _consolidate_selection_chunks(
+                runtime, state, progress, metadata, logs, warnings,
+            )
         return _close(progress)
 
     chunk = [str(item) for item in chunks[index]]
@@ -6235,6 +6378,16 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         progress["raised_ids"] = list(progress.get("raised_ids") or []) + ids
         progress["reviewed_ids"] = list(progress.get("reviewed_ids") or []) + chunk
         progress["chunks_validated"] = int(progress.get("chunks_validated") or 0) + 1
+        record_validated_chunk(
+            progress,
+            code_ids=chunk,
+            input_fingerprint=chunk_input_fingerprint(state, chunk, compaction_map),
+            prompt_hash_value=str((audit or {}).get("prompt_hash") or ""),
+            policy_fingerprint=str(progress.get("policy_fingerprint") or ""),
+            raised_code_ids=ids,
+            chunk_index=index,
+            chunk_count=len(chunks),
+        )
         # A recovered item was reviewed. Drop the named stop so a later close can apply.
         progress["stop_reasons"] = [
             item for item in (progress.get("stop_reasons") or []) if str(item) != "oversized_unrecovered"
@@ -6243,6 +6396,10 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         progress["next_index"] = index + 1
         metadata["decision_chunk_state"] = progress
         if progress["next_index"] >= len(chunks):
+            if getattr(runtime, "selection_consolidation", False) and not progress.get("consolidation_done"):
+                await _consolidate_selection_chunks(
+                    runtime, state, progress, metadata, logs, warnings,
+                )
             return _close(progress)
         progress["open"] = True
         metadata["decision_chunk_state"] = progress
@@ -6493,11 +6650,20 @@ def _selection_pause_node(state: FocusedState) -> dict:
             "provisional_raised_code_ids": list(metadata.get("provisional_raised_code_ids") or []),
             "partial_selection_is_code_id_slice": metadata.get("partial_selection_is_code_id_slice"),
             "partial_selection_bias": metadata.get("partial_selection_bias"),
+            "calls_required": metadata.get("calls_required"),
+            "calls_available": metadata.get("calls_available"),
+            "tokens_required": metadata.get("tokens_required"),
+            "tokens_available": metadata.get("tokens_available"),
+            "preflight_can_finish": metadata.get("preflight_can_finish"),
             "instructions": (
                 "This selection is provisional. It is not applied and it is not downstream eligible. "
                 "Chunk order did not promote any code. "
-                "Chunks are reviewed in code-id order. A partial selection is the prefix of that order, not a sample of the codes. "
-                "Resume with {\"continue_selection\": true} to review the uncovered codes, "
+                + (
+                    str(metadata.get("partial_selection_bias")) + " "
+                    if metadata.get("partial_selection_bias")
+                    else ""
+                )
+                + "Resume with {\"continue_selection\": true} to review the uncovered codes, "
                 "or {\"leave_selection\": true} to export without promoting them."
             ),
         }
@@ -6600,6 +6766,25 @@ def _selection_export(state: Mapping[str, Any]) -> dict[str, Any]:
         "selection_uncovered_code_ids": [str(item) for item in (metadata.get("selection_uncovered_code_ids") or [])],
         "partial_selection_is_code_id_slice": metadata.get("partial_selection_is_code_id_slice"),
         "partial_selection_bias": metadata.get("partial_selection_bias"),
+        "selection_chunk_order": metadata.get("selection_chunk_order"),
+        "selection_chunk_order_seed": metadata.get("selection_chunk_order_seed"),
+        "calls_required": metadata.get("calls_required"),
+        "calls_available": metadata.get("calls_available"),
+        "tokens_required": metadata.get("tokens_required"),
+        "tokens_available": metadata.get("tokens_available"),
+        "preflight_can_finish": metadata.get("preflight_can_finish"),
+        "auto_size_covers_calls_only": metadata.get("auto_size_covers_calls_only"),
+        "auto_size_raised_tokens": metadata.get("auto_size_raised_tokens"),
+        "token_estimate_includes_output_tokens": metadata.get("token_estimate_includes_output_tokens"),
+        "token_estimate_includes_retry_or_repair_margin": metadata.get(
+            "token_estimate_includes_retry_or_repair_margin"
+        ),
+        "token_estimate_includes_fixed_prompt_overhead": metadata.get(
+            "token_estimate_includes_fixed_prompt_overhead"
+        ),
+        "token_estimate_scope": metadata.get("token_estimate_scope"),
+        "chunks_reused": metadata.get("chunks_reused"),
+        "selection_consolidation": metadata.get("selection_consolidation"),
     }
 
 
@@ -6648,6 +6833,21 @@ def load_focused_export(directory: str | Path) -> dict[str, Any]:
         "selection_uncovered_code_ids",
         "partial_selection_is_code_id_slice",
         "partial_selection_bias",
+        "selection_chunk_order",
+        "selection_chunk_order_seed",
+        "calls_required",
+        "calls_available",
+        "tokens_required",
+        "tokens_available",
+        "preflight_can_finish",
+        "auto_size_covers_calls_only",
+        "auto_size_raised_tokens",
+        "token_estimate_includes_output_tokens",
+        "token_estimate_includes_retry_or_repair_margin",
+        "token_estimate_includes_fixed_prompt_overhead",
+        "token_estimate_scope",
+        "chunks_reused",
+        "selection_consolidation",
     )
     record = {}
     for key in keys:
@@ -7299,6 +7499,9 @@ async def afocused_code(
     max_decision_tokens: int = 24000,
     decision_token_budget: int = 6000,
     auto_size_decision_calls: bool = AUTO_SIZE_DECISION_CALLS,
+    selection_chunk_order: str = SELECTION_CHUNK_ORDER_ID,
+    selection_chunk_order_seed: int | None = None,
+    selection_consolidation: bool = False,
     interrupt: bool = True,
     resume: Any = None,
     resuming: bool = False,
@@ -7361,6 +7564,14 @@ async def afocused_code(
             raise ValueError(f"{name} must be a non-negative integer.")
     if not isinstance(auto_size_decision_calls, bool):
         raise ValueError("auto_size_decision_calls must be true or false. The default is false.")
+    if selection_chunk_order not in {SELECTION_CHUNK_ORDER_ID, SELECTION_CHUNK_ORDER_SHUFFLE}:
+        raise ValueError("selection_chunk_order must be 'id' or 'seeded_shuffle'. The default is 'id'.")
+    if selection_chunk_order_seed is not None and (
+        isinstance(selection_chunk_order_seed, bool) or not isinstance(selection_chunk_order_seed, int)
+    ):
+        raise ValueError("selection_chunk_order_seed must be an integer or null.")
+    if not isinstance(selection_consolidation, bool):
+        raise ValueError("selection_consolidation must be true or false. The default is false.")
     if decision_mode == "human" and decision_model is not None:
         raise ValueError("decision_model requires decision_mode='llm'.")
     source = _as_result(open_coding_result)
@@ -7410,6 +7621,9 @@ async def afocused_code(
         if reviewer_model is not None else None), max_decision_calls=max_decision_calls,
         max_decision_tokens=max_decision_tokens, decision_token_budget=decision_token_budget,
         auto_size_decision_calls=bool(auto_size_decision_calls),
+        selection_chunk_order=selection_chunk_order,
+        selection_chunk_order_seed=selection_chunk_order_seed,
+        selection_consolidation=bool(selection_consolidation),
         **review_procedure_fields())
     coder = (
         _resolve_model(model, timeout=focused_request_timeout)
@@ -7481,6 +7695,9 @@ async def afocused_code(
             else 0.0
         ),
         auto_size_decision_calls=bool(auto_size_decision_calls),
+        selection_chunk_order=selection_chunk_order,
+        selection_chunk_order_seed=selection_chunk_order_seed,
+        selection_consolidation=bool(selection_consolidation),
     )
     metadata["timeout_policy"] = timeout_policy(
         run_timeout_seconds=float(procedure["focused_request_timeout"]),
