@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.38
+
+- A core visit clears inherited stops it can derive again, including `core_pair_exceeds_request_budget`, `invalid_decision`, and `review_error`, then adds a stop back only when the current plan, the current preflight, or this visit's send still produces it. A saved `core_pair_exceeds_request_budget` no longer finishes the tournament after the next match when every remaining opening match fits. A pair the planner still cannot split stops again as `core_pair_exceeds_request_budget` and sends nothing. The rule is `core_resume_stop_rule` `rederive_inherited_stops_v1`.
+- That rule is part of the procedure fingerprint, so a 0.9.37 thread checkpoint raises `DecisionChunkingCheckpointError` before `allow_changes` is considered. It is not part of a match's policy fingerprint. A validated match is not dropped as `policy_changed` because this rule was added. `resume_core_selection` continues a frozen export whose chunk plan still matches. The chunking version stays `request_budget_v6`.
+- An export written before match fingerprints freezes the chunk index, chunk count, and round role used to stamp the payload. A later match does not change that stamp. The match is not sent again, and its seats are not counted twice.
+- `core_candidates_compared` counts seats in a match that recorded a substantive decision: a select, or an abstention of `no_suitable_candidate` or `insufficient_evidence`. A failed call, a parse failure, an invalid decision, and the scheduling of a richer retry do not add seats. A sent failure still counts against the call and token allowance.
+- These checks are processing coverage. They are not selection validity. The synthetic fixture is 54 candidates in six opening matches, each under the 6000 cap on this character heuristic. It is not a live export. `pattern_min_cases` stays 2. `max_axial_review_tokens` stays 24000 per step. `batch_size` stays 1. Decision and axial request budgets stay 6000. `selection_consolidation` stays off. Tier 4 stays human-only. No LLM judge is added. Undefined metrics stay null. The review note is [docs/design-review-fixes-0938.md](docs/design-review-fixes-0938.md). `policy_version` is `0.9.38`.
+
 ## 0.9.37
 
 - Core selection has its own call allowance and token allowance, `max_core_review_calls` and `max_core_review_tokens`. Omitting them leaves the core step on the existing defaults: `max_decision_calls` (4) and `max_axial_review_tokens` (24000). Relation review, saturation review, and the coding pool are unchanged. The per-request limit stays 6000. The rule is `core_budget_rule` `separate_core_allowance_v1`.

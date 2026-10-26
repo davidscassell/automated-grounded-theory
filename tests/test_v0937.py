@@ -55,8 +55,8 @@ def _run(source, steps, **kwargs):
 
 
 def test_version_names_the_core_budget_rules():
-    assert __version__ == "0.9.37"
-    assert POLICY_VERSION == "0.9.37"
+    assert __version__ == "0.9.38"
+    assert POLICY_VERSION == "0.9.38"
     assert CORE_BUDGET_RULE == "separate_core_allowance_v1"
     assert CORE_PREFLIGHT_RULE == "opening_unavoidable_later_contingent_v1"
     assert CORE_PARTIAL_EXECUTION_RULE == "partial_core_off_by_default_v1"
@@ -65,6 +65,7 @@ def test_version_names_the_core_budget_rules():
     assert CORE_AUTO_SIZE_RULE == "bounded_core_auto_size_off_v1"
     assert "0.9.36" in CHUNKING_CHECKPOINT_MESSAGE
     assert "0.9.37" in CHUNKING_CHECKPOINT_MESSAGE
+    assert "0.9.38" in CHUNKING_CHECKPOINT_MESSAGE
 
 
 def _wide_source():
