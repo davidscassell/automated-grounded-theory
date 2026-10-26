@@ -46,8 +46,8 @@ from tests.test_v080 import FakeAxialCoder, _corpus
 
 
 def test_version_and_defaults_stay_put():
-    assert __version__ == "0.9.36"
-    assert POLICY_VERSION == "0.9.36"
+    assert __version__ == "0.9.37"
+    assert POLICY_VERSION == "0.9.37"
     assert DECISION_REVIEW_CHUNKING == "request_budget_v6"
     assert PATTERN_MIN_CASES == 2
     assert DEFAULT_MAX_AXIAL_REVIEW_TOKENS == 24000

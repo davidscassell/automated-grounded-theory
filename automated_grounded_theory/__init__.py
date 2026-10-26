@@ -17,8 +17,10 @@ from automated_grounded_theory.axial import (
     aaxial_code,
     aselective_code,
     axial_code,
+    load_axial_export,
     read_axial_interrupt,
     relation_stability,
+    resume_core_selection,
     selective_code,
 )
 from automated_grounded_theory.api import (
@@ -201,6 +203,7 @@ __all__ = [
     "export_gate_relationships",
     "freeze_discovery_set",
     "load_adjudications",
+    "load_axial_export",
     "load_discovery_file",
     "score_attribution_accuracy",
     "score_conditional_readings",
@@ -224,6 +227,7 @@ __all__ = [
     "plan_coding",
     "property_stability",
     "proposal_stability",
+    "resume_core_selection",
     "selective_code",
     "selection_payload",
     "stopping_criteria_report",

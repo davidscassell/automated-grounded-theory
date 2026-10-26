@@ -49,14 +49,23 @@ from automated_grounded_theory.backends import (
 )
 from automated_grounded_theory.batching import request_input_tokens, shrink_repair_messages
 from automated_grounded_theory.decision_review import (
+    CORE_AUTO_SIZE_RULE,
     CORE_BRACKET_INCOMPLETE,
+    CORE_BUDGET_RULE,
+    CORE_CALL_ALLOWANCE_INSUFFICIENT,
     CORE_COMPARISON_RULE,
     CORE_EVIDENCE_SUMMARY_RULE,
     CORE_FINAL_DECISION_RULE,
     CORE_MATCH_ABSTENTION_RULE,
     CORE_OUTCOME_RULE,
+    CORE_MATCH_REUSE_RULE,
     CORE_PAIR_EXCEEDS_REQUEST_BUDGET,
+    CORE_PARTIAL_EXECUTION_RULE,
+    CORE_PREFLIGHT_RULE,
     CORE_PROMPT_SCOPE_RULE,
+    CORE_REQUEST_TOO_LARGE,
+    CORE_STOP_REASON_RULE,
+    CORE_TOKEN_ALLOWANCE_INSUFFICIENT,
     CORE_SCHEDULE_NOTE,
     RAISED_VARIANCE_RULE,
     RELATION_UNREVIEWED_RULE,
@@ -256,6 +265,18 @@ _PROCEDURE_KEYS = (
     "relation_unreviewed_rule",
     "withheld_export_rule",
     "raised_variance_rule",
+    "core_budget_rule",
+    "core_preflight_rule",
+    "core_partial_execution_rule",
+    "core_stop_reason_rule",
+    "core_match_reuse_rule",
+    "core_auto_size_rule",
+    "max_core_review_calls",
+    "max_core_review_tokens",
+    "auto_size_core_review",
+    "allow_partial_core_review",
+    "max_core_review_call_hard_limit",
+    "max_core_review_token_hard_limit",
     "reread_coverage_rule",
     "reread_bound_rule",
     "export_assessment_rule",
@@ -640,7 +661,22 @@ def _book(codebook: Any) -> dict[str, dict]:
 
 def _source_mapping(source: Any) -> dict[str, Any]:
     if isinstance(source, (str, Path)):
-        source = load_focused_export(source)
+        place = Path(source)
+        directory = place.parent if place.is_file() else place
+        # A directory that still holds the focused export keeps that resume path,
+        # so an edited selection is honored. An axial or selective export with
+        # frozen core candidates, and no focused export beside it, continues
+        # core selection from those candidates.
+        focused_export = (directory / "focused_run.json").is_file() or (
+            directory / "focused_selection.json"
+        ).is_file()
+        axial_export = (directory / "core_candidates.json").is_file() and (
+            (directory / "selective_run.json").is_file() or (directory / "axial_run.json").is_file()
+        )
+        if directory.is_dir() and axial_export and not focused_export:
+            source = load_axial_export(directory)
+        else:
+            source = load_focused_export(source)
     if isinstance(source, Mapping):
         data = dict(source)
     else:
@@ -3098,6 +3134,7 @@ def export_axial_state(state: Mapping[str, Any], directory: str | Path) -> dict[
                 "core_bracket": (state.get("metadata") or {}).get("core_bracket"),
                 "core_comparison_stop": (state.get("metadata") or {}).get("core_comparison_stop"),
                 "core_comparison_rule": (state.get("metadata") or {}).get("core_comparison_rule"),
+                "relationships": _public_relationships(state.get("relationships") or []),
             },
         )
     memos = [
@@ -3509,6 +3546,9 @@ _RESUMED_ALLOWANCE_STOPS = frozenset({
     "token_allowance",
     "request_budget",
     CORE_BRACKET_INCOMPLETE,
+    CORE_REQUEST_TOO_LARGE,
+    CORE_CALL_ALLOWANCE_INSUFFICIENT,
+    CORE_TOKEN_ALLOWANCE_INSUFFICIENT,
 })
 
 
@@ -3607,7 +3647,14 @@ _STAGE_RANK = {
     "budget_limited": 2,
     "incomplete": 3,
 }
-_BUDGET_STOPS = {"token_allowance", "call_allowance", "request_budget"}
+_BUDGET_STOPS = {
+    "token_allowance",
+    "call_allowance",
+    "request_budget",
+    CORE_REQUEST_TOO_LARGE,
+    CORE_CALL_ALLOWANCE_INSUFFICIENT,
+    CORE_TOKEN_ALLOWANCE_INSUFFICIENT,
+}
 
 
 def _note_stage(metadata: dict[str, Any], name: str, *, required: bool, status: str, reason: str = "") -> None:
@@ -6237,7 +6284,82 @@ def _story_core(state: Mapping[str, Any]) -> tuple[str, str]:
 
 
 def _load_category(state: AxialState) -> dict:
+    metadata = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
+    frozen = [dict(row) for row in (state.get("core_candidates") or []) if isinstance(row, Mapping)]
+    if metadata.get("freeze_core_candidates") and frozen:
+        return {"core_candidates": frozen}
     return {"core_candidates": _score_candidates(state)}
+
+
+def load_axial_export(directory: str | Path) -> dict[str, Any]:
+    """Read an axial or selective export, including its frozen core candidates.
+
+    ``selective_code`` on this directory continues core selection from those
+    candidates. It does not rerun focused coding or relation review. A
+    ``decision_chunk_state`` in the export is the resume plan: validated matches
+    are reused when their payload and policy fingerprints still match.
+    """
+    place = Path(directory)
+    if place.is_file():
+        place = place.parent
+    if not place.is_dir():
+        raise FileNotFoundError(f"No axial export directory at {place}")
+
+    def read(name: str) -> Any:
+        path = place / name
+        if not path.is_file():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    run = read("selective_run.json")
+    if not isinstance(run, Mapping):
+        run = read("axial_run.json")
+    if not isinstance(run, Mapping):
+        run = {}
+    candidates = read("core_candidates.json")
+    if not isinstance(candidates, Mapping) and not run:
+        raise FileNotFoundError(
+            f"No axial export in {place}. Expected axial_run.json, selective_run.json, or core_candidates.json."
+        )
+    if not isinstance(candidates, Mapping):
+        candidates = {}
+    relationships = read("category_relationships.json")
+    if not isinstance(relationships, Mapping):
+        relationships = {
+            "relationships": candidates.get("relationships") or [],
+        } if isinstance(candidates, Mapping) else {}
+    metadata = dict(run.get("metadata") or {})
+    rows = [dict(row) for row in (candidates.get("candidates") or []) if isinstance(row, Mapping)]
+    if rows:
+        metadata["freeze_core_candidates"] = True
+    return {
+        "codebook": dict(run.get("codebook") or {}),
+        "passages": [dict(row) for row in (run.get("passages") or []) if isinstance(row, Mapping)],
+        "segments": [dict(row) for row in (run.get("segments") or []) if isinstance(row, Mapping)],
+        "relationships": [
+            dict(row)
+            for row in (relationships.get("relationships") or run.get("relationships") or [])
+            if isinstance(row, Mapping)
+        ],
+        "saturation": dict(run.get("saturation") or {}),
+        "coverage": dict(run.get("coverage") or {}),
+        "core_candidates": rows,
+        "metadata": metadata,
+        "warnings": [str(item) for item in (run.get("warnings") or [])],
+        "prompt_log": [dict(row) if isinstance(row, Mapping) else row for row in (run.get("prompt_log") or [])],
+        "memos": [dict(row) for row in (run.get("memos") or []) if isinstance(row, Mapping)],
+        "storyline": list(run.get("storyline") or []),
+    }
+
+
+def resume_core_selection(directory: str | Path, model: BaseChatModel, **kwargs: Any) -> AxialResult:
+    """Continue core selection from a frozen axial export.
+
+    Focused coding is not run again. Pass a larger ``max_core_review_calls`` or
+    ``max_core_review_tokens`` to spend that allowance on matches that were not
+    validated. ``allow_partial_core_review`` stays off unless the caller sets it.
+    """
+    return selective_code(load_axial_export(directory), model, **kwargs)
 
 
 _PRIOR_RATIONALE_CHARS = 240
@@ -6392,9 +6514,15 @@ def _core_round_role(
 
 
 def _prior_core_rationales(bracket: Mapping[str, Any], round_index: int) -> list[dict[str, Any]]:
+    """Rationales from earlier rounds only.
+
+    Matches in the same round do not quote each other. Doing that made a later
+    opening match larger than the match the planner priced, and the overflow
+    was reported as a pair that did not fit the per-request budget.
+    """
     found = []
     for index, row in enumerate(bracket.get("rounds") or []):
-        if index > int(round_index) or not isinstance(row, Mapping):
+        if index >= int(round_index) or not isinstance(row, Mapping):
             continue
         for item in row.get("match_records") or []:
             if isinstance(item, Mapping):
@@ -6690,6 +6818,619 @@ def _open_next_core_round(progress: dict, estimate, *, per_request: int) -> None
     ]
 
 
+def _optional_budget(value: Any) -> int | None:
+    """None when the caller omitted a core allowance. Zero is a closed ceiling."""
+    if value is None or value == "":
+        return None
+    return max(0, int(value))
+
+
+def _core_call_ceiling(runtime: AxialRuntime, reviewer) -> int:
+    """Calls this core step may make. Omitted core settings use the shared default."""
+    allowance = getattr(getattr(runtime, "limiter", None), "provider_allowance", None)
+    ceilings = getattr(allowance, "stage_ceilings", None) or {}
+    if "axial_core_review" in ceilings and ceilings.get("axial_core_review") is not None:
+        return int(ceilings["axial_core_review"])
+    return int(getattr(reviewer, "max_calls", 0) or 0)
+
+
+def _core_token_ceiling(runtime: AxialRuntime, reviewer) -> int:
+    """Tokens this core step may spend. Omitted core settings use the shared default."""
+    allowance = getattr(getattr(runtime, "limiter", None), "provider_allowance", None)
+    ceilings = getattr(allowance, "stage_token_ceilings", None) or {}
+    if "axial_core_review" in ceilings and ceilings.get("axial_core_review") is not None:
+        return int(ceilings["axial_core_review"])
+    return int(getattr(reviewer, "max_tokens", 0) or 0)
+
+
+def _core_policy_fingerprint() -> str:
+    """Policy identity for a core match. Call and token ceilings are not part of it."""
+    payload = {
+        "rules": review_procedure_fields(),
+        "system_prompt": _AXIAL_REVIEW_SYSTEM,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _core_payload_fingerprint(payload: Mapping[str, Any]) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _reserved_core_prior(match_ids: Sequence[str]) -> dict[str, Any]:
+    """A full prior rationale, used only to price a match that has not been sent."""
+    ids = [str(item) for item in match_ids if str(item)]
+    return {
+        "match": ids,
+        "winner": ids[0] if ids else "",
+        "decision": "select",
+        "status": "winner",
+        "rationale": "m" * _PRIOR_RATIONALE_CHARS,
+    }
+
+
+def _core_live_payload(
+    by_id: Mapping[str, Mapping[str, Any]],
+    match_ids: Sequence[str],
+    *,
+    preferred: Sequence[str],
+    snapshot: Mapping[str, Any],
+    eligible_ids: Sequence[str],
+    priors: Sequence[Mapping[str, Any]],
+    round_role: str,
+    chunk_index: int,
+    chunk_count: int,
+    metadata: Mapping[str, Any],
+    reviewer,
+    richer: bool = False,
+) -> dict[str, Any]:
+    """The payload a match would send, with summaries fit to that match."""
+    ids = [str(item) for item in match_ids if str(item)]
+    rows = [dict(by_id[item]) for item in ids if item in by_id]
+    fitted, _cap = _candidates_for_match(rows, metadata=metadata, reviewer=reviewer, richer=richer)
+    return _core_match_request(
+        fitted,
+        preferred=preferred,
+        snapshot=snapshot,
+        chunk_index=int(chunk_index),
+        chunk_count=max(1, int(chunk_count)),
+        match_ids=ids,
+        eligible_ids=eligible_ids,
+        round_role=round_role,
+        prior_rationales=priors,
+    )
+
+
+def _core_live_estimate(reviewer, payload: Mapping[str, Any], metadata: Mapping[str, Any]) -> int:
+    return int(reviewer.refusal_reason(payload, ModelCoreDecision, metadata)[1])
+
+
+def _core_match_reusable(record: Mapping[str, Any]) -> bool:
+    """A finished select, or an abstention that advances nobody, can be reused."""
+    decision = str(record.get("decision") or "")
+    if decision == "select" and str(record.get("winner") or ""):
+        return True
+    return decision == "abstain" and str(record.get("abstention_reason") or "") == "no_suitable_candidate"
+
+
+def _flatten_core_records(bracket: Mapping[str, Any]) -> list[tuple[int, int, dict[str, Any]]]:
+    found = []
+    for round_index, row in enumerate(bracket.get("rounds") or []):
+        if not isinstance(row, Mapping):
+            continue
+        for record_index, item in enumerate(row.get("match_records") or []):
+            if isinstance(item, Mapping):
+                found.append((round_index, record_index, dict(item)))
+    return found
+
+
+def _truncate_core_progress(progress: dict[str, Any], keep: int) -> None:
+    """Drop match decisions after ``keep`` and point the bracket at the next send."""
+    bracket = progress.get("core_bracket")
+    if not isinstance(bracket, dict):
+        return
+    rounds = [dict(row) if isinstance(row, Mapping) else {} for row in (bracket.get("rounds") or [])]
+    remaining = max(0, int(keep))
+    kept_rounds: list[dict[str, Any]] = []
+    for row in rounds:
+        records = [dict(item) for item in (row.get("match_records") or []) if isinstance(item, Mapping)]
+        kept = records[:remaining]
+        remaining -= len(kept)
+        copied = dict(row)
+        copied["match_records"] = kept
+        copied["winners"] = [str(item.get("winner") or "") for item in kept if str(item.get("winner") or "")]
+        copied["compared"] = sum(len(item.get("match") or []) for item in kept)
+        kept_rounds.append(copied)
+        if remaining <= 0:
+            break
+    if not kept_rounds and rounds:
+        opening = dict(rounds[0])
+        opening["match_records"] = []
+        opening["winners"] = []
+        opening["compared"] = 0
+        kept_rounds = [opening]
+    bracket = dict(bracket)
+    bracket["rounds"] = kept_rounds
+    bracket["round_index"] = 0 if not kept_rounds else max(0, len(kept_rounds) - 1)
+    progress["core_bracket"] = bracket
+    chunks: list[list[str]] = []
+    reviewed: list[str] = []
+    tokens = 0
+    for row in kept_rounds:
+        for match in row.get("matches") or []:
+            chunks.append([str(item) for item in match])
+        for item in row.get("match_records") or []:
+            if not isinstance(item, Mapping):
+                continue
+            reviewed.extend(str(part) for part in (item.get("match") or []))
+            tokens += int(item.get("estimated_input_tokens") or 0)
+    progress["chunks"] = chunks
+    progress["next_index"] = max(0, int(keep))
+    progress["chunks_sent"] = max(0, int(keep))
+    progress["calls"] = max(0, int(keep))
+    progress["chunks_validated"] = max(0, int(keep))
+    progress["tokens_estimated"] = tokens
+    progress["reviewed_ids"] = reviewed
+    for name in (
+        "champion_id",
+        "core_decision",
+        "core_decision_rationale",
+        "final_core_id",
+        "abstention_reason",
+        "no_candidate_remains",
+    ):
+        progress.pop(name, None)
+    progress["stop_reasons"] = [
+        item
+        for item in (progress.get("stop_reasons") or [])
+        if str(item) not in _RESUMED_ALLOWANCE_STOPS
+    ]
+
+
+def _stamp_core_records(bracket: Mapping[str, Any], updates: Sequence[tuple[int, int, dict[str, Any]]]) -> None:
+    rounds = [dict(row) if isinstance(row, Mapping) else {} for row in (bracket.get("rounds") or [])]
+    for round_index, record_index, record in updates:
+        if round_index >= len(rounds):
+            continue
+        records = [dict(item) for item in (rounds[round_index].get("match_records") or []) if isinstance(item, Mapping)]
+        if record_index >= len(records):
+            continue
+        records[record_index] = dict(record)
+        rounds[round_index]["match_records"] = records
+    if isinstance(bracket, dict):
+        bracket["rounds"] = rounds
+
+
+def _reconcile_core_match_reuse(
+    progress: dict[str, Any],
+    *,
+    by_id: Mapping[str, Mapping[str, Any]],
+    preferred: Sequence[str],
+    snapshot: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+    reviewer,
+) -> dict[str, Any]:
+    """Keep validated matches whose payload and policy still match.
+
+    A record written before fingerprints existed is trusted once and stamped
+    from the frozen candidates. A later edit, or a policy change, drops that
+    match and every match that followed it.
+    """
+    bracket = progress.get("core_bracket")
+    if not isinstance(bracket, dict) or not bracket.get("rounds"):
+        progress["core_matches_reused"] = 0
+        return {"reused": 0, "invalidated": "", "unfingerprinted": 0}
+    policy = _core_policy_fingerprint()
+    ordered = _flatten_core_records(bracket)
+    if not ordered:
+        progress["core_matches_reused"] = 0
+        progress["core_policy_fingerprint"] = policy
+        return {"reused": 0, "invalidated": "", "unfingerprinted": 0}
+    eligible_ids = [str(item) for item in (bracket.get("ordered_ids") or []) if str(item)]
+    kept_records: list[tuple[int, dict[str, Any]]] = []
+    keep = 0
+    invalidated = ""
+    # A later visit in this same run re-stamps the matches it resends. Keep the
+    # first reason those stored decisions were dropped.
+    prior_invalidated = str(progress.get("core_reuse_invalidated") or "")
+    unfingerprinted = 0
+    updates: list[tuple[int, int, dict[str, Any]]] = []
+    for round_index, record_index, record in ordered:
+        if not _core_match_reusable(record):
+            # An unresolved or incomplete match is not reused and is not rewound.
+            # Only a changed payload or policy drops that match and what followed it.
+            break
+        match_ids = [str(item) for item in (record.get("match") or []) if str(item)]
+        role = str(record.get("round_role") or "opening")
+        chunk_index = record.get("chunk_index")
+        chunk_count = record.get("chunk_count")
+        priors = [item for prior_round, item in kept_records if prior_round < round_index]
+        payload = _core_live_payload(
+            by_id,
+            match_ids,
+            preferred=preferred,
+            snapshot=snapshot,
+            eligible_ids=eligible_ids,
+            priors=priors,
+            round_role=role,
+            chunk_index=int(chunk_index) if isinstance(chunk_index, int) and not isinstance(chunk_index, bool) else keep,
+            chunk_count=int(chunk_count) if isinstance(chunk_count, int) and not isinstance(chunk_count, bool) else max(1, len(ordered)),
+            metadata=metadata,
+            reviewer=reviewer,
+            richer=bool(record.get("evidence_retry")),
+        )
+        current = _core_payload_fingerprint(payload)
+        stored_payload = str(record.get("payload_fingerprint") or "")
+        stored_policy = str(record.get("policy_fingerprint") or "")
+        if not stored_payload or not stored_policy:
+            record["payload_fingerprint"] = current
+            record["policy_fingerprint"] = policy
+            record["reuse"] = "unfingerprinted_export"
+            unfingerprinted += 1
+            updates.append((round_index, record_index, record))
+            kept_records.append((round_index, record))
+            keep += 1
+            continue
+        if stored_payload == current and stored_policy == policy:
+            record["reuse"] = "validated_match"
+            updates.append((round_index, record_index, record))
+            kept_records.append((round_index, record))
+            keep += 1
+            continue
+        invalidated = "payload_changed" if stored_payload != current else "policy_changed"
+        break
+    if updates:
+        _stamp_core_records(bracket, updates)
+        progress["core_bracket"] = bracket
+    if invalidated:
+        _truncate_core_progress(progress, keep)
+    progress["core_matches_reused"] = keep
+    progress["core_policy_fingerprint"] = policy
+    progress["core_reuse_invalidated"] = invalidated or prior_invalidated
+    progress["core_unfingerprinted_reused"] = unfingerprinted
+    return {"reused": keep, "invalidated": invalidated, "unfingerprinted": unfingerprinted}
+
+
+def _sync_core_consumption(runtime: AxialRuntime, metadata: dict[str, Any], progress: Mapping[str, Any]) -> None:
+    """Make the live core ceiling account match the matches this resume kept."""
+    allowance = getattr(getattr(runtime, "limiter", None), "provider_allowance", None)
+    used = int(progress.get("calls") or 0)
+    tokens = int(progress.get("tokens_estimated") or 0)
+    if allowance is not None:
+        allowance.stage_used["axial_core_review"] = used
+        allowance.stage_tokens_used["axial_core_review"] = tokens
+    reviewer = getattr(runtime, "reviewer", None)
+    call_ceiling = _core_call_ceiling(runtime, reviewer)
+    token_ceiling = _core_token_ceiling(runtime, reviewer)
+    steps = [dict(item) for item in (metadata.get("decision_budget_steps") or []) if isinstance(item, Mapping)]
+    for item in steps:
+        if item.get("step") == "axial_core_review" and item.get("open"):
+            item["starting_usage"] = used
+            item["allowance"] = call_ceiling
+            item["remaining_allowance"] = max(0, call_ceiling - used)
+            item["token_allowance"] = token_ceiling
+            item["starting_tokens"] = tokens
+            item["tokens_available"] = max(0, token_ceiling - tokens)
+            item["remaining_tokens"] = max(0, token_ceiling - tokens)
+    metadata["decision_budget_steps"] = steps
+
+
+def _apply_core_auto_size(
+    runtime: AxialRuntime,
+    procedure: Mapping[str, Any],
+    projection: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Raise the core ceilings to the projected bracket, never past a hard limit.
+
+    When auto-sizing is off, the configured ceilings stay as they are. When
+    the hard limits are omitted, those configured ceilings are the hard limits,
+    so turning auto-sizing on does not expand the allowance by itself.
+    """
+    configured_calls = _core_call_ceiling(runtime, getattr(runtime, "reviewer", None))
+    configured_tokens = _core_token_ceiling(runtime, getattr(runtime, "reviewer", None))
+    if not bool(procedure.get("auto_size_core_review")):
+        return {
+            "applied": False,
+            "calls": configured_calls,
+            "tokens": configured_tokens,
+            "hard_calls": None,
+            "hard_tokens": None,
+        }
+    hard_calls = _optional_budget(procedure.get("max_core_review_call_hard_limit"))
+    hard_tokens = _optional_budget(procedure.get("max_core_review_token_hard_limit"))
+    cap_calls = configured_calls if hard_calls is None else hard_calls
+    cap_tokens = configured_tokens if hard_tokens is None else hard_tokens
+    required_calls = int(projection.get("opening_calls") or 0) + int(projection.get("contingent_calls") or 0)
+    required_tokens = int(projection.get("opening_tokens") or 0) + int(projection.get("contingent_tokens") or 0)
+    new_calls = min(cap_calls, max(configured_calls, required_calls))
+    new_tokens = min(cap_tokens, max(configured_tokens, required_tokens))
+    allowance = getattr(getattr(runtime, "limiter", None), "provider_allowance", None)
+    if allowance is not None:
+        allowance.stage_ceilings["axial_core_review"] = new_calls
+        allowance.stage_token_ceilings["axial_core_review"] = new_tokens
+    return {
+        "applied": new_calls != configured_calls or new_tokens != configured_tokens,
+        "calls": new_calls,
+        "tokens": new_tokens,
+        "hard_calls": cap_calls,
+        "hard_tokens": cap_tokens,
+        "required_calls": required_calls,
+        "required_tokens": required_tokens,
+    }
+
+
+def _project_core_costs(
+    *,
+    reviewer,
+    by_id: Mapping[str, Mapping[str, Any]],
+    preferred: Sequence[str],
+    snapshot: Mapping[str, Any],
+    eligible_ids: Sequence[str],
+    matches: Sequence[Sequence[str]],
+    byes: Sequence[str],
+    whole_set: bool,
+    ordered_ids: Sequence[str],
+    metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Price every opening match, then later rounds if every match advances someone.
+
+    Opening costs are unavoidable: those matches are sent whether or not a
+    candidate advances. Later rounds are contingent. A substantive abstention
+    advances nobody, so that later work does not happen.
+    """
+    per_request = int(getattr(reviewer, "token_budget", 0) or 0)
+    opening = [list(match) for match in matches]
+    opening_role = "final" if whole_set else "opening"
+    priors: list[dict[str, Any]] = []
+    opening_estimates: list[int] = []
+    opening_too_large: list[list[str]] = []
+    for index, match in enumerate(opening):
+        payload = _core_live_payload(
+            by_id,
+            match,
+            preferred=preferred,
+            snapshot=snapshot,
+            eligible_ids=eligible_ids,
+            priors=[],
+            round_role=opening_role,
+            chunk_index=index,
+            chunk_count=max(1, len(opening)),
+            metadata=metadata,
+            reviewer=reviewer,
+        )
+        estimate = _core_live_estimate(reviewer, payload, metadata)
+        opening_estimates.append(estimate)
+        if per_request and estimate > per_request:
+            opening_too_large.append(list(match))
+    for match in opening:
+        priors.append(_reserved_core_prior(match))
+    order = {item: pos for pos, item in enumerate(ordered_ids)}
+    field: list[str] = []
+    for match in opening:
+        if match and match[0] not in field:
+            field.append(match[0])
+    for bye in byes:
+        if str(bye) and str(bye) not in field:
+            field.append(str(bye))
+    field.sort(key=lambda item: order.get(item, 10**9))
+    contingent: list[int] = []
+    contingent_too_large: list[list[str]] = []
+    already_final = bool(whole_set)
+    guard = 0
+    while field and guard <= len(ordered_ids) + 1:
+        guard += 1
+        if len(field) == 1:
+            if already_final:
+                break
+            payload = _core_live_payload(
+                by_id,
+                field,
+                preferred=preferred,
+                snapshot=snapshot,
+                eligible_ids=eligible_ids,
+                priors=priors,
+                round_role="final",
+                chunk_index=10**6,
+                chunk_count=10**6,
+                metadata=metadata,
+                reviewer=reviewer,
+            )
+            estimate = _core_live_estimate(reviewer, payload, metadata)
+            contingent.append(estimate)
+            if per_request and estimate > per_request:
+                contingent_too_large.append(list(field))
+            break
+
+        def _fits(ids: Sequence[str], _priors=list(priors)) -> int:
+            payload = _core_live_payload(
+                by_id,
+                ids,
+                preferred=preferred,
+                snapshot=snapshot,
+                eligible_ids=eligible_ids,
+                priors=_priors,
+                round_role="final",
+                chunk_index=10**6,
+                chunk_count=10**6,
+                metadata=metadata,
+                reviewer=reviewer,
+            )
+            return _core_live_estimate(reviewer, payload, metadata)
+
+        partitioned = partition_core_matches(field, _fits, per_request=per_request)
+        if partitioned.get("reason"):
+            contingent_too_large.append([str(item) for item in field[:2]])
+            break
+        winners: list[str] = []
+        for match in partitioned.get("matches") or []:
+            role = "final" if partitioned.get("whole_set") else "continuation"
+            payload = _core_live_payload(
+                by_id,
+                match,
+                preferred=preferred,
+                snapshot=snapshot,
+                eligible_ids=eligible_ids,
+                priors=priors,
+                round_role=role,
+                chunk_index=10**6,
+                chunk_count=10**6,
+                metadata=metadata,
+                reviewer=reviewer,
+            )
+            estimate = _core_live_estimate(reviewer, payload, metadata)
+            contingent.append(estimate)
+            if per_request and estimate > per_request:
+                contingent_too_large.append([str(item) for item in match])
+            priors.append(_reserved_core_prior(match))
+            if match:
+                winners.append(str(match[0]))
+        field = []
+        for item in winners + [str(item) for item in (partitioned.get("byes") or [])]:
+            if item and item not in field:
+                field.append(item)
+        field.sort(key=lambda item: order.get(item, 10**9))
+        already_final = bool(partitioned.get("whole_set"))
+    return {
+        "opening_calls": len(opening_estimates),
+        "opening_tokens": sum(opening_estimates),
+        "opening_match_tokens": opening_estimates,
+        "opening_request_too_large": bool(opening_too_large),
+        "opening_requests_too_large": opening_too_large,
+        "contingent_calls": len(contingent),
+        "contingent_tokens": sum(contingent),
+        "contingent_match_tokens": contingent,
+        "contingent_request_too_large": bool(contingent_too_large),
+        "per_request_budget": per_request,
+        "abstention_note": (
+            "Substantive abstentions (no_suitable_candidate) advance nobody and reduce later-round work. "
+            "The contingent estimate assumes every match advances a candidate."
+        ),
+    }
+
+
+def _core_preflight_report(
+    projection: Mapping[str, Any],
+    *,
+    calls_available: int,
+    tokens_available: int,
+    calls_used: int,
+    tokens_used: int,
+    remaining_opening_calls: int,
+    remaining_opening_tokens: int,
+) -> dict[str, Any]:
+    call_shortfall = max(0, int(projection.get("opening_calls") or 0) - int(calls_available))
+    token_shortfall = max(0, int(projection.get("opening_tokens") or 0) - int(tokens_available))
+    remaining_call_shortfall = max(0, int(remaining_opening_calls) - max(0, int(calls_available) - int(calls_used)))
+    remaining_token_shortfall = max(0, int(remaining_opening_tokens) - max(0, int(tokens_available) - int(tokens_used)))
+    return {
+        "unavoidable_opening_calls": int(projection.get("opening_calls") or 0),
+        "unavoidable_opening_tokens": int(projection.get("opening_tokens") or 0),
+        "opening_match_tokens": list(projection.get("opening_match_tokens") or []),
+        "contingent_later_calls": int(projection.get("contingent_calls") or 0),
+        "contingent_later_tokens": int(projection.get("contingent_tokens") or 0),
+        "calls_available": int(calls_available),
+        "tokens_available": int(tokens_available),
+        "calls_used": int(calls_used),
+        "tokens_used": int(tokens_used),
+        "call_shortfall": call_shortfall,
+        "token_shortfall": token_shortfall,
+        "remaining_opening_calls": int(remaining_opening_calls),
+        "remaining_opening_tokens": int(remaining_opening_tokens),
+        "remaining_call_shortfall": remaining_call_shortfall,
+        "remaining_token_shortfall": remaining_token_shortfall,
+        "opening_request_too_large": bool(projection.get("opening_request_too_large")),
+        "per_request_budget": int(projection.get("per_request_budget") or 0),
+        "abstention_note": str(projection.get("abstention_note") or ""),
+        "provider_cost_note": (
+            "This preflight is a character heuristic for the payloads in this run. "
+            "A low figure on this model is not a safe assumption for every provider."
+        ),
+    }
+
+
+def _core_preflight_warning(report: Mapping[str, Any]) -> str:
+    return (
+        "Core bracket preflight, before a match is sent. "
+        f"Unavoidable opening matches need {int(report.get('unavoidable_opening_calls') or 0)} calls "
+        f"and {int(report.get('unavoidable_opening_tokens') or 0)} tokens. "
+        f"Contingent later rounds, assuming every match advances a candidate, need "
+        f"{int(report.get('contingent_later_calls') or 0)} calls and "
+        f"{int(report.get('contingent_later_tokens') or 0)} tokens. "
+        f"Calls available: {int(report.get('calls_available') or 0)}. "
+        f"Tokens available: {int(report.get('tokens_available') or 0)}. "
+        f"Opening call shortfall: {int(report.get('call_shortfall') or 0)}. "
+        f"Opening token shortfall: {int(report.get('token_shortfall') or 0)}. "
+        f"{report.get('abstention_note') or ''} "
+        f"{report.get('provider_cost_note') or ''}"
+    ).strip()
+
+
+def _core_resource_stop(
+    stop: str | None,
+    *,
+    estimate: int,
+    calls_sent: int,
+    tokens_sent: int,
+    call_ceiling: int,
+    token_ceiling: int,
+    per_request: int,
+) -> str | None:
+    """Name the resource that blocks this match. A pair-plan failure is not one of these."""
+    if per_request and int(estimate or 0) > int(per_request):
+        return CORE_REQUEST_TOO_LARGE
+    if stop == "request_budget":
+        return CORE_REQUEST_TOO_LARGE
+    if stop == "call_allowance" or (calls_sent and call_ceiling and calls_sent >= call_ceiling):
+        return CORE_CALL_ALLOWANCE_INSUFFICIENT
+    if stop == "token_allowance" or (
+        token_ceiling and calls_sent and tokens_sent + int(estimate or 0) > token_ceiling
+    ):
+        return CORE_TOKEN_ALLOWANCE_INSUFFICIENT
+    if stop in {
+        CORE_REQUEST_TOO_LARGE,
+        CORE_CALL_ALLOWANCE_INSUFFICIENT,
+        CORE_TOKEN_ALLOWANCE_INSUFFICIENT,
+    }:
+        return str(stop)
+    return str(stop) if stop else None
+
+
+def _stamp_validated_core_match(
+    progress: dict[str, Any],
+    round_index: int,
+    payload: Mapping[str, Any],
+    *,
+    estimate: int,
+    chunk_index: int,
+    chunk_count: int,
+    round_role: str,
+    evidence_retry: bool = False,
+) -> None:
+    bracket = progress.get("core_bracket")
+    if not isinstance(bracket, dict):
+        return
+    rounds = [dict(row) if isinstance(row, Mapping) else {} for row in (bracket.get("rounds") or [])]
+    if round_index >= len(rounds):
+        return
+    records = [dict(item) for item in (rounds[round_index].get("match_records") or []) if isinstance(item, Mapping)]
+    if not records:
+        return
+    last = dict(records[-1])
+    last["payload_fingerprint"] = _core_payload_fingerprint(payload)
+    last["policy_fingerprint"] = _core_policy_fingerprint()
+    last["estimated_input_tokens"] = int(estimate)
+    last["chunk_index"] = int(chunk_index)
+    last["chunk_count"] = int(chunk_count)
+    last["round_role"] = str(round_role or "")
+    last["evidence_retry"] = bool(evidence_retry)
+    records[-1] = last
+    rounds[round_index]["match_records"] = records
+    bracket = dict(bracket)
+    bracket["rounds"] = rounds
+    progress["core_bracket"] = bracket
+
+
 async def _advance_core_review(
     runtime: AxialRuntime,
     state: Mapping[str, Any],
@@ -6708,12 +7449,13 @@ async def _advance_core_review(
     one-candidate chunk of a larger set.
     """
     reviewer = runtime.reviewer
+    metadata["core_selection_withheld"] = False
     core_used = _align_step_calls(runtime, metadata, "axial_core_review")
     open_budget_step(
         metadata,
         step="axial_core_review",
         allowance_scope=PER_STEP_DECISION_REVIEW,
-        allowance=int(reviewer.max_calls),
+        allowance=_core_call_ceiling(runtime, reviewer),
         shared_with=(),
         usage=core_used,
     )
@@ -6745,12 +7487,35 @@ async def _advance_core_review(
         ordered_ids,
         estimate,
         per_request=int(reviewer.token_budget),
-        max_tokens=int(reviewer.max_tokens),
-        max_calls=int(reviewer.max_calls),
+        max_tokens=_core_token_ceiling(runtime, reviewer),
+        max_calls=_core_call_ceiling(runtime, reviewer),
     )
-    progress = load_chunk_progress(metadata, plan)
+    try:
+        progress = load_chunk_progress(metadata, plan)
+    except DecisionChunkingCheckpointError:
+        metadata.pop("decision_chunk_state", None)
+        progress = load_chunk_progress(metadata, plan)
+        progress["core_reuse_invalidated"] = "plan_changed"
     _seed_core_bracket(progress, plan)
+    _reconcile_core_match_reuse(
+        progress,
+        by_id=by_id,
+        preferred=preferred,
+        snapshot=snapshot,
+        metadata=metadata,
+        reviewer=reviewer,
+    )
+    _sync_core_consumption(runtime, metadata, progress)
     metadata["core_comparison_rule"] = CORE_COMPARISON_RULE
+    metadata["core_budget_rule"] = CORE_BUDGET_RULE
+    metadata["core_preflight_rule"] = CORE_PREFLIGHT_RULE
+    metadata["core_partial_execution_rule"] = CORE_PARTIAL_EXECUTION_RULE
+    metadata["core_stop_reason_rule"] = CORE_STOP_REASON_RULE
+    metadata["core_match_reuse_rule"] = CORE_MATCH_REUSE_RULE
+    metadata["core_auto_size_rule"] = CORE_AUTO_SIZE_RULE
+    metadata["core_matches_reused"] = int(progress.get("core_matches_reused") or 0)
+    metadata["core_reuse_invalidated"] = str(progress.get("core_reuse_invalidated") or "")
+    metadata["core_unfingerprinted_reused"] = int(progress.get("core_unfingerprinted_reused") or 0)
     metadata["core_candidates_eligible"] = int(plan.get("core_candidates_eligible") or 0)
     metadata["core_candidates_compared"] = 0
     metadata["core_candidates_compared_by_round"] = []
@@ -6759,13 +7524,6 @@ async def _advance_core_review(
         metadata["decision_stop"] = str(plan["core_comparison_reason"])
         add_stop_reason(progress, str(plan["core_comparison_reason"]))
     _drop_cleared_allowance_stops(metadata, progress)
-    _note_decision_token_preflight(
-        runtime,
-        metadata,
-        "axial_core_review",
-        list(progress.get("chunks") or [])[int(progress.get("next_index") or 0):],
-        estimate,
-    )
 
     def _finish_choice(progress_row: dict, warnings: list[str]) -> dict:
         progress_row["open"] = False
@@ -6966,9 +7724,125 @@ async def _advance_core_review(
             row["model_core"] = False
         return {"core_candidates": candidates, "metadata": metadata, "prompt_log": logs, "warnings": warnings}
 
+    warnings = list(state.get("warnings") or [])
+    procedure = metadata.get("procedure") if isinstance(metadata.get("procedure"), Mapping) else {}
+    bracket_now = progress.get("core_bracket") if isinstance(progress.get("core_bracket"), Mapping) else {}
+    rounds_now = [row for row in (bracket_now.get("rounds") or []) if isinstance(row, Mapping)]
+    opening_round = dict(rounds_now[0]) if rounds_now else {}
+    opening_matches = [list(match) for match in (opening_round.get("matches") or progress.get("chunks") or [])]
+    projection = _project_core_costs(
+        reviewer=reviewer,
+        by_id=by_id,
+        preferred=preferred,
+        snapshot=snapshot,
+        eligible_ids=ordered_ids,
+        matches=opening_matches,
+        byes=list(opening_round.get("byes") or []),
+        whole_set=bool(opening_round.get("whole_set")),
+        ordered_ids=ordered_ids,
+        metadata=metadata,
+    )
+    auto_size = _apply_core_auto_size(runtime, procedure, projection)
+    _sync_core_consumption(runtime, metadata, progress)
+    call_ceiling = _core_call_ceiling(runtime, reviewer)
+    token_ceiling = _core_token_ceiling(runtime, reviewer)
+    calls_used = int(progress.get("calls") or 0)
+    tokens_used = int(progress.get("tokens_estimated") or 0)
+    done = int(progress.get("next_index") or 0)
+    remaining_matches = opening_matches[done:] if done < len(opening_matches) else []
+    remaining_tokens = 0
+    if remaining_matches:
+        remaining_tokens = sum(list(projection.get("opening_match_tokens") or [])[done:done + len(remaining_matches)])
+    preflight = _core_preflight_report(
+        projection,
+        calls_available=call_ceiling,
+        tokens_available=token_ceiling,
+        calls_used=calls_used,
+        tokens_used=tokens_used,
+        remaining_opening_calls=len(remaining_matches),
+        remaining_opening_tokens=remaining_tokens,
+    )
+    per_request_cap = int(getattr(reviewer, "token_budget", 0) or 0)
+    remaining_estimates = list(projection.get("opening_match_tokens") or [])[done:done + len(remaining_matches)]
+    remaining_too_large = bool(per_request_cap) and any(int(item) > per_request_cap for item in remaining_estimates)
+    preflight["remaining_opening_request_too_large"] = remaining_too_large
+    preflight["auto_size_core_review"] = bool(procedure.get("auto_size_core_review"))
+    preflight["auto_size_applied"] = bool(auto_size.get("applied"))
+    preflight["auto_size_hard_calls"] = auto_size.get("hard_calls")
+    preflight["auto_size_hard_tokens"] = auto_size.get("hard_tokens")
+    metadata["core_bracket_preflight"] = preflight
+    metadata["auto_size_core_review"] = bool(procedure.get("auto_size_core_review"))
+    metadata["auto_size_core_applied"] = bool(auto_size.get("applied"))
+    metadata["core_auto_size_low_cost_is_not_provider_safe"] = True
+    contingent_call_shortfall = max(
+        0,
+        int(projection.get("opening_calls") or 0) + int(projection.get("contingent_calls") or 0) - call_ceiling,
+    )
+    contingent_token_shortfall = max(
+        0,
+        int(projection.get("opening_tokens") or 0) + int(projection.get("contingent_tokens") or 0) - token_ceiling,
+    )
+    preflight["contingent_call_shortfall"] = contingent_call_shortfall
+    preflight["contingent_token_shortfall"] = contingent_token_shortfall
+    if (
+        remaining_too_large
+        or int(preflight.get("call_shortfall") or 0) > 0
+        or int(preflight.get("token_shortfall") or 0) > 0
+        or contingent_call_shortfall > 0
+        or contingent_token_shortfall > 0
+    ):
+        note = _core_preflight_warning(preflight)
+        if note not in warnings:
+            warnings.append(note)
+    _note_decision_token_preflight(
+        runtime,
+        metadata,
+        "axial_core_review",
+        remaining_matches,
+        estimate,
+    )
+    allow_partial = bool(procedure.get("allow_partial_core_review"))
+    metadata["allow_partial_core_review"] = allow_partial
+    openings_blocked = bool(remaining_matches) and (
+        remaining_too_large
+        or int(preflight.get("remaining_call_shortfall") or 0) > 0
+        or int(preflight.get("remaining_token_shortfall") or 0) > 0
+    )
+    if openings_blocked and not allow_partial:
+        if remaining_too_large:
+            add_stop_reason(progress, CORE_REQUEST_TOO_LARGE)
+        if int(preflight.get("remaining_call_shortfall") or 0) > 0:
+            add_stop_reason(progress, CORE_CALL_ALLOWANCE_INSUFFICIENT)
+        if int(preflight.get("remaining_token_shortfall") or 0) > 0:
+            add_stop_reason(progress, CORE_TOKEN_ALLOWANCE_INSUFFICIENT)
+        stops_now = [str(item) for item in (progress.get("stop_reasons") or []) if str(item)]
+        primary = next(
+            (
+                item
+                for item in (
+                    CORE_REQUEST_TOO_LARGE,
+                    CORE_CALL_ALLOWANCE_INSUFFICIENT,
+                    CORE_TOKEN_ALLOWANCE_INSUFFICIENT,
+                )
+                if item in stops_now
+            ),
+            stops_now[0] if stops_now else CORE_CALL_ALLOWANCE_INSUFFICIENT,
+        )
+        metadata["decision_stop"] = primary
+        metadata["core_comparison_stop"] = primary
+        return _finish_choice(progress, warnings)
+    if not openings_blocked:
+        progress["stop_reasons"] = [
+            item
+            for item in (progress.get("stop_reasons") or [])
+            if str(item) not in _RESUMED_ALLOWANCE_STOPS
+        ]
+        if not plan.get("core_comparison_reason"):
+            metadata.pop("decision_stop", None)
+            metadata.pop("core_comparison_stop", None)
+
     index = int(progress.get("next_index") or 0)
     chunks = list(progress.get("chunks") or [])
-    warnings = list(state.get("warnings") or [])
     if index >= len(chunks):
         _open_next_core_round(progress, estimate, per_request=int(reviewer.token_budget))
         chunks = list(progress.get("chunks") or [])
@@ -7031,20 +7905,21 @@ async def _advance_core_review(
         prior_rationales=priors,
     )
     stop, _estimate = reviewer.refusal_reason(payload, ModelCoreDecision, metadata)
-    if stop == "request_budget":
-        add_stop_reason(progress, CORE_PAIR_EXCEEDS_REQUEST_BUDGET)
-        metadata["decision_stop"] = CORE_PAIR_EXCEEDS_REQUEST_BUDGET
-        metadata["core_comparison_stop"] = CORE_PAIR_EXCEEDS_REQUEST_BUDGET
-        return _finish_choice(progress, warnings)
     calls_sent = int(progress.get("calls") or 0)
     tokens_sent = int(progress.get("tokens_estimated") or 0)
-    if calls_sent and (
-        calls_sent >= int(reviewer.max_calls)
-        or (int(reviewer.max_tokens) and tokens_sent + int(_estimate or 0) > int(reviewer.max_tokens))
-    ):
-        add_stop_reason(progress, CORE_BRACKET_INCOMPLETE)
-        metadata["decision_stop"] = CORE_BRACKET_INCOMPLETE
-        metadata["core_comparison_stop"] = CORE_BRACKET_INCOMPLETE
+    resource_stop = _core_resource_stop(
+        stop,
+        estimate=int(_estimate or 0),
+        calls_sent=calls_sent,
+        tokens_sent=tokens_sent,
+        call_ceiling=call_ceiling,
+        token_ceiling=token_ceiling,
+        per_request=int(reviewer.token_budget),
+    )
+    if resource_stop:
+        add_stop_reason(progress, resource_stop)
+        metadata["decision_stop"] = resource_stop
+        metadata["core_comparison_stop"] = resource_stop
         return _finish_choice(progress, warnings)
     parsed, audit = await reviewer.decide(payload, ModelCoreDecision, metadata)
     if audit:
@@ -7052,8 +7927,12 @@ async def _advance_core_review(
         _record_audit_usage(metadata, audit)
     if stop or parsed is None:
         reason = stop or str(metadata.get("decision_stop") or "review_error")
-        if calls_sent and reason in {"call_allowance", "token_allowance"}:
-            reason = CORE_BRACKET_INCOMPLETE
+        if reason == "request_budget":
+            reason = CORE_REQUEST_TOO_LARGE
+        elif reason == "call_allowance":
+            reason = CORE_CALL_ALLOWANCE_INSUFFICIENT
+        elif reason == "token_allowance":
+            reason = CORE_TOKEN_ALLOWANCE_INSUFFICIENT
         add_stop_reason(progress, reason)
         metadata["decision_stop"] = reason
         metadata["core_comparison_stop"] = reason
@@ -7104,9 +7983,9 @@ async def _advance_core_review(
             )
             calls_used = int(progress.get("calls") or 0)
             tokens_used = int(progress.get("tokens_estimated") or 0)
-            can_retry = richer_stop is None and calls_used < int(reviewer.max_calls) and (
-                not int(reviewer.max_tokens)
-                or tokens_used + int(richer_estimate or 0) <= int(reviewer.max_tokens)
+            can_retry = richer_stop is None and calls_used < int(call_ceiling) and (
+                not int(token_ceiling)
+                or tokens_used + int(richer_estimate or 0) <= int(token_ceiling)
             )
             if can_retry:
                 progress["evidence_retried_matches"] = retried + [match_key]
@@ -7133,6 +8012,17 @@ async def _advance_core_review(
             abstention_reason=abstention_reason,
         )
         _count_core_attempt(progress, round_index, len(chunk_ids))
+        if match_status == "no_winner":
+            _stamp_validated_core_match(
+                progress,
+                round_index,
+                payload,
+                estimate=int((audit or {}).get("estimated_input_tokens") or 0),
+                chunk_index=index,
+                chunk_count=len(chunks),
+                round_role=role,
+                evidence_retry=richer,
+            )
         progress["reviewed_ids"] = list(progress.get("reviewed_ids") or []) + chunk_ids
         progress["chunks_validated"] = int(progress.get("chunks_validated") or 0) + 1
         progress["next_index"] = index + 1
@@ -7178,6 +8068,16 @@ async def _advance_core_review(
         winner=chosen,
         decision="select",
         rationale=rationale,
+    )
+    _stamp_validated_core_match(
+        progress,
+        round_index,
+        payload,
+        estimate=int((audit or {}).get("estimated_input_tokens") or 0),
+        chunk_index=index,
+        chunk_count=len(chunks),
+        round_role=role,
+        evidence_retry=richer,
     )
     progress["nominations"] = list(progress.get("nominations") or []) + [chosen]
     progress["reviewed_ids"] = list(progress.get("reviewed_ids") or []) + chunk_ids
@@ -8362,7 +9262,17 @@ def _check_resume(saved: Mapping[str, Any], current: Mapping[str, Any], *, allow
     if locked:
         raise AxialCheckpointMismatch(differences)
     names = {item.split(".", 1)[-1] for item in differences}
-    if names <= {"max_decision_calls", "max_axial_review_tokens", "max_selective_review_calls"}:
+    if names <= {
+        "max_decision_calls",
+        "max_axial_review_tokens",
+        "max_selective_review_calls",
+        "max_core_review_calls",
+        "max_core_review_tokens",
+        "max_core_review_call_hard_limit",
+        "max_core_review_token_hard_limit",
+        "auto_size_core_review",
+        "allow_partial_core_review",
+    }:
         return
     if not allow_changes:
         raise AxialCheckpointMismatch(differences)
@@ -8404,7 +9314,14 @@ def _axial_budget_resume_entry(state: Mapping[str, Any]) -> str | None:
     """
     meta = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
     progress = meta.get("decision_chunk_state") if isinstance(meta.get("decision_chunk_state"), Mapping) else {}
-    names = {"call_allowance", "token_allowance", "request_budget"}
+    names = {
+        "call_allowance",
+        "token_allowance",
+        "request_budget",
+        CORE_REQUEST_TOO_LARGE,
+        CORE_CALL_ALLOWANCE_INSUFFICIENT,
+        CORE_TOKEN_ALLOWANCE_INSUFFICIENT,
+    }
     stop = str(meta.get("decision_stop") or "")
     stops = {str(item) for item in (progress.get("stop_reasons") or [])}
     allowance = stop in names or bool(stops & names)
@@ -8659,8 +9576,63 @@ def _procedure_from_kwargs(data: Mapping[str, Any], **kwargs: Any) -> dict[str, 
         "one_document_one_respondent": bool(kwargs.get("one_document_one_respondent", False)),
         "core_evidence_summaries": _core_evidence_enabled(kwargs.get("core_evidence_summaries", True)),
         "core_evidence_token_cap": _core_evidence_cap(kwargs.get("core_evidence_token_cap", DEFAULT_CORE_EVIDENCE_TOKEN_CAP)),
+        **_core_caller_settings(
+            max_core_review_calls=kwargs.get("max_core_review_calls"),
+            max_core_review_tokens=kwargs.get("max_core_review_tokens"),
+            auto_size_core_review=kwargs.get("auto_size_core_review", False),
+            allow_partial_core_review=kwargs.get("allow_partial_core_review", False),
+            max_core_review_call_hard_limit=kwargs.get("max_core_review_call_hard_limit"),
+            max_core_review_token_hard_limit=kwargs.get("max_core_review_token_hard_limit"),
+        ),
     }
     return procedure
+
+
+def _core_caller_settings(
+    *,
+    max_core_review_calls: Any,
+    max_core_review_tokens: Any,
+    auto_size_core_review: Any,
+    allow_partial_core_review: Any,
+    max_core_review_call_hard_limit: Any,
+    max_core_review_token_hard_limit: Any,
+) -> dict[str, Any]:
+    """Caller knobs for the core step. Omitted allowances keep today's defaults."""
+    if not isinstance(auto_size_core_review, bool):
+        raise AxialError("auto_size_core_review must be true or false. The default is false.")
+    if not isinstance(allow_partial_core_review, bool):
+        raise AxialError("allow_partial_core_review must be true or false. The default is false.")
+    values = {
+        "max_core_review_calls": max_core_review_calls,
+        "max_core_review_tokens": max_core_review_tokens,
+        "max_core_review_call_hard_limit": max_core_review_call_hard_limit,
+        "max_core_review_token_hard_limit": max_core_review_token_hard_limit,
+    }
+    parsed = {}
+    for name, value in values.items():
+        if value is None:
+            parsed[name] = None
+            continue
+        try:
+            number = int(value)
+        except (TypeError, ValueError) as exc:
+            raise AxialError(f"{name} must be zero or more.") from exc
+        if number < 0:
+            raise AxialError(f"{name} must be zero or more.")
+        parsed[name] = number
+    parsed["auto_size_core_review"] = bool(auto_size_core_review)
+    parsed["allow_partial_core_review"] = bool(allow_partial_core_review)
+    return parsed
+
+
+def _core_recursion_calls(decision_calls: int, settings: Mapping[str, Any]) -> int:
+    """Graph visits have to cover the core ceiling this run might actually use."""
+    numbers = [max(0, int(decision_calls or 0))]
+    if settings.get("max_core_review_calls") is not None:
+        numbers.append(int(settings["max_core_review_calls"]))
+    if settings.get("auto_size_core_review") and settings.get("max_core_review_call_hard_limit") is not None:
+        numbers.append(int(settings["max_core_review_call_hard_limit"]))
+    return max(numbers)
 
 
 _AXIAL_REVIEW_SYSTEM = """You are the automated reviewer for axial and selective coding.
@@ -8744,8 +9716,12 @@ class AxialDecisionReviewer:
         shared_stop = None
         if shared is not None and shared.would_refuse(estimate, stage=stage):
             shared_stop = shared.preview(estimate, stage=stage)["reason"]
+        stage_call_ceiling = self.max_calls
+        ceilings = getattr(shared, "stage_ceilings", None) or {}
+        if shared is not None and stage in ceilings and ceilings.get(stage) is not None:
+            stage_call_ceiling = int(ceilings[stage])
         stop = (
-            "call_allowance" if calls >= self.max_calls
+            "call_allowance" if calls >= stage_call_ceiling
             else shared_stop if shared_stop
             else None if shared is not None
             else "token_allowance" if tokens + estimate > self.max_tokens
@@ -8856,6 +9832,8 @@ def _runtime(
     coding_calls: int | None = None,
     review_calls: int | None = None,
     selective_call_ceiling: int | None = None,
+    core_review_calls: int | None = None,
+    core_review_tokens: int | None = None,
     tokens_already: int = 0,
     token_reserve: int = 0,
     provider_max_attempts: int = 1,
@@ -8903,6 +9881,12 @@ def _runtime(
         for name in ("axial_relation_review", "axial_saturation_review", "axial_core_review"):
             stages[name] = max(0, int(review_calls))
             stage_token_ceilings[name] = max(0, int(max_review_tokens))
+        # A separate core allowance replaces only the core step. Relation review
+        # and saturation review keep max_decision_calls and max_axial_review_tokens.
+        if core_review_calls is not None:
+            stages["axial_core_review"] = max(0, int(core_review_calls))
+        if core_review_tokens is not None:
+            stage_token_ceilings["axial_core_review"] = max(0, int(core_review_tokens))
     if selective_call_ceiling is not None:
         stages["selective"] = max(0, int(selective_call_ceiling))
     allowance = ProviderAllowance(
@@ -8942,6 +9926,12 @@ async def aaxial_code(
     decision_mode: str = "human",
     decision_model: BaseChatModel | None = None,
     max_decision_calls: int = 4,
+    max_core_review_calls: int | None = None,
+    max_core_review_tokens: int | None = None,
+    auto_size_core_review: bool = False,
+    allow_partial_core_review: bool = False,
+    max_core_review_call_hard_limit: int | None = None,
+    max_core_review_token_hard_limit: int | None = None,
     max_axial_review_tokens: int = DEFAULT_MAX_AXIAL_REVIEW_TOKENS,
     axial_token_budget: int = DEFAULT_AXIAL_TOKEN_BUDGET,
     pattern_min_cases: int = 2,
@@ -9019,6 +10009,12 @@ async def aaxial_code(
         max_decision_calls=max_decision_calls,
         negative_case_search=negative_case_search,
         core_stability_min_n=core_stability_min_n,
+        max_core_review_calls=max_core_review_calls,
+        max_core_review_tokens=max_core_review_tokens,
+        auto_size_core_review=auto_size_core_review,
+        allow_partial_core_review=allow_partial_core_review,
+        max_core_review_call_hard_limit=max_core_review_call_hard_limit,
+        max_core_review_token_hard_limit=max_core_review_token_hard_limit,
     )
     metadata = {
         "procedure": procedure,
@@ -9031,7 +10027,9 @@ async def aaxial_code(
             "recursion_limit": _derived_recursion_limit(
                 procedure,
                 override=recursion_limit,
-                decision_calls=int(max_decision_calls) if decision_mode == "llm" else 0,
+                decision_calls=(
+                    _core_recursion_calls(int(max_decision_calls), procedure) if decision_mode == "llm" else 0
+                ),
             ),
         },
         "comparison_runs": list(comparison_runs or []),
@@ -9070,6 +10068,8 @@ async def aaxial_code(
             token_budget=axial_token_budget,
             coding_calls=int(procedure["max_axial_review_calls"]),
             review_calls=int(max_decision_calls) if decision_mode == "llm" else 0,
+            core_review_calls=procedure.get("max_core_review_calls"),
+            core_review_tokens=procedure.get("max_core_review_tokens"),
             token_reserve=int(procedure.get("storyline_token_reserve") or 0),
             provider_max_attempts=int(provider_max_attempts),
             retry_backoff=float(retry_backoff),
@@ -9116,7 +10116,7 @@ async def aaxial_code(
             recursion_limit=recursion_limit,
             durability=mode,
             legacy_source_hash=_source_hash(data),
-            decision_calls=int(max_decision_calls) if decision_mode == "llm" else 0,
+            decision_calls=_core_recursion_calls(int(max_decision_calls), procedure) if decision_mode == "llm" else 0,
         )
         if also_selective and not result.interrupted and result.metadata.get("stop") != "timeout":
             return await aselective_code(
@@ -9129,6 +10129,12 @@ async def aaxial_code(
                 decision_mode=decision_mode,
                 decision_model=decision_model,
                 max_decision_calls=max_decision_calls,
+                max_core_review_calls=max_core_review_calls,
+                max_core_review_tokens=max_core_review_tokens,
+                auto_size_core_review=auto_size_core_review,
+                allow_partial_core_review=allow_partial_core_review,
+                max_core_review_call_hard_limit=max_core_review_call_hard_limit,
+                max_core_review_token_hard_limit=max_core_review_token_hard_limit,
                 max_axial_review_tokens=max_axial_review_tokens,
                 axial_token_budget=axial_token_budget,
                 core_evidence_summaries=core_evidence_summaries,
@@ -9169,6 +10175,12 @@ async def aselective_code(
     decision_mode: str = "human",
     decision_model: BaseChatModel | None = None,
     max_decision_calls: int = 4,
+    max_core_review_calls: int | None = None,
+    max_core_review_tokens: int | None = None,
+    auto_size_core_review: bool = False,
+    allow_partial_core_review: bool = False,
+    max_core_review_call_hard_limit: int | None = None,
+    max_core_review_token_hard_limit: int | None = None,
     one_document_one_respondent: bool = False,
     core_evidence_summaries: bool = True,
     core_evidence_token_cap: int = DEFAULT_CORE_EVIDENCE_TOKEN_CAP,
@@ -9239,6 +10251,14 @@ async def aselective_code(
             int(max_axial_review_tokens), include_storyline=bool(include_storyline)
         ),
         "max_decision_calls": int(max_decision_calls),
+        **_core_caller_settings(
+            max_core_review_calls=max_core_review_calls,
+            max_core_review_tokens=max_core_review_tokens,
+            auto_size_core_review=auto_size_core_review,
+            allow_partial_core_review=allow_partial_core_review,
+            max_core_review_call_hard_limit=max_core_review_call_hard_limit,
+            max_core_review_token_hard_limit=max_core_review_token_hard_limit,
+        ),
         "negative_case_search": bool(axial_procedure.get("negative_case_search", True)),
         "core_stability_min_n": max(2, int(axial_procedure.get("core_stability_min_n") or CORE_STABILITY_MIN_N)),
         "core_stability_min_n_note": (
@@ -9267,7 +10287,9 @@ async def aselective_code(
         "recursion_limit": _derived_recursion_limit(
             procedure,
             override=recursion_limit,
-            decision_calls=int(max_decision_calls) if decision_mode == "llm" else 0,
+            decision_calls=(
+                _core_recursion_calls(int(max_decision_calls), procedure) if decision_mode == "llm" else 0
+            ),
         ),
     }
     metadata["output_dir"] = str(output_dir) if output_dir else str(metadata.get("output_dir") or "")
@@ -9300,6 +10322,8 @@ async def aselective_code(
             token_budget=axial_token_budget,
             selective_call_ceiling=int(max_selective_review_calls if (include_memos or include_storyline) else 0),
             review_calls=int(max_decision_calls) if decision_mode == "llm" else 0,
+            core_review_calls=procedure.get("max_core_review_calls"),
+            core_review_tokens=procedure.get("max_core_review_tokens"),
             tokens_already=int(metadata.get("axial_tokens_estimated") or 0),
             token_reserve=int(procedure.get("storyline_token_reserve") or 0),
             node_timeout=node_timeout,
@@ -9350,7 +10374,7 @@ async def aselective_code(
             legacy_source_hash=_source_hash(data),
             legacy_evidence_hash=_evidence_source_hash(data),
             legacy_evidence_message=_SELECTIVE_LEGACY_FINGERPRINT,
-            decision_calls=int(max_decision_calls) if decision_mode == "llm" else 0,
+            decision_calls=_core_recursion_calls(int(max_decision_calls), procedure) if decision_mode == "llm" else 0,
         )
 
     if checkpoint_path is None:

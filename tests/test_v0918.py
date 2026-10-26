@@ -19,8 +19,8 @@ _PRICES = {"input_usd_per_million": 3.0, "output_usd_per_million": 15.0}
 
 
 def test_version_is_0918():
-    assert __version__ == "0.9.36"
-    assert POLICY_VERSION == "0.9.36"
+    assert __version__ == "0.9.37"
+    assert POLICY_VERSION == "0.9.37"
 
 
 def _priced_corpus() -> dict:

@@ -110,6 +110,7 @@ def test_twelve_of_fifty_five_stops_early_and_counts_the_attempt():
         max_decision_calls=1,
         max_axial_review_tokens=10**6,
         axial_token_budget=fit,
+        allow_partial_core_review=True,
         batch_size=1,
     )
     assert finished.metadata["core_candidates_eligible"] == 55

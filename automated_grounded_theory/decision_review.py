@@ -121,6 +121,24 @@ CORE_COMPARISON_RULE = "deterministic_tournament_v1"
 CORE_CANDIDATES_DO_NOT_FIT = "core_candidates_do_not_fit"
 CORE_BRACKET_INCOMPLETE = "core_bracket_incomplete"
 CORE_PAIR_EXCEEDS_REQUEST_BUDGET = "core_pair_exceeds_request_budget"
+# A planned match whose live payload does not fit the per-request cap.
+CORE_REQUEST_TOO_LARGE = "core_request_too_large"
+# The core step's own call ceiling cannot cover the matches that must be sent.
+CORE_CALL_ALLOWANCE_INSUFFICIENT = "core_call_allowance_insufficient"
+# The core step's own token ceiling cannot cover the matches that must be sent.
+CORE_TOKEN_ALLOWANCE_INSUFFICIENT = "core_token_allowance_insufficient"
+# Omitted core allowances keep the shared decision-step defaults.
+CORE_BUDGET_RULE = "separate_core_allowance_v1"
+# Opening matches are priced apart from later rounds that a winner would create.
+CORE_PREFLIGHT_RULE = "opening_unavoidable_later_contingent_v1"
+# Partial execution is off unless the caller turns it on.
+CORE_PARTIAL_EXECUTION_RULE = "partial_core_off_by_default_v1"
+# A request, a call ceiling, and a token ceiling are different stops.
+CORE_STOP_REASON_RULE = "request_call_or_token_v1"
+# A validated match is reused only when its payload and the policy still match.
+CORE_MATCH_REUSE_RULE = "reuse_validated_match_v1"
+# Auto-sizing the core allowance is off unless the caller turns it on.
+CORE_AUTO_SIZE_RULE = "bounded_core_auto_size_off_v1"
 # A recorded condition must be a full clause. A bare pronoun is not a qualifier.
 CONDITION_COMPLETENESS_RULE = "full_clause_or_incomplete_v1"
 # A supported pattern under a complete condition stays eligible. Speculation does not.
@@ -225,6 +243,10 @@ CHUNKING_CHECKPOINT_MESSAGE = (
     "still needed a final assessment, incomplete coverage was not reported as "
     "complete, evidence summaries were sized from the match budget, unreviewed "
     "relation rows named the call limit, or the 0.9.36 rules, "
+    "or before core selection had its own call and token allowance, the bracket "
+    "was priced before the first match, a shortfall stopped before spending unless "
+    "partial execution was allowed, a request over the per-request cap was "
+    "core_request_too_large, or the 0.9.37 rules, "
     "or the stored chunk plan does not match this resume. Resume cannot continue "
     "that review. Start a new run."
 )
@@ -1017,6 +1039,12 @@ def review_procedure_fields() -> dict[str, str]:
         "relation_unreviewed_rule": RELATION_UNREVIEWED_RULE,
         "withheld_export_rule": WITHHELD_EXPORT_RULE,
         "raised_variance_rule": RAISED_VARIANCE_RULE,
+        "core_budget_rule": CORE_BUDGET_RULE,
+        "core_preflight_rule": CORE_PREFLIGHT_RULE,
+        "core_partial_execution_rule": CORE_PARTIAL_EXECUTION_RULE,
+        "core_stop_reason_rule": CORE_STOP_REASON_RULE,
+        "core_match_reuse_rule": CORE_MATCH_REUSE_RULE,
+        "core_auto_size_rule": CORE_AUTO_SIZE_RULE,
         "reread_coverage_rule": REREAD_COVERAGE_RULE,
         "reread_bound_rule": REREAD_BOUND_RULE,
         "case_identity_source_rule": CASE_IDENTITY_SOURCE_RULE,
@@ -1988,6 +2016,12 @@ def same_chunking_fingerprint(saved: Any, current: Any) -> bool:
         "relation_unreviewed_rule": RELATION_UNREVIEWED_RULE,
         "withheld_export_rule": WITHHELD_EXPORT_RULE,
         "raised_variance_rule": RAISED_VARIANCE_RULE,
+        "core_budget_rule": CORE_BUDGET_RULE,
+        "core_preflight_rule": CORE_PREFLIGHT_RULE,
+        "core_partial_execution_rule": CORE_PARTIAL_EXECUTION_RULE,
+        "core_stop_reason_rule": CORE_STOP_REASON_RULE,
+        "core_match_reuse_rule": CORE_MATCH_REUSE_RULE,
+        "core_auto_size_rule": CORE_AUTO_SIZE_RULE,
         "reread_coverage_rule": REREAD_COVERAGE_RULE,
         "reread_bound_rule": REREAD_BOUND_RULE,
         "case_identity_source_rule": CASE_IDENTITY_SOURCE_RULE,

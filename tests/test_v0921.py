@@ -33,8 +33,8 @@ _TEMPLATE = Path("examples/discovery_adjudication_template.csv")
 
 
 def test_package_version_is_0921():
-    assert __version__ == "0.9.36"
-    assert POLICY_VERSION == "0.9.36"
+    assert __version__ == "0.9.37"
+    assert POLICY_VERSION == "0.9.37"
     assert DISCOVERY_SCHEMA_VERSION == "discovery-eval-3"
 
 

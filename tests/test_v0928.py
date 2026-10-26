@@ -69,8 +69,8 @@ _ASIDE = Path(__file__).resolve().parents[0] / "fixtures" / "discourse_aside_092
 
 
 def test_version_rules_and_unchanged_defaults():
-    assert __version__ == "0.9.36"
-    assert POLICY_VERSION == "0.9.36"
+    assert __version__ == "0.9.37"
+    assert POLICY_VERSION == "0.9.37"
     assert DECISION_REVIEW_CHUNKING == "request_budget_v6"
     assert CONDITIONAL_SCOPE_RULE == "condition_scope_v1"
     assert DUPLICATE_ASSERTION_RULE == "merge_all_evidence_v1"
@@ -1280,7 +1280,7 @@ def test_finished_incomplete_core_resumes_on_a_larger_budget():
         **common,
     )
     assert finished.interrupted is False
-    assert finished.metadata["decision_stop"] == "token_allowance"
+    assert finished.metadata["decision_stop"] == "core_token_allowance_insufficient"
     assert finished.metadata["core_selection_complete"] is False
     assert finished.metadata["decision_reviews"]["axial_core_review"]["chunks_sent"] == 0
     assert finished.metadata["core_candidates_compared"] == 0
