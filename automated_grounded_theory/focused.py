@@ -301,6 +301,10 @@ _PROCEDURE_KEYS = (
     "case_identity_source_rule",
     "case_count_rule",
     "reread_estimate_rule",
+    "condition_completeness_rule",
+    "eligibility_decision_rule",
+    "reread_coverage_rule",
+    "reread_bound_rule",
     "export_assessment_rule",
     "chunk_review_recovery",
     "auto_size_decision_calls",
@@ -3091,6 +3095,19 @@ def _documents_for(state: Mapping[str, Any], passage_ids: Sequence[str] | None =
     return found
 
 
+def _withheld_reread_ids(state: Mapping[str, Any]) -> list[str]:
+    """Passages withheld because one request could not fit the per-request cap."""
+    found: list[str] = []
+    metadata = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
+    for item in metadata.get("reread_requests_over_budget") or []:
+        if not isinstance(item, Mapping):
+            continue
+        passage_id = str(item.get("passage_id") or "")
+        if passage_id and passage_id not in found:
+            found.append(passage_id)
+    return found
+
+
 def _coverage_statement(state: Mapping[str, Any], not_reread: Sequence[str]) -> dict[str, Any]:
     corpus = _corpus_passage_ids(state)
     corpus_set = set(corpus)
@@ -3099,6 +3116,11 @@ def _coverage_statement(state: Mapping[str, Any], not_reread: Sequence[str]) -> 
     reread = [str(item) for item in (state.get("focused_reread") or [])]
     reread_in_corpus = [passage_id for passage_id in reread if passage_id in corpus_set]
     not_queued = [passage_id for passage_id in corpus if passage_id not in queued_set]
+    withheld = _withheld_reread_ids(state)
+    not_reread_ids = [str(item) for item in not_reread if str(item)]
+    for passage_id in withheld:
+        if passage_id not in not_reread_ids:
+            not_reread_ids.append(passage_id)
     documents_in_corpus = _documents_for(state)
     documents_covered = _documents_for(state, reread_in_corpus)
     return {
@@ -3111,17 +3133,22 @@ def _coverage_statement(state: Mapping[str, Any], not_reread: Sequence[str]) -> 
         "reread": len(reread),
         "not_queued": not_queued,
         "not_queued_count": len(not_queued),
-        "not_reread": list(not_reread),
-        "not_reread_count": len(list(not_reread)),
-        "queue_complete": not list(not_reread),
-        "corpus_complete": not list(not_reread) and not not_queued,
+        "not_reread": not_reread_ids,
+        "not_reread_count": len(not_reread_ids),
+        "withheld_over_budget": withheld,
+        "withheld_over_budget_count": len(withheld),
+        "queue_complete": not not_reread_ids and not withheld,
+        "corpus_complete": not not_reread_ids and not withheld and not not_queued,
         "complete_for_queue_is_corpus_coverage": False,
         "note": (
             "complete means every corpus passage was reread. "
             "complete_for_queue means the reread queue finished. It is not corpus coverage. "
             "passages_covered of passages_in_corpus and documents_covered of documents_in_corpus "
             "were reread. "
-            "focused_not_reread lists passages that were queued and not sent. "
+            "focused_not_reread lists passages that were queued and not sent, "
+            "including a passage withheld because it does not fit the per-request cap. "
+            "withheld_over_budget is that same withheld list. "
+            "The queue is not complete while any of those passages are withheld. "
             "focused_not_queued lists passages that never entered the queue."
         ),
     }
@@ -3204,6 +3231,11 @@ def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
     procedure = (state.get("metadata") or {}).get("procedure") or {}
     stop = str(state.get("recode_stop") or "")
     not_reread = [str(item) for item in (state.get("focused_not_reread") or [])]
+    for passage_id in _withheld_reread_ids(state):
+        if passage_id not in not_reread:
+            not_reread.append(passage_id)
+    if not_reread and stop in {"", "complete", "complete_for_queue"}:
+        stop = REREAD_REQUEST_EXCEEDS_TOKEN_BUDGET
     coverage = _coverage_statement(state, not_reread)
     not_queued = list(coverage["not_queued"])
     if stop in {REREAD_ALLOWANCE_INSUFFICIENT, REREAD_REQUEST_EXCEEDS_TOKEN_BUDGET}:
@@ -4738,14 +4770,17 @@ def _prepare_node(state: FocusedState) -> dict:
                 "Other passages and claim review are not blocked by that passage."
             )
             updates["metadata"] = metadata
+        withheld_ids = [str(item.get("passage_id") or "") for item in over_budget if item.get("passage_id")]
+        if withheld_ids:
+            updates["focused_not_reread"] = withheld_ids
         if new_cursor < len(queue) or _claim_round_pending({**state, "metadata": metadata}):
             return updates
-        if not skipped:
+        if not withheld_ids:
             updates["focused_not_reread"] = []
             updates["recode_stop"] = "complete"
             return updates
         updates["recode_stop"] = REREAD_REQUEST_EXCEEDS_TOKEN_BUDGET
-        updates["focused_not_reread"] = [str(item.get("passage_id") or "") for item in over_budget if item.get("passage_id")]
+        updates["focused_not_reread"] = withheld_ids
         return updates
     if skipped:
         metadata = dict(updates.get("metadata") or state.get("metadata") or {})
@@ -4757,6 +4792,9 @@ def _prepare_node(state: FocusedState) -> dict:
             "Other passages and claim review are not blocked by that passage."
         )
         updates["metadata"] = metadata
+        updates["focused_not_reread"] = [
+            str(item.get("passage_id") or "") for item in over_budget if item.get("passage_id")
+        ]
     segments = list(state.get("segments") or [])
     purposes = {str(item.get("passage_id") or ""): str(item.get("purpose") or "develop") for item in chosen_items}
     initial_codes = {
@@ -6835,6 +6873,23 @@ def _reread_estimate_for(
     }
 
 
+def _reread_upper_bound(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Pre-selection ceiling: the per-request cap times the reserved reread calls.
+
+    This is a bound, not the number of tokens a request will use.
+    """
+    metadata = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
+    procedure = metadata.get("procedure") if isinstance(metadata.get("procedure"), Mapping) else {}
+    calls = max(0, int(procedure.get("max_focused_review_calls") or 0))
+    cap = max(0, _reread_token_budget(state))
+    return {
+        "tokens": cap * calls,
+        "calls": calls,
+        "cap": cap,
+        "label": "per-request cap times reserved reread calls",
+    }
+
+
 def _focused_reread_preflight(state: Mapping[str, Any]) -> dict[str, Any] | None:
     """Worst-case reread estimate before selection. It does not block selection.
 
@@ -6845,6 +6900,7 @@ def _focused_reread_preflight(state: Mapping[str, Any]) -> dict[str, Any] | None
     estimate = _reread_estimate_for(state, _codebook_ids(book))
     if estimate is None:
         return None
+    bound = _reread_upper_bound(state)
     return {
         "focused_review_tokens_required_worst_case": estimate["focused_review_tokens_required"],
         "focused_review_tokens_available": estimate["focused_review_tokens_available"],
@@ -6853,6 +6909,10 @@ def _focused_reread_preflight(state: Mapping[str, Any]) -> dict[str, Any] | None
         "focused_review_requests_withheld_worst_case": estimate.get("focused_review_requests_withheld"),
         "worst_case": True,
         "worst_case_assumes_all_codes_raised": True,
+        "focused_review_tokens_upper_bound": bound["tokens"],
+        "focused_review_upper_bound_calls": bound["calls"],
+        "focused_review_upper_bound_label": bound["label"],
+        "focused_review_upper_bound_is_a_bound": True,
         "blocked": False,
         "note": (
             "Worst case before selection. It assumes every codebook code is raised. "
@@ -7302,6 +7362,10 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         metadata["focused_review_requests_withheld_worst_case"] = reread_preflight.get(
             "focused_review_requests_withheld_worst_case"
         )
+        metadata["focused_review_tokens_upper_bound"] = reread_preflight.get("focused_review_tokens_upper_bound")
+        metadata["focused_review_upper_bound_calls"] = reread_preflight.get("focused_review_upper_bound_calls")
+        metadata["focused_review_upper_bound_label"] = reread_preflight.get("focused_review_upper_bound_label")
+        metadata["focused_review_upper_bound_is_a_bound"] = True
         progress["focused_review_tokens_required_worst_case"] = reread_preflight[
             "focused_review_tokens_required_worst_case"
         ]
@@ -7312,6 +7376,11 @@ async def _selection_review_visit(runtime: FocusedRuntime, state: FocusedState, 
         metadata["focused_review_worst_case_note"] = None
         metadata["focused_review_requests_projected_worst_case"] = None
         metadata["focused_review_requests_withheld_worst_case"] = None
+        bound = _reread_upper_bound(state)
+        metadata["focused_review_tokens_upper_bound"] = bound["tokens"]
+        metadata["focused_review_upper_bound_calls"] = bound["calls"]
+        metadata["focused_review_upper_bound_label"] = bound["label"]
+        metadata["focused_review_upper_bound_is_a_bound"] = True
     metadata["token_estimate_is_dollar_bound"] = False
     metadata["token_estimate_includes_output_tokens"] = fields["token_estimate_includes_output_tokens"]
     metadata["token_estimate_includes_retry_or_repair_margin"] = fields["token_estimate_includes_retry_or_repair_margin"]
@@ -7904,6 +7973,9 @@ def _selection_export(state: Mapping[str, Any]) -> dict[str, Any]:
         "focused_review_requests_withheld_worst_case": metadata.get(
             "focused_review_requests_withheld_worst_case"
         ),
+        "focused_review_tokens_upper_bound": metadata.get("focused_review_tokens_upper_bound"),
+        "focused_review_upper_bound_calls": metadata.get("focused_review_upper_bound_calls"),
+        "focused_review_upper_bound_label": metadata.get("focused_review_upper_bound_label"),
         "reread_stop": metadata.get("reread_stop"),
         "reread_requests_over_budget": metadata.get("reread_requests_over_budget"),
         "reread_request_bound": metadata.get("reread_request_bound"),
@@ -7983,6 +8055,9 @@ def load_focused_export(directory: str | Path) -> dict[str, Any]:
         "focused_review_requests_withheld",
         "focused_review_requests_projected_worst_case",
         "focused_review_requests_withheld_worst_case",
+        "focused_review_tokens_upper_bound",
+        "focused_review_upper_bound_calls",
+        "focused_review_upper_bound_label",
         "reread_stop",
         "reread_requests_over_budget",
         "reread_request_bound",

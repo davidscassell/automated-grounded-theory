@@ -116,9 +116,19 @@ DUPLICATE_ASSERTION_RULE = "merge_all_evidence_v1"
 BUDGET_LEDGER_RULE = "per_step_review_ledger_v1"
 # Each decision step has its own token allowance. The number is not raised.
 DECISION_TOKEN_SCOPE = "per_step_v1"
-# Core selection compares every eligible candidate in one request, or withholds.
-CORE_COMPARISON_RULE = "all_candidates_one_request_v1"
+# Core selection is a deterministic tournament. A subset is never the core.
+CORE_COMPARISON_RULE = "deterministic_tournament_v1"
 CORE_CANDIDATES_DO_NOT_FIT = "core_candidates_do_not_fit"
+CORE_BRACKET_INCOMPLETE = "core_bracket_incomplete"
+CORE_PAIR_EXCEEDS_REQUEST_BUDGET = "core_pair_exceeds_request_budget"
+# A recorded condition must be a full clause. A bare pronoun is not a qualifier.
+CONDITION_COMPLETENESS_RULE = "full_clause_or_incomplete_v1"
+# A row needs a review decision, and a hypothetical or incomplete condition blocks it.
+ELIGIBILITY_DECISION_RULE = "reviewed_complete_condition_v1"
+# Passages withheld as too big stay in the coverage counts. The queue is not complete.
+REREAD_COVERAGE_RULE = "withheld_not_complete_v1"
+# The pre-selection reread figure is the per-request cap times the reserved calls.
+REREAD_BOUND_RULE = "cap_times_reserved_calls_v1"
 # A reread request is packed to the per-request budget. Only sendable requests are estimated.
 REREAD_REQUEST_RULE = "pack_to_request_budget_v1"
 # A recorded condition stays on the presented statement.
@@ -183,6 +193,9 @@ CHUNKING_CHECKPOINT_MESSAGE = (
     "compared every eligible candidate in one request, a recorded condition stayed "
     "on the presented statement, decision allowances were labeled per step, case "
     "identity named its source, or the 0.9.33 rules, "
+    "or before core selection ran a deterministic tournament, a condition span had "
+    "to be a full clause, an unreviewed or hypothetical row stayed ineligible, "
+    "withheld rereads stayed in the coverage counts, or the 0.9.34 rules, "
     "or the stored chunk plan does not match this resume. Resume cannot continue "
     "that review. Start a new run."
 )
@@ -559,39 +572,129 @@ def pack_decision_chunks(
     return {"chunks": chunks, "omissions": omissions, "ordered_ids": ordered}
 
 
+def order_core_candidates(ids: Sequence[str]) -> list[str]:
+    """Stable code-id order. The same ids always open the same bracket."""
+    ordered: list[str] = []
+    for item in ids:
+        text = str(item or "")
+        if text and text not in ordered:
+            ordered.append(text)
+    ordered.sort()
+    return ordered
+
+
+def partition_core_matches(
+    ids: Sequence[str],
+    estimate: Callable[[Sequence[str]], int],
+    *,
+    per_request: int,
+) -> dict[str, Any]:
+    """Split one round into matches of at least two, plus byes.
+
+    ``ids`` are already in bracket order. The whole set is one match when it
+    fits. A leftover single advances without a request. Two ids that do not
+    fit one request cannot open a match. A one-candidate request is sent only
+    when that candidate is the entire eligible set.
+    """
+    ordered = [str(item) for item in ids if str(item)]
+    budget = int(per_request)
+
+    def fits(group: Sequence[str]) -> bool:
+        if budget <= 0 or not group:
+            return False
+        return int(estimate(group)) <= budget
+
+    if not ordered:
+        return {"matches": [], "byes": [], "reason": None, "whole_set": False, "estimate": 0}
+    whole = int(estimate(ordered))
+    if len(ordered) == 1:
+        if fits(ordered):
+            return {
+                "matches": [ordered],
+                "byes": [],
+                "reason": None,
+                "whole_set": True,
+                "estimate": whole,
+            }
+        return {
+            "matches": [],
+            "byes": [],
+            "reason": CORE_PAIR_EXCEEDS_REQUEST_BUDGET,
+            "whole_set": False,
+            "estimate": whole,
+        }
+    if fits(ordered):
+        return {
+            "matches": [ordered],
+            "byes": [],
+            "reason": None,
+            "whole_set": True,
+            "estimate": whole,
+        }
+    matches: list[list[str]] = []
+    byes: list[str] = []
+    index = 0
+    while index < len(ordered):
+        chunk = [ordered[index]]
+        cursor = index + 1
+        while cursor < len(ordered) and fits([*chunk, ordered[cursor]]):
+            chunk.append(ordered[cursor])
+            cursor += 1
+        if len(chunk) < 2:
+            if cursor < len(ordered) or not matches:
+                return {
+                    "matches": [],
+                    "byes": [],
+                    "reason": CORE_PAIR_EXCEEDS_REQUEST_BUDGET,
+                    "whole_set": False,
+                    "estimate": int(estimate(ordered[:2])) if len(ordered) >= 2 else whole,
+                }
+            byes.append(chunk[0])
+            break
+        matches.append(chunk)
+        index = cursor
+    return {"matches": matches, "byes": byes, "reason": None, "whole_set": False, "estimate": whole}
+
+
 def plan_core_comparison(
     ids: Sequence[str],
     estimate: Callable[[Sequence[str]], int],
     *,
     per_request: int,
 ) -> dict[str, Any]:
-    """Compare every eligible core candidate in one request, or withhold.
+    """First round of a deterministic core tournament.
 
-    A request that cannot hold the full set is not split. A one-candidate
-    chunk is not a comparison, and it is not a core choice. ``compared`` is
-    the number of candidates in the request that can be sent, or zero when
-    the set does not fit.
+    Candidates are ordered by code id. Every match has at least two
+    candidates unless the eligible set itself is one candidate. ``compared``
+    is how many candidates sit in matches that can be sent. A bye is not
+    compared in this round.
     """
-    ordered = [str(item) for item in ids if str(item)]
-    budget = int(per_request)
+    ordered = order_core_candidates(ids)
     eligible = len(ordered)
     if not ordered:
-        return {"chunks": [], "eligible": 0, "compared": 0, "reason": None, "estimate": 0}
-    needed = int(estimate(ordered))
-    if budget > 0 and needed <= budget:
         return {
-            "chunks": [ordered],
-            "eligible": eligible,
-            "compared": eligible,
+            "chunks": [],
+            "byes": [],
+            "eligible": 0,
+            "compared": 0,
             "reason": None,
-            "estimate": needed,
+            "estimate": 0,
+            "ordered_ids": [],
+            "whole_set": False,
         }
+    partitioned = partition_core_matches(ordered, estimate, per_request=per_request)
+    matches = [list(chunk) for chunk in (partitioned.get("matches") or [])]
+    byes = [str(item) for item in (partitioned.get("byes") or [])]
+    compared = sum(len(chunk) for chunk in matches)
     return {
-        "chunks": [],
+        "chunks": matches,
+        "byes": byes,
         "eligible": eligible,
-        "compared": 0,
-        "reason": CORE_CANDIDATES_DO_NOT_FIT,
-        "estimate": needed,
+        "compared": compared if partitioned.get("reason") is None else 0,
+        "reason": partitioned.get("reason"),
+        "estimate": int(partitioned.get("estimate") or 0),
+        "ordered_ids": ordered,
+        "whole_set": bool(partitioned.get("whole_set")),
     }
 
 
@@ -603,18 +706,21 @@ def build_core_comparison_plan(
     max_tokens: int,
     max_calls: int,
 ) -> dict[str, Any]:
-    """One core-comparison request, or a plan that sends nothing.
+    """First round of the core tournament.
 
-    The hash includes the per-request budget, so a withheld plan does not
-    resume as a larger request. ``max_tokens`` and ``max_calls`` limit how
-    far a fitting plan gets. They do not split the candidates.
+    The hash includes the per-request budget and the first-round matches.
+    Later rounds are derived from the winners. ``max_tokens`` and
+    ``max_calls`` limit how far the bracket gets. They do not change the
+    first-round partition. A pair that does not fit is not sent.
     """
     comparison = plan_core_comparison(ids, estimate, per_request=per_request)
-    ordered = [str(item) for item in ids if str(item)]
+    ordered = list(comparison.get("ordered_ids") or [])
+    reason = comparison.get("reason")
+    chunks = [] if reason else [list(chunk) for chunk in (comparison.get("chunks") or [])]
+    byes = [] if reason else [str(item) for item in (comparison.get("byes") or [])]
     omissions: list[dict[str, str]] = []
-    if comparison.get("reason") == CORE_CANDIDATES_DO_NOT_FIT:
-        omissions = [{"id": item, "reason": CORE_CANDIDATES_DO_NOT_FIT} for item in ordered]
-    chunks = [list(chunk) for chunk in (comparison.get("chunks") or [])]
+    if reason:
+        omissions = [{"id": item, "reason": str(reason)} for item in ordered]
     plan_hash = decision_plan_hash(
         kind="axial_core_review",
         per_request=per_request,
@@ -624,6 +730,13 @@ def build_core_comparison_plan(
         chunks=chunks,
         omissions=omissions,
     )
+    first_round = {
+        "matches": chunks,
+        "byes": byes,
+        "winners": [],
+        "compared": 0,
+        "whole_set": bool(comparison.get("whole_set")) and not reason,
+    }
     return {
         "version": DECISION_REVIEW_CHUNKING,
         "kind": "axial_core_review",
@@ -636,9 +749,11 @@ def build_core_comparison_plan(
         "compaction": {},
         "plan_hash": plan_hash,
         "core_candidates_eligible": int(comparison.get("eligible") or 0),
-        "core_candidates_compared": int(comparison.get("compared") or 0),
-        "core_comparison_reason": comparison.get("reason"),
+        "core_candidates_compared": 0,
+        "core_comparison_reason": reason,
         "estimate": int(comparison.get("estimate") or 0),
+        "core_bracket_rounds": [first_round],
+        "core_whole_set": bool(first_round["whole_set"]),
     }
 
 
@@ -782,6 +897,10 @@ def review_procedure_fields() -> dict[str, str]:
         "core_comparison_rule": CORE_COMPARISON_RULE,
         "reread_request_rule": REREAD_REQUEST_RULE,
         "condition_statement_rule": CONDITION_STATEMENT_RULE,
+        "condition_completeness_rule": CONDITION_COMPLETENESS_RULE,
+        "eligibility_decision_rule": ELIGIBILITY_DECISION_RULE,
+        "reread_coverage_rule": REREAD_COVERAGE_RULE,
+        "reread_bound_rule": REREAD_BOUND_RULE,
         "case_identity_source_rule": CASE_IDENTITY_SOURCE_RULE,
         "case_count_rule": CASE_COUNT_RULE,
         "reread_estimate_rule": REREAD_ESTIMATE_RULE,
@@ -1740,6 +1859,10 @@ def same_chunking_fingerprint(saved: Any, current: Any) -> bool:
         "core_comparison_rule": CORE_COMPARISON_RULE,
         "reread_request_rule": REREAD_REQUEST_RULE,
         "condition_statement_rule": CONDITION_STATEMENT_RULE,
+        "condition_completeness_rule": CONDITION_COMPLETENESS_RULE,
+        "eligibility_decision_rule": ELIGIBILITY_DECISION_RULE,
+        "reread_coverage_rule": REREAD_COVERAGE_RULE,
+        "reread_bound_rule": REREAD_BOUND_RULE,
         "case_identity_source_rule": CASE_IDENTITY_SOURCE_RULE,
         "case_count_rule": CASE_COUNT_RULE,
         "reread_estimate_rule": REREAD_ESTIMATE_RULE,

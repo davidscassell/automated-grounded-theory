@@ -148,6 +148,9 @@ WITHHOLDING_CAUSES = (
     "omitted_oversized",
     "llm_reviewer_rejected",
     "reviewer_policy_rejection",
+    "incomplete_condition",
+    "hypothetical_link",
+    "no_review_decision",
     "other_withheld",
 )
 PRIMARY_WITHHOLDING_CAUSE = (
@@ -326,6 +329,12 @@ def withholding_reasons(row: Mapping[str, Any], rules: Sequence[str] | None = No
             add("llm_reviewer_rejected")
         else:
             add("reviewer_policy_rejection")
+    if "condition_incomplete" in names or row.get("condition_incomplete") is True:
+        add("incomplete_condition")
+    if "participant_link_hypothetical" in names or "hypothetical_link" in names:
+        add("hypothetical_link")
+    if "no_review_decision" in names or str(row.get("eligibility_reason") or "") == "no_review_decision":
+        add("no_review_decision")
     ordered = [name for name in WITHHOLDING_CAUSES if name in found and name != "other_withheld"]
     if not ordered:
         ordered = ["other_withheld"]
