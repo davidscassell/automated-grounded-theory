@@ -663,7 +663,17 @@ def _source_mapping(source: Any) -> dict[str, Any]:
     if isinstance(source, (str, Path)):
         place = Path(source)
         directory = place.parent if place.is_file() else place
-        if directory.is_dir() and (directory / "core_candidates.json").is_file():
+        # A directory that still holds the focused export keeps that resume path,
+        # so an edited selection is honored. An axial or selective export with
+        # frozen core candidates, and no focused export beside it, continues
+        # core selection from those candidates.
+        focused_export = (directory / "focused_run.json").is_file() or (
+            directory / "focused_selection.json"
+        ).is_file()
+        axial_export = (directory / "core_candidates.json").is_file() and (
+            (directory / "selective_run.json").is_file() or (directory / "axial_run.json").is_file()
+        )
+        if directory.is_dir() and axial_export and not focused_export:
             source = load_axial_export(directory)
         else:
             source = load_focused_export(source)
@@ -9304,7 +9314,14 @@ def _axial_budget_resume_entry(state: Mapping[str, Any]) -> str | None:
     """
     meta = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
     progress = meta.get("decision_chunk_state") if isinstance(meta.get("decision_chunk_state"), Mapping) else {}
-    names = {"call_allowance", "token_allowance", "request_budget"}
+    names = {
+        "call_allowance",
+        "token_allowance",
+        "request_budget",
+        CORE_REQUEST_TOO_LARGE,
+        CORE_CALL_ALLOWANCE_INSUFFICIENT,
+        CORE_TOKEN_ALLOWANCE_INSUFFICIENT,
+    }
     stop = str(meta.get("decision_stop") or "")
     stops = {str(item) for item in (progress.get("stop_reasons") or [])}
     allowance = stop in names or bool(stops & names)

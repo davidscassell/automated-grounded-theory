@@ -24,7 +24,7 @@ Auto-sizing stays off. That is a decision. `auto_size_core_review` computes the 
 
 `load_axial_export(directory)` reads `selective_run.json` or `axial_run.json`, plus `core_candidates.json`. When candidate rows are present it sets `freeze_core_candidates`, and core selection uses those rows instead of scoring the codebook again.
 
-`resume_core_selection(directory, model, decision_mode="llm", max_core_review_calls=..., max_core_review_tokens=...)` is `selective_code` on that export. `selective_code` on the directory does the same thing when `core_candidates.json` is present. Focused coding and relation review are not run again. Pass a larger core allowance to spend it on matches that were not validated. `allow_partial_core_review` stays off unless the caller sets it.
+`resume_core_selection(directory, model, decision_mode="llm", max_core_review_calls=..., max_core_review_tokens=...)` is `selective_code` on that loaded export. `selective_code` on the directory does the same when `core_candidates.json` is present together with `selective_run.json` or `axial_run.json`, and the directory is not also a focused export. A directory that still holds `focused_run.json` or `focused_selection.json` keeps the focused resume path, so an edited selection is honored. Focused coding and relation review are not run again. Pass a larger core allowance to spend it on matches that were not validated. `allow_partial_core_review` stays off unless the caller sets it.
 
 The next eval can finish the 54-candidate v42 bracket from that export. The two stored `no_suitable_candidate` matches are trusted once, because a 0.9.36 export has no payload fingerprint, and then stamped. A larger core allowance sends the matches that remain.
 

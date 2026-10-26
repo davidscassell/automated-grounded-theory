@@ -1280,7 +1280,7 @@ def test_finished_incomplete_core_resumes_on_a_larger_budget():
         **common,
     )
     assert finished.interrupted is False
-    assert finished.metadata["decision_stop"] == "token_allowance"
+    assert finished.metadata["decision_stop"] == "core_token_allowance_insufficient"
     assert finished.metadata["core_selection_complete"] is False
     assert finished.metadata["decision_reviews"]["axial_core_review"]["chunks_sent"] == 0
     assert finished.metadata["core_candidates_compared"] == 0
