@@ -152,6 +152,8 @@ def test_insufficient_evidence_retries_once_and_stays_unresolved():
     )
     assert retried.metadata["model_core_id"] == "c02"
     assert retried.metadata["core_outcome"] == "core_selected"
+    # The opening pair is one seat count. Scheduling the richer retry does not add another.
+    assert retried.metadata["core_candidates_compared"] == 4
 
     unresolved = _run_core(
         [("abstain", "insufficient_evidence"), ("abstain", "insufficient_evidence"), "c02"]
@@ -184,7 +186,7 @@ def test_a_sent_parse_failure_is_incomplete_and_not_an_abstention():
     assert recorded["decision"] == "incomplete"
     assert recorded["status"] == "incomplete"
     assert recorded["abstention_reason"] == ""
-    assert failed.metadata["core_candidates_compared"] == 2
+    assert failed.metadata["core_candidates_compared"] == 0
 
 
 def test_match_budget_keeps_a_definition_a_statement_and_counterevidence():

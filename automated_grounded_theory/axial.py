@@ -64,6 +64,7 @@ from automated_grounded_theory.decision_review import (
     CORE_PREFLIGHT_RULE,
     CORE_PROMPT_SCOPE_RULE,
     CORE_REQUEST_TOO_LARGE,
+    CORE_RESUME_STOP_RULE,
     CORE_STOP_REASON_RULE,
     CORE_TOKEN_ALLOWANCE_INSUFFICIENT,
     CORE_SCHEDULE_NOTE,
@@ -271,6 +272,7 @@ _PROCEDURE_KEYS = (
     "core_stop_reason_rule",
     "core_match_reuse_rule",
     "core_auto_size_rule",
+    "core_resume_stop_rule",
     "max_core_review_calls",
     "max_core_review_tokens",
     "auto_size_core_review",
@@ -3550,6 +3552,12 @@ _RESUMED_ALLOWANCE_STOPS = frozenset({
     CORE_CALL_ALLOWANCE_INSUFFICIENT,
     CORE_TOKEN_ALLOWANCE_INSUFFICIENT,
 })
+# Stops this visit can derive again. A saved copy is not evidence that they still apply.
+_INHERITED_CORE_STOPS = _RESUMED_ALLOWANCE_STOPS | frozenset({
+    CORE_PAIR_EXCEEDS_REQUEST_BUDGET,
+    "invalid_decision",
+    "review_error",
+})
 
 
 def _drop_cleared_allowance_stops(metadata: Mapping[str, Any], progress: dict[str, Any]) -> None:
@@ -3565,6 +3573,25 @@ def _drop_cleared_allowance_stops(metadata: Mapping[str, Any], progress: dict[st
         for item in (progress.get("stop_reasons") or [])
         if str(item) not in _RESUMED_ALLOWANCE_STOPS
     ]
+
+
+def _drop_inherited_core_stops(metadata: dict[str, Any], progress: dict[str, Any]) -> None:
+    """Clear stops a checkpoint carried in, then let this visit derive them.
+
+    ``_drop_cleared_allowance_stops`` removes a call or token stop only after
+    the continuation has already cleared ``decision_stop``. A non-allowance
+    stop such as ``core_pair_exceeds_request_budget`` stays on the plan and
+    ends the tournament after the next recorded match. This drops every stop
+    the current plan, preflight, or send can add back, including that one.
+    """
+    progress["stop_reasons"] = [
+        item
+        for item in (progress.get("stop_reasons") or [])
+        if str(item) not in _INHERITED_CORE_STOPS
+    ]
+    for key in ("decision_stop", "core_comparison_stop"):
+        if str(metadata.get(key) or "") in _INHERITED_CORE_STOPS:
+            metadata.pop(key, None)
 
 
 def _pair_key(pair: Mapping[str, Any]) -> tuple[str, str]:
@@ -6567,7 +6594,12 @@ def _record_core_match(
 
 
 def _count_core_attempt(progress: dict, round_index: int, seat_count: int) -> None:
-    """Count seats in a match that was sent. An abstention still counts."""
+    """Count seats in a match that received a substantive decision.
+
+    A recorded abstention counts. A failed call, an invalid decision, and the
+    scheduling of a richer retry do not. Those calls still count against the
+    allowance when they were sent.
+    """
     bracket = progress.get("core_bracket")
     if not isinstance(bracket, dict):
         return
@@ -6844,9 +6876,16 @@ def _core_token_ceiling(runtime: AxialRuntime, reviewer) -> int:
 
 
 def _core_policy_fingerprint() -> str:
-    """Policy identity for a core match. Call and token ceilings are not part of it."""
+    """Policy identity for a core match. Call and token ceilings are not part of it.
+
+    The resume-stop rule is not part of it either. Clearing an inherited stop
+    does not change a decision that was already validated, so a match stamped
+    before that rule still matches.
+    """
+    rules = review_procedure_fields()
+    rules.pop("core_resume_stop_rule", None)
     payload = {
-        "rules": review_procedure_fields(),
+        "rules": rules,
         "system_prompt": _AXIAL_REVIEW_SYSTEM,
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
@@ -7045,6 +7084,17 @@ def _reconcile_core_match_reuse(
         role = str(record.get("round_role") or "opening")
         chunk_index = record.get("chunk_index")
         chunk_count = record.get("chunk_count")
+        # An export written before fingerprints stored neither index nor count.
+        # Freeze the values used for this stamp. A later match must not change
+        # them, or the next visit treats the payload as new and sends it again.
+        resolved_index = (
+            int(chunk_index) if isinstance(chunk_index, int) and not isinstance(chunk_index, bool) else keep
+        )
+        resolved_count = (
+            int(chunk_count)
+            if isinstance(chunk_count, int) and not isinstance(chunk_count, bool)
+            else max(1, len(ordered))
+        )
         priors = [item for prior_round, item in kept_records if prior_round < round_index]
         payload = _core_live_payload(
             by_id,
@@ -7054,8 +7104,8 @@ def _reconcile_core_match_reuse(
             eligible_ids=eligible_ids,
             priors=priors,
             round_role=role,
-            chunk_index=int(chunk_index) if isinstance(chunk_index, int) and not isinstance(chunk_index, bool) else keep,
-            chunk_count=int(chunk_count) if isinstance(chunk_count, int) and not isinstance(chunk_count, bool) else max(1, len(ordered)),
+            chunk_index=resolved_index,
+            chunk_count=resolved_count,
             metadata=metadata,
             reviewer=reviewer,
             richer=bool(record.get("evidence_retry")),
@@ -7066,6 +7116,9 @@ def _reconcile_core_match_reuse(
         if not stored_payload or not stored_policy:
             record["payload_fingerprint"] = current
             record["policy_fingerprint"] = policy
+            record["chunk_index"] = resolved_index
+            record["chunk_count"] = resolved_count
+            record["round_role"] = role
             record["reuse"] = "unfingerprinted_export"
             unfingerprinted += 1
             updates.append((round_index, record_index, record))
@@ -7513,6 +7566,8 @@ async def _advance_core_review(
     metadata["core_stop_reason_rule"] = CORE_STOP_REASON_RULE
     metadata["core_match_reuse_rule"] = CORE_MATCH_REUSE_RULE
     metadata["core_auto_size_rule"] = CORE_AUTO_SIZE_RULE
+    metadata["core_resume_stop_rule"] = CORE_RESUME_STOP_RULE
+    _drop_inherited_core_stops(metadata, progress)
     metadata["core_matches_reused"] = int(progress.get("core_matches_reused") or 0)
     metadata["core_reuse_invalidated"] = str(progress.get("core_reuse_invalidated") or "")
     metadata["core_unfingerprinted_reused"] = int(progress.get("core_unfingerprinted_reused") or 0)
@@ -7939,7 +7994,6 @@ async def _advance_core_review(
         sent = parsed is None and audit and str(audit.get("status") or "") not in {"omitted", "refused", "not_sent"}
         if sent:
             note_chunk_send(progress, audit, estimate=int((audit or {}).get("estimated_input_tokens") or 0))
-            _count_core_attempt(progress, round_index, len(chunk_ids))
             _record_core_match(
                 progress,
                 round_index,
@@ -7990,7 +8044,6 @@ async def _advance_core_review(
             if can_retry:
                 progress["evidence_retried_matches"] = retried + [match_key]
                 progress["evidence_retry_ids"] = list(chunk_ids)
-                _count_core_attempt(progress, round_index, len(chunk_ids))
                 progress["open"] = True
                 metadata["decision_chunk_state"] = progress
                 _publish_core_bracket(metadata, progress)
@@ -8046,7 +8099,6 @@ async def _advance_core_review(
         metadata["decision_chunk_state"] = progress
         return {"core_candidates": candidates, "metadata": metadata, "prompt_log": logs, "warnings": warnings}
     if decision_name != "select" or chosen not in set(chunk_ids):
-        _count_core_attempt(progress, round_index, len(chunk_ids))
         _record_core_match(
             progress,
             round_index,

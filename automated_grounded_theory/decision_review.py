@@ -139,6 +139,8 @@ CORE_STOP_REASON_RULE = "request_call_or_token_v1"
 CORE_MATCH_REUSE_RULE = "reuse_validated_match_v1"
 # Auto-sizing the core allowance is off unless the caller turns it on.
 CORE_AUTO_SIZE_RULE = "bounded_core_auto_size_off_v1"
+# A stop saved on a checkpoint is derived again from this visit's plan and budgets.
+CORE_RESUME_STOP_RULE = "rederive_inherited_stops_v1"
 # A recorded condition must be a full clause. A bare pronoun is not a qualifier.
 CONDITION_COMPLETENESS_RULE = "full_clause_or_incomplete_v1"
 # A supported pattern under a complete condition stays eligible. Speculation does not.
@@ -247,6 +249,9 @@ CHUNKING_CHECKPOINT_MESSAGE = (
     "was priced before the first match, a shortfall stopped before spending unless "
     "partial execution was allowed, a request over the per-request cap was "
     "core_request_too_large, or the 0.9.37 rules, "
+    "or before an inherited core stop was derived again from the current bracket "
+    "and budgets, a reused match kept the chunk it was stamped with, a failed "
+    "call was not counted as a compared seat, or the 0.9.38 rules, "
     "or the stored chunk plan does not match this resume. Resume cannot continue "
     "that review. Start a new run."
 )
@@ -1045,6 +1050,7 @@ def review_procedure_fields() -> dict[str, str]:
         "core_stop_reason_rule": CORE_STOP_REASON_RULE,
         "core_match_reuse_rule": CORE_MATCH_REUSE_RULE,
         "core_auto_size_rule": CORE_AUTO_SIZE_RULE,
+        "core_resume_stop_rule": CORE_RESUME_STOP_RULE,
         "reread_coverage_rule": REREAD_COVERAGE_RULE,
         "reread_bound_rule": REREAD_BOUND_RULE,
         "case_identity_source_rule": CASE_IDENTITY_SOURCE_RULE,
@@ -2022,6 +2028,7 @@ def same_chunking_fingerprint(saved: Any, current: Any) -> bool:
         "core_stop_reason_rule": CORE_STOP_REASON_RULE,
         "core_match_reuse_rule": CORE_MATCH_REUSE_RULE,
         "core_auto_size_rule": CORE_AUTO_SIZE_RULE,
+        "core_resume_stop_rule": CORE_RESUME_STOP_RULE,
         "reread_coverage_rule": REREAD_COVERAGE_RULE,
         "reread_bound_rule": REREAD_BOUND_RULE,
         "case_identity_source_rule": CASE_IDENTITY_SOURCE_RULE,
