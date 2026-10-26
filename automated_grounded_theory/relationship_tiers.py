@@ -81,6 +81,9 @@ _CLAIM_FLAGS = frozenset(
         "frequency_qualified",
         "negation_does_not_reject_link",
         "shared_quote_inspect",
+        "condition_not_in_statement",
+        "condition_incomplete",
+        "no_review_decision",
     }
 )
 # Longer phrases are listed with the short ones. Matching keeps the longest
@@ -858,6 +861,83 @@ def _strip_discourse_asides(folded: str) -> str:
     return _norm("".join(pieces))
 
 
+_BARE_PRONOUNS = frozenset({
+    "i",
+    "you",
+    "he",
+    "she",
+    "it",
+    "we",
+    "they",
+    "me",
+    "him",
+    "her",
+    "us",
+    "them",
+    "one",
+})
+_CONDITION_MARKER_WORDS = (
+    "on condition that",
+    "provided that",
+    "providing that",
+    "as long as",
+    "so long as",
+    "only when",
+    "except when",
+    "except if",
+    "in case",
+    "assuming that",
+    "provided",
+    "providing",
+    "assuming",
+    "unless",
+    "whether",
+    "if",
+)
+
+
+def _condition_words(span: str) -> list[str]:
+    return re.findall(r"[a-z0-9']+", _norm(span))
+
+
+def condition_span_is_incomplete(span: str | None) -> bool:
+    """True when the span is only a connective plus one pronoun.
+
+    ``if you`` and ``unless you`` do not state a condition. ``if you help``
+    and ``if it rains`` do. A missing span is not an incomplete condition.
+    """
+    words = _condition_words(str(span or ""))
+    if len(words) < 2:
+        return False
+    marker = ""
+    for phrase in _CONDITION_MARKER_WORDS:
+        phrase_words = phrase.split()
+        if words[: len(phrase_words)] == phrase_words:
+            marker = phrase
+            break
+    if not marker:
+        return False
+    rest = words[len(marker.split()) :]
+    return len(rest) == 1 and rest[0] in _BARE_PRONOUNS
+
+
+def _condition_span_end(tail: str) -> int:
+    """End of the conditional clause.
+
+    A comma ends the clause only when the words before it are more than a
+    connective and a pronoun. ``if you, violated the agreement`` keeps going.
+    ``if it rains, the crew stops`` stops at the comma. ``.?!;`` always end it.
+    """
+    for index, char in enumerate(tail):
+        if char in ".?!;":
+            return index
+        if char == ",":
+            candidate = tail[:index].strip()
+            if candidate and not condition_span_is_incomplete(candidate):
+                return index
+    return len(tail)
+
+
 def _condition_text(clause: str) -> str | None:
     """The condition span that governs ``clause``, or None.
 
@@ -879,11 +959,7 @@ def _condition_text(clause: str) -> str | None:
         if marker in {"if", "whether"} and _EMBEDDED_CONDITION_RE.search(prefix):
             continue
         tail = stripped[match.start():]
-        end = len(tail)
-        for index, char in enumerate(tail):
-            if char in ".?!;,":
-                end = index
-                break
+        end = _condition_span_end(tail)
         span = _MATRIX_COPULA_RE.sub("", tail[:end]).strip()
         if span:
             return span
@@ -1167,7 +1243,21 @@ def _participant_link(
     condition = chosen.get("condition")
     statement = _norm(str(relationship.get("statement") or ""))
     retained = None
-    if condition:
+    incomplete = condition_span_is_incomplete(str(condition or "") or None)
+    chosen["condition_incomplete"] = True if incomplete else (False if condition else None)
+    if incomplete:
+        # A bare pronoun is not a qualifier and does not count as retained.
+        retained = None
+        qualifications = [
+            str(item)
+            for item in (chosen.get("qualifications") or [])
+            if str(item) != "condition_not_in_statement"
+        ]
+        if "condition_incomplete" not in qualifications:
+            qualifications.append("condition_incomplete")
+        chosen["qualifications"] = qualifications
+        chosen["authorizes_tier_3"] = False
+    elif condition:
         retained = _norm(str(condition)) in statement
         if not retained:
             qualifications = [str(item) for item in (chosen.get("qualifications") or [])]
@@ -1335,9 +1425,11 @@ def assess_relationship(
     counts_are_respondents = case_counts_are_respondents(identity_cases)
     wording_unit = "respondents" if counts_are_respondents else "documents"
     wording = allowed_wording(tier, len(both_cases) if tier >= 2 else None, unit=wording_unit)
+    raw_condition = participant.get("condition")
+    incomplete_condition = condition_span_is_incomplete(str(raw_condition or "") or None)
     presented, statement_keeps_condition = qualify_statement(
         str(relationship.get("statement") or ""),
-        participant.get("condition"),
+        None if incomplete_condition else raw_condition,
     )
     claims = _empty_claims()
     pattern_supported = tier >= 2
@@ -1381,7 +1473,8 @@ def assess_relationship(
         "claims": claims,
         "participant_link": participant if participant.get("present") else None,
         "condition": participant.get("condition"),
-        "condition_retained": participant.get("condition_retained"),
+        "condition_incomplete": True if incomplete_condition else (False if raw_condition else None),
+        "condition_retained": None if incomplete_condition else participant.get("condition_retained"),
         "presented_statement": presented,
         "statement_omits_condition": (
             None if statement_keeps_condition is None else statement_keeps_condition is False
@@ -1699,6 +1792,31 @@ def assign_relationship_eligibility(row: dict) -> str:
                 copied["supports_core"] = False
                 claims[key] = copied
         row["claims"] = claims
+    blocks = _eligibility_blocks(row)
+    flags = _unique_flags(row.get("flags") or [])
+    flags = [item for item in flags if item not in {"no_review_decision", "condition_incomplete"}]
+    if "incomplete_condition" in blocks:
+        flags.append("condition_incomplete")
+    if "no_review_decision" in blocks:
+        flags.append("no_review_decision")
+    row["flags"] = flags
+    row["eligibility_blocks"] = blocks
+    if blocks:
+        if str(row.get("eligibility_reason") or "") not in _FOCUS_ENDPOINT_FLAGS:
+            row["eligibility_reason"] = blocks[0]
+        row["downstream_eligible"] = False
+        if isinstance(claims, dict) and isinstance(pattern, Mapping):
+            pattern = dict(claims.get("pattern") or {})
+            pattern["downstream_eligible"] = False
+            pattern["supports_core"] = False
+            claims["pattern"] = pattern
+            row["claims"] = claims
+        row["core_support_component"] = None
+        blocked_use = HYPOTHESIS_EXPLORATION if use != WITHHELD_EVIDENCE else use
+        row["evidence_use"] = blocked_use
+        return blocked_use
+    if row.get("eligibility_reason") in {"incomplete_condition", "hypothetical_link", "no_review_decision"}:
+        row.pop("eligibility_reason", None)
     if row_ok and isinstance(pattern, Mapping) and pattern.get("supports_core"):
         row["core_support_component"] = "pattern"
     else:
@@ -1798,6 +1916,70 @@ def sync_validation_flags(row: dict) -> None:
     ]
 
 
+def _unique_flags(items: Sequence[Any]) -> list[str]:
+    found: list[str] = []
+    for item in items:
+        name = str(item or "")
+        if name and name not in found:
+            found.append(name)
+    return found
+
+
+def _has_review_decision(row: Mapping[str, Any]) -> bool:
+    """True when a reviewer recorded a disposition, or no review was in scope.
+
+    A row that carries ``reviewer_decided`` false, and no human or model
+    disposition, was left unreviewed. An evidence assessment that never
+    opened a review does not carry those fields and is not blocked here.
+    """
+    if row.get("reviewer_decided") is True:
+        return True
+    for key in ("human_disposition", "reviewer_disposition", "model_disposition"):
+        if str(row.get(key) or "").strip():
+            return True
+    if str(row.get("review_actor") or "").strip().casefold() in {"llm", "human"}:
+        return True
+    return not any(
+        key in row
+        for key in (
+            "reviewer_decided",
+            "review_actor",
+            "model_disposition",
+            "human_disposition",
+            "reviewer_disposition",
+            "review_history",
+        )
+    )
+
+
+def _eligibility_blocks(row: Mapping[str, Any]) -> list[str]:
+    """Causes that keep a row from counting as eligible.
+
+    No review decision, a hypothetical link, and an incomplete condition each
+    block eligibility. The list can carry more than one.
+    """
+    flags = {str(item) for item in (row.get("flags") or []) if str(item)}
+    claims = row.get("claims") if isinstance(row.get("claims"), Mapping) else {}
+    participant = claims.get("participant_explanation") if isinstance(claims.get("participant_explanation"), Mapping) else {}
+    blocks: list[str] = []
+    incomplete = (
+        row.get("condition_incomplete") is True
+        or participant.get("condition_incomplete") is True
+        or "condition_incomplete" in flags
+    )
+    if incomplete:
+        blocks.append("incomplete_condition")
+    hypothetical = (
+        "participant_link_hypothetical" in flags
+        or str(participant.get("status") or "") == "hypothetical"
+    )
+    if hypothetical:
+        blocks.append("hypothetical_link")
+    if not _has_review_decision(row):
+        blocks.append("no_review_decision")
+    return blocks
+
+
 def _claim_flags(claims: Mapping[str, Any]) -> list[str]:
     participant = claims.get("participant_explanation") if isinstance(claims.get("participant_explanation"), Mapping) else {}
     status = str(participant.get("status") or "")
@@ -1823,6 +2005,8 @@ def _claim_flags(claims: Mapping[str, Any]) -> list[str]:
         flags.append("participant_direction_unspecified")
     if "condition_not_in_statement" in qualifications:
         flags.append("condition_not_in_statement")
+    if "condition_incomplete" in qualifications or participant.get("condition_incomplete") is True:
+        flags.append("condition_incomplete")
     if status == "hypothetical":
         flags.append("participant_link_hypothetical")
     if status == "ambiguous":
@@ -1909,7 +2093,7 @@ def apply_evidence_tier(relationship: dict, **kwargs: Any) -> dict[str, Any]:
     claim_flags = _claim_flags(fields.get("claims") or {})
     if fields.get("shared_quote_inspect") and "shared_quote_inspect" not in claim_flags:
         claim_flags.append("shared_quote_inspect")
-    relationship["flags"] = flags + claim_flags
+    relationship["flags"] = _unique_flags(flags + claim_flags)
     if claim_flags:
         relationship["needs_review"] = True
     sync_validation_flags(relationship)

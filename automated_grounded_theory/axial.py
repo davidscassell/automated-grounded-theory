@@ -49,8 +49,9 @@ from automated_grounded_theory.backends import (
 )
 from automated_grounded_theory.batching import request_input_tokens, shrink_repair_messages
 from automated_grounded_theory.decision_review import (
-    CORE_CANDIDATES_DO_NOT_FIT,
+    CORE_BRACKET_INCOMPLETE,
     CORE_COMPARISON_RULE,
+    CORE_PAIR_EXCEEDS_REQUEST_BUDGET,
     DECISION_REVIEW_CHUNKING,
     PER_STEP_DECISION_REVIEW,
     DecisionChunkingCheckpointError,
@@ -58,9 +59,9 @@ from automated_grounded_theory.decision_review import (
     budget_ledger,
     build_core_comparison_plan,
     build_decision_plan,
+    partition_core_matches,
     finish_decision_report,
     load_chunk_progress,
-    merge_core_nominations,
     note_chunk_send,
     close_budget_step,
     note_token_preflight,
@@ -231,6 +232,10 @@ _PROCEDURE_KEYS = (
     "case_identity_source_rule",
     "case_count_rule",
     "reread_estimate_rule",
+    "condition_completeness_rule",
+    "eligibility_decision_rule",
+    "reread_coverage_rule",
+    "reread_bound_rule",
     "export_assessment_rule",
     "chunk_review_recovery",
     "one_document_one_respondent",
@@ -2929,6 +2934,10 @@ def export_axial_state(state: Mapping[str, Any], directory: str | Path) -> dict[
                 "model_core_id": (state.get("metadata") or {}).get("model_core_id") or "",
                 "core_candidates_eligible": (state.get("metadata") or {}).get("core_candidates_eligible"),
                 "core_candidates_compared": (state.get("metadata") or {}).get("core_candidates_compared"),
+                "core_candidates_compared_by_round": (state.get("metadata") or {}).get(
+                    "core_candidates_compared_by_round"
+                ),
+                "core_bracket": (state.get("metadata") or {}).get("core_bracket"),
                 "core_comparison_stop": (state.get("metadata") or {}).get("core_comparison_stop"),
                 "core_comparison_rule": (state.get("metadata") or {}).get("core_comparison_rule"),
             },
@@ -3224,19 +3233,11 @@ def _axial_token_plan(
     pool_requests = 0 if pool <= 0 else math.ceil(pool / batch)
     pool_estimate = (pool_requests + counter_calls + memo_calls + storyline_calls) * per_request
     shortfall = max(0, estimate - ceiling) if ceiling else 0
+    # The old warning compared this planning figure with max_axial_review_tokens
+    # as if 24000 were one shared ceiling. That sentence is not emitted.
+    # Decision steps keep their own allowances. The coding calls are still
+    # capped when they are sent. This record is not that cap.
     warning = ""
-    if ceiling and shortfall:
-        warning = (
-            "Axial coding-pool plan exceeds the shared coding allowance. "
-            f"The planning estimate for {planned} planned pairs is {estimate} and that pool's ceiling is {ceiling}, "
-            f"a shortfall of {shortfall}. "
-            "That pool covers proposals, counterexamples, memos, and the storyline. "
-            "It is not the per-step decision allowance. "
-            "Relation review, saturation review, and core selection each have their own allowance "
-            f"of {ceiling} and are not in this estimate. "
-            f"The raw pool estimate for {pool} unordered pairs is {pool_estimate} and is not the cap comparison. "
-            "This does not change the ceiling."
-        )
     return {
         "ceiling": ceiling,
         "per_request_budget": per_request,
@@ -3249,12 +3250,14 @@ def _axial_token_plan(
         "shortfall": shortfall,
         "warning": warning,
         "changes_default": False,
+        "coding_pool_bound_label": (
+            "Planning figure for proposal, counterexample, memo, and storyline calls. "
+            "It is not a warning, and it is not the per-step decision allowance."
+        ),
         "note": (
-            "Planning estimate only. max_axial_review_tokens is unchanged. "
-            "The package default remains 24000. This plan compares proposal, "
-            "counterexample, memo, and storyline calls with that number as their "
-            "shared pool. Relation review, saturation review, and core selection "
-            "each have their own allowance of the same number and are not in this estimate. "
+            "Planning estimate only. No ceiling warning is emitted. "
+            "max_axial_review_tokens stays 24000 per decision step. "
+            "Relation review, saturation review, and core selection are not in this estimate. "
             "The estimate uses pairs in this round. "
             "pool_estimate is the raw full-pool figure and is not a cap warning."
         ),
@@ -3343,7 +3346,12 @@ def _align_step_calls(runtime: AxialRuntime, metadata: Mapping[str, Any], step: 
     return int(allowance.stage_used.get(step, 0))
 
 
-_RESUMED_ALLOWANCE_STOPS = frozenset({"call_allowance", "token_allowance", "request_budget"})
+_RESUMED_ALLOWANCE_STOPS = frozenset({
+    "call_allowance",
+    "token_allowance",
+    "request_budget",
+    CORE_BRACKET_INCOMPLETE,
+})
 
 
 def _drop_cleared_allowance_stops(metadata: Mapping[str, Any], progress: dict[str, Any]) -> None:
@@ -6045,21 +6053,38 @@ def _load_category(state: AxialState) -> dict:
     return {"core_candidates": _score_candidates(state)}
 
 
-_CORE_REVIEW_INSTRUCTION = (
-    "The numbers on each candidate are the evidence. "
-    "graph_supported is true only for an endpoint of a relationship at tier 2 or higher. "
-    "pattern_supported_centrality, cases_covered, related_category_count, "
-    "contradicted_relationships, and qualified_relationships are counts, not a decision. "
-    "A proposed link or a tier-1 hypothesis does not make a core supported. "
-    "A choice without graph support is kept as model_core_id and flagged "
-    "core_unsupported_by_graph. It is not promoted. "
-    "core_stability is undefined below the recorded minimum n. "
-    "This request contains every eligible candidate. "
-    "Choose one code_id by comparing those candidates with each other. "
-    "Do not choose a core because only one candidate was supplied. "
-    "A request that does not contain every eligible candidate is not a comparison and is not sent. "
-    "You cannot set verified or authorize attribution wording."
-)
+def _core_match_instruction(*, whole_set: bool, match_size: int, eligible: int) -> str:
+    """Tell the model which comparison this request is.
+
+    A tournament match is not the whole eligible set. The model still has to
+    compare the candidates in front of it, and a one-candidate request is not
+    a reason to choose.
+    """
+    if whole_set:
+        scope = (
+            f"This request contains every eligible candidate ({int(eligible)}). "
+            "Choose one code_id by comparing those candidates with each other. "
+        )
+    else:
+        scope = (
+            f"This request is one match in a deterministic tournament ({int(match_size)} candidates). "
+            f"{int(eligible)} candidates are eligible. Other matches are separate requests. "
+            "Choose one code_id from the candidates in this request. That winner advances. "
+        )
+    return (
+        "The numbers on each candidate are the evidence. "
+        "graph_supported is true only for an endpoint of a relationship at tier 2 or higher. "
+        "pattern_supported_centrality, cases_covered, related_category_count, "
+        "contradicted_relationships, and qualified_relationships are counts, not a decision. "
+        "A proposed link or a tier-1 hypothesis does not make a core supported. "
+        "A choice without graph support is kept as model_core_id and flagged "
+        "core_unsupported_by_graph. It is not promoted. "
+        "core_stability is undefined below the recorded minimum n. "
+        + scope
+        + "Do not choose a core because only one candidate was supplied. "
+        "A one-candidate request is not a match unless it is the entire eligible set. "
+        "You cannot set verified or authorize attribution wording."
+    )
 
 
 def _core_review_payload(
@@ -6069,6 +6094,7 @@ def _core_review_payload(
     snapshot: Mapping[str, Any],
     chunk_index: int,
     chunk_count: int,
+    instruction: str | None = None,
 ) -> dict[str, Any]:
     present = {str(row.get("code_id") or "") for row in candidates}
     return {
@@ -6081,8 +6107,99 @@ def _core_review_payload(
             "count": int(chunk_count),
             "code_ids": [str(row.get("code_id") or "") for row in candidates],
         },
-        "instruction": _CORE_REVIEW_INSTRUCTION,
+        "instruction": instruction
+        or _core_match_instruction(whole_set=True, match_size=len(candidates), eligible=len(candidates)),
     }
+
+
+def _seed_core_bracket(progress: dict, plan: Mapping[str, Any]) -> None:
+    """Keep a resumed bracket. A new plan stores the first round."""
+    stored = progress.get("core_bracket")
+    if isinstance(stored, Mapping) and stored.get("rounds"):
+        return
+    rounds = []
+    for row in plan.get("core_bracket_rounds") or []:
+        if not isinstance(row, Mapping):
+            continue
+        rounds.append(
+            {
+                "matches": [list(match) for match in (row.get("matches") or [])],
+                "byes": [str(item) for item in (row.get("byes") or [])],
+                "winners": [str(item) for item in (row.get("winners") or [])],
+                "compared": int(row.get("compared") or 0),
+                "whole_set": bool(row.get("whole_set")),
+            }
+        )
+    progress["core_bracket"] = {
+        "eligible": int(plan.get("core_candidates_eligible") or 0),
+        "ordered_ids": [str(item) for item in (plan.get("ordered_ids") or [])],
+        "rounds": rounds,
+        "round_index": 0,
+    }
+
+
+def _publish_core_bracket(metadata: dict, progress: Mapping[str, Any]) -> None:
+    bracket = progress.get("core_bracket") if isinstance(progress.get("core_bracket"), Mapping) else {}
+    rounds = [dict(row) for row in (bracket.get("rounds") or []) if isinstance(row, Mapping)]
+    compared_by_round = [int(row.get("compared") or 0) for row in rounds]
+    metadata["core_bracket"] = {
+        "eligible": int(bracket.get("eligible") or 0),
+        "ordered_ids": [str(item) for item in (bracket.get("ordered_ids") or [])],
+        "rounds": rounds,
+        "round_index": int(bracket.get("round_index") or 0),
+    }
+    metadata["core_candidates_compared_by_round"] = compared_by_round
+    metadata["core_candidates_compared"] = sum(compared_by_round)
+    metadata["core_candidates_eligible"] = int(bracket.get("eligible") or metadata.get("core_candidates_eligible") or 0)
+
+
+def _open_next_core_round(progress: dict, estimate, *, per_request: int) -> None:
+    """After a round's matches, advance winners and byes or name the champion."""
+    bracket = progress.get("core_bracket")
+    if not isinstance(bracket, dict):
+        return
+    rounds = [dict(row) if isinstance(row, Mapping) else {} for row in (bracket.get("rounds") or [])]
+    index = int(bracket.get("round_index") or 0)
+    if index >= len(rounds):
+        return
+    current = dict(rounds[index])
+    matches = list(current.get("matches") or [])
+    winners = [str(item) for item in (current.get("winners") or []) if str(item)]
+    if len(winners) < len(matches):
+        return
+    byes = [str(item) for item in (current.get("byes") or []) if str(item)]
+    order = {item: pos for pos, item in enumerate(bracket.get("ordered_ids") or [])}
+    field = []
+    for item in winners + byes:
+        if item not in field:
+            field.append(item)
+    field.sort(key=lambda item: order.get(item, 10**9))
+    if len(field) <= 1:
+        progress["champion_id"] = field[0] if field else ""
+        bracket["rounds"] = rounds
+        progress["core_bracket"] = bracket
+        return
+    nxt = partition_core_matches(field, estimate, per_request=per_request)
+    if nxt.get("reason"):
+        add_stop_reason(progress, str(nxt["reason"]))
+        bracket["rounds"] = rounds
+        progress["core_bracket"] = bracket
+        return
+    rounds.append(
+        {
+            "matches": [list(match) for match in (nxt.get("matches") or [])],
+            "byes": [str(item) for item in (nxt.get("byes") or [])],
+            "winners": [],
+            "compared": 0,
+            "whole_set": bool(nxt.get("whole_set")),
+        }
+    )
+    bracket["round_index"] = index + 1
+    bracket["rounds"] = rounds
+    progress["core_bracket"] = bracket
+    progress["chunks"] = list(progress.get("chunks") or []) + [
+        list(match) for match in (nxt.get("matches") or [])
+    ]
 
 
 async def _advance_core_review(
@@ -6093,12 +6210,14 @@ async def _advance_core_review(
     metadata: dict[str, Any],
     logs: list,
 ) -> dict:
-    """Compare every eligible core candidate in one request, or withhold.
+    """Compare eligible core candidates in one deterministic tournament.
 
-    Candidate order is the evidence order from ``_score_candidates``. The
-    set is not split. A one-candidate request is sent only when that
-    candidate is the whole eligible set. If the set does not fit the
-    per-request budget, nothing is sent and no core is chosen.
+    Code-id order is the bracket order. A round's matches each hold at least
+    two candidates, unless the eligible set is one candidate. Winners and
+    byes advance until one request compares the finalists, or one finalist
+    remains. A match is not sent when the core step's call or token allowance
+    cannot finish it. No core is chosen from an unfinished bracket or from a
+    one-candidate chunk of a larger set.
     """
     reviewer = runtime.reviewer
     core_used = _align_step_calls(runtime, metadata, "axial_core_review")
@@ -6140,9 +6259,11 @@ async def _advance_core_review(
         max_calls=int(reviewer.max_calls),
     )
     progress = load_chunk_progress(metadata, plan)
+    _seed_core_bracket(progress, plan)
     metadata["core_comparison_rule"] = CORE_COMPARISON_RULE
     metadata["core_candidates_eligible"] = int(plan.get("core_candidates_eligible") or 0)
     metadata["core_candidates_compared"] = 0
+    metadata["core_candidates_compared_by_round"] = []
     if plan.get("core_comparison_reason"):
         metadata["core_comparison_stop"] = str(plan["core_comparison_reason"])
         metadata["decision_stop"] = str(plan["core_comparison_reason"])
@@ -6178,52 +6299,36 @@ async def _advance_core_review(
         uncovered = list(report.get("uncovered_ids") or [])
         metadata["core_uncovered_code_ids"] = uncovered
         metadata["core_chunk_order_selects"] = False
+        _publish_core_bracket(metadata, progress_row)
         if not report["complete"]:
             progress_row["open"] = True
             progress_row["provisional"] = True
             metadata["decision_chunk_state"] = progress_row
             stops = [str(item) for item in (progress_row.get("stop_reasons") or [])]
-            if CORE_CANDIDATES_DO_NOT_FIT in stops:
-                metadata["model_core_id"] = ""
-                metadata["model_core_judgment"] = False
-                metadata["core_candidates_compared"] = 0
-                metadata["provisional_core_id"] = ""
-                metadata["core_selection_truncated"] = True
-                metadata["core_selection_withheld"] = True
-                metadata["core_status"] = "withheld"
-                metadata["core_downstream_eligible"] = False
-                metadata["decision_stop"] = CORE_CANDIDATES_DO_NOT_FIT
-                eligible = int(metadata.get("core_candidates_eligible") or len(candidates))
-                warnings.append(
-                    "Core selection was not applied. The eligible candidates do not fit one request. "
-                    f"{eligible} candidates were eligible and 0 were compared."
-                )
-                return {
-                    "core_candidates": candidates,
-                    "metadata": metadata,
-                    "prompt_log": logs,
-                    "warnings": warnings,
-                }
-            merged = merge_core_nominations(candidates, nominations)
             metadata["model_core_id"] = ""
             metadata["model_core_judgment"] = False
-            metadata["provisional_core_id"] = str(merged.get("core_id") or unknown or "")
+            metadata["provisional_core_id"] = ""
             metadata["core_selection_truncated"] = True
             metadata["core_selection_withheld"] = True
-            metadata["core_status"] = "provisional"
+            metadata["core_status"] = "withheld"
             metadata["core_downstream_eligible"] = False
+            if not metadata.get("decision_stop") and stops:
+                metadata["decision_stop"] = stops[0]
+            metadata["core_comparison_stop"] = str(metadata.get("decision_stop") or "")
+            eligible = int(metadata.get("core_candidates_eligible") or len(candidates))
+            compared = int(metadata.get("core_candidates_compared") or 0)
+            warnings.append(
+                "Core selection was not applied. The tournament did not finish. "
+                f"{eligible} candidates were eligible and {compared} seats were compared."
+            )
+            for row in candidates:
+                row["model_core"] = False
             metadata["core_resume"] = {
                 "resumable": True,
                 "next_index": int(progress_row.get("next_index") or 0),
                 "plan_hash": str(progress_row.get("plan_hash") or ""),
                 "uncovered_code_ids": uncovered,
             }
-            for row in candidates:
-                row["model_core"] = False
-            warnings.append(
-                "Core selection is provisional and was not applied. "
-                f"{len(uncovered)} candidates were not reviewed."
-            )
             return {
                 "core_candidates": candidates,
                 "metadata": metadata,
@@ -6255,11 +6360,14 @@ async def _advance_core_review(
                 "prompt_log": logs,
                 "warnings": warnings,
             }
-        merged = merge_core_nominations(candidates, nominations)
-        chosen = str(merged.get("core_id") or "")
+        chosen = str(progress_row.get("champion_id") or "")
+        if not chosen and len(nominations) == 1:
+            chosen = nominations[-1]
         if chosen:
             metadata["model_core_id"] = chosen
-            metadata["model_core_rationale"] = str(progress_row.get("rationale") or "Merged from core-review chunks by evidence tier.")
+            metadata["model_core_rationale"] = str(
+                progress_row.get("rationale") or "Chosen by the final match of the core tournament."
+            )
             metadata["model_core_judgment"] = True
             _note_core_support(state, metadata, chosen)
             if metadata.get("core_unsupported_by_graph") and preferred and chosen not in preferred:
@@ -6278,32 +6386,49 @@ async def _advance_core_review(
     chunks = list(progress.get("chunks") or [])
     warnings = list(state.get("warnings") or [])
     if index >= len(chunks):
-        return _finish_choice(progress, warnings)
+        _open_next_core_round(progress, estimate, per_request=int(reviewer.token_budget))
+        chunks = list(progress.get("chunks") or [])
+        if progress.get("stop_reasons") or progress.get("champion_id") or index >= len(chunks):
+            return _finish_choice(progress, warnings)
     chunk_ids = [str(item) for item in chunks[index]]
     eligible_n = int(metadata.get("core_candidates_eligible") or 0)
-    if eligible_n and (len(chunks) != 1 or len(chunk_ids) != eligible_n):
-        add_stop_reason(progress, CORE_CANDIDATES_DO_NOT_FIT)
-        metadata["decision_stop"] = CORE_CANDIDATES_DO_NOT_FIT
-        metadata["core_comparison_stop"] = CORE_CANDIDATES_DO_NOT_FIT
-        metadata["core_candidates_compared"] = 0
-        progress["next_index"] = len(chunks)
+    bracket = progress.get("core_bracket") if isinstance(progress.get("core_bracket"), Mapping) else {}
+    round_index = int(bracket.get("round_index") or 0)
+    rounds = list(bracket.get("rounds") or [])
+    whole_set = bool(rounds and rounds[round_index].get("whole_set")) if round_index < len(rounds) else False
+    if len(chunk_ids) < 2 and eligible_n != 1:
+        add_stop_reason(progress, CORE_BRACKET_INCOMPLETE)
+        metadata["decision_stop"] = CORE_BRACKET_INCOMPLETE
+        metadata["core_comparison_stop"] = CORE_BRACKET_INCOMPLETE
         return _finish_choice(progress, warnings)
     subset = [by_id[item] for item in chunk_ids if item in by_id]
-    only_full_chunk = len(chunks) == 1 and not progress.get("omissions")
     payload = _core_review_payload(
         subset,
         preferred=preferred,
         snapshot=snapshot,
         chunk_index=index,
         chunk_count=len(chunks),
+        instruction=_core_match_instruction(
+            whole_set=whole_set,
+            match_size=len(chunk_ids),
+            eligible=eligible_n,
+        ),
     )
     stop, _estimate = reviewer.refusal_reason(payload, ModelCoreDecision, metadata)
     if stop == "request_budget":
-        add_stop_reason(progress, CORE_CANDIDATES_DO_NOT_FIT)
-        metadata["decision_stop"] = CORE_CANDIDATES_DO_NOT_FIT
-        metadata["core_comparison_stop"] = CORE_CANDIDATES_DO_NOT_FIT
-        metadata["core_candidates_compared"] = 0
-        progress["next_index"] = len(chunks)
+        add_stop_reason(progress, CORE_PAIR_EXCEEDS_REQUEST_BUDGET)
+        metadata["decision_stop"] = CORE_PAIR_EXCEEDS_REQUEST_BUDGET
+        metadata["core_comparison_stop"] = CORE_PAIR_EXCEEDS_REQUEST_BUDGET
+        return _finish_choice(progress, warnings)
+    calls_sent = int(progress.get("calls") or 0)
+    tokens_sent = int(progress.get("tokens_estimated") or 0)
+    if calls_sent and (
+        calls_sent >= int(reviewer.max_calls)
+        or (int(reviewer.max_tokens) and tokens_sent + int(_estimate or 0) > int(reviewer.max_tokens))
+    ):
+        add_stop_reason(progress, CORE_BRACKET_INCOMPLETE)
+        metadata["decision_stop"] = CORE_BRACKET_INCOMPLETE
+        metadata["core_comparison_stop"] = CORE_BRACKET_INCOMPLETE
         return _finish_choice(progress, warnings)
     parsed, audit = await reviewer.decide(payload, ModelCoreDecision, metadata)
     if audit:
@@ -6311,21 +6436,32 @@ async def _advance_core_review(
         _record_audit_usage(metadata, audit)
     if stop or parsed is None:
         reason = stop or str(metadata.get("decision_stop") or "review_error")
+        if calls_sent and reason in {"call_allowance", "token_allowance"}:
+            reason = CORE_BRACKET_INCOMPLETE
         add_stop_reason(progress, reason)
+        metadata["decision_stop"] = reason
+        metadata["core_comparison_stop"] = reason
         if parsed is None and audit and str(audit.get("status") or "") not in {"omitted", "refused", "not_sent"}:
             note_chunk_send(progress, audit, estimate=int((audit or {}).get("estimated_input_tokens") or 0))
         progress["next_index"] = index
         return _finish_choice(progress, warnings)
     note_chunk_send(progress, audit, estimate=int((audit or {}).get("estimated_input_tokens") or 0))
-    metadata["core_candidates_compared"] = len(chunk_ids)
     chosen = str(parsed.get("core_id") or "")
     progress["rationale"] = str(parsed.get("rationale") or progress.get("rationale") or "")
     if chosen in set(chunk_ids):
         progress["nominations"] = list(progress.get("nominations") or []) + [chosen]
         progress["reviewed_ids"] = list(progress.get("reviewed_ids") or []) + chunk_ids
         progress["chunks_validated"] = int(progress.get("chunks_validated") or 0) + 1
+        if round_index < len(rounds):
+            current = dict(rounds[round_index])
+            current["winners"] = [str(item) for item in (current.get("winners") or [])] + [chosen]
+            current["compared"] = int(current.get("compared") or 0) + len(chunk_ids)
+            rounds[round_index] = current
+            bracket = dict(bracket)
+            bracket["rounds"] = rounds
+            progress["core_bracket"] = bracket
         metadata.pop("decision_stop", None)
-    elif only_full_chunk:
+    elif whole_set:
         progress["unknown_nomination"] = chosen
         progress["reviewed_ids"] = list(progress.get("reviewed_ids") or []) + chunk_ids
         progress["chunks_validated"] = int(progress.get("chunks_validated") or 0) + 1
@@ -6334,11 +6470,13 @@ async def _advance_core_review(
         add_stop_reason(progress, "invalid_decision")
         progress["invalid_chunks"] = int(progress.get("invalid_chunks") or 0) + 1
         metadata["decision_stop"] = "invalid_decision"
-        progress["next_index"] = len(chunks)
+        metadata["core_comparison_stop"] = "invalid_decision"
         return _finish_choice(progress, warnings)
     progress["next_index"] = index + 1
+    _open_next_core_round(progress, estimate, per_request=int(reviewer.token_budget))
+    _publish_core_bracket(metadata, progress)
     metadata["decision_chunk_state"] = progress
-    if progress["next_index"] >= len(chunks):
+    if progress.get("stop_reasons") or progress.get("champion_id") or progress["next_index"] >= len(progress.get("chunks") or []):
         return _finish_choice(progress, warnings)
     progress["open"] = True
     metadata["decision_chunk_state"] = progress

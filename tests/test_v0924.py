@@ -46,8 +46,8 @@ from tests.test_v080 import FakeAxialCoder, _corpus
 
 
 def test_version_and_defaults_stay_put():
-    assert __version__ == "0.9.33"
-    assert POLICY_VERSION == "0.9.33"
+    assert __version__ == "0.9.34"
+    assert POLICY_VERSION == "0.9.34"
     assert DECISION_REVIEW_CHUNKING == "request_budget_v6"
     assert PATTERN_MIN_CASES == 2
     assert DEFAULT_MAX_AXIAL_REVIEW_TOKENS == 24000
@@ -447,7 +447,7 @@ def test_oversized_candidate_list_makes_core_selection_calls():
     assert finished.metadata["model_core_judgment"] is not True
     assert finished.metadata["core_candidates_compared"] == 0
     assert finished.metadata["core_candidates_eligible"] > 1
-    assert finished.metadata["decision_stop"] == "core_candidates_do_not_fit"
+    assert finished.metadata["decision_stop"] == "core_pair_exceeds_request_budget"
     assert finished.metadata["core_selection_withheld"] is True
     assert finished.metadata["core_downstream_eligible"] is False
     assert finished.metadata["performance"]["batch_size"] == 1
@@ -471,7 +471,7 @@ def test_oversized_candidate_list_makes_core_selection_calls():
     assert truncated.metadata["model_core_id"] == ""
     assert truncated.metadata["core_candidates_compared"] == 0
     assert truncated.metadata["core_downstream_eligible"] is False
-    assert truncated.metadata["decision_stop"] == "core_candidates_do_not_fit"
+    assert truncated.metadata["decision_stop"] == "core_pair_exceeds_request_budget"
     assert truncated.metadata["complete"] is False
 
 
