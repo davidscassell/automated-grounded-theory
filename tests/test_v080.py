@@ -328,8 +328,8 @@ def _run(model=None, **kwargs):
 
 
 def test_version_and_graphs():
-    assert __version__ == "0.9.34"
-    assert POLICY_VERSION == "0.9.34"
+    assert __version__ == "0.9.35"
+    assert POLICY_VERSION == "0.9.35"
     from automated_grounded_theory.axial import aaxial_code
 
     assert inspect.signature(aaxial_code).parameters["batch_size"].default == 1
@@ -693,11 +693,12 @@ def test_selective_human_and_llm_stay_separate(tmp_path):
     assert empty_memo.memos[0]["text"] == ""
     llm = selective_code(source, FakeAxialCoder(core_id="missing-core"), seed=3, decision_mode="llm", interrupt=True)
     assert llm.interrupted is False
-    assert llm.model_core_id == "missing-core"
+    assert llm.model_core_id == ""
     assert llm.researcher_core_id == ""
-    assert llm.metadata["model_core_judgment"] is True
-    assert llm.metadata["model_core_unknown"] is True
-    assert any("not a candidate" in note for note in llm.warnings)
+    assert llm.metadata["decision_stop"] == "invalid_decision"
+    assert llm.metadata["core_status"] == "withheld"
+    assert llm.metadata.get("model_core_unknown") is not True
+    assert not any("was kept and flagged" in note for note in llm.warnings)
     core_saver = InMemorySaver()
     selective_code(
         source,

@@ -21,7 +21,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.errors import GraphRecursionError, NodeTimeoutError
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, RetryPolicy, interrupt
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from typing_extensions import Literal, TypedDict
 
 from automated_grounded_theory.async_support import (
@@ -51,7 +51,11 @@ from automated_grounded_theory.batching import request_input_tokens, shrink_repa
 from automated_grounded_theory.decision_review import (
     CORE_BRACKET_INCOMPLETE,
     CORE_COMPARISON_RULE,
+    CORE_EVIDENCE_SUMMARY_RULE,
+    CORE_FINAL_DECISION_RULE,
     CORE_PAIR_EXCEEDS_REQUEST_BUDGET,
+    CORE_PROMPT_SCOPE_RULE,
+    CORE_SCHEDULE_NOTE,
     DECISION_REVIEW_CHUNKING,
     PER_STEP_DECISION_REVIEW,
     DecisionChunkingCheckpointError,
@@ -84,6 +88,8 @@ from automated_grounded_theory.saturation import (
 )
 from automated_grounded_theory.graph_grounding import (
     CORE_STABILITY_MIN_N,
+    DEFAULT_CORE_EVIDENCE_TOKEN_CAP,
+    candidate_evidence_summary,
     contradicted as _row_contradicted,
     core_agreement,
     graph_snapshot,
@@ -234,6 +240,10 @@ _PROCEDURE_KEYS = (
     "reread_estimate_rule",
     "condition_completeness_rule",
     "eligibility_decision_rule",
+    "core_final_decision_rule",
+    "core_prompt_scope_rule",
+    "condition_pattern_rule",
+    "core_evidence_summary_rule",
     "reread_coverage_rule",
     "reread_bound_rule",
     "export_assessment_rule",
@@ -363,9 +373,29 @@ class ModelSaturationDecision(BaseModel):
 
 
 class ModelCoreDecision(BaseModel):
+    """A core choice, or an explicit abstention.
+
+    ``select`` names one candidate. ``abstain`` names none. An empty
+    ``core_id`` is not a selection and it is not an implicit abstention.
+    """
+
     model_config = ConfigDict(extra="forbid")
-    core_id: str
+    decision: Literal["select", "abstain"] = "select"
+    core_id: str = ""
     rationale: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _decision_agrees_with_core(self) -> "ModelCoreDecision":
+        named = str(self.core_id or "").strip()
+        if self.decision == "abstain":
+            if named:
+                raise ValueError("An abstention cannot name a core_id.")
+            self.core_id = ""
+            return self
+        if not named:
+            raise ValueError("A selection must name a core_id.")
+        self.core_id = named
+        return self
 
 
 class AxialState(TypedDict, total=False):
@@ -2671,12 +2701,67 @@ def _core_candidate_request(
     return "caller_codebook", None
 
 
+def _core_evidence_enabled(value: Any) -> bool:
+    if value is None:
+        return True
+    return bool(value)
+
+
+def _core_evidence_cap(value: Any) -> int:
+    try:
+        cap = int(DEFAULT_CORE_EVIDENCE_TOKEN_CAP if value is None else value)
+    except (TypeError, ValueError):
+        cap = DEFAULT_CORE_EVIDENCE_TOKEN_CAP
+    return max(1, cap)
+
+
+def _core_evidence_settings(metadata: Mapping[str, Any], candidate_count: int) -> tuple[bool, int]:
+    """Whether summaries are on, and the per-candidate cap that fits the allowance.
+
+    The cap is the configured value, shrunk so the candidates together stay
+    inside a quarter of the smaller of the per-request budget and the
+    per-step allowance. A missing setting leaves summaries on at 80 tokens.
+    """
+    procedure = metadata.get("procedure") if isinstance(metadata.get("procedure"), Mapping) else {}
+    performance = metadata.get("performance") if isinstance(metadata.get("performance"), Mapping) else {}
+    enabled = procedure.get("core_evidence_summaries", True)
+    if enabled is None:
+        enabled = True
+    try:
+        cap = int(procedure.get("core_evidence_token_cap") or DEFAULT_CORE_EVIDENCE_TOKEN_CAP)
+    except (TypeError, ValueError):
+        cap = DEFAULT_CORE_EVIDENCE_TOKEN_CAP
+    cap = max(1, cap)
+    try:
+        per_request = int(performance.get("axial_token_budget") or 6000)
+    except (TypeError, ValueError):
+        per_request = 6000
+    try:
+        per_step = int(procedure.get("max_axial_review_tokens") or DEFAULT_MAX_AXIAL_REVIEW_TOKENS)
+    except (TypeError, ValueError):
+        per_step = DEFAULT_MAX_AXIAL_REVIEW_TOKENS
+    limits = [value for value in (per_request, per_step) if value > 0]
+    allowance = min(limits) if limits else 0
+    count = max(0, int(candidate_count))
+    if allowance and count:
+        room = max(1, allowance // 4)
+        if cap * count > room:
+            cap = max(1, room // count)
+    return bool(enabled), cap
+
+
 def _score_candidates(state: Mapping[str, Any]) -> list[dict[str, Any]]:
     book = state.get("codebook") or {}
     metadata = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
     allowed = metadata.get("focused_category_ids")
     allowed_ids = None if allowed is None else {str(item) for item in allowed}
     relationships = [row for row in (state.get("relationships") or []) if isinstance(row, Mapping)]
+    candidate_count = sum(
+        1
+        for code_id in book
+        if allowed_ids is None or str(code_id) in allowed_ids
+    )
+    summaries_on, evidence_cap = _core_evidence_settings(metadata, candidate_count)
     passages = _by_passage(state)
     rows = []
     for code_id, entry in book.items():
@@ -2722,10 +2807,24 @@ def _score_candidates(state: Mapping[str, Any]) -> list[dict[str, Any]]:
             for row in list(state.get("properties") or []) + list(state.get("dimensions") or [])
             if str(row.get("category_id") or "") == code_id
         ]
+        definition = str(entry.get("definition") or "") if isinstance(entry, Mapping) else ""
+        if summaries_on:
+            summary = candidate_evidence_summary(
+                definition=definition,
+                relationships=proposed,
+                token_cap=evidence_cap,
+            )
+            extra_tokens = int(summary["tokens"])
+        else:
+            summary = None
+            extra_tokens = 0
         rows.append(
             {
                 "code_id": code_id,
                 "code": entry.get("code") if isinstance(entry, Mapping) else entry,
+                "evidence_summary": summary,
+                "core_evidence_extra_tokens_per_candidate": extra_tokens,
+                "core_evidence_improves_selection": None,
                 "proposed_centrality": len(proposed),
                 "accepted_centrality": len(accepted),
                 "pattern_supported_centrality": len(supported),
@@ -6053,37 +6152,258 @@ def _load_category(state: AxialState) -> dict:
     return {"core_candidates": _score_candidates(state)}
 
 
-def _core_match_instruction(*, whole_set: bool, match_size: int, eligible: int) -> str:
+_PRIOR_RATIONALE_CHARS = 240
+
+
+def _truncate_rationale(text: str) -> str:
+    raw = " ".join(str(text or "").split())
+    if len(raw) <= _PRIOR_RATIONALE_CHARS:
+        return raw
+    return raw[: _PRIOR_RATIONALE_CHARS - 1].rstrip() + "…"
+
+
+def _core_comparison_scope(
+    *,
+    match_ids: Sequence[str],
+    eligible_ids: Sequence[str],
+    round_role: str,
+    prior_rationales: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Name the original eligible set, this round, and the finalists separately.
+
+    ``contains_every_eligible_candidate`` is true only when this request's ids
+    are the original eligible set. A later final of two is not that set.
+    """
+    eligible = [str(item) for item in eligible_ids if str(item)]
+    match = [str(item) for item in match_ids if str(item)]
+    contains = bool(eligible) and set(match) == set(eligible) and len(match) == len(eligible)
+    role = str(round_role or "opening")
+    if role not in {"opening", "continuation", "final"}:
+        role = "opening"
+    priors = []
+    for item in prior_rationales or []:
+        if not isinstance(item, Mapping):
+            continue
+        priors.append(
+            {
+                "match": [str(part) for part in (item.get("match") or []) if str(part)],
+                "winner": str(item.get("winner") or ""),
+                "decision": str(item.get("decision") or ""),
+                "rationale": _truncate_rationale(str(item.get("rationale") or "")),
+            }
+        )
+    return {
+        "eligible_total": len(eligible),
+        "eligible_ids": eligible,
+        "round_role": role,
+        "match_ids": match,
+        "finalists": list(match) if role == "final" else [],
+        "contains_every_eligible_candidate": contains,
+        "prior_match_rationales": priors,
+    }
+
+
+def _core_match_instruction(
+    *,
+    match_ids: Sequence[str],
+    eligible_ids: Sequence[str],
+    round_role: str,
+    prior_rationales: Sequence[Mapping[str, Any]] | None = None,
+) -> str:
     """Tell the model which comparison this request is.
 
-    A tournament match is not the whole eligible set. The model still has to
-    compare the candidates in front of it, and a one-candidate request is not
-    a reason to choose.
+    The original eligible count, the round, and the ids in this request are
+    separate. A final of two does not say it contains every eligible candidate.
     """
-    if whole_set:
-        scope = (
-            f"This request contains every eligible candidate ({int(eligible)}). "
-            "Choose one code_id by comparing those candidates with each other. "
-        )
+    scope = _core_comparison_scope(
+        match_ids=match_ids,
+        eligible_ids=eligible_ids,
+        round_role=round_role,
+        prior_rationales=prior_rationales,
+    )
+    role = str(scope["round_role"])
+    match_text = ", ".join(scope["match_ids"])
+    contained = str(scope["contains_every_eligible_candidate"]).lower()
+    lines = [
+        "The numbers on each candidate are the evidence. ",
+        "graph_supported is true only for an endpoint of a relationship at tier 2 or higher. ",
+        "pattern_supported_centrality, cases_covered, related_category_count, ",
+        "contradicted_relationships, and qualified_relationships are counts, not a decision. ",
+        "A proposed link or a tier-1 hypothesis does not make a core supported. ",
+        "A choice without graph support is kept as model_core_id and flagged ",
+        "core_unsupported_by_graph. It is not promoted. ",
+        "core_stability is undefined below the recorded minimum n. ",
+        f"The original eligible set has {scope['eligible_total']} candidates. ",
+        f"This round is {role}. ",
+        f"This request compares {len(scope['match_ids'])} candidates: {match_text}. ",
+        f"contains_every_eligible_candidate is {contained}. ",
+    ]
+    if role == "final":
+        lines.append(f"The finalists are {match_text}. ")
+        if scope["contains_every_eligible_candidate"]:
+            lines.append("This request compares the finalists, who are the original eligible set. ")
+        else:
+            lines.append(
+                "This request does not contain every originally eligible candidate "
+                f"({scope['eligible_total']}). "
+            )
     else:
-        scope = (
-            f"This request is one match in a deterministic tournament ({int(match_size)} candidates). "
-            f"{int(eligible)} candidates are eligible. Other matches are separate requests. "
-            "Choose one code_id from the candidates in this request. That winner advances. "
+        lines.append("This request is not the final. The winner of this match advances. ")
+        lines.append(
+            "This request does not contain every originally eligible candidate "
+            f"({scope['eligible_total']}). "
         )
-    return (
-        "The numbers on each candidate are the evidence. "
-        "graph_supported is true only for an endpoint of a relationship at tier 2 or higher. "
-        "pattern_supported_centrality, cases_covered, related_category_count, "
-        "contradicted_relationships, and qualified_relationships are counts, not a decision. "
-        "A proposed link or a tier-1 hypothesis does not make a core supported. "
-        "A choice without graph support is kept as model_core_id and flagged "
-        "core_unsupported_by_graph. It is not promoted. "
-        "core_stability is undefined below the recorded minimum n. "
-        + scope
-        + "Do not choose a core because only one candidate was supplied. "
+    if scope["prior_match_rationales"]:
+        lines.append("Earlier match rationales: ")
+        for item in scope["prior_match_rationales"]:
+            label = ", ".join(item["match"])
+            winner = item["winner"] or "no winner"
+            lines.append(f"{label} chose {winner}. {item['rationale']} ")
+    lines.append(
+        "Choose one code_id from the candidates in this request, or abstain with an empty core_id. "
+        "An abstention chooses no core. "
+        "Do not choose a core because only one candidate was supplied. "
         "A one-candidate request is not a match unless it is the entire eligible set. "
         "You cannot set verified or authorize attribution wording."
+    )
+    return "".join(lines)
+
+
+def _core_round_role(
+    bracket: Mapping[str, Any],
+    round_index: int,
+    match_ids: Sequence[str],
+    eligible_ids: Sequence[str],
+) -> str:
+    """``opening``, ``continuation``, or ``final`` for the match about to be sent."""
+    eligible = [str(item) for item in eligible_ids if str(item)]
+    match = [str(item) for item in match_ids if str(item)]
+    if eligible and set(match) == set(eligible) and len(match) == len(eligible):
+        return "final"
+    rounds = list(bracket.get("rounds") or [])
+    current = dict(rounds[round_index]) if round_index < len(rounds) and isinstance(rounds[round_index], Mapping) else {}
+    matches = list(current.get("matches") or [])
+    winners = [str(item) for item in (current.get("winners") or []) if str(item)]
+    byes = [str(item) for item in (current.get("byes") or []) if str(item)]
+    if len(matches) - (len(winners) + 1) > 0:
+        return "opening" if int(round_index) == 0 else "continuation"
+    projected = len(winners) + 1 + len(byes)
+    if projected <= 1:
+        return "final"
+    return "opening" if int(round_index) == 0 else "continuation"
+
+
+def _prior_core_rationales(bracket: Mapping[str, Any], round_index: int) -> list[dict[str, Any]]:
+    found = []
+    for index, row in enumerate(bracket.get("rounds") or []):
+        if index > int(round_index) or not isinstance(row, Mapping):
+            continue
+        for item in row.get("match_records") or []:
+            if isinstance(item, Mapping):
+                found.append(dict(item))
+    return found
+
+
+def _record_core_match(
+    progress: dict,
+    round_index: int,
+    *,
+    match: Sequence[str],
+    winner: str,
+    decision: str,
+    rationale: str,
+) -> None:
+    bracket = progress.get("core_bracket")
+    if not isinstance(bracket, dict):
+        return
+    rounds = [dict(row) if isinstance(row, Mapping) else {} for row in (bracket.get("rounds") or [])]
+    if round_index >= len(rounds):
+        return
+    current = dict(rounds[round_index])
+    records = [dict(item) for item in (current.get("match_records") or []) if isinstance(item, Mapping)]
+    records.append(
+        {
+            "match": [str(item) for item in match],
+            "winner": str(winner or ""),
+            "decision": str(decision or ""),
+            "rationale": str(rationale or ""),
+        }
+    )
+    current["match_records"] = records
+    rounds[round_index] = current
+    bracket = dict(bracket)
+    bracket["rounds"] = rounds
+    progress["core_bracket"] = bracket
+
+
+def _core_match_request(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    preferred: Sequence[str],
+    snapshot: Mapping[str, Any],
+    chunk_index: int,
+    chunk_count: int,
+    match_ids: Sequence[str],
+    eligible_ids: Sequence[str],
+    round_role: str,
+    prior_rationales: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """The core request that will be sent, including its comparison scope."""
+    payload = _core_review_payload(
+        candidates,
+        preferred=preferred,
+        snapshot=snapshot,
+        chunk_index=chunk_index,
+        chunk_count=chunk_count,
+        instruction=_core_match_instruction(
+            match_ids=match_ids,
+            eligible_ids=eligible_ids,
+            round_role=round_role,
+            prior_rationales=prior_rationales,
+        ),
+    )
+    payload["comparison_scope"] = _core_comparison_scope(
+        match_ids=match_ids,
+        eligible_ids=eligible_ids,
+        round_role=round_role,
+        prior_rationales=prior_rationales,
+    )
+    return payload
+
+
+def _core_match_upper_bound(
+    candidates: Sequence[Mapping[str, Any]],
+    ids: Sequence[str],
+    *,
+    preferred: Sequence[str],
+    snapshot: Mapping[str, Any],
+    eligible_ids: Sequence[str],
+) -> dict[str, Any]:
+    """A final-shaped request with one full prior rationale.
+
+    Later rounds quote earlier rationales. Pricing every match as a final
+    with that reserved rationale keeps the first-round plan from sending a
+    match the final cannot fit.
+    """
+    match_ids = [str(item) for item in ids if str(item)]
+    prior = [
+        {
+            "match": match_ids[:2] or match_ids,
+            "winner": match_ids[0] if match_ids else "",
+            "decision": "select",
+            "rationale": "m" * _PRIOR_RATIONALE_CHARS,
+        }
+    ]
+    return _core_match_request(
+        candidates,
+        preferred=preferred,
+        snapshot=snapshot,
+        chunk_index=10**6,
+        chunk_count=10**6,
+        match_ids=match_ids,
+        eligible_ids=eligible_ids,
+        round_role="final",
+        prior_rationales=prior,
     )
 
 
@@ -6108,7 +6428,11 @@ def _core_review_payload(
             "code_ids": [str(row.get("code_id") or "") for row in candidates],
         },
         "instruction": instruction
-        or _core_match_instruction(whole_set=True, match_size=len(candidates), eligible=len(candidates)),
+        or _core_match_instruction(
+            match_ids=[str(row.get("code_id") or "") for row in candidates],
+            eligible_ids=[str(row.get("code_id") or "") for row in candidates],
+            round_role="final",
+        ),
     }
 
 
@@ -6242,12 +6566,14 @@ async def _advance_core_review(
     def estimate(ids: Sequence[str]) -> int:
         wanted = [str(item) for item in ids]
         subset = [by_id[item] for item in wanted if item in by_id]
-        payload = _core_review_payload(
+        # Price every match as a final with one full prior rationale so a
+        # first-round plan cannot send a match the later final cannot fit.
+        payload = _core_match_upper_bound(
             subset,
+            wanted,
             preferred=preferred,
             snapshot=snapshot,
-            chunk_index=10**6,
-            chunk_count=10**6,
+            eligible_ids=ordered_ids,
         )
         return reviewer.refusal_reason(payload, ModelCoreDecision, metadata)[1]
 
@@ -6294,12 +6620,50 @@ async def _advance_core_review(
         _note_chunked_review(metadata, "decision_review", report, required=True)
         _note_chunked_review(metadata, "selective_core", report, required=True)
         metadata["researcher_core_id"] = ""
-        unknown = str(progress_row.get("unknown_nomination") or "")
-        nominations = [str(item) for item in (progress_row.get("nominations") or []) if str(item)]
         uncovered = list(report.get("uncovered_ids") or [])
         metadata["core_uncovered_code_ids"] = uncovered
         metadata["core_chunk_order_selects"] = False
+        metadata["core_bracket_is_substantive_stability"] = False
+        metadata["core_bracket_schedule_note"] = CORE_SCHEDULE_NOTE
+        metadata["core_final_decision_rule"] = CORE_FINAL_DECISION_RULE
+        metadata["core_prompt_scope_rule"] = CORE_PROMPT_SCOPE_RULE
+        metadata["core_evidence_summary_rule"] = CORE_EVIDENCE_SUMMARY_RULE
+        metadata["core_evidence_improves_selection"] = None
         _publish_core_bracket(metadata, progress_row)
+        decision = str(progress_row.get("core_decision") or "")
+        decision_rationale = str(progress_row.get("core_decision_rationale") or "")
+        final_core = str(progress_row.get("final_core_id") or "")
+        if decision == "abstain":
+            progress_row["open"] = False
+            progress_row["provisional"] = False
+            metadata["decision_chunk_state"] = progress_row
+            metadata["model_core_id"] = ""
+            metadata["model_core_decision"] = "abstain"
+            metadata["model_core_rationale"] = decision_rationale
+            metadata["model_core_judgment"] = True
+            metadata["model_core_unknown"] = False
+            metadata["provisional_core_id"] = ""
+            metadata["core_status"] = "abstained"
+            metadata["core_selection_complete"] = True
+            metadata["core_selection_truncated"] = False
+            metadata["core_selection_withheld"] = False
+            metadata["core_downstream_eligible"] = False
+            metadata.pop("decision_stop", None)
+            metadata.pop("core_comparison_stop", None)
+            for row in candidates:
+                row["model_core"] = False
+            metadata["core_resume"] = {
+                "resumable": False,
+                "next_index": int(progress_row.get("next_index") or 0),
+                "plan_hash": str(progress_row.get("plan_hash") or ""),
+                "uncovered_code_ids": uncovered,
+            }
+            return {
+                "core_candidates": candidates,
+                "metadata": metadata,
+                "prompt_log": logs,
+                "warnings": warnings,
+            }
         if not report["complete"]:
             progress_row["open"] = True
             progress_row["provisional"] = True
@@ -6337,49 +6701,43 @@ async def _advance_core_review(
             }
         progress_row["open"] = False
         progress_row["provisional"] = False
-        metadata["core_selection_withheld"] = False
-        metadata["core_status"] = "applied"
         metadata["core_resume"] = {
             "resumable": False,
             "next_index": int(progress_row.get("next_index") or 0),
             "plan_hash": str(progress_row.get("plan_hash") or ""),
             "uncovered_code_ids": [],
         }
-        if unknown:
-            metadata["model_core_id"] = unknown
-            metadata["model_core_rationale"] = str(progress_row.get("rationale") or "")
+        candidate_ids = {str(row.get("code_id") or "") for row in candidates}
+        # Only the validated final selection sets the core. An earlier nomination
+        # and an unknown id do not.
+        if decision == "select" and final_core in candidate_ids:
+            metadata["core_selection_withheld"] = False
+            metadata["core_status"] = "applied"
+            metadata["model_core_id"] = final_core
+            metadata["model_core_decision"] = "select"
+            metadata["model_core_rationale"] = decision_rationale
             metadata["model_core_judgment"] = True
-            metadata["model_core_unknown"] = True
-            metadata["core_unsupported_by_graph"] = True
-            metadata["core_graph_support"] = "core_unsupported_by_graph"
-            warnings.append(f"Model core id {unknown!r} is not a candidate. It was kept and flagged.")
-            metadata["core_downstream_eligible"] = False
-            return {
-                "core_candidates": candidates,
-                "metadata": metadata,
-                "prompt_log": logs,
-                "warnings": warnings,
-            }
-        chosen = str(progress_row.get("champion_id") or "")
-        if not chosen and len(nominations) == 1:
-            chosen = nominations[-1]
-        if chosen:
-            metadata["model_core_id"] = chosen
-            metadata["model_core_rationale"] = str(
-                progress_row.get("rationale") or "Chosen by the final match of the core tournament."
-            )
-            metadata["model_core_judgment"] = True
-            _note_core_support(state, metadata, chosen)
-            if metadata.get("core_unsupported_by_graph") and preferred and chosen not in preferred:
+            metadata["model_core_unknown"] = False
+            _note_core_support(state, metadata, final_core)
+            if metadata.get("core_unsupported_by_graph") and preferred and final_core not in preferred:
                 metadata["relationship_preferred_core_id"] = preferred[0]
                 metadata["core_chooser_preference"] = "graph_supported"
             for row in candidates:
-                row["model_core"] = row.get("code_id") == chosen
-                if row.get("code_id") == chosen and metadata.get("core_unsupported_by_graph"):
+                row["model_core"] = row.get("code_id") == final_core
+                if row.get("code_id") == final_core and metadata.get("core_unsupported_by_graph"):
                     row["core_unsupported_by_graph"] = True
-        metadata["core_downstream_eligible"] = bool(metadata.get("model_core_id")) and not metadata.get(
-            "core_unsupported_by_graph"
-        )
+            metadata["core_downstream_eligible"] = bool(final_core) and not metadata.get("core_unsupported_by_graph")
+            return {"core_candidates": candidates, "metadata": metadata, "prompt_log": logs, "warnings": warnings}
+        metadata["model_core_id"] = ""
+        metadata["model_core_decision"] = ""
+        metadata["model_core_judgment"] = False
+        metadata["model_core_unknown"] = False
+        metadata["core_status"] = "withheld"
+        metadata["core_selection_withheld"] = True
+        metadata["core_selection_complete"] = False
+        metadata["core_downstream_eligible"] = False
+        for row in candidates:
+            row["model_core"] = False
         return {"core_candidates": candidates, "metadata": metadata, "prompt_log": logs, "warnings": warnings}
 
     index = int(progress.get("next_index") or 0)
@@ -6395,24 +6753,39 @@ async def _advance_core_review(
     bracket = progress.get("core_bracket") if isinstance(progress.get("core_bracket"), Mapping) else {}
     round_index = int(bracket.get("round_index") or 0)
     rounds = list(bracket.get("rounds") or [])
-    whole_set = bool(rounds and rounds[round_index].get("whole_set")) if round_index < len(rounds) else False
+    eligible_ids = [str(item) for item in (bracket.get("ordered_ids") or ordered_ids) if str(item)]
+    role = _core_round_role(bracket, round_index, chunk_ids, eligible_ids)
+    priors = _prior_core_rationales(bracket, round_index)
+    scope = _core_comparison_scope(
+        match_ids=chunk_ids,
+        eligible_ids=eligible_ids,
+        round_role=role,
+        prior_rationales=priors,
+    )
+    if round_index < len(rounds) and isinstance(rounds[round_index], Mapping):
+        current_round = dict(rounds[round_index])
+        current_round["comparison_scope"] = scope
+        current_round["round_role"] = role
+        rounds[round_index] = current_round
+        bracket = dict(bracket)
+        bracket["rounds"] = rounds
+        progress["core_bracket"] = bracket
     if len(chunk_ids) < 2 and eligible_n != 1:
         add_stop_reason(progress, CORE_BRACKET_INCOMPLETE)
         metadata["decision_stop"] = CORE_BRACKET_INCOMPLETE
         metadata["core_comparison_stop"] = CORE_BRACKET_INCOMPLETE
         return _finish_choice(progress, warnings)
     subset = [by_id[item] for item in chunk_ids if item in by_id]
-    payload = _core_review_payload(
+    payload = _core_match_request(
         subset,
         preferred=preferred,
         snapshot=snapshot,
         chunk_index=index,
         chunk_count=len(chunks),
-        instruction=_core_match_instruction(
-            whole_set=whole_set,
-            match_size=len(chunk_ids),
-            eligible=eligible_n,
-        ),
+        match_ids=chunk_ids,
+        eligible_ids=eligible_ids,
+        round_role=role,
+        prior_rationales=priors,
     )
     stop, _estimate = reviewer.refusal_reason(payload, ModelCoreDecision, metadata)
     if stop == "request_budget":
@@ -6446,32 +6819,60 @@ async def _advance_core_review(
         progress["next_index"] = index
         return _finish_choice(progress, warnings)
     note_chunk_send(progress, audit, estimate=int((audit or {}).get("estimated_input_tokens") or 0))
-    chosen = str(parsed.get("core_id") or "")
-    progress["rationale"] = str(parsed.get("rationale") or progress.get("rationale") or "")
-    if chosen in set(chunk_ids):
-        progress["nominations"] = list(progress.get("nominations") or []) + [chosen]
+    decision_name = str(parsed.get("decision") or "select")
+    chosen = str(parsed.get("core_id") or "").strip()
+    rationale = str(parsed.get("rationale") or "")
+    progress["rationale"] = rationale
+    if decision_name == "abstain":
+        _record_core_match(
+            progress,
+            round_index,
+            match=chunk_ids,
+            winner="",
+            decision="abstain",
+            rationale=rationale,
+        )
+        progress["core_decision"] = "abstain"
+        progress["core_decision_rationale"] = rationale
+        progress["final_core_id"] = ""
         progress["reviewed_ids"] = list(progress.get("reviewed_ids") or []) + chunk_ids
         progress["chunks_validated"] = int(progress.get("chunks_validated") or 0) + 1
-        if round_index < len(rounds):
-            current = dict(rounds[round_index])
-            current["winners"] = [str(item) for item in (current.get("winners") or [])] + [chosen]
-            current["compared"] = int(current.get("compared") or 0) + len(chunk_ids)
-            rounds[round_index] = current
-            bracket = dict(bracket)
-            bracket["rounds"] = rounds
-            progress["core_bracket"] = bracket
+        progress["next_index"] = index + 1
         metadata.pop("decision_stop", None)
-    elif whole_set:
-        progress["unknown_nomination"] = chosen
-        progress["reviewed_ids"] = list(progress.get("reviewed_ids") or []) + chunk_ids
-        progress["chunks_validated"] = int(progress.get("chunks_validated") or 0) + 1
-        metadata.pop("decision_stop", None)
-    else:
+        return _finish_choice(progress, warnings)
+    if decision_name != "select" or chosen not in set(chunk_ids):
         add_stop_reason(progress, "invalid_decision")
         progress["invalid_chunks"] = int(progress.get("invalid_chunks") or 0) + 1
         metadata["decision_stop"] = "invalid_decision"
         metadata["core_comparison_stop"] = "invalid_decision"
         return _finish_choice(progress, warnings)
+    _record_core_match(
+        progress,
+        round_index,
+        match=chunk_ids,
+        winner=chosen,
+        decision="select",
+        rationale=rationale,
+    )
+    progress["nominations"] = list(progress.get("nominations") or []) + [chosen]
+    progress["reviewed_ids"] = list(progress.get("reviewed_ids") or []) + chunk_ids
+    progress["chunks_validated"] = int(progress.get("chunks_validated") or 0) + 1
+    bracket = progress.get("core_bracket") if isinstance(progress.get("core_bracket"), Mapping) else {}
+    rounds = [dict(row) if isinstance(row, Mapping) else {} for row in (bracket.get("rounds") or [])]
+    if round_index < len(rounds):
+        current = dict(rounds[round_index])
+        current["winners"] = [str(item) for item in (current.get("winners") or [])] + [chosen]
+        current["compared"] = int(current.get("compared") or 0) + len(chunk_ids)
+        rounds[round_index] = current
+        bracket = dict(bracket)
+        bracket["rounds"] = rounds
+        progress["core_bracket"] = bracket
+    metadata.pop("decision_stop", None)
+    if role == "final":
+        progress["final_core_id"] = chosen
+        progress["core_decision"] = "select"
+        progress["core_decision_rationale"] = rationale
+        progress["champion_id"] = chosen
     progress["next_index"] = index + 1
     _open_next_core_round(progress, estimate, per_request=int(reviewer.token_budget))
     _publish_core_bracket(metadata, progress)
@@ -7931,6 +8332,8 @@ def _procedure_from_kwargs(data: Mapping[str, Any], **kwargs: Any) -> dict[str, 
             "A design choice for this package. It is not a quotation from the method literature."
         ),
         "one_document_one_respondent": bool(kwargs.get("one_document_one_respondent", False)),
+        "core_evidence_summaries": _core_evidence_enabled(kwargs.get("core_evidence_summaries", True)),
+        "core_evidence_token_cap": _core_evidence_cap(kwargs.get("core_evidence_token_cap", DEFAULT_CORE_EVIDENCE_TOKEN_CAP)),
     }
     return procedure
 
@@ -7948,8 +8351,9 @@ Use only the allowed_wording for the evidence_tier. Causal wording needs tier 3 
 Do not set human claim_support.
 For saturation, record an assessment and a rationale. That assessment is a model
 judgment. It is not a researcher confirmation and it does not set judgment.
-For a core category, choose one supplied candidate and explain the choice.
-Alternatives stay candidates. Do not present the choice as a human decision.
+For a core category, choose one supplied candidate or abstain. An abstention
+names no core_id. A selection must name one supplied code_id. Explain the
+choice. Alternatives stay candidates. Do not present the choice as a human decision.
 """
 
 
@@ -8214,6 +8618,8 @@ async def aaxial_code(
     axial_token_budget: int = DEFAULT_AXIAL_TOKEN_BUDGET,
     pattern_min_cases: int = 2,
     one_document_one_respondent: bool = False,
+    core_evidence_summaries: bool = True,
+    core_evidence_token_cap: int = DEFAULT_CORE_EVIDENCE_TOKEN_CAP,
     negative_case_search: bool = True,
     core_stability_min_n: int = CORE_STABILITY_MIN_N,
     batch_size: int = 1,
@@ -8280,6 +8686,8 @@ async def aaxial_code(
         max_axial_review_tokens=max_axial_review_tokens,
         pattern_min_cases=pattern_min_cases,
         one_document_one_respondent=one_document_one_respondent,
+        core_evidence_summaries=core_evidence_summaries,
+        core_evidence_token_cap=core_evidence_token_cap,
         max_decision_calls=max_decision_calls,
         negative_case_search=negative_case_search,
         core_stability_min_n=core_stability_min_n,
@@ -8395,6 +8803,8 @@ async def aaxial_code(
                 max_decision_calls=max_decision_calls,
                 max_axial_review_tokens=max_axial_review_tokens,
                 axial_token_budget=axial_token_budget,
+                core_evidence_summaries=core_evidence_summaries,
+                core_evidence_token_cap=core_evidence_token_cap,
                 batch_size=batch_size,
                 axial_request_timeout=axial_request_timeout,
                 idle_timeout=idle_timeout,
@@ -8432,6 +8842,8 @@ async def aselective_code(
     decision_model: BaseChatModel | None = None,
     max_decision_calls: int = 4,
     one_document_one_respondent: bool = False,
+    core_evidence_summaries: bool = True,
+    core_evidence_token_cap: int = DEFAULT_CORE_EVIDENCE_TOKEN_CAP,
     max_axial_review_tokens: int = DEFAULT_MAX_AXIAL_REVIEW_TOKENS,
     axial_token_budget: int = DEFAULT_AXIAL_TOKEN_BUDGET,
     batch_size: int = 1,
@@ -8507,6 +8919,8 @@ async def aselective_code(
         "one_document_one_respondent": bool(
             one_document_one_respondent or axial_procedure.get("one_document_one_respondent")
         ),
+        "core_evidence_summaries": _core_evidence_enabled(core_evidence_summaries),
+        "core_evidence_token_cap": _core_evidence_cap(core_evidence_token_cap),
         **review_procedure_fields(),
     }
     metadata = dict(upstream)

@@ -331,7 +331,17 @@ def withholding_reasons(row: Mapping[str, Any], rules: Sequence[str] | None = No
             add("reviewer_policy_rejection")
     if "condition_incomplete" in names or row.get("condition_incomplete") is True:
         add("incomplete_condition")
-    if "participant_link_hypothetical" in names or "hypothetical_link" in names:
+    pattern = str(row.get("condition_pattern") or "")
+    if not pattern:
+        from automated_grounded_theory.relationship_tiers import classify_condition_pattern
+
+        pattern = str(classify_condition_pattern(row) or "")
+    # An observed conditional is not a hypothetical link. Causal wording stays
+    # its own cause. Speculation and every other hypothetical flag still are.
+    if pattern == "speculative_counterfactual" or (
+        pattern != "observed_conditional"
+        and ("participant_link_hypothetical" in names or "hypothetical_link" in names)
+    ):
         add("hypothetical_link")
     if "no_review_decision" in names or str(row.get("eligibility_reason") or "") == "no_review_decision":
         add("no_review_decision")

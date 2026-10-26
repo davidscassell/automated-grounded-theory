@@ -11,8 +11,7 @@ from automated_grounded_theory.axial import (
     AxialDecisionReviewer,
     ModelCoreDecision,
     _axial_token_plan,
-    _core_match_instruction,
-    _core_review_payload,
+    _core_match_upper_bound,
     _score_candidates,
     graph_snapshot,
     selective_code,
@@ -55,14 +54,14 @@ from tests.test_v0933 import _packed_state
 
 
 def test_version_fingerprint_and_unchanged_defaults():
-    assert __version__ == "0.9.34"
-    assert POLICY_VERSION == "0.9.34"
+    assert __version__ == "0.9.35"
+    assert POLICY_VERSION == "0.9.35"
     assert PATTERN_MIN_CASES == 2
     assert DEFAULT_MAX_AXIAL_REVIEW_TOKENS == 24000
     assert DECISION_REVIEW_CHUNKING == "request_budget_v6"
     assert CORE_COMPARISON_RULE == "deterministic_tournament_v1"
     assert CONDITION_COMPLETENESS_RULE == "full_clause_or_incomplete_v1"
-    assert ELIGIBILITY_DECISION_RULE == "reviewed_complete_condition_v1"
+    assert ELIGIBILITY_DECISION_RULE == "observed_conditional_eligible_v1"
     assert REREAD_COVERAGE_RULE == "withheld_not_complete_v1"
     assert REREAD_BOUND_RULE == "cap_times_reserved_calls_v1"
     assert "0.9.28" in CHUNKING_CHECKPOINT_MESSAGE
@@ -118,14 +117,29 @@ def _core_source(width_label: str, count: int) -> dict:
 
 
 def _payload_estimate(reviewer, candidates, ids, *, whole_set: bool, eligible: int) -> int:
-    subset = [row for row in candidates if row["code_id"] in set(ids)]
-    payload = _core_review_payload(
+    """Token count of the same final-shaped upper bound the planner uses.
+
+    ``whole_set`` is kept so callers can still name a complete eligible set.
+    The bound always reserves one full prior rationale, matching
+    ``_core_match_upper_bound``.
+    """
+    by_id = {row["code_id"]: row for row in candidates}
+    subset = [by_id[item] for item in ids if item in by_id]
+    known = [row["code_id"] for row in candidates]
+    if whole_set:
+        eligible_ids = [str(item) for item in ids]
+    elif len(known) == int(eligible):
+        eligible_ids = known
+    else:
+        eligible_ids = [str(item) for item in ids] + [
+            f"extra-{index}" for index in range(max(0, int(eligible) - len(ids)))
+        ]
+    payload = _core_match_upper_bound(
         subset,
+        list(ids),
         preferred=[],
         snapshot=graph_snapshot([]),
-        chunk_index=0,
-        chunk_count=1,
-        instruction=_core_match_instruction(whole_set=whole_set, match_size=len(ids), eligible=eligible),
+        eligible_ids=eligible_ids,
     )
     return reviewer.refusal_reason(payload, ModelCoreDecision, {"decision_calls_used": 0})[1]
 
@@ -279,10 +293,12 @@ def test_unreviewed_hypothetical_and_incomplete_rows_are_ineligible_with_a_cause
 
     conditional = _tier(f"{_LINK} if it rains")
     assert conditional["condition_incomplete"] is False
+    assert conditional["condition_pattern"] == "observed_conditional"
     assert conditional["downstream_eligible"] is False
-    assert "hypothetical_link" in conditional["eligibility_blocks"]
+    assert "hypothetical_link" not in conditional["eligibility_blocks"]
     assert "incomplete_condition" not in conditional["eligibility_blocks"]
-    assert "hypothetical_link" in withholding_reasons(conditional)
+    assert "wording_withheld" in withholding_reasons(conditional)
+    assert "hypothetical_link" not in withholding_reasons(conditional)
 
     plain = _tier(_LINK)
     assert plain["downstream_eligible"] is True
