@@ -123,8 +123,19 @@ CORE_BRACKET_INCOMPLETE = "core_bracket_incomplete"
 CORE_PAIR_EXCEEDS_REQUEST_BUDGET = "core_pair_exceeds_request_budget"
 # A recorded condition must be a full clause. A bare pronoun is not a qualifier.
 CONDITION_COMPLETENESS_RULE = "full_clause_or_incomplete_v1"
-# A row needs a review decision, and a hypothetical or incomplete condition blocks it.
-ELIGIBILITY_DECISION_RULE = "reviewed_complete_condition_v1"
+# A supported pattern under a complete condition stays eligible. Speculation does not.
+ELIGIBILITY_DECISION_RULE = "observed_conditional_eligible_v1"
+# Only the validated final match may set the core. An earlier winner is a nomination.
+CORE_FINAL_DECISION_RULE = "final_match_only_v1"
+# The prompt names the original eligible set, this round, and the finalists separately.
+CORE_PROMPT_SCOPE_RULE = "eligible_round_finalists_v1"
+# Observed conditional, speculative counterfactual, and incomplete condition are different.
+CONDITION_PATTERN_RULE = "observed_conditional_eligible_v1"
+# Each core candidate can carry a compact evidence summary under a token cap.
+CORE_EVIDENCE_SUMMARY_RULE = "capped_candidate_evidence_v1"
+CORE_SCHEDULE_NOTE = (
+    "A deterministic bracket is reproducible scheduling, not evidence of substantive stability."
+)
 # Passages withheld as too big stay in the coverage counts. The queue is not complete.
 REREAD_COVERAGE_RULE = "withheld_not_complete_v1"
 # The pre-selection reread figure is the per-request cap times the reserved calls.
@@ -196,6 +207,10 @@ CHUNKING_CHECKPOINT_MESSAGE = (
     "or before core selection ran a deterministic tournament, a condition span had "
     "to be a full clause, an unreviewed or hypothetical row stayed ineligible, "
     "withheld rereads stayed in the coverage counts, or the 0.9.34 rules, "
+    "or before only a validated final core decision could set the core, an abstention "
+    "left no core, the core prompt named the eligible set and the finalists separately, "
+    "an observed conditional pattern stayed eligible, candidate evidence summaries were "
+    "capped, or the 0.9.35 rules, "
     "or the stored chunk plan does not match this resume. Resume cannot continue "
     "that review. Start a new run."
 )
@@ -583,6 +598,86 @@ def order_core_candidates(ids: Sequence[str]) -> list[str]:
     return ordered
 
 
+def pair_core_round(ordered: Sequence[str]) -> dict[str, Any]:
+    """Pair a field from the front. A leftover single is a bye.
+
+    ``ordered`` is already the bracket order. This does not sort. Production
+    sorts by code id before it calls the partition. A different order here is
+    a different schedule.
+    """
+    ids: list[str] = []
+    for item in ordered:
+        text = str(item or "")
+        if text and text not in ids:
+            ids.append(text)
+    matches: list[list[str]] = []
+    index = 0
+    while index + 1 < len(ids):
+        matches.append([ids[index], ids[index + 1]])
+        index += 2
+    return {"matches": matches, "byes": ids[index:]}
+
+
+def play_core_bracket(ordered: Sequence[str], choose) -> str:
+    """Play one pairing order. ``choose`` returns the winner of a match.
+
+    The next field keeps that order. It is not re-sorted. The return is the
+    last remaining id, or empty when a chooser names an id outside the match.
+    """
+    field: list[str] = []
+    for item in ordered:
+        text = str(item or "")
+        if text and text not in field:
+            field.append(text)
+    guard = 0
+    while len(field) > 1:
+        guard += 1
+        if guard > len(field) + 4:
+            return ""
+        paired = pair_core_round(field)
+        winners: list[str] = []
+        for match in paired["matches"]:
+            winner = str(choose(list(match)) or "")
+            if winner not in set(match):
+                return ""
+            winners.append(winner)
+        nxt: list[str] = []
+        for item in winners + list(paired["byes"]):
+            if item not in nxt:
+                nxt.append(item)
+        field = nxt
+    return field[0] if field else ""
+
+
+def bracket_order_report(ids: Sequence[str], choose) -> dict[str, Any]:
+    """Whether code-id order and one other pairing name the same core.
+
+    Permuting the input does not change the code-id bracket. A different
+    pairing can change the winner. That is scheduling, not substantive
+    stability. ``substantive_stability`` stays false.
+    """
+    base = list(ids)
+    rotated = base[1:] + base[:1] if len(base) > 1 else list(base)
+    reversed_ids = list(reversed(base))
+    schedules = [
+        order_core_candidates(base),
+        order_core_candidates(rotated),
+        order_core_candidates(reversed_ids),
+    ]
+    ordered = schedules[0]
+    alternative = ordered[1:] + ordered[:1] if len(ordered) > 1 else list(ordered)
+    code_id_core = play_core_bracket(ordered, choose) if ordered else ""
+    alternative_core = play_core_bracket(alternative, choose) if alternative else ""
+    return {
+        "input_order_changes_bracket": any(item != ordered for item in schedules),
+        "alternative_bracket_changes_core": code_id_core != alternative_core,
+        "code_id_core": code_id_core,
+        "alternative_core": alternative_core,
+        "substantive_stability": False,
+        "note": CORE_SCHEDULE_NOTE,
+    }
+
+
 def partition_core_matches(
     ids: Sequence[str],
     estimate: Callable[[Sequence[str]], int],
@@ -899,6 +994,10 @@ def review_procedure_fields() -> dict[str, str]:
         "condition_statement_rule": CONDITION_STATEMENT_RULE,
         "condition_completeness_rule": CONDITION_COMPLETENESS_RULE,
         "eligibility_decision_rule": ELIGIBILITY_DECISION_RULE,
+        "core_final_decision_rule": CORE_FINAL_DECISION_RULE,
+        "core_prompt_scope_rule": CORE_PROMPT_SCOPE_RULE,
+        "condition_pattern_rule": CONDITION_PATTERN_RULE,
+        "core_evidence_summary_rule": CORE_EVIDENCE_SUMMARY_RULE,
         "reread_coverage_rule": REREAD_COVERAGE_RULE,
         "reread_bound_rule": REREAD_BOUND_RULE,
         "case_identity_source_rule": CASE_IDENTITY_SOURCE_RULE,
@@ -1861,6 +1960,10 @@ def same_chunking_fingerprint(saved: Any, current: Any) -> bool:
         "condition_statement_rule": CONDITION_STATEMENT_RULE,
         "condition_completeness_rule": CONDITION_COMPLETENESS_RULE,
         "eligibility_decision_rule": ELIGIBILITY_DECISION_RULE,
+        "core_final_decision_rule": CORE_FINAL_DECISION_RULE,
+        "core_prompt_scope_rule": CORE_PROMPT_SCOPE_RULE,
+        "condition_pattern_rule": CONDITION_PATTERN_RULE,
+        "core_evidence_summary_rule": CORE_EVIDENCE_SUMMARY_RULE,
         "reread_coverage_rule": REREAD_COVERAGE_RULE,
         "reread_bound_rule": REREAD_BOUND_RULE,
         "case_identity_source_rule": CASE_IDENTITY_SOURCE_RULE,

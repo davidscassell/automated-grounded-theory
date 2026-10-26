@@ -1755,6 +1755,31 @@ def relationship_evidence_use(row: Mapping[str, Any]) -> str:
     return SUPPORTED_EVIDENCE
 
 
+def _carry_downstream_condition(row: dict, pattern_kind: str | None) -> None:
+    """Keep a supported condition on the row and on the pattern component.
+
+    A speculative or incomplete row does not carry a downstream condition.
+    Causal wording can still withhold the row. That withhold does not erase
+    the condition already stored on ``condition``.
+    """
+    if row.get("downstream_eligible") is not True or pattern_kind != "observed_conditional":
+        row["downstream_condition"] = None
+        return
+    span = recorded_condition_span(row)
+    row["downstream_condition"] = span or None
+    claims = row.get("claims")
+    if not isinstance(claims, dict) or not span:
+        return
+    pattern = claims.get("pattern")
+    if not isinstance(pattern, Mapping):
+        return
+    copied = dict(pattern)
+    copied["condition"] = span
+    copied["condition_pattern"] = "observed_conditional"
+    claims["pattern"] = copied
+    row["claims"] = claims
+
+
 def assign_relationship_eligibility(row: dict) -> str:
     """Write row and component eligibility from one rule.
 
@@ -1792,6 +1817,8 @@ def assign_relationship_eligibility(row: dict) -> str:
                 copied["supports_core"] = False
                 claims[key] = copied
         row["claims"] = claims
+    pattern_kind = classify_condition_pattern(row)
+    row["condition_pattern"] = pattern_kind
     blocks = _eligibility_blocks(row)
     flags = _unique_flags(row.get("flags") or [])
     flags = [item for item in flags if item not in {"no_review_decision", "condition_incomplete"}]
@@ -1812,6 +1839,7 @@ def assign_relationship_eligibility(row: dict) -> str:
             claims["pattern"] = pattern
             row["claims"] = claims
         row["core_support_component"] = None
+        row["downstream_condition"] = None
         blocked_use = HYPOTHESIS_EXPLORATION if use != WITHHELD_EVIDENCE else use
         row["evidence_use"] = blocked_use
         return blocked_use
@@ -1821,6 +1849,7 @@ def assign_relationship_eligibility(row: dict) -> str:
         row["core_support_component"] = "pattern"
     else:
         row["core_support_component"] = None
+    _carry_downstream_condition(row, pattern_kind)
     return use
 
 
@@ -1952,26 +1981,134 @@ def _has_review_decision(row: Mapping[str, Any]) -> bool:
     )
 
 
+def _pattern_is_supported(row: Mapping[str, Any]) -> bool:
+    """True when the row is a tier-2 or higher pattern, not a hypothesis."""
+    tier = row.get("evidence_tier")
+    try:
+        tier_n = int(tier) if tier is not None and not isinstance(tier, bool) else None
+    except (TypeError, ValueError):
+        tier_n = None
+    if tier_n is None or tier_n < 2:
+        return False
+    claims = row.get("claims") if isinstance(row.get("claims"), Mapping) else {}
+    pattern = claims.get("pattern") if isinstance(claims.get("pattern"), Mapping) else {}
+    if pattern and pattern.get("present") is False:
+        return False
+    return True
+
+
+def _condition_sources(row: Mapping[str, Any]) -> tuple[str, Mapping[str, Any]]:
+    claims = row.get("claims") if isinstance(row.get("claims"), Mapping) else {}
+    participant = claims.get("participant_explanation") if isinstance(claims.get("participant_explanation"), Mapping) else {}
+    condition = str(row.get("condition") or participant.get("condition") or "").strip()
+    return condition, participant
+
+
+def _speculative_counterfactual(row: Mapping[str, Any], participant: Mapping[str, Any], condition: str) -> bool:
+    """True when the link is a supposed or reported counterfactual.
+
+    ``would``, ``someone said``, ``they said``, ``i heard``, ``suppose``,
+    ``supposing``, ``what if``, and ``had said`` stay speculative even when
+    an ``if`` is also present. A stated condition without those markers is
+    not speculative.
+    """
+    texts = (
+        condition,
+        str(row.get("statement") or ""),
+        str(row.get("presented_statement") or ""),
+        str(row.get("quote") or ""),
+        str(participant.get("link_text") or ""),
+    )
+    return any(_OTHER_HYPOTHETICAL_RE.search(_norm(text)) for text in texts if str(text or "").strip())
+
+
+def _condition_is_carried(row: Mapping[str, Any], participant: Mapping[str, Any], condition: str) -> bool:
+    if not condition or condition_span_is_incomplete(condition):
+        return False
+    if row.get("condition_retained") is True or participant.get("condition_retained") is True:
+        return True
+    folded = _norm(condition)
+    for key in ("presented_statement", "statement"):
+        if folded and folded in _norm(str(row.get(key) or "")):
+            return True
+    return False
+
+
+def classify_condition_pattern(row: Mapping[str, Any]) -> str | None:
+    """``observed_conditional``, ``speculative_counterfactual``, ``incomplete``, or None.
+
+    An observed conditional is a supported pattern under a complete condition
+    the row still carries. A speculative counterfactual and an incomplete
+    span are not that pattern. Causal wording is not part of this label.
+    """
+    if not isinstance(row, Mapping):
+        return None
+    flags = {str(item) for item in (row.get("flags") or []) if str(item)}
+    condition, participant = _condition_sources(row)
+    incomplete = (
+        row.get("condition_incomplete") is True
+        or participant.get("condition_incomplete") is True
+        or "condition_incomplete" in flags
+        or condition_span_is_incomplete(condition)
+    )
+    if incomplete:
+        return "incomplete"
+    if _speculative_counterfactual(row, participant, condition):
+        return "speculative_counterfactual"
+    span = condition
+    if not span:
+        span = str(_condition_text(str(row.get("presented_statement") or row.get("statement") or "")) or "")
+    if (
+        span
+        and not condition_span_is_incomplete(span)
+        and _pattern_is_supported(row)
+        and _condition_is_carried(row, participant, span)
+    ):
+        return "observed_conditional"
+    return None
+
+
+def recorded_condition_span(row: Mapping[str, Any]) -> str:
+    """The complete condition this row carries, or an empty string."""
+    condition, participant = _condition_sources(row)
+    if condition and not condition_span_is_incomplete(condition):
+        return condition
+    span = str(_condition_text(str(row.get("presented_statement") or row.get("statement") or "")) or "")
+    if span and not condition_span_is_incomplete(span):
+        return span
+    return ""
+
+
 def _eligibility_blocks(row: Mapping[str, Any]) -> list[str]:
     """Causes that keep a row from counting as eligible.
 
-    No review decision, a hypothetical link, and an incomplete condition each
-    block eligibility. The list can carry more than one.
+    An incomplete condition and a speculative counterfactual block eligibility.
+    A supported pattern under a complete carried condition does not. No review
+    decision still blocks. Causal wording is a separate withhold and is not
+    one of these blocks. The list can carry more than one cause.
     """
     flags = {str(item) for item in (row.get("flags") or []) if str(item)}
     claims = row.get("claims") if isinstance(row.get("claims"), Mapping) else {}
     participant = claims.get("participant_explanation") if isinstance(claims.get("participant_explanation"), Mapping) else {}
+    pattern = str(row.get("condition_pattern") or "") or str(classify_condition_pattern(row) or "")
     blocks: list[str] = []
     incomplete = (
-        row.get("condition_incomplete") is True
+        pattern == "incomplete"
+        or row.get("condition_incomplete") is True
         or participant.get("condition_incomplete") is True
         or "condition_incomplete" in flags
     )
     if incomplete:
         blocks.append("incomplete_condition")
     hypothetical = (
-        "participant_link_hypothetical" in flags
-        or str(participant.get("status") or "") == "hypothetical"
+        pattern == "speculative_counterfactual"
+        or (
+            pattern != "observed_conditional"
+            and (
+                "participant_link_hypothetical" in flags
+                or str(participant.get("status") or "") == "hypothetical"
+            )
+        )
     )
     if hypothetical:
         blocks.append("hypothetical_link")

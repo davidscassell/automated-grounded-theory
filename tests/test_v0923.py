@@ -27,8 +27,8 @@ _FIXTURE = Path("tests/fixtures/attribution_adversarial_2.json")
 
 
 def test_package_version_is_0923():
-    assert __version__ == "0.9.34"
-    assert POLICY_VERSION == "0.9.34"
+    assert __version__ == "0.9.35"
+    assert POLICY_VERSION == "0.9.35"
     assert DISCOVERY_SCHEMA_VERSION == "discovery-eval-3"
 
 

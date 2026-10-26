@@ -12,7 +12,10 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
+from automated_grounded_theory.batching import estimate_tokens
 from automated_grounded_theory.relationship_tiers import case_id_of, weak_stem_relationship
+
+DEFAULT_CORE_EVIDENCE_TOKEN_CAP = 80
 
 CORE_STABILITY_MIN_N = 2
 CORE_STABILITY_MIN_N_NOTE = (
@@ -153,6 +156,160 @@ def graph_snapshot(relationships: Sequence[Mapping[str, Any]]) -> dict[str, Any]
             "support_components names the claim that supports a core, when one does. "
             "Later edits do not rewrite it."
         ),
+    }
+
+
+def _summary_text(
+    definition: str,
+    statements: Sequence[str],
+    variation: str,
+    counterevidence: str,
+) -> str:
+    return " ".join(
+        piece
+        for piece in (
+            definition,
+            "; ".join(item for item in statements if item),
+            variation,
+            counterevidence,
+        )
+        if piece
+    )
+
+
+def _fit_piece(text: str, token_cap: int, prefix: str) -> str:
+    """The longest prefix of ``text`` whose summary still fits ``token_cap``."""
+    raw = " ".join(str(text or "").split())
+    if not raw or token_cap < 1:
+        return ""
+    joiner = " " if prefix else ""
+    if estimate_tokens(prefix + joiner + raw) <= token_cap:
+        return raw
+    lo = 0
+    hi = len(raw)
+    best = ""
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = raw[:mid].rstrip()
+        if not candidate:
+            hi = mid - 1
+            continue
+        trial = prefix + joiner + candidate
+        if estimate_tokens(trial) <= token_cap:
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
+def candidate_evidence_summary(
+    *,
+    definition: str,
+    relationships: Sequence[Mapping[str, Any]],
+    token_cap: int,
+) -> dict[str, Any]:
+    """Compact evidence for one core candidate, truncated to ``token_cap``.
+
+    The summary keeps a category definition, up to two relationship
+    statements, one variation note, and one counterexample quote. ``tokens``
+    is the heuristic for that text. ``improves_selection`` stays null: this
+    package has not measured whether the extra text changes a choice.
+    """
+    cap = max(1, int(token_cap or 1))
+    statements: list[str] = []
+    variation = ""
+    counter = ""
+    for row in relationships:
+        if not isinstance(row, Mapping) or row.get("synthetic"):
+            continue
+        if str(row.get("disposition") or "").strip().casefold() == "rejected":
+            continue
+        statement = str(row.get("presented_statement") or row.get("statement") or "").strip()
+        if statement and statement not in statements and len(statements) < 2:
+            statements.append(statement)
+        if not variation:
+            variation = str(row.get("variation_note") or row.get("condition_note") or "").strip()
+        if counter:
+            continue
+        for case in list(row.get("counterexamples") or []) + list(row.get("negative_cases") or []):
+            if not isinstance(case, Mapping) or case.get("synthetic"):
+                continue
+            quote = str(case.get("quote") or case.get("text") or "").strip()
+            if not quote:
+                continue
+            judgment = str(case.get("judgment") or "")
+            if judgment == "contradicts" or not counter:
+                counter = quote
+            if judgment == "contradicts":
+                break
+    full = _summary_text(str(definition or "").strip(), statements, variation, counter)
+    slots = []
+    if statements:
+        slots.append("statements")
+    if variation:
+        slots.append("variation")
+    if counter:
+        slots.append("counter")
+    if str(definition or "").strip():
+        slots.append("definition")
+    weights = {"statements": 3, "variation": 2, "counter": 2, "definition": 4}
+    budgets: dict[str, int] = {}
+    used = 0
+    # Statements, variation, and counterevidence are reserved before the definition
+    # so a long definition cannot consume the whole cap.
+    ordered_slots = [name for name in ("statements", "variation", "counter", "definition") if name in slots]
+    total_weight = sum(weights[name] for name in ordered_slots) or 1
+    for index, name in enumerate(ordered_slots):
+        if index == len(ordered_slots) - 1:
+            budgets[name] = max(0, cap - used)
+            continue
+        share = max(1, (cap * weights[name]) // total_weight)
+        remaining_slots = len(ordered_slots) - index - 1
+        if used + share + remaining_slots > cap:
+            share = max(0, cap - used - remaining_slots)
+        budgets[name] = share
+        used += share
+    statement_budget = int(budgets.get("statements") or 0)
+    kept: list[str] = []
+    statement_prefix = ""
+    for statement in statements:
+        if statement_budget < 1:
+            break
+        piece = _fit_piece(statement, statement_budget, statement_prefix)
+        if not piece:
+            continue
+        joiner = "; " if statement_prefix else ""
+        trial = statement_prefix + joiner + piece
+        if estimate_tokens(trial) > statement_budget:
+            continue
+        kept.append(piece)
+        statement_prefix = trial
+    variation_out = _fit_piece(variation, int(budgets.get("variation") or 0), "")
+    counter_out = _fit_piece(counter, int(budgets.get("counter") or 0), "")
+    definition_out = _fit_piece(str(definition or ""), int(budgets.get("definition") or 0), "")
+    text = _summary_text(definition_out, kept, variation_out, counter_out)
+    while estimate_tokens(text) > cap:
+        if definition_out:
+            definition_out = _fit_piece(definition_out, max(0, estimate_tokens(definition_out) - 1), "")
+        elif counter_out:
+            counter_out = _fit_piece(counter_out, max(0, estimate_tokens(counter_out) - 1), "")
+        elif variation_out:
+            variation_out = _fit_piece(variation_out, max(0, estimate_tokens(variation_out) - 1), "")
+        elif kept:
+            kept.pop()
+        else:
+            break
+        text = _summary_text(definition_out, kept, variation_out, counter_out)
+    return {
+        "definition": definition_out,
+        "representative_statements": kept,
+        "key_variation": variation_out,
+        "counterevidence": counter_out,
+        "tokens": estimate_tokens(text),
+        "token_cap": cap,
+        "truncated": text != full,
+        "improves_selection": None,
     }
 
 

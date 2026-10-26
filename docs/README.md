@@ -1,6 +1,6 @@
 # Design notes
 
-Package `policy_version` is `0.9.34`. This index says which notes describe the package now and which notes are the record of an earlier version. A historical note can disagree with the code. The code, the README, and the current notes below win. A count of every item reviewed, including 355 of 355, and a passing synthetic fixture establish processing coverage only. They do not establish that a selection is valid.
+Package `policy_version` is `0.9.35`. This index says which notes describe the package now and which notes are the record of an earlier version. A historical note can disagree with the code. The code, the README, and the current notes below win. A count of every item reviewed, including 355 of 355, and a passing synthetic fixture establish processing coverage only. They do not establish that a selection is valid.
 
 Axial coding, selective coding, and theoretical sampling are experimental. No study adjudication file is included. The discovery example is synthetic. Live evaluation runs through v31, on package 0.9.9, did not measure analytic accuracy.
 
@@ -10,18 +10,18 @@ Axial coding, selective coding, and theoretical sampling are experimental. No st
 | --- | --- |
 | [../README.md](../README.md) | The pipeline, the defaults, the evidence tiers, quiet rounds, timeouts, and gate scoring. |
 | [methodology.md](methodology.md) | How the open-coding default maps onto the sources already named there. |
-| [design.md](design.md) | The open-coding engineering design, plus a version log through `0.9.34`. The early sections are the 0.6 run. |
+| [design.md](design.md) | The open-coding engineering design, plus a version log through `0.9.35`. The early sections are the 0.6 run. |
 | [design-relationship-tiers.md](design-relationship-tiers.md) | Evidence tiers. `pattern_min_cases` is 2. Tier labels are `category_evidence`, `hypothesis`, `pattern_supported`, `attribution`, and `verified`. |
 | [design-negative-cases-092.md](design-negative-cases-092.md) | Negative-case search at respondent level, and a core that needs tier 2. Later search corrections are in the 0.9.3 review note. |
 | [design-gate-evaluation.md](design-gate-evaluation.md) | `export_gate_relationships`, `load_adjudications`, and `score_gate_adjudications`, including `downstream_precision` and `downstream_withheld_supported_recall`. |
 | [design-discovery-evaluation.md](design-discovery-evaluation.md) | `load_discovery_file`, `freeze_discovery_set`, and `score_discovery`. Recall, precision, distortion, and gate false negatives for a frozen human discovery file. |
 | [design-sampling-0900.md](design-sampling-0900.md) | The sampling graph. Later sections through 0.9.18 are part of the current behavior. 0.9.23 does not change that graph. |
 | [focused-evaluation.md](focused-evaluation.md) | The offline focused comparison and its live-cost estimate. It does not call an API. |
-| [design-review-fixes-0934.md](design-review-fixes-0934.md) | Core selection is a deterministic tournament. A condition span is the full clause, and a bare pronoun is incomplete. Unreviewed, hypothetical, and incomplete rows are not eligible. Withheld rereads stay in the coverage counts. The reread preflight records a labeled upper bound. The coding-pool ceiling warning is not emitted. Full review coverage and passing synthetic fixtures are processing coverage, not selection validity. This is the latest review note. |
+| [design-review-fixes-0935.md](design-review-fixes-0935.md) | Only a validated final core decision sets the core. An abstention leaves no core. The prompt names the eligible set, the round, and the finalists separately. A deterministic bracket is reproducible scheduling, not substantive stability. An observed conditional pattern stays eligible. Speculative and incomplete conditions stay blocked. Candidate evidence summaries are capped. Whether they improve selections is unmeasured. Synthetic fixtures are not adjudications. This is the latest review note. |
 
 ## Historical
 
-These notes stay so a reader can see what a version changed. They are not the current contract. `design-review-fixes-*` through 0.9.33 are in this list. `design-review-fixes-0934.md` is the latest review note, listed above.
+These notes stay so a reader can see what a version changed. They are not the current contract. `design-review-fixes-*` through 0.9.34 are in this list. `design-review-fixes-0935.md` is the latest review note, listed above.
 
 | Note | Version it records |
 | --- | --- |
@@ -58,8 +58,9 @@ These notes stay so a reader can see what a version changed. They are not the cu
 | [design-review-fixes-0931.md](design-review-fixes-0931.md) | 0.9.31. Condition scope stays on the relationship, and consolidation accounts for every candidate. 0.9.32 gives each decision step its own token allowance, counts respondents, and estimates the reread after selection. |
 | [design-review-fixes-0932.md](design-review-fixes-0932.md) | 0.9.32. Each decision step has its own token allowance, supporting cases are respondents, and the reread is estimated after selection. 0.9.33 packs reread requests, compares every core candidate in one request, keeps a recorded condition on the presented statement, labels the per-step allowances, and names the case-identity source. |
 | [design-review-fixes-0933.md](design-review-fixes-0933.md) | 0.9.33. Reread requests are packed to the 6000 cap. Core selection compared every eligible candidate in one request or withheld the set. A recorded condition stayed on the presented statement. 0.9.34 replaces that core withhold with a deterministic tournament. |
+| [design-review-fixes-0934.md](design-review-fixes-0934.md) | 0.9.34. Core selection is a deterministic tournament. A full-clause condition is kept, and a bare pronoun is incomplete. Unreviewed and incomplete rows are not eligible. 0.9.35 keeps only a validated final decision as the core, and an observed conditional pattern stays eligible. |
 
-`design-review-fixes-0933.md` records the 0.9.33 packing and one-request core comparison. `design-review-fixes-0934.md` is the current review note.
+`design-review-fixes-0934.md` records the 0.9.34 tournament. `design-review-fixes-0935.md` is the current review note.
 
 ## Defaults the tests check
 
