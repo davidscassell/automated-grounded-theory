@@ -1,6 +1,6 @@
 # 0.9.33 review fixes
 
-Status: record of package 0.9.33. Package 0.9.36 is current. The 0.9.32 note stays the record of per-step token allowances, respondent case counts, and the post-selection reread estimate. This note does not change `pattern_min_cases` (2), the axial token number (24000 per step), `batch_size` (1), or the 6000 request budgets. `auto_size_decision_calls` stays off. `selection_consolidation` stays off. Tier 4 stays human-only. Undefined metrics stay null. Human input still arrives through `interrupt()` and `Command(resume=...)`. No paid call is added. No LLM judge is added.
+Status: record of package 0.9.33. Package 0.9.37 is current. The 0.9.32 note stays the record of per-step token allowances, respondent case counts, and the post-selection reread estimate. This note does not change `pattern_min_cases` (2), the axial token number (24000 per step), `batch_size` (1), or the 6000 request budgets. `auto_size_decision_calls` stays off. `selection_consolidation` stays off. Tier 4 stays human-only. Undefined metrics stay null. Human input still arrives through `interrupt()` and `Command(resume=...)`. No paid call is added. No LLM judge is added.
 
 ## Decisions
 

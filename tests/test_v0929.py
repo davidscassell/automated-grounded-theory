@@ -39,8 +39,8 @@ _STATEMENT = "tools for the shift may be related to coworkers on the crew"
 
 
 def test_version_and_fingerprint():
-    assert __version__ == "0.9.36"
-    assert POLICY_VERSION == "0.9.36"
+    assert __version__ == "0.9.37"
+    assert POLICY_VERSION == "0.9.37"
     assert DECISION_REVIEW_CHUNKING == "request_budget_v6"
     assert CONDITIONAL_SCOPE_RULE == "condition_scope_v1"
     assert DUPLICATE_ASSERTION_RULE == "merge_all_evidence_v1"

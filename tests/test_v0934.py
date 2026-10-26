@@ -18,7 +18,7 @@ from automated_grounded_theory.axial import (
 )
 from automated_grounded_theory.decision_review import (
     CHUNKING_CHECKPOINT_MESSAGE,
-    CORE_BRACKET_INCOMPLETE,
+    CORE_CALL_ALLOWANCE_INSUFFICIENT,
     CORE_COMPARISON_RULE,
     CORE_PAIR_EXCEEDS_REQUEST_BUDGET,
     DECISION_REVIEW_CHUNKING,
@@ -54,8 +54,8 @@ from tests.test_v0933 import _packed_state
 
 
 def test_version_fingerprint_and_unchanged_defaults():
-    assert __version__ == "0.9.36"
-    assert POLICY_VERSION == "0.9.36"
+    assert __version__ == "0.9.37"
+    assert POLICY_VERSION == "0.9.37"
     assert PATTERN_MIN_CASES == 2
     assert DEFAULT_MAX_AXIAL_REVIEW_TOKENS == 24000
     assert DECISION_REVIEW_CHUNKING == "request_budget_v6"
@@ -203,7 +203,8 @@ def test_a_core_tournament_compares_finalists_and_an_unfinished_bracket_picks_no
         axial_token_budget=budget,
         batch_size=1,
     )
-    assert stopped.metadata["decision_stop"] == CORE_BRACKET_INCOMPLETE
+    assert stopped.metadata["decision_stop"] == CORE_CALL_ALLOWANCE_INSUFFICIENT
+    assert stopped.metadata["core_outcome"] == "selection_unresolved"
     assert stopped.metadata["model_core_id"] == ""
     assert stopped.metadata["provisional_core_id"] == ""
     assert stopped.metadata["core_status"] == "withheld"
