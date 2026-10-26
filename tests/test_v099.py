@@ -30,8 +30,8 @@ from tests.test_v090 import FakeSamplingCoder, _kwargs, _payload
 
 
 def test_version_is_099():
-    assert __version__ == "0.9.35"
-    assert POLICY_VERSION == "0.9.35"
+    assert __version__ == "0.9.36"
+    assert POLICY_VERSION == "0.9.36"
 
 
 class _SameRelevantNote(FakeSamplingCoder):

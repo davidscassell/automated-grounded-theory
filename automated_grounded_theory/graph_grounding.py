@@ -306,11 +306,122 @@ def candidate_evidence_summary(
         "representative_statements": kept,
         "key_variation": variation_out,
         "counterevidence": counter_out,
+        "source_definition": " ".join(str(definition or "").split()),
+        "source_statements": list(statements),
+        "source_variation": variation,
+        "source_counterevidence": counter,
         "tokens": estimate_tokens(text),
         "token_cap": cap,
         "truncated": text != full,
         "improves_selection": None,
     }
+
+
+def evidence_cap_for_match(
+    match_count: int,
+    *,
+    per_request: int,
+    per_step: int,
+    configured: int = DEFAULT_CORE_EVIDENCE_TOKEN_CAP,
+    richer: bool = False,
+) -> int:
+    """Per-candidate evidence cap for one match, from that match's budget.
+
+    The original eligible-set size is not used. A match of 12 is not priced
+    as if every eligible candidate were in the request. ``richer`` is the
+    insufficient-evidence retry: a larger share of the same match budget.
+    """
+    count = max(1, int(match_count or 1))
+    ceiling = max(1, int(configured or DEFAULT_CORE_EVIDENCE_TOKEN_CAP))
+    limits = []
+    for value in (per_request, per_step):
+        try:
+            number = int(value or 0)
+        except (TypeError, ValueError):
+            number = 0
+        if number > 0:
+            limits.append(number)
+    allowance = min(limits) if limits else 0
+    if allowance <= 0:
+        return ceiling * (4 if richer else 1)
+    share = 2 if richer else 4
+    room = max(count, allowance // share)
+    cap = max(1, room // count)
+    if richer:
+        return max(ceiling, min(cap, ceiling * 4))
+    return min(cap, ceiling)
+
+
+def refit_evidence_summary(summary: Mapping[str, Any] | None, token_cap: int) -> dict[str, Any] | None:
+    """Fit a stored summary to a match cap, from the original source text.
+
+    A definition, a representative statement, and counterevidence stay in the
+    summary when the source has them and the cap can hold one token of each.
+    """
+    if not isinstance(summary, Mapping):
+        return None
+    definition = str(summary.get("source_definition") or summary.get("definition") or "")
+    statements = [
+        str(item)
+        for item in (summary.get("source_statements") or summary.get("representative_statements") or [])
+        if str(item)
+    ]
+    variation = str(summary.get("source_variation") or summary.get("key_variation") or "")
+    counter = str(summary.get("source_counterevidence") or summary.get("counterevidence") or "")
+    relationships = []
+    if statements or variation or counter:
+        relationships.append(
+            {
+                "statement": statements[0] if statements else "",
+                "variation_note": variation,
+                "counterexamples": [{"quote": counter, "judgment": "contradicts"}] if counter else [],
+            }
+        )
+        if len(statements) > 1:
+            relationships.append({"statement": statements[1]})
+    fitted = candidate_evidence_summary(
+        definition=definition,
+        relationships=relationships,
+        token_cap=max(1, int(token_cap or 1)),
+    )
+    # Keep the original source so a later retry can fit a larger cap.
+    fitted["source_definition"] = definition
+    fitted["source_statements"] = statements
+    fitted["source_variation"] = variation
+    fitted["source_counterevidence"] = counter
+    present = []
+    if definition:
+        present.append("definition")
+    if statements:
+        present.append("statement")
+    if counter:
+        present.append("counterevidence")
+    cap = max(1, int(token_cap or 1))
+    if cap >= len(present) >= 1:
+        if "definition" in present and not fitted["definition"]:
+            fitted["definition"] = _fit_piece(definition, 1, "")
+        if "statement" in present and not fitted["representative_statements"]:
+            piece = _fit_piece(statements[0], 1, "")
+            fitted["representative_statements"] = [piece] if piece else []
+        if "counterevidence" in present and not fitted["counterevidence"]:
+            fitted["counterevidence"] = _fit_piece(counter, 1, "")
+        text = _summary_text(
+            fitted["definition"],
+            fitted["representative_statements"],
+            fitted["key_variation"],
+            fitted["counterevidence"],
+        )
+        while estimate_tokens(text) > cap and fitted["key_variation"]:
+            fitted["key_variation"] = _fit_piece(fitted["key_variation"], max(0, estimate_tokens(fitted["key_variation"]) - 1), "")
+            text = _summary_text(
+                fitted["definition"],
+                fitted["representative_statements"],
+                fitted["key_variation"],
+                fitted["counterevidence"],
+            )
+        fitted["tokens"] = estimate_tokens(text)
+        fitted["truncated"] = text != _summary_text(definition, statements[:2], variation, counter)
+    return fitted
 
 
 def named_core_id(run: Any) -> str:

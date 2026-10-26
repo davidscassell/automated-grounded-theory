@@ -11,6 +11,7 @@ import hashlib
 from typing import Any, Callable, Mapping, Sequence
 
 from automated_grounded_theory.async_support import run_sync
+from automated_grounded_theory.decision_review import RAISED_VARIANCE_RULE
 
 
 def statement_hash(text: str) -> str:
@@ -125,10 +126,21 @@ def _pair_report(left: Any, right: Any, left_index: int, right_index: int) -> di
             {_statement_key(row) for row in right_rows},
         )
         eligibility = _eligibility_changes(left_rows, right_rows)
+    count_left = None if left_ids is None else len(left_ids)
+    count_right = None if right_ids is None else len(right_ids)
     return {
         "left": left_index,
         "right": right_index,
         "selected_code_jaccard": selected,
+        "raised_code_count_left": count_left,
+        "raised_code_count_right": count_right,
+        "raised_code_count_diff": None if count_left is None or count_right is None else abs(count_left - count_right),
+        "raised_code_ids_only_left": None
+        if left_ids is None or right_ids is None
+        else sorted(set(left_ids) - set(right_ids)),
+        "raised_code_ids_only_right": None
+        if left_ids is None or right_ids is None
+        else sorted(set(right_ids) - set(left_ids)),
         "directed_pair_jaccard": directed,
         "statement_jaccard": statements,
         "eligibility_changes": eligibility,
@@ -238,6 +250,38 @@ def _mean(values: Sequence[float | None]) -> float | None:
     return sum(defined) / len(defined)
 
 
+def _raised_count_report(runs: Sequence[Any]) -> dict[str, Any]:
+    """Run-to-run raised-code counts. A missing list stays null.
+
+    Jaccard can stay high when the counts differ. The counts are recorded
+    beside it. They are null when any run has no ``raised_code_ids``.
+    """
+    lists = [_raised_ids(_as_run(run)) for run in runs]
+    if any(item is None for item in lists):
+        return {
+            "raised_variance_rule": RAISED_VARIANCE_RULE,
+            "raised_code_counts": None,
+            "raised_code_count_min": None,
+            "raised_code_count_max": None,
+            "raised_code_count_range": None,
+            "raised_code_counts_vary": None,
+            "raised_code_ids_not_in_every_run": None,
+        }
+    counts = [len(item or []) for item in lists]
+    present = [set(item or []) for item in lists]
+    common = set.intersection(*present) if present else set()
+    union = set.union(*present) if present else set()
+    return {
+        "raised_variance_rule": RAISED_VARIANCE_RULE,
+        "raised_code_counts": counts,
+        "raised_code_count_min": min(counts) if counts else None,
+        "raised_code_count_max": max(counts) if counts else None,
+        "raised_code_count_range": (max(counts) - min(counts)) if counts else None,
+        "raised_code_counts_vary": len(set(counts)) > 1 if counts else None,
+        "raised_code_ids_not_in_every_run": sorted(union - common),
+    }
+
+
 def compare_pipeline_runs(runs: Sequence[Any]) -> dict[str, Any]:
     """Pairwise overlap of two or more runs. Undefined comparisons stay null.
 
@@ -255,6 +299,7 @@ def compare_pipeline_runs(runs: Sequence[Any]) -> dict[str, Any]:
         for right_index in range(left_index + 1, len(items)):
             pairwise.append(_pair_report(items[left_index], items[right_index], left_index, right_index))
     defined = [item["eligibility_changes"] for item in pairwise if item["eligibility_changes"] is not None]
+    variance = _raised_count_report(items)
     return {
         "run_count": len(items),
         "pairwise": pairwise,
@@ -265,5 +310,6 @@ def compare_pipeline_runs(runs: Sequence[Any]) -> dict[str, Any]:
             "eligibility_changes": None
             if not defined
             else [change for report in defined for change in report["matched"]],
+            **variance,
         },
     }
