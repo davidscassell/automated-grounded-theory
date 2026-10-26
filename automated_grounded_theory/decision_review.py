@@ -125,14 +125,24 @@ CORE_PAIR_EXCEEDS_REQUEST_BUDGET = "core_pair_exceeds_request_budget"
 CONDITION_COMPLETENESS_RULE = "full_clause_or_incomplete_v1"
 # A supported pattern under a complete condition stays eligible. Speculation does not.
 ELIGIBILITY_DECISION_RULE = "observed_conditional_eligible_v1"
-# Only the validated final match may set the core. An earlier winner is a nomination.
-CORE_FINAL_DECISION_RULE = "final_match_only_v1"
-# The prompt names the original eligible set, this round, and the finalists separately.
-CORE_PROMPT_SCOPE_RULE = "eligible_round_finalists_v1"
+# Only a final assessment may set the core. An opening abstention does not end the tournament.
+CORE_FINAL_DECISION_RULE = "final_assessment_only_v1"
+# An opening abstention ends that match. Later matches still run.
+CORE_MATCH_ABSTENTION_RULE = "continue_after_opening_abstention_v1"
+# core_selected, no_core_supported, or selection_unresolved. Incomplete coverage is not a conclusion.
+CORE_OUTCOME_RULE = "selected_unsupported_or_unresolved_v1"
+# The prompt names the eligible set, this match, and the finalists without inviting an abstention.
+CORE_PROMPT_SCOPE_RULE = "eligible_match_finalists_no_abstain_cue_v1"
 # Observed conditional, speculative counterfactual, and incomplete condition are different.
 CONDITION_PATTERN_RULE = "observed_conditional_eligible_v1"
-# Each core candidate can carry a compact evidence summary under a token cap.
-CORE_EVIDENCE_SUMMARY_RULE = "capped_candidate_evidence_v1"
+# Evidence summaries are sized from the match budget, not the whole eligible set.
+CORE_EVIDENCE_SUMMARY_RULE = "match_budget_candidate_evidence_v1"
+# Unreviewed relation rows keep the call-limit cause. The limit is not raised.
+RELATION_UNREVIEWED_RULE = "report_call_limit_v1"
+# withheld_over_budget at the top of the run matches the coverage list.
+WITHHELD_EXPORT_RULE = "coverage_matches_top_level_v1"
+# Repeatability records raised-code count differences instead of hiding them in Jaccard.
+RAISED_VARIANCE_RULE = "record_run_to_run_counts_v1"
 CORE_SCHEDULE_NOTE = (
     "A deterministic bracket is reproducible scheduling, not evidence of substantive stability."
 )
@@ -211,6 +221,10 @@ CHUNKING_CHECKPOINT_MESSAGE = (
     "left no core, the core prompt named the eligible set and the finalists separately, "
     "an observed conditional pattern stayed eligible, candidate evidence summaries were "
     "capped, or the 0.9.35 rules, "
+    "or before an opening abstention continued the tournament, a sole survivor "
+    "still needed a final assessment, incomplete coverage was not reported as "
+    "complete, evidence summaries were sized from the match budget, unreviewed "
+    "relation rows named the call limit, or the 0.9.36 rules, "
     "or the stored chunk plan does not match this resume. Resume cannot continue "
     "that review. Start a new run."
 )
@@ -995,9 +1009,14 @@ def review_procedure_fields() -> dict[str, str]:
         "condition_completeness_rule": CONDITION_COMPLETENESS_RULE,
         "eligibility_decision_rule": ELIGIBILITY_DECISION_RULE,
         "core_final_decision_rule": CORE_FINAL_DECISION_RULE,
+        "core_match_abstention_rule": CORE_MATCH_ABSTENTION_RULE,
+        "core_outcome_rule": CORE_OUTCOME_RULE,
         "core_prompt_scope_rule": CORE_PROMPT_SCOPE_RULE,
         "condition_pattern_rule": CONDITION_PATTERN_RULE,
         "core_evidence_summary_rule": CORE_EVIDENCE_SUMMARY_RULE,
+        "relation_unreviewed_rule": RELATION_UNREVIEWED_RULE,
+        "withheld_export_rule": WITHHELD_EXPORT_RULE,
+        "raised_variance_rule": RAISED_VARIANCE_RULE,
         "reread_coverage_rule": REREAD_COVERAGE_RULE,
         "reread_bound_rule": REREAD_BOUND_RULE,
         "case_identity_source_rule": CASE_IDENTITY_SOURCE_RULE,
@@ -1961,9 +1980,14 @@ def same_chunking_fingerprint(saved: Any, current: Any) -> bool:
         "condition_completeness_rule": CONDITION_COMPLETENESS_RULE,
         "eligibility_decision_rule": ELIGIBILITY_DECISION_RULE,
         "core_final_decision_rule": CORE_FINAL_DECISION_RULE,
+        "core_match_abstention_rule": CORE_MATCH_ABSTENTION_RULE,
+        "core_outcome_rule": CORE_OUTCOME_RULE,
         "core_prompt_scope_rule": CORE_PROMPT_SCOPE_RULE,
         "condition_pattern_rule": CONDITION_PATTERN_RULE,
         "core_evidence_summary_rule": CORE_EVIDENCE_SUMMARY_RULE,
+        "relation_unreviewed_rule": RELATION_UNREVIEWED_RULE,
+        "withheld_export_rule": WITHHELD_EXPORT_RULE,
+        "raised_variance_rule": RAISED_VARIANCE_RULE,
         "reread_coverage_rule": REREAD_COVERAGE_RULE,
         "reread_bound_rule": REREAD_BOUND_RULE,
         "case_identity_source_rule": CASE_IDENTITY_SOURCE_RULE,

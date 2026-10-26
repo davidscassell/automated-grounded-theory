@@ -77,8 +77,20 @@ class ScriptedCore(FakeAxialCoder):
                 if not include_raw:
                     raise ValueError("unreadable core decision")
                 return {"raw": raw, "parsed": None, "parsing_error": "unreadable"}
-            if step == "abstain":
-                parsed = schema(decision="abstain", core_id="", rationale="No defensible core")
+            if isinstance(step, tuple) and step and step[0] == "abstain":
+                parsed = schema(
+                    decision="abstain",
+                    core_id="",
+                    abstention_reason=str(step[1]),
+                    rationale="No defensible core",
+                )
+            elif step == "abstain":
+                parsed = schema(
+                    decision="abstain",
+                    core_id="",
+                    abstention_reason="no_suitable_candidate",
+                    rationale="No defensible core",
+                )
             elif step == "empty_select":
                 parsed = schema(core_id="", rationale="No defensible core")
             elif step == "invalid":
@@ -106,6 +118,7 @@ def _tournament_budget() -> int:
 def _run_core(steps: list, **kwargs):
     source = _core_source("packing " * 40, 3)
     budget = kwargs.pop("axial_token_budget", _tournament_budget())
+    calls = kwargs.pop("max_decision_calls", 8)
     return selective_code(
         source,
         ScriptedCore(core_steps=list(steps)),
@@ -114,7 +127,7 @@ def _run_core(steps: list, **kwargs):
         interrupt=False,
         include_memos=False,
         include_storyline=False,
-        max_decision_calls=8,
+        max_decision_calls=calls,
         max_axial_review_tokens=10**6,
         axial_token_budget=budget,
         batch_size=1,
@@ -179,21 +192,22 @@ def _cycle(match: list[str]) -> str:
 
 
 def test_version_fingerprint_and_unchanged_defaults():
-    assert __version__ == "0.9.35"
-    assert POLICY_VERSION == "0.9.35"
+    assert __version__ == "0.9.36"
+    assert POLICY_VERSION == "0.9.36"
     assert PATTERN_MIN_CASES == 2
     assert DEFAULT_MAX_AXIAL_REVIEW_TOKENS == 24000
-    assert CORE_FINAL_DECISION_RULE == "final_match_only_v1"
-    assert CORE_PROMPT_SCOPE_RULE == "eligible_round_finalists_v1"
+    assert CORE_FINAL_DECISION_RULE == "final_assessment_only_v1"
+    assert CORE_PROMPT_SCOPE_RULE == "eligible_match_finalists_no_abstain_cue_v1"
     assert CONDITION_PATTERN_RULE == "observed_conditional_eligible_v1"
     assert ELIGIBILITY_DECISION_RULE == "observed_conditional_eligible_v1"
-    assert CORE_EVIDENCE_SUMMARY_RULE == "capped_candidate_evidence_v1"
+    assert CORE_EVIDENCE_SUMMARY_RULE == "match_budget_candidate_evidence_v1"
     assert "reproducible scheduling" in CORE_SCHEDULE_NOTE
     assert "not evidence of substantive stability" in CORE_SCHEDULE_NOTE
     assert "0.9.28" in CHUNKING_CHECKPOINT_MESSAGE
     assert "0.9.33" in CHUNKING_CHECKPOINT_MESSAGE
     assert "0.9.34" in CHUNKING_CHECKPOINT_MESSAGE
     assert "0.9.35" in CHUNKING_CHECKPOINT_MESSAGE
+    assert "0.9.36" in CHUNKING_CHECKPOINT_MESSAGE
     current = review_procedure_fields()
     assert current["core_final_decision_rule"] == CORE_FINAL_DECISION_RULE
     assert current["core_prompt_scope_rule"] == CORE_PROMPT_SCOPE_RULE
@@ -221,7 +235,8 @@ def test_an_empty_final_core_does_not_keep_the_earlier_nomination():
 def test_an_explicit_abstention_ends_with_no_core_in_either_round():
     final = _run_core(["c00", "abstain"])
     assert final.metadata["model_core_id"] == ""
-    assert final.metadata["core_status"] == "abstained"
+    assert final.metadata["core_status"] == "no_core_supported"
+    assert final.metadata["core_outcome"] == "no_core_supported"
     assert final.metadata["model_core_decision"] == "abstain"
     assert final.metadata["model_core_rationale"] == "No defensible core"
     assert final.metadata["core_selection_withheld"] is False
@@ -231,12 +246,14 @@ def test_an_explicit_abstention_ends_with_no_core_in_either_round():
     assert "Chosen by the final match" not in str(final.metadata.get("model_core_rationale") or "")
     assert all(not row.get("model_core") for row in final.core_candidates)
 
-    opening = _run_core(["abstain"])
+    opening = _run_core(["abstain", "abstain"])
     assert opening.metadata["model_core_id"] == ""
-    assert opening.metadata["core_status"] == "abstained"
+    assert opening.metadata["core_status"] == "no_core_supported"
+    assert opening.metadata["core_outcome"] == "no_core_supported"
     assert opening.metadata["model_core_decision"] == "abstain"
     assert opening.metadata["model_core_rationale"] == "No defensible core"
     assert opening.metadata["core_selection_complete"] is True
+    assert opening.metadata["core_candidates_compared"] == 3
     assert opening.metadata["core_downstream_eligible"] is False
 
 
@@ -284,7 +301,8 @@ def test_the_final_prompt_names_the_eligible_set_the_round_and_the_finalists():
     opening = bodies[0]
     final = bodies[1]
     assert "This request contains every eligible candidate" not in final["instruction"]
-    assert "contains_every_eligible_candidate is false" in final["instruction"]
+    assert "contains_every_eligible_candidate is false" not in final["instruction"]
+    assert "partial" not in final["instruction"].casefold()
     assert "original eligible set has 3" in final["instruction"]
     assert "This round is final." in final["instruction"]
     assert "c00" in final["instruction"] and "c02" in final["instruction"]
@@ -450,11 +468,12 @@ def test_candidate_evidence_summaries_are_capped_and_configurable():
             "performance": {"axial_token_budget": 40},
         },
     }
-    shrunk = {row["code_id"]: row for row in _score_candidates(tight)}
-    tight_summary = shrunk["c00"]["evidence_summary"]
-    assert tight_summary["token_cap"] < 80
-    assert tight_summary["tokens"] <= tight_summary["token_cap"]
-    assert tight_summary["truncated"] is True
+    stored = {row["code_id"]: row for row in _score_candidates(tight)}
+    tight_summary = stored["c00"]["evidence_summary"]
+    assert tight_summary["token_cap"] == 80
+    assert tight_summary["source_definition"]
+    assert tight_summary["source_statements"]
+    assert tight_summary["source_counterevidence"]
 
     off = {
         **state,
@@ -477,7 +496,9 @@ def test_core_instruction_scope_is_explicit_without_a_model_call():
         prior_rationales=[{"match": ["c00", "c01"], "winner": "c00", "rationale": "c00 held " * 80}],
     )
     assert "This request contains every eligible candidate" not in text
-    assert "contains_every_eligible_candidate is false" in text
+    assert "contains_every_eligible_candidate is false" not in text
+    assert "partial" not in text.casefold()
+    assert "Do not abstain because this match is not the whole eligible set." in text
     assert "original eligible set has 3" in text
     assert "This round is final." in text
     assert "c00, c02" in text

@@ -53,9 +53,14 @@ from automated_grounded_theory.decision_review import (
     CORE_COMPARISON_RULE,
     CORE_EVIDENCE_SUMMARY_RULE,
     CORE_FINAL_DECISION_RULE,
+    CORE_MATCH_ABSTENTION_RULE,
+    CORE_OUTCOME_RULE,
     CORE_PAIR_EXCEEDS_REQUEST_BUDGET,
     CORE_PROMPT_SCOPE_RULE,
     CORE_SCHEDULE_NOTE,
+    RAISED_VARIANCE_RULE,
+    RELATION_UNREVIEWED_RULE,
+    WITHHELD_EXPORT_RULE,
     DECISION_REVIEW_CHUNKING,
     PER_STEP_DECISION_REVIEW,
     DecisionChunkingCheckpointError,
@@ -90,6 +95,8 @@ from automated_grounded_theory.graph_grounding import (
     CORE_STABILITY_MIN_N,
     DEFAULT_CORE_EVIDENCE_TOKEN_CAP,
     candidate_evidence_summary,
+    evidence_cap_for_match,
+    refit_evidence_summary,
     contradicted as _row_contradicted,
     core_agreement,
     graph_snapshot,
@@ -241,9 +248,14 @@ _PROCEDURE_KEYS = (
     "condition_completeness_rule",
     "eligibility_decision_rule",
     "core_final_decision_rule",
+    "core_match_abstention_rule",
+    "core_outcome_rule",
     "core_prompt_scope_rule",
     "condition_pattern_rule",
     "core_evidence_summary_rule",
+    "relation_unreviewed_rule",
+    "withheld_export_rule",
+    "raised_variance_rule",
     "reread_coverage_rule",
     "reread_bound_rule",
     "export_assessment_rule",
@@ -381,20 +393,30 @@ class ModelCoreDecision(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     decision: Literal["select", "abstain"] = "select"
+    abstention_reason: Literal["", "no_suitable_candidate", "insufficient_evidence"] = ""
     core_id: str = ""
     rationale: str = Field(min_length=1)
 
     @model_validator(mode="after")
     def _decision_agrees_with_core(self) -> "ModelCoreDecision":
         named = str(self.core_id or "").strip()
+        reason = str(self.abstention_reason or "")
         if self.decision == "abstain":
             if named:
                 raise ValueError("An abstention cannot name a core_id.")
+            if reason not in {"no_suitable_candidate", "insufficient_evidence"}:
+                raise ValueError(
+                    "An abstention must name no_suitable_candidate or insufficient_evidence."
+                )
             self.core_id = ""
+            self.abstention_reason = reason
             return self
+        if reason:
+            raise ValueError("A selection cannot name an abstention reason.")
         if not named:
             raise ValueError("A selection must name a core_id.")
         self.core_id = named
+        self.abstention_reason = ""
         return self
 
 
@@ -2716,14 +2738,16 @@ def _core_evidence_cap(value: Any) -> int:
 
 
 def _core_evidence_settings(metadata: Mapping[str, Any], candidate_count: int) -> tuple[bool, int]:
-    """Whether summaries are on, and the per-candidate cap that fits the allowance.
+    """Whether summaries are on, and the configured per-candidate cap.
 
-    The cap is the configured value, shrunk so the candidates together stay
-    inside a quarter of the smaller of the per-request budget and the
-    per-step allowance. A missing setting leaves summaries on at 80 tokens.
+    Scoring keeps the source text at this cap. The request that is sent
+    refits each summary to the match in that request. The eligible-set
+    size is not used here: pricing all 55 candidates at once was what
+    left a match of 12 with about 27 tokens and no usable statement.
+    ``candidate_count`` stays in the signature for callers.
     """
+    del candidate_count
     procedure = metadata.get("procedure") if isinstance(metadata.get("procedure"), Mapping) else {}
-    performance = metadata.get("performance") if isinstance(metadata.get("performance"), Mapping) else {}
     enabled = procedure.get("core_evidence_summaries", True)
     if enabled is None:
         enabled = True
@@ -2731,23 +2755,58 @@ def _core_evidence_settings(metadata: Mapping[str, Any], candidate_count: int) -
         cap = int(procedure.get("core_evidence_token_cap") or DEFAULT_CORE_EVIDENCE_TOKEN_CAP)
     except (TypeError, ValueError):
         cap = DEFAULT_CORE_EVIDENCE_TOKEN_CAP
-    cap = max(1, cap)
+    return bool(enabled), max(1, cap)
+
+
+def _match_evidence_budget(metadata: Mapping[str, Any], reviewer) -> tuple[int, int, int]:
+    procedure = metadata.get("procedure") if isinstance(metadata.get("procedure"), Mapping) else {}
+    performance = metadata.get("performance") if isinstance(metadata.get("performance"), Mapping) else {}
     try:
-        per_request = int(performance.get("axial_token_budget") or 6000)
+        per_request = int(performance.get("axial_token_budget") or getattr(reviewer, "token_budget", 0) or 6000)
     except (TypeError, ValueError):
         per_request = 6000
     try:
-        per_step = int(procedure.get("max_axial_review_tokens") or DEFAULT_MAX_AXIAL_REVIEW_TOKENS)
+        per_step = int(procedure.get("max_axial_review_tokens") or getattr(reviewer, "max_tokens", 0) or DEFAULT_MAX_AXIAL_REVIEW_TOKENS)
     except (TypeError, ValueError):
         per_step = DEFAULT_MAX_AXIAL_REVIEW_TOKENS
-    limits = [value for value in (per_request, per_step) if value > 0]
-    allowance = min(limits) if limits else 0
-    count = max(0, int(candidate_count))
-    if allowance and count:
-        room = max(1, allowance // 4)
-        if cap * count > room:
-            cap = max(1, room // count)
-    return bool(enabled), cap
+    try:
+        configured = int(procedure.get("core_evidence_token_cap") or DEFAULT_CORE_EVIDENCE_TOKEN_CAP)
+    except (TypeError, ValueError):
+        configured = DEFAULT_CORE_EVIDENCE_TOKEN_CAP
+    return per_request, per_step, max(1, configured)
+
+
+def _candidates_for_match(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    metadata: Mapping[str, Any],
+    reviewer,
+    richer: bool = False,
+) -> tuple[list[dict[str, Any]], int]:
+    """Copies of the match rows with summaries fit to this match's budget."""
+    per_request, per_step, configured = _match_evidence_budget(metadata, reviewer)
+    enabled = True
+    procedure = metadata.get("procedure") if isinstance(metadata.get("procedure"), Mapping) else {}
+    if procedure.get("core_evidence_summaries") is False:
+        enabled = False
+    cap = evidence_cap_for_match(
+        len(candidates),
+        per_request=per_request,
+        per_step=per_step,
+        configured=configured,
+        richer=richer,
+    )
+    fitted = []
+    for row in candidates:
+        copied = dict(row)
+        summary = copied.get("evidence_summary")
+        if enabled and isinstance(summary, Mapping):
+            refit = refit_evidence_summary(summary, cap)
+            copied["evidence_summary"] = refit
+            copied["core_evidence_extra_tokens_per_candidate"] = int((refit or {}).get("tokens") or 0)
+            copied["core_evidence_retry"] = bool(richer)
+        fitted.append(copied)
+    return fitted, cap
 
 
 def _score_candidates(state: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -5099,6 +5158,18 @@ async def _advance_relation_review(
         list(progress.get("chunks") or [])[int(progress.get("next_index") or 0):],
         estimate,
     )
+    planned_chunks = list(progress.get("chunks") or [])
+    call_limit = int(reviewer.max_calls)
+    metadata["relation_unreviewed_rule"] = RELATION_UNREVIEWED_RULE
+    metadata["relation_review_call_limit_raised"] = False
+    if len(planned_chunks) > call_limit:
+        metadata["relation_review_call_warning"] = (
+            f"Relation review has {len(ordered_ids)} rows and needs {len(planned_chunks)} calls. "
+            f"The call limit is {call_limit}. The call limit is not raised. "
+            "Rows that are not sent stay unreviewed."
+        )
+    else:
+        metadata["relation_review_call_warning"] = ""
 
     def _apply(progress_row: dict) -> list[dict]:
         decisions = [dict(item) for item in (progress_row.get("decisions") or []) if isinstance(item, Mapping)]
@@ -5132,6 +5203,23 @@ async def _advance_relation_review(
         store_decision_report(metadata, report)
         _note_chunked_review(metadata, "decision_review", report, required=True)
         updated = _apply(progress_row)
+        reviewed = {str(item) for item in (progress_row.get("reviewed_ids") or [])}
+        omissions = {}
+        for item in progress_row.get("omissions") or []:
+            if isinstance(item, Mapping) and item.get("id"):
+                omissions[str(item.get("id"))] = str(item.get("reason") or "omitted")
+        stops = [str(item) for item in (progress_row.get("stop_reasons") or []) if str(item)]
+        cause = stops[0] if stops else "call_allowance"
+        unreviewed = []
+        for row in updated:
+            relationship_id = str(row.get("relationship_id") or "")
+            if not relationship_id or relationship_id in reviewed:
+                continue
+            reason = omissions.get(relationship_id) or cause
+            row["relation_review_status"] = "unreviewed"
+            row["relation_unreviewed_reason"] = reason
+            unreviewed.append({"relationship_id": relationship_id, "reason": reason})
+        metadata["relation_unreviewed_rows"] = unreviewed
         return {"relationships": updated, "metadata": metadata, "prompt_log": logs}
 
     index = int(progress.get("next_index") or 0)
@@ -6223,7 +6311,7 @@ def _core_match_instruction(
     )
     role = str(scope["round_role"])
     match_text = ", ".join(scope["match_ids"])
-    contained = str(scope["contains_every_eligible_candidate"]).lower()
+    eligible_text = ", ".join(scope["eligible_ids"])
     lines = [
         "The numbers on each candidate are the evidence. ",
         "graph_supported is true only for an endpoint of a relationship at tier 2 or higher. ",
@@ -6233,25 +6321,31 @@ def _core_match_instruction(
         "A choice without graph support is kept as model_core_id and flagged ",
         "core_unsupported_by_graph. It is not promoted. ",
         "core_stability is undefined below the recorded minimum n. ",
-        f"The original eligible set has {scope['eligible_total']} candidates. ",
+        f"The original eligible set has {scope['eligible_total']} candidates: {eligible_text}. ",
         f"This round is {role}. ",
-        f"This request compares {len(scope['match_ids'])} candidates: {match_text}. ",
-        f"contains_every_eligible_candidate is {contained}. ",
+        f"This match compares {len(scope['match_ids'])} candidates: {match_text}. ",
     ]
     if role == "final":
         lines.append(f"The finalists are {match_text}. ")
-        if scope["contains_every_eligible_candidate"]:
-            lines.append("This request compares the finalists, who are the original eligible set. ")
+        if len(scope["match_ids"]) == 1:
+            lines.append(
+                "This is a final assessment of the one remaining candidate against the core-category criteria. "
+                "Being the only candidate left does not make it the core. "
+            )
+        elif scope["contains_every_eligible_candidate"]:
+            lines.append("The finalists are the original eligible set. ")
         else:
             lines.append(
-                "This request does not contain every originally eligible candidate "
-                f"({scope['eligible_total']}). "
+                "The finalists and the original eligible set are different lists. "
+                "Judge the finalists in this request. "
             )
     else:
-        lines.append("This request is not the final. The winner of this match advances. ")
         lines.append(
-            "This request does not contain every originally eligible candidate "
-            f"({scope['eligible_total']}). "
+            "This match is one comparison in the bracket. "
+            "The winner of this match advances. "
+            "Other eligible candidates are compared in other matches. "
+            "Judge only the candidates in this match. "
+            "How many candidates are in this match is not a reason to abstain. "
         )
     if scope["prior_match_rationales"]:
         lines.append("Earlier match rationales: ")
@@ -6260,10 +6354,10 @@ def _core_match_instruction(
             winner = item["winner"] or "no winner"
             lines.append(f"{label} chose {winner}. {item['rationale']} ")
     lines.append(
-        "Choose one code_id from the candidates in this request, or abstain with an empty core_id. "
-        "An abstention chooses no core. "
-        "Do not choose a core because only one candidate was supplied. "
-        "A one-candidate request is not a match unless it is the entire eligible set. "
+        "Select one code_id from this match when one candidate meets the core-category criteria. "
+        "Abstain with abstention_reason no_suitable_candidate and an empty core_id when none of these candidates is suitable. "
+        "Abstain with abstention_reason insufficient_evidence and an empty core_id when this request does not contain enough evidence to judge. "
+        "Do not abstain because this match is not the whole eligible set. "
         "You cannot set verified or authorize attribution wording."
     )
     return "".join(lines)
@@ -6278,6 +6372,10 @@ def _core_round_role(
     """``opening``, ``continuation``, or ``final`` for the match about to be sent."""
     eligible = [str(item) for item in eligible_ids if str(item)]
     match = [str(item) for item in match_ids if str(item)]
+    rounds = list(bracket.get("rounds") or [])
+    current = dict(rounds[round_index]) if round_index < len(rounds) and isinstance(rounds[round_index], Mapping) else {}
+    if current.get("final_assessment"):
+        return "final"
     if eligible and set(match) == set(eligible) and len(match) == len(eligible):
         return "final"
     rounds = list(bracket.get("rounds") or [])
@@ -6312,6 +6410,8 @@ def _record_core_match(
     winner: str,
     decision: str,
     rationale: str,
+    status: str = "",
+    abstention_reason: str = "",
 ) -> None:
     bracket = progress.get("core_bracket")
     if not isinstance(bracket, dict):
@@ -6326,10 +6426,28 @@ def _record_core_match(
             "match": [str(item) for item in match],
             "winner": str(winner or ""),
             "decision": str(decision or ""),
+            "status": str(status or ""),
+            "abstention_reason": str(abstention_reason or ""),
             "rationale": str(rationale or ""),
         }
     )
     current["match_records"] = records
+    rounds[round_index] = current
+    bracket = dict(bracket)
+    bracket["rounds"] = rounds
+    progress["core_bracket"] = bracket
+
+
+def _count_core_attempt(progress: dict, round_index: int, seat_count: int) -> None:
+    """Count seats in a match that was sent. An abstention still counts."""
+    bracket = progress.get("core_bracket")
+    if not isinstance(bracket, dict):
+        return
+    rounds = [dict(row) if isinstance(row, Mapping) else {} for row in (bracket.get("rounds") or [])]
+    if round_index >= len(rounds):
+        return
+    current = dict(rounds[round_index])
+    current["compared"] = int(current.get("compared") or 0) + max(0, int(seat_count))
     rounds[round_index] = current
     bracket = dict(bracket)
     bracket["rounds"] = rounds
@@ -6407,6 +6525,23 @@ def _core_match_upper_bound(
     )
 
 
+def _model_candidate(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Candidate row for a model request.
+
+    Source text stays on the in-memory summary so a retry can refit it.
+    The request carries the fitted summary only.
+    """
+    copied = dict(row)
+    summary = copied.get("evidence_summary")
+    if isinstance(summary, Mapping):
+        copied["evidence_summary"] = {
+            str(key): value
+            for key, value in summary.items()
+            if not str(key).startswith("source_")
+        }
+    return copied
+
+
 def _core_review_payload(
     candidates: Sequence[Mapping[str, Any]],
     *,
@@ -6419,7 +6554,7 @@ def _core_review_payload(
     present = {str(row.get("code_id") or "") for row in candidates}
     return {
         "kind": "axial_core_review",
-        "candidates": [dict(row) for row in candidates],
+        "candidates": [_model_candidate(row) for row in candidates],
         "relationship_preferred_core_ids": [item for item in preferred if item in present],
         "graph_snapshot": dict(snapshot),
         "review_chunk": {
@@ -6489,17 +6624,46 @@ def _open_next_core_round(progress: dict, estimate, *, per_request: int) -> None
     current = dict(rounds[index])
     matches = list(current.get("matches") or [])
     winners = [str(item) for item in (current.get("winners") or []) if str(item)]
-    if len(winners) < len(matches):
+    records = [item for item in (current.get("match_records") or []) if isinstance(item, Mapping)]
+    if len(records) < len(matches):
         return
     byes = [str(item) for item in (current.get("byes") or []) if str(item)]
     order = {item: pos for pos, item in enumerate(bracket.get("ordered_ids") or [])}
+    # Recompute the field after every match has a record. An abstention
+    # advances nobody from that match. Other winners and byes still advance.
     field = []
     for item in winners + byes:
         if item not in field:
             field.append(item)
     field.sort(key=lambda item: order.get(item, 10**9))
+    already_final = bool(
+        current.get("final_assessment")
+        or current.get("whole_set")
+        or str(current.get("round_role") or "") == "final"
+    )
     if len(field) <= 1:
-        progress["champion_id"] = field[0] if field else ""
+        # A sole survivor of an opening round is not the core. It still needs
+        # a final assessment. The winner of a final does not get another one.
+        if len(field) == 1 and not already_final:
+            rounds.append(
+                {
+                    "matches": [list(field)],
+                    "byes": [],
+                    "winners": [],
+                    "compared": 0,
+                    "whole_set": False,
+                    "final_assessment": True,
+                }
+            )
+            bracket["round_index"] = index + 1
+            bracket["rounds"] = rounds
+            progress["core_bracket"] = bracket
+            progress["chunks"] = list(progress.get("chunks") or []) + [list(field)]
+            return
+        if len(field) == 1:
+            progress["champion_id"] = field[0]
+        else:
+            progress["no_candidate_remains"] = True
         bracket["rounds"] = rounds
         progress["core_bracket"] = bracket
         return
@@ -6626,6 +6790,8 @@ async def _advance_core_review(
         metadata["core_bracket_is_substantive_stability"] = False
         metadata["core_bracket_schedule_note"] = CORE_SCHEDULE_NOTE
         metadata["core_final_decision_rule"] = CORE_FINAL_DECISION_RULE
+        metadata["core_match_abstention_rule"] = CORE_MATCH_ABSTENTION_RULE
+        metadata["core_outcome_rule"] = CORE_OUTCOME_RULE
         metadata["core_prompt_scope_rule"] = CORE_PROMPT_SCOPE_RULE
         metadata["core_evidence_summary_rule"] = CORE_EVIDENCE_SUMMARY_RULE
         metadata["core_evidence_improves_selection"] = None
@@ -6633,7 +6799,66 @@ async def _advance_core_review(
         decision = str(progress_row.get("core_decision") or "")
         decision_rationale = str(progress_row.get("core_decision_rationale") or "")
         final_core = str(progress_row.get("final_core_id") or "")
-        if decision == "abstain":
+        records = []
+        bracket_now = progress_row.get("core_bracket") if isinstance(progress_row.get("core_bracket"), Mapping) else {}
+        for round_row in bracket_now.get("rounds") or []:
+            if not isinstance(round_row, Mapping):
+                continue
+            for item in round_row.get("match_records") or []:
+                if isinstance(item, Mapping):
+                    records.append(item)
+        stops = [str(item) for item in (progress_row.get("stop_reasons") or []) if str(item)]
+        incomplete_match = any(str(item.get("status") or "") == "incomplete" for item in records)
+        unresolved_match = any(str(item.get("status") or "") == "unresolved" for item in records)
+        eligible_n = int(metadata.get("core_candidates_eligible") or len(candidates))
+        compared_n = int(metadata.get("core_candidates_compared") or 0)
+        all_no_suitable = bool(records) and all(
+            str(item.get("abstention_reason") or "") == "no_suitable_candidate" for item in records
+        )
+        if (
+            decision == "select"
+            and final_core
+            and not uncovered
+            and not stops
+            and not incomplete_match
+            and not unresolved_match
+        ):
+            outcome = "core_selected"
+        elif (
+            not uncovered
+            and not stops
+            and not incomplete_match
+            and not unresolved_match
+            and decision != "select"
+            and (
+                str(progress_row.get("abstention_reason") or "") == "no_suitable_candidate"
+                or all_no_suitable
+                or progress_row.get("no_candidate_remains")
+            )
+        ):
+            outcome = "no_core_supported"
+        else:
+            outcome = "selection_unresolved"
+        metadata["core_outcome"] = outcome
+        # Examining part of the eligible set is an early stop, not a finding that no core exists.
+        if uncovered or compared_n < eligible_n:
+            metadata["core_selection_complete"] = False
+            metadata["core_coverage_note"] = (
+                f"Examining {compared_n} of {eligible_n} candidates means selection stopped early. "
+                "It does not mean that no core exists."
+            )
+            outcome = "selection_unresolved"
+            metadata["core_outcome"] = outcome
+        elif outcome == "selection_unresolved":
+            metadata["core_selection_complete"] = False
+            metadata["core_coverage_note"] = (
+                "Selection is unresolved. Missing evidence, an unfinished match, or the budget "
+                "prevents a conclusion. That is not a finding that no core exists."
+            )
+        else:
+            metadata["core_selection_complete"] = True
+            metadata["core_coverage_note"] = ""
+        if outcome == "no_core_supported":
             progress_row["open"] = False
             progress_row["provisional"] = False
             metadata["decision_chunk_state"] = progress_row
@@ -6643,8 +6868,7 @@ async def _advance_core_review(
             metadata["model_core_judgment"] = True
             metadata["model_core_unknown"] = False
             metadata["provisional_core_id"] = ""
-            metadata["core_status"] = "abstained"
-            metadata["core_selection_complete"] = True
+            metadata["core_status"] = "no_core_supported"
             metadata["core_selection_truncated"] = False
             metadata["core_selection_withheld"] = False
             metadata["core_downstream_eligible"] = False
@@ -6656,7 +6880,7 @@ async def _advance_core_review(
                 "resumable": False,
                 "next_index": int(progress_row.get("next_index") or 0),
                 "plan_hash": str(progress_row.get("plan_hash") or ""),
-                "uncovered_code_ids": uncovered,
+                "uncovered_code_ids": [],
             }
             return {
                 "core_candidates": candidates,
@@ -6664,17 +6888,19 @@ async def _advance_core_review(
                 "prompt_log": logs,
                 "warnings": warnings,
             }
-        if not report["complete"]:
+        if outcome != "core_selected":
             progress_row["open"] = True
             progress_row["provisional"] = True
             metadata["decision_chunk_state"] = progress_row
             stops = [str(item) for item in (progress_row.get("stop_reasons") or [])]
             metadata["model_core_id"] = ""
+            metadata["model_core_decision"] = ""
             metadata["model_core_judgment"] = False
             metadata["provisional_core_id"] = ""
             metadata["core_selection_truncated"] = True
             metadata["core_selection_withheld"] = True
-            metadata["core_status"] = "withheld"
+            metadata["core_selection_complete"] = False
+            metadata["core_status"] = "unresolved" if unresolved_match and not stops else "withheld"
             metadata["core_downstream_eligible"] = False
             if not metadata.get("decision_stop") and stops:
                 metadata["decision_stop"] = stops[0]
@@ -6746,7 +6972,12 @@ async def _advance_core_review(
     if index >= len(chunks):
         _open_next_core_round(progress, estimate, per_request=int(reviewer.token_budget))
         chunks = list(progress.get("chunks") or [])
-        if progress.get("stop_reasons") or progress.get("champion_id") or index >= len(chunks):
+        if (
+            progress.get("stop_reasons")
+            or progress.get("champion_id")
+            or progress.get("no_candidate_remains")
+            or index >= len(chunks)
+        ):
             return _finish_choice(progress, warnings)
     chunk_ids = [str(item) for item in chunks[index]]
     eligible_n = int(metadata.get("core_candidates_eligible") or 0)
@@ -6770,12 +7001,24 @@ async def _advance_core_review(
         bracket = dict(bracket)
         bracket["rounds"] = rounds
         progress["core_bracket"] = bracket
-    if len(chunk_ids) < 2 and eligible_n != 1:
+    final_assessment = bool(
+        round_index < len(rounds)
+        and isinstance(rounds[round_index], Mapping)
+        and rounds[round_index].get("final_assessment")
+    )
+    if len(chunk_ids) < 2 and eligible_n != 1 and not final_assessment:
         add_stop_reason(progress, CORE_BRACKET_INCOMPLETE)
         metadata["decision_stop"] = CORE_BRACKET_INCOMPLETE
         metadata["core_comparison_stop"] = CORE_BRACKET_INCOMPLETE
         return _finish_choice(progress, warnings)
     subset = [by_id[item] for item in chunk_ids if item in by_id]
+    retry_ids = [str(item) for item in (progress.get("evidence_retry_ids") or [])]
+    richer = retry_ids == chunk_ids and bool(chunk_ids)
+    if richer:
+        progress["evidence_retry_ids"] = []
+    subset, _match_cap = _candidates_for_match(
+        subset, metadata=metadata, reviewer=reviewer, richer=richer
+    )
     payload = _core_match_request(
         subset,
         preferred=preferred,
@@ -6814,16 +7057,71 @@ async def _advance_core_review(
         add_stop_reason(progress, reason)
         metadata["decision_stop"] = reason
         metadata["core_comparison_stop"] = reason
-        if parsed is None and audit and str(audit.get("status") or "") not in {"omitted", "refused", "not_sent"}:
+        sent = parsed is None and audit and str(audit.get("status") or "") not in {"omitted", "refused", "not_sent"}
+        if sent:
             note_chunk_send(progress, audit, estimate=int((audit or {}).get("estimated_input_tokens") or 0))
+            _count_core_attempt(progress, round_index, len(chunk_ids))
+            _record_core_match(
+                progress,
+                round_index,
+                match=chunk_ids,
+                winner="",
+                decision="incomplete",
+                rationale="",
+                status="incomplete",
+            )
         progress["next_index"] = index
         return _finish_choice(progress, warnings)
     note_chunk_send(progress, audit, estimate=int((audit or {}).get("estimated_input_tokens") or 0))
     decision_name = str(parsed.get("decision") or "select")
     chosen = str(parsed.get("core_id") or "").strip()
     rationale = str(parsed.get("rationale") or "")
+    abstention_reason = str(parsed.get("abstention_reason") or "")
     progress["rationale"] = rationale
     if decision_name == "abstain":
+        retried = [str(item) for item in (progress.get("evidence_retried_matches") or [])]
+        match_key = ",".join(chunk_ids)
+        if abstention_reason == "insufficient_evidence" and match_key not in retried:
+            richer_rows, _cap = _candidates_for_match(
+                [by_id[item] for item in chunk_ids if item in by_id],
+                metadata=metadata,
+                reviewer=reviewer,
+                richer=True,
+            )
+            richer_payload = _core_match_request(
+                richer_rows,
+                preferred=preferred,
+                snapshot=snapshot,
+                chunk_index=index,
+                chunk_count=len(chunks),
+                match_ids=chunk_ids,
+                eligible_ids=eligible_ids,
+                round_role=role,
+                prior_rationales=priors,
+            )
+            richer_stop, richer_estimate = reviewer.refusal_reason(
+                richer_payload, ModelCoreDecision, metadata
+            )
+            calls_used = int(progress.get("calls") or 0)
+            tokens_used = int(progress.get("tokens_estimated") or 0)
+            can_retry = richer_stop is None and calls_used < int(reviewer.max_calls) and (
+                not int(reviewer.max_tokens)
+                or tokens_used + int(richer_estimate or 0) <= int(reviewer.max_tokens)
+            )
+            if can_retry:
+                progress["evidence_retried_matches"] = retried + [match_key]
+                progress["evidence_retry_ids"] = list(chunk_ids)
+                _count_core_attempt(progress, round_index, len(chunk_ids))
+                progress["open"] = True
+                metadata["decision_chunk_state"] = progress
+                _publish_core_bracket(metadata, progress)
+                return {
+                    "core_candidates": candidates,
+                    "metadata": metadata,
+                    "prompt_log": logs,
+                    "warnings": warnings,
+                }
+        match_status = "unresolved" if abstention_reason == "insufficient_evidence" else "no_winner"
         _record_core_match(
             progress,
             round_index,
@@ -6831,16 +7129,43 @@ async def _advance_core_review(
             winner="",
             decision="abstain",
             rationale=rationale,
+            status=match_status,
+            abstention_reason=abstention_reason,
         )
-        progress["core_decision"] = "abstain"
-        progress["core_decision_rationale"] = rationale
-        progress["final_core_id"] = ""
+        _count_core_attempt(progress, round_index, len(chunk_ids))
         progress["reviewed_ids"] = list(progress.get("reviewed_ids") or []) + chunk_ids
         progress["chunks_validated"] = int(progress.get("chunks_validated") or 0) + 1
         progress["next_index"] = index + 1
         metadata.pop("decision_stop", None)
-        return _finish_choice(progress, warnings)
+        if role == "final" and match_status == "no_winner":
+            progress["core_decision"] = "abstain"
+            progress["abstention_reason"] = abstention_reason
+            progress["core_decision_rationale"] = rationale
+            progress["final_core_id"] = ""
+        _open_next_core_round(progress, estimate, per_request=int(reviewer.token_budget))
+        _publish_core_bracket(metadata, progress)
+        metadata["decision_chunk_state"] = progress
+        if (
+            progress.get("stop_reasons")
+            or progress.get("champion_id")
+            or progress.get("no_candidate_remains")
+            or progress["next_index"] >= len(progress.get("chunks") or [])
+        ):
+            return _finish_choice(progress, warnings)
+        progress["open"] = True
+        metadata["decision_chunk_state"] = progress
+        return {"core_candidates": candidates, "metadata": metadata, "prompt_log": logs, "warnings": warnings}
     if decision_name != "select" or chosen not in set(chunk_ids):
+        _count_core_attempt(progress, round_index, len(chunk_ids))
+        _record_core_match(
+            progress,
+            round_index,
+            match=chunk_ids,
+            winner="",
+            decision="incomplete",
+            rationale=rationale,
+            status="incomplete",
+        )
         add_stop_reason(progress, "invalid_decision")
         progress["invalid_chunks"] = int(progress.get("invalid_chunks") or 0) + 1
         metadata["decision_stop"] = "invalid_decision"
@@ -8352,8 +8677,11 @@ Do not set human claim_support.
 For saturation, record an assessment and a rationale. That assessment is a model
 judgment. It is not a researcher confirmation and it does not set judgment.
 For a core category, choose one supplied candidate or abstain. An abstention
-names no core_id. A selection must name one supplied code_id. Explain the
-choice. Alternatives stay candidates. Do not present the choice as a human decision.
+names no core_id and names abstention_reason no_suitable_candidate or
+insufficient_evidence. A selection must name one supplied code_id and must not
+name an abstention reason. Explain the choice. Alternatives stay candidates.
+Do not present the choice as a human decision. Do not abstain because this
+request is one match in a larger eligible set.
 """
 
 

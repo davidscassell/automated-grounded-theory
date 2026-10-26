@@ -304,9 +304,14 @@ _PROCEDURE_KEYS = (
     "condition_completeness_rule",
     "eligibility_decision_rule",
     "core_final_decision_rule",
+    "core_match_abstention_rule",
+    "core_outcome_rule",
     "core_prompt_scope_rule",
     "condition_pattern_rule",
     "core_evidence_summary_rule",
+    "relation_unreviewed_rule",
+    "withheld_export_rule",
+    "raised_variance_rule",
     "reread_coverage_rule",
     "reread_bound_rule",
     "export_assessment_rule",
@@ -489,6 +494,8 @@ class FocusedResult:
     purpose_coverage: dict
     metadata: dict
     focused_not_queued: list[str] = field(default_factory=list)
+    withheld_over_budget: list[str] = field(default_factory=list)
+    withheld_over_budget_count: int = 0
     warnings: list[str] = field(default_factory=list)
     prompt_log: list[dict] = field(default_factory=list)
     export_paths: dict[str, str] = field(default_factory=dict)
@@ -512,6 +519,8 @@ class FocusedResult:
             "category_development": self.category_development,
             "focused_not_reread": self.focused_not_reread,
             "focused_not_queued": self.focused_not_queued,
+            "withheld_over_budget": list(self.withheld_over_budget),
+            "withheld_over_budget_count": int(self.withheld_over_budget_count),
             "focused_reread": self.focused_reread,
             "purpose_coverage": self.purpose_coverage,
             "metadata": self.metadata,
@@ -3139,7 +3148,7 @@ def _coverage_statement(state: Mapping[str, Any], not_reread: Sequence[str]) -> 
         "not_queued_count": len(not_queued),
         "not_reread": not_reread_ids,
         "not_reread_count": len(not_reread_ids),
-        "withheld_over_budget": withheld,
+        "withheld_over_budget": list(withheld),
         "withheld_over_budget_count": len(withheld),
         "queue_complete": not not_reread_ids and not withheld,
         "corpus_complete": not not_reread_ids and not withheld and not not_queued,
@@ -3312,6 +3321,8 @@ def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
         },
         "max_focused_review_calls": int(procedure.get("max_focused_review_calls") or 0),
         "max_focused_review_tokens": int(procedure.get("max_focused_review_tokens") or 0),
+        "withheld_over_budget": list(coverage["withheld_over_budget"]),
+        "withheld_over_budget_count": int(coverage["withheld_over_budget_count"]),
         "focused_not_reread": not_reread,
         "focused_not_queued": not_queued,
         "focused_reread": [str(item) for item in (state.get("focused_reread") or [])],
@@ -7982,6 +7993,8 @@ def _selection_export(state: Mapping[str, Any]) -> dict[str, Any]:
         "focused_review_upper_bound_label": metadata.get("focused_review_upper_bound_label"),
         "reread_stop": metadata.get("reread_stop"),
         "reread_requests_over_budget": metadata.get("reread_requests_over_budget"),
+        "withheld_over_budget": _withheld_reread_ids(state),
+        "withheld_over_budget_count": len(_withheld_reread_ids(state)),
         "reread_request_bound": metadata.get("reread_request_bound"),
         "chunks_reused": metadata.get("chunks_reused"),
         "selection_consolidation": metadata.get("selection_consolidation"),
@@ -8064,6 +8077,8 @@ def load_focused_export(directory: str | Path) -> dict[str, Any]:
         "focused_review_upper_bound_label",
         "reread_stop",
         "reread_requests_over_budget",
+        "withheld_over_budget",
+        "withheld_over_budget_count",
         "reread_request_bound",
         "chunks_reused",
         "selection_consolidation",
@@ -8556,6 +8571,8 @@ def _result_from_state(
         focused_not_reread=[str(item) for item in (state.get("focused_not_reread") or [])],
         focused_reread=[str(item) for item in (state.get("focused_reread") or [])],
         focused_not_queued=[str(item) for item in (metadata.get("focused_not_queued") or state.get("focused_not_queued") or [])],
+        withheld_over_budget=_withheld_reread_ids(state),
+        withheld_over_budget_count=len(_withheld_reread_ids(state)),
         purpose_coverage=dict((state.get("metadata") or {}).get("purpose_coverage") or state.get("purpose_coverage") or {}),
         metadata=metadata,
         warnings=list(state.get("warnings") or []),
