@@ -2,7 +2,7 @@
 
 ## 0.9.43
 
-- Every pair coded together in at least `pattern_min_cases` documents is examined, or `budget_blocked` with that reason, before a single-document pair and before a counterexample. Spare counterexample calls and unused quote-copy retries move onto those proposals. The coding ceiling is not raised. An unplanned multi-document pair without a reason does not remain.
+- Every pair coded together in at least `pattern_min_cases` documents is examined, or `budget_blocked` with that reason, before a single-document pair and before a counterexample. Spare counterexample calls and unused quote-copy retries move onto those proposals, and those moved calls run. One counterexample call stays so a row still in play can be tested after the multi-document proposals. When some multi-document pairs do not fit, the last proposal slot is the first single-document pair and it is sent after those proposals. The coding ceiling is not raised. An unplanned multi-document pair without a reason does not remain.
 - A counterexample is not sent for a row the reviewer has already rejected. The rejection stands. The targeting decision is recorded.
 - `call_usage` lists every stage, including core. `complete` is false and `usage_completeness` is partial when a ledger call is missing from the log.
 - The pair funnel counts statement-copy retries. Each row shows that retry's outcome. A retry is not another pair.

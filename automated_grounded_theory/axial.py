@@ -1048,6 +1048,11 @@ def _select_counterexamples(
             "The rejection stands. The call is not spent, and it does not reopen the row."
         ),
         "skipped_relationship_ids": [item for item in skipped_rejected if item],
+        "skipped": [
+            {"relationship_id": item, "reason": "reviewer_rejected_not_applicable"}
+            for item in skipped_rejected
+            if item
+        ],
         "selected_relationship_ids": [str(row.get("relationship_id") or "") for row in applicable if row.get("relationship_id")],
     }
     if not enabled:
@@ -1098,6 +1103,18 @@ def _select_counterexamples(
         segments=segments,
     )
     stats["counterexample_targeting"] = targeting
+    by_relationship = stats.get("by_relationship") if isinstance(stats.get("by_relationship"), dict) else {}
+    for relationship_id in skipped_rejected:
+        if not relationship_id:
+            continue
+        by_relationship[relationship_id] = {
+            "relationship_id": relationship_id,
+            "skipped": True,
+            "queued": 0,
+            "no_call_reason": "reviewer_rejected_not_applicable",
+            "note": targeting["decision"],
+        }
+    stats["by_relationship"] = by_relationship
     if skipped_rejected and not applicable:
         stats["no_call_reason"] = "reviewer_rejected_not_applicable"
         stats.setdefault("notes", []).append(targeting["decision"])
@@ -3614,6 +3631,60 @@ def _load_focused(state: AxialState) -> dict:
 _MULTI_DOCUMENT_TERMINAL = frozenset({"proposed", "nothing_to_propose", "failed", "budget_blocked"})
 
 
+def _seat_multi_document_round(
+    category_ids: Sequence[str],
+    multi_rows: Sequence[Mapping[str, Any]],
+    evidence_classes: Mapping[str, Any] | None,
+    slots: int,
+) -> list[dict[str, str]]:
+    """Multi-document pairs take the proposal slots. One single-document pair is last when some multi-document pairs still do not fit.
+
+    A single-document pair is not seated ahead of a multi-document pair. The
+    last slot is that single-document pair only after the multi-document pairs
+    that fit are seated, and only when at least one multi-document pair remains
+    outside the slots. Those outside pairs are budget-blocked by the caller.
+    """
+    if slots <= 0:
+        return []
+    multi_keys = {_pair_key(row) for row in multi_rows if isinstance(row, Mapping)}
+    spread: dict[tuple[str, str], int] = {}
+    if isinstance(evidence_classes, Mapping):
+        for class_rows in evidence_classes.values():
+            for item in class_rows or []:
+                if isinstance(item, Mapping):
+                    spread[_pair_key(item)] = int(item.get("document_cooccurrence") or 0)
+    seen_ids: list[str] = []
+    for item in category_ids:
+        text = str(item)
+        if text and text not in seen_ids:
+            seen_ids.append(text)
+    singles: list[dict[str, str]] = []
+    for index, left in enumerate(seen_ids):
+        for right in seen_ids[index + 1 :]:
+            key = _pair_key({"from_id": left, "to_id": right})
+            if key in multi_keys or spread.get(key, 0) != 1:
+                continue
+            singles.append({"from_id": key[0], "to_id": key[1], "band": "single_document"})
+    multi_slots = slots
+    if singles and len(multi_keys) > slots and slots > 1:
+        multi_slots = slots - 1
+    seated: list[dict[str, str]] = []
+    for row in multi_rows:
+        if len(seated) >= multi_slots:
+            break
+        if not isinstance(row, Mapping):
+            continue
+        key = _pair_key(row)
+        if not key[0] or not key[1]:
+            continue
+        seated.append({"from_id": key[0], "to_id": key[1], "band": "multi_document"})
+    if len(seated) < slots and singles and len(multi_keys) > len(seated):
+        seated.extend(singles[: slots - len(seated)])
+    elif len(seated) < slots and len(multi_keys) <= len(seated):
+        seated.extend(singles[: slots - len(seated)])
+    return seated
+
+
 def _prefer_multi_document_calls(metadata: dict[str, Any], needed_requests: int) -> int:
     """Move counterexample calls and unused retries onto proposals until every multi-document pair fits or the coding ceiling is reached.
 
@@ -3621,12 +3692,17 @@ def _prefer_multi_document_calls(metadata: dict[str, Any], needed_requests: int)
     """
     procedure = dict(metadata.get("procedure") or {})
     propose = int(procedure.get("propose_calls") or 0)
+    propose_before = propose
     retries = int(procedure.get("statement_copy_retry_calls") or 0)
     counter = int(procedure.get("counterexample_calls") or 0)
     ceiling = int(procedure.get("max_axial_review_calls") or 0)
     needed = max(0, int(needed_requests))
     shortfall = max(0, needed - propose)
-    from_counter = min(counter, shortfall)
+    # One counterexample call stays so a row that is still in play can be tested
+    # after the multi-document proposals. The rest move. The ceiling is not raised.
+    keep_counter = 1 if counter > 0 else 0
+    movable_counter = max(0, counter - keep_counter)
+    from_counter = min(movable_counter, shortfall)
     counter -= from_counter
     shortfall -= from_counter
     from_retry = min(retries, shortfall)
@@ -3670,6 +3746,7 @@ def _prefer_multi_document_calls(metadata: dict[str, Any], needed_requests: int)
     )
     metadata["multi_document_call_priority"] = {
         "needed_requests": needed,
+        "propose_calls_before_transfer": propose_before,
         "propose_calls": propose,
         "moved_from_counterexamples": from_counter,
         "moved_from_retries": from_retry,
@@ -3760,6 +3837,13 @@ def _plan_node(state: AxialState) -> dict:
         if _pair_key(pair)[0] and _pair_key(pair)[1]
     ]
     metadata["examined_pair_count"] = len(metadata["examined_pairs"])
+    if calls > 0 and metadata.get("multi_document_pairs"):
+        plan["round"] = _seat_multi_document_round(
+            ids,
+            metadata["multi_document_pairs"],
+            evidence_classes,
+            calls * batch,
+        )
     seated = {_pair_key(pair) for pair in plan["round"] if isinstance(pair, Mapping)}
     priority = metadata.get("multi_document_call_priority") if isinstance(metadata.get("multi_document_call_priority"), Mapping) else {}
     block_reason = str(priority.get("block_reason") or "")
