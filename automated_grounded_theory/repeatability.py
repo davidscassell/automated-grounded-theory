@@ -327,6 +327,36 @@ def compare_selection_replays(left_log: Sequence[Any], right_log: Sequence[Any])
         right_set = set(right["raised_code_ids"])
         flipped = sorted(left_set ^ right_set)
         flipped_codes.update(flipped)
+        consequences = []
+        for code in sorted(left_set - right_set):
+            consequences.append({
+                "code_id": code,
+                "change": "raised_only_in_left",
+                "consequence": (
+                    f"{code} is raised only in the first log. It would enter that run's raised set, "
+                    "focused reread, and axial pair pool, and it would be absent from the second log. "
+                    "The response hash shows the response changed. This does not say which decision is correct."
+                ),
+            })
+        for code in sorted(right_set - left_set):
+            consequences.append({
+                "code_id": code,
+                "change": "raised_only_in_right",
+                "consequence": (
+                    f"{code} is raised only in the second log. It would enter that run's raised set, "
+                    "focused reread, and axial pair pool, and it would be absent from the first log. "
+                    "The response hash shows the response changed. This does not say which decision is correct."
+                ),
+            })
+        if left["response_hash"] != right["response_hash"] and not flipped:
+            consequences.append({
+                "code_id": None,
+                "change": "response_changed_without_parsed_difference",
+                "consequence": (
+                    "The response hash changed and the parsed raised set did not. "
+                    "No raised code was added or removed, so the analytic selection is the same."
+                ),
+            })
         matched.append({
             "request_hash": left["request_hash"],
             "left_response_hash": left["response_hash"],
@@ -334,6 +364,8 @@ def compare_selection_replays(left_log: Sequence[Any], right_log: Sequence[Any])
             "left_raised_code_ids": left["raised_code_ids"],
             "right_raised_code_ids": right["raised_code_ids"],
             "flipped_code_ids": flipped,
+            "response_changed": left["response_hash"] != right["response_hash"],
+            "analytic_consequences": consequences,
         })
     decisions_differ = [item for item in matched if item["flipped_code_ids"]]
     return {
@@ -342,8 +374,9 @@ def compare_selection_replays(left_log: Sequence[Any], right_log: Sequence[Any])
         "flipped_code_ids": sorted(flipped_codes),
         "matches": matched,
         "note": (
-            "A flipped code was raised for one copy of a request hash and not the other. "
-            "Same request hashes with different decisions are model variation, not a version change. "
+            "A response hash identifies a changed response. "
+            "analytic_consequences explains what a parsed difference does to the raised set. "
+            "A hash change with the same raised codes does not change that selection. "
             "Analytic accuracy is unmeasured."
         ),
     }

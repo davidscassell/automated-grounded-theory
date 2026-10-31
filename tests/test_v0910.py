@@ -616,7 +616,8 @@ def test_token_plan_uses_planned_pairs_and_names_the_guarded_figure():
         pool_pairs=946,
     )
     assert plan["planned_pairs"] == 2
-    assert plan["estimate"] == 12000
+    assert plan["statement_copy_retry_calls_reserved"] == 2
+    assert plan["estimate"] == 24000
     assert plan["pool_estimate"] > plan["ceiling"]
     assert plan["warning"] == ""
     assert plan["pool_estimate_label"] == "raw unordered pool, not compared with the ceiling"

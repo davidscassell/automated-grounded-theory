@@ -1323,6 +1323,9 @@ DEFAULT_EXPLORATION_QUOTAS = {
     "same_respondent": 1,
     "lexical_cross_case": 1,
 }
+# Share of a round kept for pairs that are not multi-document qualifying pairs.
+# A qualifying pair is planning priority, not a cap on how many assertions it can support.
+DEFAULT_PAIR_EXPLORATION_SHARE = 0.25
 _UNEXAMINED_MATERIALIZE_LIMIT = 256
 
 
@@ -1488,6 +1491,8 @@ def plan_relation_pairs(
     seed: int = 0,
     evidence_classes: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
     exploration_quotas: Mapping[str, int] | None = None,
+    exploration_share: float = DEFAULT_PAIR_EXPLORATION_SHARE,
+    pattern_min_cases: int = 2,
 ) -> dict[str, Any]:
     """Choose the next axial pairs and reserve slots across evidence classes.
 
@@ -1505,6 +1510,8 @@ def plan_relation_pairs(
         raise ValueError("round_size must be zero or more.")
     if not 0 <= obvious_share <= 1:
         raise ValueError("obvious_share must be between 0 and 1.")
+    if not 0 <= float(exploration_share) <= 1:
+        raise ValueError("exploration_share must be between 0 and 1.")
     quotas = dict(DEFAULT_EXPLORATION_QUOTAS if exploration_quotas is None else exploration_quotas)
     for name in _EVIDENCE_CLASS_ORDER:
         quotas.setdefault(name, 0)
@@ -1614,6 +1621,41 @@ def plan_relation_pairs(
     if short_less > 0:
         chosen_obvious = obvious_pending[: take_obvious + short_less]
     chosen = list(prioritized) + [("obvious", pair) for pair in chosen_obvious] + [("less_obvious", pair) for pair in chosen_less]
+    minimum_documents = max(1, int(pattern_min_cases))
+    explore_slots = int(round(float(exploration_share) * max(0, int(round_size))))
+    explore_slots = max(0, min(int(round_size), explore_slots))
+
+    def _qualifying(pair: tuple[str, str]) -> bool:
+        return document_spread.get(tuple(sorted(pair)), 0) >= minimum_documents
+
+    # A multi-document pair qualifies for priority. It does not use up the
+    # round. pair_exploration_share keeps slots for other pairs.
+    other_in_round = [pair for _band, pair in chosen if not _qualifying(pair)]
+    if explore_slots > len(other_in_round):
+        need = explore_slots - len(other_in_round)
+        pool: list[tuple[str, str]] = []
+        seen_pool = {tuple(sorted(pair)) for _band, pair in chosen}
+        # Evidence-class pairs that are rare, contrasting, or coded in fewer
+        # documents come before adjacency fill, so the slot is not spent on an
+        # uncoded neighboring pair.
+        class_rows = [item for rows in by_class.values() for item in rows]
+        for pair in class_rows + list(less_pending) + list(obvious_pending):
+            key = tuple(sorted(pair))
+            if key in seen_pool or _qualifying(pair) or not key[0] or not key[1]:
+                continue
+            seen_pool.add(key)
+            pool.append(pair)
+        replacements = pool[:need]
+        if replacements:
+            kept: list[tuple[str, tuple[str, str]]] = []
+            removed = 0
+            for band, pair in reversed(chosen):
+                if removed < len(replacements) and _qualifying(pair):
+                    removed += 1
+                    continue
+                kept.append((band, pair))
+            kept.reverse()
+            chosen = kept + [("exploration", pair) for pair in replacements]
     chosen_keys = {tuple(sorted(pair)) for _band, pair in chosen}
     covered = {key for key in examined_keys if key in oriented} | chosen_keys
     unexamined_count = len(pairs) - len(covered)
@@ -1660,10 +1702,19 @@ def plan_relation_pairs(
             "seed": int(seed),
             "round_size": int(round_size),
             "obvious_share": float(obvious_share),
+            "pair_exploration_share": float(exploration_share),
+            "exploration_slots": explore_slots,
             "quotas": {name: int(quotas.get(name) or 0) for name in _EVIDENCE_CLASS_ORDER},
             "category_ids": list(seen_ids),
             "examined_pair_count": len(examined_keys),
         },
+        "pair_exploration_share": float(exploration_share),
+        "qualifying_pair_note": (
+            "A pair coded together in at least pattern_min_cases documents is a qualifying pair. "
+            "That is planning priority, not a ceiling. One pair can support several distinct assertions. "
+            "Coded co-occurrence does not set the corpus's total relationship potential. "
+            f"pair_exploration_share defaults to {DEFAULT_PAIR_EXPLORATION_SHARE} and keeps room for other pairs."
+        ),
         "allowance_note": "Call and token allowances are ceilings, not measured costs.",
     }
 

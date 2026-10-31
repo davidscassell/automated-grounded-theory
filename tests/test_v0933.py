@@ -189,9 +189,10 @@ def test_the_coding_pool_warning_names_per_step_allowances():
             "storyline_calls": 0,
         },
     )
-    assert plan["estimate"] == 48000
+    assert plan["statement_copy_retry_calls_reserved"] == 4
+    assert plan["estimate"] == 72000
     assert plan["ceiling"] == 24000
-    assert plan["shortfall"] == 24000
+    assert plan["shortfall"] == 48000
     assert plan["changes_default"] is False
     assert plan["warning"] == ""
     assert "48000" not in plan["warning"]
