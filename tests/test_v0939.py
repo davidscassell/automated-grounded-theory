@@ -27,8 +27,8 @@ from tests.test_v0938 import _partial_wide_export
 
 
 def test_version_names_the_reuse_accounting_rules():
-    assert __version__ == "0.9.39"
-    assert POLICY_VERSION == "0.9.39"
+    assert __version__ == "0.9.40"
+    assert POLICY_VERSION == "0.9.40"
     assert CORE_REUSE_ACCOUNTING_RULE == "loaded_unsent_and_final_usage_v1"
     assert CORE_UPSTREAM_EVIDENCE_RULE == "note_thin_axial_evidence_v1"
     assert "0.9.38" in CHUNKING_CHECKPOINT_MESSAGE

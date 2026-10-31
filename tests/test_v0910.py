@@ -48,8 +48,8 @@ from tests.test_v084 import _one_relationship
 
 
 def test_version_is_0910():
-    assert __version__ == "0.9.39"
-    assert POLICY_VERSION == "0.9.39"
+    assert __version__ == "0.9.40"
+    assert POLICY_VERSION == "0.9.40"
     assert PATTERN_MIN_CASES == 2
     assert DEFAULT_AXIAL_TOKEN_BUDGET == 6000
     assert DEFAULT_SAMPLING_TOKEN_BUDGET == 6000
@@ -218,7 +218,7 @@ def test_case_id_reads_metadata_respondent_and_tier2_gets_stricter():
     assert collapsed["pairs_reaching_pattern_min_cases"] == 0
     assert separate["pairs_reaching_pattern_min_cases"] == 1
     assert collapsed["pattern_min_cases"] == 2
-    assert collapsed["by_class"]["same_passage"] == [{"from_id": "c-a", "to_id": "c-b"}]
+    assert [(row["from_id"], row["to_id"]) for row in collapsed["by_class"]["same_passage"]] == [("c-a", "c-b")]
     split = classify_pair_evidence(
         ["c-a", "c-b"],
         questions,
@@ -227,7 +227,7 @@ def test_case_id_reads_metadata_respondent_and_tier2_gets_stricter():
             {"code_id": "c-b", "passage_id": "R010_q2"},
         ],
     )
-    assert split["by_class"]["same_respondent"] == [{"from_id": "c-a", "to_id": "c-b"}]
+    assert [(row["from_id"], row["to_id"]) for row in split["by_class"]["same_respondent"]] == [("c-a", "c-b")]
     assert split["by_class"]["same_passage"] == []
 
 
@@ -616,7 +616,8 @@ def test_token_plan_uses_planned_pairs_and_names_the_guarded_figure():
         pool_pairs=946,
     )
     assert plan["planned_pairs"] == 2
-    assert plan["estimate"] == 12000
+    assert plan["statement_copy_retry_calls_reserved"] == 2
+    assert plan["estimate"] == 24000
     assert plan["pool_estimate"] > plan["ceiling"]
     assert plan["warning"] == ""
     assert plan["pool_estimate_label"] == "raw unordered pool, not compared with the ceiling"

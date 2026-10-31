@@ -55,8 +55,8 @@ def _run(source, steps, **kwargs):
 
 
 def test_version_names_the_core_budget_rules():
-    assert __version__ == "0.9.39"
-    assert POLICY_VERSION == "0.9.39"
+    assert __version__ == "0.9.40"
+    assert POLICY_VERSION == "0.9.40"
     assert CORE_BUDGET_RULE == "separate_core_allowance_v1"
     assert CORE_PREFLIGHT_RULE == "opening_unavoidable_later_contingent_v1"
     assert CORE_PARTIAL_EXECUTION_RULE == "partial_core_off_by_default_v1"

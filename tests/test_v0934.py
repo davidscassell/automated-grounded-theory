@@ -54,8 +54,8 @@ from tests.test_v0933 import _packed_state
 
 
 def test_version_fingerprint_and_unchanged_defaults():
-    assert __version__ == "0.9.39"
-    assert POLICY_VERSION == "0.9.39"
+    assert __version__ == "0.9.40"
+    assert POLICY_VERSION == "0.9.40"
     assert PATTERN_MIN_CASES == 2
     assert DEFAULT_MAX_AXIAL_REVIEW_TOKENS == 24000
     assert DECISION_REVIEW_CHUNKING == "request_budget_v6"
@@ -384,9 +384,10 @@ def test_preflight_records_a_reread_upper_bound_and_the_pool_warning_is_gone():
             "storyline_calls": 0,
         },
     )
-    assert plan["estimate"] == 48000
+    assert plan["statement_copy_retry_calls_reserved"] == 4
+    assert plan["estimate"] == 72000
     assert plan["ceiling"] == 24000
-    assert plan["shortfall"] == 24000
+    assert plan["shortfall"] == 48000
     assert plan["warning"] == ""
     assert "48000" not in plan["warning"]
     assert "exceeds ceiling" not in plan["note"]

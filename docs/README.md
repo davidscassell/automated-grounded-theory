@@ -1,6 +1,6 @@
 # Design notes
 
-Package `policy_version` is `0.9.39`. This index says which notes describe the package now and which notes are the record of an earlier version. A historical note can disagree with the code. The code, the README, and the current notes below win. A count of every item reviewed, including 355 of 355, and a passing synthetic fixture establish processing coverage only. They do not establish that a selection is valid.
+Package `policy_version` is `0.9.40`. This index says which notes describe the package now and which notes are the record of an earlier version. A historical note can disagree with the code. The code, the README, and the current notes below win. A count of every item reviewed, including 355 of 355, and a passing synthetic fixture establish processing coverage only. They do not establish that a selection is valid.
 
 Axial coding, selective coding, and theoretical sampling are experimental. No study adjudication file is included. The discovery example is synthetic. Live evaluation runs through v31, on package 0.9.9, did not measure analytic accuracy.
 
@@ -10,18 +10,18 @@ Axial coding, selective coding, and theoretical sampling are experimental. No st
 | --- | --- |
 | [../README.md](../README.md) | The pipeline, the defaults, the evidence tiers, quiet rounds, timeouts, and gate scoring. |
 | [methodology.md](methodology.md) | How the open-coding default maps onto the sources already named there. |
-| [design.md](design.md) | The open-coding engineering design, plus a version log through `0.9.39`. The early sections are the 0.6 run. |
+| [design.md](design.md) | The open-coding engineering design, plus a version log through `0.9.40`. The early sections are the 0.6 run. |
 | [design-relationship-tiers.md](design-relationship-tiers.md) | Evidence tiers. `pattern_min_cases` is 2. Tier labels are `category_evidence`, `hypothesis`, `pattern_supported`, `attribution`, and `verified`. |
 | [design-negative-cases-092.md](design-negative-cases-092.md) | Negative-case search at respondent level, and a core that needs tier 2. Later search corrections are in the 0.9.3 review note. |
 | [design-gate-evaluation.md](design-gate-evaluation.md) | `export_gate_relationships`, `load_adjudications`, and `score_gate_adjudications`, including `downstream_precision` and `downstream_withheld_supported_recall`. |
 | [design-discovery-evaluation.md](design-discovery-evaluation.md) | `load_discovery_file`, `freeze_discovery_set`, and `score_discovery`. Recall, precision, distortion, and gate false negatives for a frozen human discovery file. |
 | [design-sampling-0900.md](design-sampling-0900.md) | The sampling graph. Later sections through 0.9.18 are part of the current behavior. 0.9.23 does not change that graph. |
 | [focused-evaluation.md](focused-evaluation.md) | The offline focused comparison and its live-cost estimate. It does not call an API. |
-| [design-review-fixes-0939.md](design-review-fixes-0939.md) | Reuse counts are matches loaded and not sent. Each match keeps `reused_export`, `reused_checkpoint`, or `sent_this_run`. `core_usage` closes prior and this-run calls and tokens at the end of the run. A thin axial graph is noted when `no_core_supported` coincides with zero centrality and no eligible relationship. This is the latest review note. |
+| [design-review-fixes-0940.md](design-review-fixes-0940.md) | Selection response hashes name flipped codes. Axial planning warns when pair coverage is low. Counterexample evidence is shortened to the request cap or its calls return to proposals. Multi-document pairs are planned first. A copied statement is retried once. Raised-code document reach, reread-queue coverage, and a reconciling relationship funnel are recorded. Core selection is unchanged. This is the latest review note. |
 
 ## Historical
 
-These notes stay so a reader can see what a version changed. They are not the current contract. `design-review-fixes-*` through 0.9.38 are in this list. `design-review-fixes-0939.md` is the latest review note, listed above.
+These notes stay so a reader can see what a version changed. They are not the current contract. `design-review-fixes-*` through 0.9.39 are in this list. `design-review-fixes-0940.md` is the latest review note, listed above.
 
 | Note | Version it records |
 | --- | --- |
@@ -63,8 +63,9 @@ These notes stay so a reader can see what a version changed. They are not the cu
 | [design-review-fixes-0936.md](design-review-fixes-0936.md) | 0.9.36. An opening abstention ends that match, and the other matches continue. A sole survivor still needs a final assessment. The outcome is `core_selected`, `no_core_supported`, or `selection_unresolved`. 0.9.37 gives core selection its own allowance, prices the bracket before the first match, and reuses validated matches on resume. |
 | [design-review-fixes-0937.md](design-review-fixes-0937.md) | 0.9.37. Core selection has its own allowance, the bracket is priced before the first match, and a validated match is reused on resume. 0.9.38 clears an inherited stop that the current bracket no longer produces, and it does not count a failed call as a compared seat. |
 | [design-review-fixes-0938.md](design-review-fixes-0938.md) | 0.9.38. An inherited core stop is derived again, and an unfingerprinted match keeps its chunk. 0.9.39 counts only loaded matches as reused and closes core usage at the end of the run. |
+| [design-review-fixes-0939.md](design-review-fixes-0939.md) | 0.9.39. Loaded matches keep a provenance label, and core usage closes at the end of the run. 0.9.40 records upstream evidence: flipped selection codes and their analytic consequences, plausible versus unexamined pair denominators, an exploration share of 0.25, counterexample requests whose adequacy stays unassessed, and a relationship funnel that keeps reviewer rejection apart from case coverage. |
 
-`design-review-fixes-0938.md` records the 0.9.38 resume stops. `design-review-fixes-0939.md` is the current review note.
+`design-review-fixes-0939.md` records the 0.9.39 core-usage account. `design-review-fixes-0940.md` is the current review note.
 
 ## Defaults the tests check
 

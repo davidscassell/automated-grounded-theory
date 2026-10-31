@@ -38,8 +38,8 @@ from tests.test_v0931 import _LINK, _tier
 
 
 def test_version_fingerprint_and_unchanged_defaults():
-    assert __version__ == "0.9.39"
-    assert POLICY_VERSION == "0.9.39"
+    assert __version__ == "0.9.40"
+    assert POLICY_VERSION == "0.9.40"
     assert PATTERN_MIN_CASES == 2
     assert BUDGET_LEDGER_RULE == "per_step_review_ledger_v1"
     assert CORE_COMPARISON_RULE == "deterministic_tournament_v1"
@@ -189,9 +189,10 @@ def test_the_coding_pool_warning_names_per_step_allowances():
             "storyline_calls": 0,
         },
     )
-    assert plan["estimate"] == 48000
+    assert plan["statement_copy_retry_calls_reserved"] == 4
+    assert plan["estimate"] == 72000
     assert plan["ceiling"] == 24000
-    assert plan["shortfall"] == 24000
+    assert plan["shortfall"] == 48000
     assert plan["changes_default"] is False
     assert plan["warning"] == ""
     assert "48000" not in plan["warning"]
