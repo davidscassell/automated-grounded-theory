@@ -256,6 +256,7 @@ graph TD;
 	__start__ --> load_focused;
 	commit_relations --> saturation_indicators;
 	counterexample_worker -.-> commit_relations;
+	counterexample_worker -.-> propose_relations;
 	load_focused --> plan_relations;
 	plan_relations --> propose_relations;
 	propose_relations -.-> relation_checkpoint;
