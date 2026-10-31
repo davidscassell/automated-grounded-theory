@@ -26,8 +26,8 @@ from tests.test_v080 import FakeAxialCoder
 
 
 def test_version_is_0940_and_pattern_minimum_stays_two():
-    assert __version__ == "0.9.40"
-    assert POLICY_VERSION == "0.9.40"
+    assert __version__ == "0.9.41"
+    assert POLICY_VERSION == "0.9.41"
     assert PATTERN_MIN_CASES == 2
 
 
@@ -432,6 +432,7 @@ def test_funnel_keeps_reviewer_rejection_apart_from_case_coverage():
                 "to_id": "c2",
                 "reviewer_disposition": "rejected",
                 "downstream_eligible": False,
+                "document_count": 2,
                 "supporting_cases": [{"case_id": "r1"}, {"case_id": "r2"}],
                 "evidence_tier": 2,
             },
@@ -440,6 +441,7 @@ def test_funnel_keeps_reviewer_rejection_apart_from_case_coverage():
                 "from_id": "c1",
                 "to_id": "c3",
                 "downstream_eligible": False,
+                "document_count": 1,
                 "supporting_cases": [{"case_id": "r1"}],
                 "evidence_tier": 1,
             },
@@ -456,9 +458,10 @@ def test_funnel_keeps_reviewer_rejection_apart_from_case_coverage():
     funnel = build_relationship_funnel(state)
     by_id = {row["relationship_id"]: row["reasons"] for row in funnel["rows"]}
     assert "reviewer_rejected" in by_id["rev"]
-    assert "insufficient_case_coverage" not in by_id["rev"]
-    assert "insufficient_case_coverage" in by_id["cases"]
+    assert "insufficient_document_count" not in by_id["rev"]
+    assert "insufficient_document_count" in by_id["cases"]
+    assert "incomplete_review" in by_id["cases"]
     assert "reviewer_rejected" not in by_id["cases"]
-    assert "deterministic_ineligible" in by_id["other"]
-    assert "insufficient_case_coverage" not in by_id["other"]
+    assert "incomplete_review" in by_id["other"]
+    assert "insufficient_document_count" not in by_id["other"]
     assert funnel["row_funnel"]["reconciles"] is True

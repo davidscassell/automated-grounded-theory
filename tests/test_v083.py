@@ -23,8 +23,8 @@ from tests.test_v082 import _RepairCoder, _install_estimates
 
 
 def test_version_is_083():
-    assert __version__ == "0.9.40"
-    assert POLICY_VERSION == "0.9.40"
+    assert __version__ == "0.9.41"
+    assert POLICY_VERSION == "0.9.41"
 
 
 def _plain(value):
@@ -132,7 +132,7 @@ def test_pause_and_uninterrupted_keep_the_same_ceiling(monkeypatch, tmp_path):
         max_axial_review_calls=4,
         axial_share_propose=0.5,
         axial_share_counterexample=0.5,
-        max_axial_review_tokens=1000,
+        max_axial_review_tokens=2000,
     )
     straight = axial_code(_corpus(), FakeAxialCoder(), interrupt=False, **common)
     saver = InMemorySaver()
@@ -150,9 +150,9 @@ def test_pause_and_uninterrupted_keep_the_same_ceiling(monkeypatch, tmp_path):
     blob_path.write_bytes(_dump_saver(saver))
     resumed = _finish_axial(_load_saver(blob_path.read_bytes()), "budget", **common)
     assert _view(straight) == _view(resumed)
-    assert _view(resumed)["tokens"] == 600
-    assert _view(resumed)["stages"]["coding"] == 1
-    assert _view(resumed)["status"] == "budget_limited"
+    assert _view(resumed)["tokens"] == 1100
+    assert _view(resumed)["stages"]["coding"] == 2
+    assert _view(resumed)["status"] == "complete"
     root = Path(__file__).resolve().parents[1]
     script = tmp_path / "resume_fresh.py"
     script.write_text(
@@ -166,7 +166,7 @@ from tests.test_v083 import _finish_axial, _load_saver, _sized_estimate, _view
 axial.request_input_tokens = _sized_estimate
 batching.request_input_tokens = _sized_estimate
 saver = _load_saver(open({str(blob_path)!r}, "rb").read())
-result = _finish_axial(saver, "budget", seed=3, max_axial_review_calls=4, axial_share_propose=0.5, axial_share_counterexample=0.5, max_axial_review_tokens=1000)
+result = _finish_axial(saver, "budget", seed=3, max_axial_review_calls=4, axial_share_propose=0.5, axial_share_counterexample=0.5, max_axial_review_tokens=2000)
 print(json.dumps(_view(result)))
 """
     )

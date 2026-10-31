@@ -1622,11 +1622,49 @@ def plan_relation_pairs(
         chosen_obvious = obvious_pending[: take_obvious + short_less]
     chosen = list(prioritized) + [("obvious", pair) for pair in chosen_obvious] + [("less_obvious", pair) for pair in chosen_less]
     minimum_documents = max(1, int(pattern_min_cases))
-    explore_slots = int(round(float(exploration_share) * max(0, int(round_size))))
-    explore_slots = max(0, min(int(round_size), explore_slots))
+
+    def _spread(pair: tuple[str, str]) -> int:
+        return document_spread.get(tuple(sorted(pair)), 0)
 
     def _qualifying(pair: tuple[str, str]) -> bool:
-        return document_spread.get(tuple(sorted(pair)), 0) >= minimum_documents
+        return _spread(pair) >= minimum_documents
+
+    # Document spread outranks evidence class. A same-passage pair coded in one
+    # document does not keep a multi-document pair out of the round. Each class
+    # still keeps its minimum when that pair is the one meeting the quota.
+    quota_floor = {
+        name: min(int(quotas.get(name) or 0), len(by_class.get(name) or []))
+        for name in _EVIDENCE_CLASS_ORDER
+    }
+    selected_keys = {tuple(sorted(pair)) for _band, pair in chosen}
+    waiting: list[tuple[str, tuple[str, str]]] = []
+    for class_name in _EVIDENCE_CLASS_ORDER:
+        for pair in by_class[class_name]:
+            key = tuple(sorted(pair))
+            if key in selected_keys or not _qualifying(pair):
+                continue
+            selected_keys.add(key)
+            waiting.append((class_name, pair))
+    waiting.sort(key=lambda item: (-_spread(item[1]), _EVIDENCE_CLASS_ORDER.index(item[0])))
+    for class_name, pair in waiting:
+        counts: dict[str, int] = {}
+        for band, _held in chosen:
+            counts[band] = counts.get(band, 0) + 1
+        drop_at = None
+        for index, (band, held) in enumerate(chosen):
+            if _qualifying(held):
+                continue
+            floor = quota_floor.get(band, 0)
+            if floor and counts.get(band, 0) <= floor:
+                continue
+            if drop_at is None or _spread(held) < _spread(chosen[drop_at][1]):
+                drop_at = index
+        if drop_at is None:
+            continue
+        chosen.pop(drop_at)
+        chosen.append((class_name, pair))
+    explore_slots = int(round(float(exploration_share) * max(0, int(round_size))))
+    explore_slots = max(0, min(int(round_size), explore_slots))
 
     # A multi-document pair qualifies for priority. It does not use up the
     # round. pair_exploration_share keeps slots for other pairs.

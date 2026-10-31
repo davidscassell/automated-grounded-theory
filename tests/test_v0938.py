@@ -32,8 +32,8 @@ _FINGERPRINT_KEYS = (
 
 
 def test_version_names_the_resume_stop_rule():
-    assert __version__ == "0.9.40"
-    assert POLICY_VERSION == "0.9.40"
+    assert __version__ == "0.9.41"
+    assert POLICY_VERSION == "0.9.41"
     assert CORE_RESUME_STOP_RULE == "rederive_inherited_stops_v1"
     assert "0.9.37" in CHUNKING_CHECKPOINT_MESSAGE
     assert "0.9.38" in CHUNKING_CHECKPOINT_MESSAGE

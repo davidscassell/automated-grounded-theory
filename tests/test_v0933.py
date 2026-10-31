@@ -38,8 +38,8 @@ from tests.test_v0931 import _LINK, _tier
 
 
 def test_version_fingerprint_and_unchanged_defaults():
-    assert __version__ == "0.9.40"
-    assert POLICY_VERSION == "0.9.40"
+    assert __version__ == "0.9.41"
+    assert POLICY_VERSION == "0.9.41"
     assert PATTERN_MIN_CASES == 2
     assert BUDGET_LEDGER_RULE == "per_step_review_ledger_v1"
     assert CORE_COMPARISON_RULE == "deterministic_tournament_v1"
@@ -194,12 +194,11 @@ def test_the_coding_pool_warning_names_per_step_allowances():
     assert plan["ceiling"] == 24000
     assert plan["shortfall"] == 48000
     assert plan["changes_default"] is False
-    assert plan["warning"] == ""
-    assert "48000" not in plan["warning"]
-    assert "24000" not in plan["warning"]
-    assert "exceeds ceiling" not in plan["note"]
-    assert "No ceiling warning is emitted" in plan["note"]
-    assert "not a warning" in plan["coding_pool_bound_label"]
+    assert "48000" in plan["warning"]
+    assert "24000" in plan["warning"]
+    assert "not raised" in plan["warning"]
+    assert "Relation review" in plan["warning"]
+    assert "coding_tokens_used" in plan["note"]
     quiet = _axial_token_plan(
         {"performance": {"axial_token_budget": 6000, "batch_size": 1}},
         {"max_axial_review_tokens": 24000, "propose_calls": 2, "counterexample_calls": 0},

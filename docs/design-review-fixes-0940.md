@@ -1,6 +1,6 @@
 # 0.9.40 review fixes
 
-Status: current for package 0.9.40. The 0.9.39 note stays the record of loaded-match provenance and closed core usage. This note does not change core selection. It does not change `pattern_min_cases` (2), `one_document_one_respondent` (off), the axial token number (24000 per step), `batch_size` (1), the 6000 request budgets, or the 8-call axial default. `auto_size_decision_calls` stays off. `selection_consolidation` stays off. Tier 4 stays human-only. Undefined metrics stay null. No paid call is added. No LLM judge is added. No adjudications are added. No live evaluation was run.
+Status: record of package 0.9.40. Package 0.9.41 is current. The 0.9.39 note stays the record of loaded-match provenance and closed core usage. This note does not change core selection. It does not change `pattern_min_cases` (2), `one_document_one_respondent` (off), the axial token number (24000 per step), `batch_size` (1), the 6000 request budgets, or the 8-call axial default. `auto_size_decision_calls` stays off. `selection_consolidation` stays off. Tier 4 stays human-only. Undefined metrics stay null. No paid call is added. No LLM judge is added. No adjudications are added. No live evaluation was run.
 
 ## What was going wrong
 

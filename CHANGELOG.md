@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.41
+
+- Quote-copy retries are reserved inside `max_axial_review_calls`. They are not added on top of the propose and counterexample split. The default of 8 calls at share 0.5 is 2 proposal requests, 2 reserved retries, and 4 counterexample calls. The 8-call default and the half split stay. A leftover single proposal slot is sent without a reserved retry, and that non-reservation is recorded.
+- Counterexample tokens are reserved before proposals spend the coding pool. The reserve follows the call split and does not raise `max_axial_review_tokens`. A coding-plan shortfall against that ceiling is reported. Decision steps are not in the estimate. The ceiling is not raised.
+- An oversized counterexample request is shortened. The claim, category definitions, relevant passage context, and provenance stay. If it still cannot be sent, `counterexample_unsent` names `request_budget` or `token_allowance`. `counterexample_adequacy` stays `unassessed`. Fitting the cap is not evidence that the test is still adequate. Unused calls move only when they fit the remaining token and dollar allowances, and every transfer is recorded on `allowance_transfers`.
+- Pairs coded together in at least `pattern_min_cases` documents are ranked before evidence class. Each class still keeps its minimum. Every such pair has a terminal status: `nothing_to_propose`, `unplanned`, `budget_blocked`, `failed`, or `proposed`. `nothing_to_propose` is not an unplanned, budget-blocked, or failed pair.
+- The relationship funnel is built from relationship ids. `reviewer_rejected`, `insufficient_document_count`, `hypothetical_only_evidence`, and `incomplete_review` are kept independently. Document counts are documents, not respondents. Reconciliation fails when a count, an id list, or a status disagrees. A filler reason is not added to force a pass.
+- Relation review sends one disposition assessment per chunk. It does not send a second assessment or a schema repair. `max_decision_calls` stays 4 and is not raised. Eight calls for four rows is not a required cost.
+- Coding-stage `tokens_used` is filled from the coding-stage ledger. It is not left at 0 while the shared token accumulator moved.
+- Core selection is unchanged. The chunking fingerprint stays `request_budget_v6`. `pattern_min_cases` stays 2. `one_document_one_respondent` stays off. No LLM judge is added. Undefined metrics stay null. These checks are engineering and evidence-traceability coverage. Analytic accuracy is unmeasured. The review note is [docs/design-review-fixes-0941.md](docs/design-review-fixes-0941.md). `policy_version` is `0.9.41`.
+
 ## 0.9.40
 
 - Focused-selection responses record `response_hash`. `compare_selection_replays` reports the codes that flipped when two logs share a request hash and disagree on `raised_code_ids`. Same requests with different decisions are model variation, not a version change.
