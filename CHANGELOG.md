@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.40
+
+- Focused-selection responses record `response_hash`. `compare_selection_replays` reports the codes that flipped when two logs share a request hash and disagree on `raised_code_ids`. Same requests with different decisions are model variation, not a version change.
+- Axial planning warns when this round plans fewer plausible pairs than the set needs. `pair_coverage.pairs_needed` and `axial_token_plan.pairs_needed` are that count. `max_axial_review_calls` stays 8 and the proposal/counterexample split stays half and half.
+- A counterexample request is shortened until it fits the 6000 per-request cap. If it still cannot be sent, the unused calls go back to proposals and `counterexample_reallocation` records the reason.
+- Pairs coded together in at least `pattern_min_cases` documents are planned before single-document pairs. Document identity is not respondent identity. `one_document_one_respondent` stays off. `pattern_min_cases` stays 2.
+- A proposal whose statement copies the quote is retried once on the proposal call path. The retry asks for a statement that is not the quote and counts against `max_axial_review_calls`. There is no new judge.
+- `raised_code_document_reach` reports how many documents each raised code reaches. `reread_queue_coverage` reports how many corpus passages were queued. Reread defaults are unchanged.
+- `relationship_funnel` is on the axial result and in the axial export. The pair sequence is possible, plausible, selected, and requests sent. The row sequence is proposals returned, valid grounded proposals, consolidated, reviewed, and eligible. Each sequence reconciles. Each row lists every applicable reason and evidence exposure: available, included, truncated, never sent, never reread.
+- Core selection is unchanged. The chunking fingerprint stays `request_budget_v6`. A 0.9.39 core checkpoint can still resume. These checks are engineering and evidence-traceability coverage. Analytic accuracy is unmeasured. No LLM judge is added. Undefined metrics stay null. The review note is [docs/design-review-fixes-0940.md](docs/design-review-fixes-0940.md). `policy_version` is `0.9.40`.
+
 ## 0.9.39
 
 - `core_matches_reused` counts matches this run loaded and did not send. `core_unfingerprinted_reused` counts how many of those had no payload or policy fingerprint when they were loaded. Later steps do not turn newly sent matches into that count, and they do not clear the unfingerprinted count after the first stamp. The rule is `core_reuse_accounting_rule` `loaded_unsent_and_final_usage_v1`.

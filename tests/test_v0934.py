@@ -54,8 +54,8 @@ from tests.test_v0933 import _packed_state
 
 
 def test_version_fingerprint_and_unchanged_defaults():
-    assert __version__ == "0.9.39"
-    assert POLICY_VERSION == "0.9.39"
+    assert __version__ == "0.9.40"
+    assert POLICY_VERSION == "0.9.40"
     assert PATTERN_MIN_CASES == 2
     assert DEFAULT_MAX_AXIAL_REVIEW_TOKENS == 24000
     assert DECISION_REVIEW_CHUNKING == "request_budget_v6"

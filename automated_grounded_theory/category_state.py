@@ -1542,16 +1542,54 @@ def plan_relation_pairs(
                 if key in examined_keys:
                     continue
                 by_class[class_name].append(oriented[key])
+    document_spread: dict[tuple[str, str], int] = {}
+    if evidence_classes:
+        for class_name in _EVIDENCE_CLASS_ORDER:
+            for item in evidence_classes.get(class_name) or []:
+                if not isinstance(item, Mapping):
+                    continue
+                key = tuple(sorted((str(item.get("from_id") or ""), str(item.get("to_id") or ""))))
+                document_spread[key] = int(item.get("document_cooccurrence") or 0)
+
+    def _by_document_spread(rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """Pairs coded together in more documents come first. Seed rotates only ties.
+
+        ``pattern_min_cases`` documents outrank a single document. Two documents
+        are not two respondents.
+        """
+        ordered = [
+            pair
+            for _, pair in sorted(
+                enumerate(rows),
+                key=lambda item: (-document_spread.get(tuple(sorted(item[1])), 0), item[0]),
+            )
+        ]
+        if not int(seed) or not ordered:
+            return ordered
+        buckets: dict[int, list[tuple[str, str]]] = {}
+        spread_order: list[int] = []
+        for pair in ordered:
+            value = document_spread.get(tuple(sorted(pair)), 0)
+            if value not in buckets:
+                spread_order.append(value)
+                buckets[value] = []
+            buckets[value].append(pair)
+        rotated: list[tuple[str, str]] = []
+        for value in spread_order:
+            group = buckets[value]
+            if len(group) > 1 and int(seed) % len(group):
+                offset = int(seed) % len(group)
+                group = group[offset:] + group[:offset]
+            rotated.extend(group)
+        return rotated
+
     pending_counts = {name: len(rows) for name, rows in by_class.items()}
     slots = _class_slots(pending_counts, round_size, quotas) if evidence_classes else {name: 0 for name in _EVIDENCE_CLASS_ORDER}
     prioritized: list[tuple[str, tuple[str, str]]] = []
     prioritized_keys: set[tuple[str, str]] = set()
     for class_name in _EVIDENCE_CLASS_ORDER:
-        rows = list(by_class[class_name])
+        rows = _by_document_spread(list(by_class[class_name]))
         take = slots.get(class_name, 0)
-        if take < len(rows) and int(seed) % len(rows):
-            offset = int(seed) % len(rows)
-            rows = rows[offset:] + rows[:offset]
         for pair in rows[:take]:
             key = tuple(sorted(pair))
             if key in prioritized_keys:
@@ -1559,12 +1597,12 @@ def plan_relation_pairs(
             prioritized.append((class_name, pair))
             prioritized_keys.add(key)
     fill_size = max(0, round_size - len(prioritized))
-    obvious_pending = [pair for pair in pending(obvious) if tuple(sorted(pair)) not in prioritized_keys]
-    less_pending = [pair for pair in pending(less) if tuple(sorted(pair)) not in prioritized_keys]
-    if obvious_pending:
-        offset = int(seed) % len(obvious_pending)
-        if offset:
-            obvious_pending = obvious_pending[offset:] + obvious_pending[:offset]
+    obvious_pending = _by_document_spread(
+        [pair for pair in pending(obvious) if tuple(sorted(pair)) not in prioritized_keys]
+    )
+    less_pending = _by_document_spread(
+        [pair for pair in pending(less) if tuple(sorted(pair)) not in prioritized_keys]
+    )
     take_obvious = int(round(fill_size * obvious_share))
     take_less = fill_size - take_obvious
     chosen_obvious = obvious_pending[:take_obvious]

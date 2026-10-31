@@ -305,6 +305,12 @@ def prompt_hash(messages: Sequence[Any]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def response_hash(payload: Any) -> str:
+    """Stable hash of one model decision. The request hash is separate."""
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 class DecisionReviewer:
     def __init__(self, model, *, max_calls=8, max_tokens=24000, token_budget=6000, timeout=120):
         self.model = model
@@ -368,6 +374,7 @@ class DecisionReviewer:
             # Validate even when a provider returns a different Pydantic model.
             parsed = schema.model_validate(parsed).model_dump()
             audit["response"] = parsed
+            audit["response_hash"] = response_hash(parsed)
             audit["status"] = "validated"
             return parsed, audit
         except Exception as exc:

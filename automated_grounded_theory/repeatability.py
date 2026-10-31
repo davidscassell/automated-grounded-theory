@@ -282,6 +282,73 @@ def _raised_count_report(runs: Sequence[Any]) -> dict[str, Any]:
     }
 
 
+def compare_selection_replays(left_log: Sequence[Any], right_log: Sequence[Any]) -> dict[str, Any]:
+    """Name codes whose selection flipped when the request hash matches.
+
+    Identical requests with different decisions are model variation. A request
+    hash that is not in both logs is not a flip. This does not score accuracy.
+    """
+
+    def rows(log: Sequence[Any]) -> list[dict[str, Any]]:
+        found = []
+        for item in log or []:
+            if not isinstance(item, Mapping):
+                continue
+            checkpoint = str(item.get("checkpoint") or "")
+            if checkpoint != "focused_selection":
+                continue
+            response = item.get("response") if isinstance(item.get("response"), Mapping) else {}
+            raised = response.get("raised_code_ids")
+            if raised is None:
+                raised = item.get("raised_code_ids")
+            found.append({
+                "request_hash": str(item.get("prompt_hash") or item.get("request_hash") or ""),
+                "response_hash": str(item.get("response_hash") or ""),
+                "raised_code_ids": [str(code) for code in (raised or [])],
+            })
+        return found
+
+    left_rows = rows(left_log)
+    right_rows = rows(right_log)
+    right_by_hash: dict[str, list[dict[str, Any]]] = {}
+    for row in right_rows:
+        right_by_hash.setdefault(row["request_hash"], []).append(row)
+    used = {key: 0 for key in right_by_hash}
+    matched = []
+    flipped_codes: set[str] = set()
+    for left in left_rows:
+        bucket = right_by_hash.get(left["request_hash"]) or []
+        index = used.get(left["request_hash"], 0)
+        if not left["request_hash"] or index >= len(bucket):
+            continue
+        used[left["request_hash"]] = index + 1
+        right = bucket[index]
+        left_set = set(left["raised_code_ids"])
+        right_set = set(right["raised_code_ids"])
+        flipped = sorted(left_set ^ right_set)
+        flipped_codes.update(flipped)
+        matched.append({
+            "request_hash": left["request_hash"],
+            "left_response_hash": left["response_hash"],
+            "right_response_hash": right["response_hash"],
+            "left_raised_code_ids": left["raised_code_ids"],
+            "right_raised_code_ids": right["raised_code_ids"],
+            "flipped_code_ids": flipped,
+        })
+    decisions_differ = [item for item in matched if item["flipped_code_ids"]]
+    return {
+        "requests_matched": len(matched),
+        "requests_with_different_decisions": len(decisions_differ),
+        "flipped_code_ids": sorted(flipped_codes),
+        "matches": matched,
+        "note": (
+            "A flipped code was raised for one copy of a request hash and not the other. "
+            "Same request hashes with different decisions are model variation, not a version change. "
+            "Analytic accuracy is unmeasured."
+        ),
+    }
+
+
 def compare_pipeline_runs(runs: Sequence[Any]) -> dict[str, Any]:
     """Pairwise overlap of two or more runs. Undefined comparisons stay null.
 

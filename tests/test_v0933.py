@@ -38,8 +38,8 @@ from tests.test_v0931 import _LINK, _tier
 
 
 def test_version_fingerprint_and_unchanged_defaults():
-    assert __version__ == "0.9.39"
-    assert POLICY_VERSION == "0.9.39"
+    assert __version__ == "0.9.40"
+    assert POLICY_VERSION == "0.9.40"
     assert PATTERN_MIN_CASES == 2
     assert BUDGET_LEDGER_RULE == "per_step_review_ledger_v1"
     assert CORE_COMPARISON_RULE == "deterministic_tournament_v1"
