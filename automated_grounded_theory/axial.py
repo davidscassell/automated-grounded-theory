@@ -64,9 +64,14 @@ from automated_grounded_theory.decision_review import (
     CORE_PREFLIGHT_RULE,
     CORE_PROMPT_SCOPE_RULE,
     CORE_REQUEST_TOO_LARGE,
+    CORE_PROVENANCE_REUSED_CHECKPOINT,
+    CORE_PROVENANCE_REUSED_EXPORT,
+    CORE_PROVENANCE_SENT_THIS_RUN,
     CORE_RESUME_STOP_RULE,
+    CORE_REUSE_ACCOUNTING_RULE,
     CORE_STOP_REASON_RULE,
     CORE_TOKEN_ALLOWANCE_INSUFFICIENT,
+    CORE_UPSTREAM_EVIDENCE_RULE,
     CORE_SCHEDULE_NOTE,
     RAISED_VARIANCE_RULE,
     RELATION_UNREVIEWED_RULE,
@@ -273,6 +278,8 @@ _PROCEDURE_KEYS = (
     "core_match_reuse_rule",
     "core_auto_size_rule",
     "core_resume_stop_rule",
+    "core_reuse_accounting_rule",
+    "core_upstream_evidence_rule",
     "max_core_review_calls",
     "max_core_review_tokens",
     "auto_size_core_review",
@@ -6584,6 +6591,8 @@ def _record_core_match(
             "status": str(status or ""),
             "abstention_reason": str(abstention_reason or ""),
             "rationale": str(rationale or ""),
+            "provenance": CORE_PROVENANCE_SENT_THIS_RUN,
+            "reuse": CORE_PROVENANCE_SENT_THIS_RUN,
         }
     )
     current["match_records"] = records
@@ -6878,12 +6887,18 @@ def _core_token_ceiling(runtime: AxialRuntime, reviewer) -> int:
 def _core_policy_fingerprint() -> str:
     """Policy identity for a core match. Call and token ceilings are not part of it.
 
-    The resume-stop rule is not part of it either. Clearing an inherited stop
-    does not change a decision that was already validated, so a match stamped
-    before that rule still matches.
+    The resume-stop rule, the reuse-accounting rule, and the thin-evidence note
+    are not part of it either. They do not change a decision that was already
+    validated, so a match stamped before those rules still matches.
     """
     rules = review_procedure_fields()
-    rules.pop("core_resume_stop_rule", None)
+    # Accounting and the thin-evidence note do not change a validated decision.
+    for name in (
+        "core_resume_stop_rule",
+        "core_reuse_accounting_rule",
+        "core_upstream_evidence_rule",
+    ):
+        rules.pop(name, None)
     payload = {
         "rules": rules,
         "system_prompt": _AXIAL_REVIEW_SYSTEM,
@@ -7041,6 +7056,94 @@ def _stamp_core_records(bracket: Mapping[str, Any], updates: Sequence[tuple[int,
         bracket["rounds"] = rounds
 
 
+_CORE_MATCH_PROVENANCE = frozenset({
+    CORE_PROVENANCE_REUSED_EXPORT,
+    CORE_PROVENANCE_REUSED_CHECKPOINT,
+    CORE_PROVENANCE_SENT_THIS_RUN,
+})
+
+
+def _label_loaded_core_matches(runtime: AxialRuntime, progress: dict[str, Any]) -> None:
+    """Name matches this run loaded. Later visits do not relabel what it sends.
+
+    The marker lives on the runtime, not the checkpoint. A later resume is a
+    new run and labels the loaded matches again.
+    """
+    if getattr(runtime, "_core_loaded_matches_labeled", False):
+        return
+    runtime._core_loaded_matches_labeled = True
+    bracket = progress.get("core_bracket")
+    if not isinstance(bracket, dict):
+        return
+    updates = []
+    for round_index, record_index, record in _flatten_core_records(bracket):
+        if str(record.get("payload_fingerprint") or "") and str(record.get("policy_fingerprint") or ""):
+            provenance = CORE_PROVENANCE_REUSED_CHECKPOINT
+        else:
+            provenance = CORE_PROVENANCE_REUSED_EXPORT
+        record["provenance"] = provenance
+        record["reuse"] = provenance
+        updates.append((round_index, record_index, record))
+    if updates:
+        _stamp_core_records(bracket, updates)
+        progress["core_bracket"] = bracket
+
+
+def _remember_inherited_core_usage(runtime: AxialRuntime, progress: Mapping[str, Any]) -> None:
+    """Keep the calls and tokens this run loaded, before it sends anything else.
+
+    The snapshot is on the runtime. A checkpoint from the run that created the
+    export must not supply this run's prior.
+    """
+    if getattr(runtime, "_core_usage_prior", None) is not None:
+        return
+    runtime._core_usage_prior = (
+        int(progress.get("calls") or 0),
+        int(progress.get("tokens_estimated") or 0),
+    )
+
+
+def _core_usage_account(progress: Mapping[str, Any], prior: tuple[int, int] | None = None) -> dict[str, int]:
+    """Closed core usage: inherited work plus what this run sent."""
+    if prior is None:
+        prior = (0, 0)
+    prior_calls, prior_tokens = prior
+    total_calls = int(progress.get("calls") or 0)
+    total_tokens = int(progress.get("tokens_estimated") or 0)
+    return {
+        "calls": total_calls,
+        "tokens_estimated": total_tokens,
+        "prior_calls": prior_calls,
+        "prior_tokens_estimated": prior_tokens,
+        "this_run_calls": max(0, total_calls - prior_calls),
+        "this_run_tokens_estimated": max(0, total_tokens - prior_tokens),
+    }
+
+
+def _core_upstream_evidence_is_thin(
+    candidates: Sequence[Mapping[str, Any]],
+    relationships: Sequence[Any],
+) -> bool:
+    """True when no candidate has supported-graph centrality and no relationship is eligible.
+
+    ``pattern_supported_centrality`` is the centrality core selection uses.
+    A missing value counts as zero. An eligible relationship is one the graph
+    can support, or one the row already marks ``downstream_eligible``.
+    """
+    rows = [row for row in candidates if isinstance(row, Mapping)]
+    if not rows:
+        return False
+    zero = all(int(row.get("pattern_supported_centrality") or 0) == 0 for row in rows)
+    if not zero:
+        return False
+    for row in relationships:
+        if not isinstance(row, Mapping) or row.get("synthetic"):
+            continue
+        if row.get("downstream_eligible") is True or _graph_supported_row(row):
+            return False
+    return True
+
+
 def _reconcile_core_match_reuse(
     progress: dict[str, Any],
     *,
@@ -7074,6 +7177,7 @@ def _reconcile_core_match_reuse(
     # first reason those stored decisions were dropped.
     prior_invalidated = str(progress.get("core_reuse_invalidated") or "")
     unfingerprinted = 0
+    loaded_reused = 0
     updates: list[tuple[int, int, dict[str, Any]]] = []
     for round_index, record_index, record in ordered:
         if not _core_match_reusable(record):
@@ -7113,36 +7217,52 @@ def _reconcile_core_match_reuse(
         current = _core_payload_fingerprint(payload)
         stored_payload = str(record.get("payload_fingerprint") or "")
         stored_policy = str(record.get("policy_fingerprint") or "")
-        if not stored_payload or not stored_policy:
+        provenance = str(record.get("provenance") or "")
+        if provenance not in _CORE_MATCH_PROVENANCE:
+            # A label is written once. Later visits must not turn a match sent
+            # this run into a reused match, or forget that an export had no
+            # fingerprint.
+            if not stored_payload or not stored_policy:
+                provenance = CORE_PROVENANCE_REUSED_EXPORT
+                record["payload_fingerprint"] = current
+                record["policy_fingerprint"] = policy
+                record["chunk_index"] = resolved_index
+                record["chunk_count"] = resolved_count
+                record["round_role"] = role
+            else:
+                provenance = CORE_PROVENANCE_REUSED_CHECKPOINT
+            record["provenance"] = provenance
+        elif not stored_payload or not stored_policy:
             record["payload_fingerprint"] = current
             record["policy_fingerprint"] = policy
             record["chunk_index"] = resolved_index
             record["chunk_count"] = resolved_count
             record["round_role"] = role
-            record["reuse"] = "unfingerprinted_export"
+        stored_payload = str(record.get("payload_fingerprint") or "")
+        stored_policy = str(record.get("policy_fingerprint") or "")
+        if stored_payload != current or stored_policy != policy:
+            invalidated = "payload_changed" if stored_payload != current else "policy_changed"
+            break
+        record["reuse"] = provenance
+        if provenance == CORE_PROVENANCE_REUSED_EXPORT:
             unfingerprinted += 1
-            updates.append((round_index, record_index, record))
-            kept_records.append((round_index, record))
-            keep += 1
-            continue
-        if stored_payload == current and stored_policy == policy:
-            record["reuse"] = "validated_match"
-            updates.append((round_index, record_index, record))
-            kept_records.append((round_index, record))
-            keep += 1
-            continue
-        invalidated = "payload_changed" if stored_payload != current else "policy_changed"
-        break
+            loaded_reused += 1
+        elif provenance == CORE_PROVENANCE_REUSED_CHECKPOINT:
+            loaded_reused += 1
+        updates.append((round_index, record_index, record))
+        kept_records.append((round_index, record))
+        keep += 1
+        continue
     if updates:
         _stamp_core_records(bracket, updates)
         progress["core_bracket"] = bracket
     if invalidated:
         _truncate_core_progress(progress, keep)
-    progress["core_matches_reused"] = keep
+    progress["core_matches_reused"] = loaded_reused
     progress["core_policy_fingerprint"] = policy
     progress["core_reuse_invalidated"] = invalidated or prior_invalidated
     progress["core_unfingerprinted_reused"] = unfingerprinted
-    return {"reused": keep, "invalidated": invalidated, "unfingerprinted": unfingerprinted}
+    return {"reused": loaded_reused, "invalidated": invalidated, "unfingerprinted": unfingerprinted}
 
 
 def _sync_core_consumption(runtime: AxialRuntime, metadata: dict[str, Any], progress: Mapping[str, Any]) -> None:
@@ -7159,13 +7279,16 @@ def _sync_core_consumption(runtime: AxialRuntime, metadata: dict[str, Any], prog
     steps = [dict(item) for item in (metadata.get("decision_budget_steps") or []) if isinstance(item, Mapping)]
     for item in steps:
         if item.get("step") == "axial_core_review" and item.get("open"):
-            item["starting_usage"] = used
+            # starting_usage and starting_tokens stay at the values from when
+            # this step opened. Moving them forward each match made the closed
+            # account look like the visit before the last send.
             item["allowance"] = call_ceiling
             item["remaining_allowance"] = max(0, call_ceiling - used)
-            item["token_allowance"] = token_ceiling
-            item["starting_tokens"] = tokens
-            item["tokens_available"] = max(0, token_ceiling - tokens)
-            item["remaining_tokens"] = max(0, token_ceiling - tokens)
+            if item.get("token_allowance") is None:
+                item["token_allowance"] = token_ceiling
+            token_allowance = item.get("token_allowance")
+            if token_allowance is not None:
+                item["remaining_tokens"] = max(0, int(token_allowance) - tokens)
     metadata["decision_budget_steps"] = steps
 
 
@@ -7477,6 +7600,9 @@ def _stamp_validated_core_match(
     last["chunk_count"] = int(chunk_count)
     last["round_role"] = str(round_role or "")
     last["evidence_retry"] = bool(evidence_retry)
+    if str(last.get("provenance") or "") not in _CORE_MATCH_PROVENANCE:
+        last["provenance"] = CORE_PROVENANCE_SENT_THIS_RUN
+    last["reuse"] = str(last.get("provenance") or CORE_PROVENANCE_SENT_THIS_RUN)
     records[-1] = last
     rounds[round_index]["match_records"] = records
     bracket = dict(bracket)
@@ -7550,6 +7676,8 @@ async def _advance_core_review(
         progress = load_chunk_progress(metadata, plan)
         progress["core_reuse_invalidated"] = "plan_changed"
     _seed_core_bracket(progress, plan)
+    _label_loaded_core_matches(runtime, progress)
+    _remember_inherited_core_usage(runtime, progress)
     _reconcile_core_match_reuse(
         progress,
         by_id=by_id,
@@ -7567,6 +7695,8 @@ async def _advance_core_review(
     metadata["core_match_reuse_rule"] = CORE_MATCH_REUSE_RULE
     metadata["core_auto_size_rule"] = CORE_AUTO_SIZE_RULE
     metadata["core_resume_stop_rule"] = CORE_RESUME_STOP_RULE
+    metadata["core_reuse_accounting_rule"] = CORE_REUSE_ACCOUNTING_RULE
+    metadata["core_upstream_evidence_rule"] = CORE_UPSTREAM_EVIDENCE_RULE
     _drop_inherited_core_stops(metadata, progress)
     metadata["core_matches_reused"] = int(progress.get("core_matches_reused") or 0)
     metadata["core_reuse_invalidated"] = str(progress.get("core_reuse_invalidated") or "")
@@ -7671,6 +7801,32 @@ async def _advance_core_review(
         else:
             metadata["core_selection_complete"] = True
             metadata["core_coverage_note"] = ""
+        loaded = [
+            item
+            for item in records
+            if str(item.get("provenance") or "")
+            in {CORE_PROVENANCE_REUSED_EXPORT, CORE_PROVENANCE_REUSED_CHECKPOINT}
+        ]
+        metadata["core_matches_reused"] = len(loaded)
+        metadata["core_unfingerprinted_reused"] = sum(
+            1 for item in loaded if str(item.get("provenance") or "") == CORE_PROVENANCE_REUSED_EXPORT
+        )
+        metadata["core_usage"] = _core_usage_account(
+            progress_row,
+            getattr(runtime, "_core_usage_prior", None),
+        )
+        thin = outcome == "no_core_supported" and _core_upstream_evidence_is_thin(
+            candidates,
+            state.get("relationships") or [],
+        )
+        metadata["core_thin_upstream_evidence"] = True if thin else None
+        metadata["core_upstream_evidence_note"] = (
+            "no_core_supported coincides with zero pattern-supported centrality and no "
+            "eligible relationships. The axial evidence upstream of this selection is thin. "
+            "The outcome is unchanged."
+            if thin
+            else None
+        )
         if outcome == "no_core_supported":
             progress_row["open"] = False
             progress_row["provisional"] = False

@@ -319,6 +319,8 @@ _PROCEDURE_KEYS = (
     "core_match_reuse_rule",
     "core_auto_size_rule",
     "core_resume_stop_rule",
+    "core_reuse_accounting_rule",
+    "core_upstream_evidence_rule",
     "reread_coverage_rule",
     "reread_bound_rule",
     "export_assessment_rule",
