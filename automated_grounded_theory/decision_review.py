@@ -141,6 +141,14 @@ CORE_MATCH_REUSE_RULE = "reuse_validated_match_v1"
 CORE_AUTO_SIZE_RULE = "bounded_core_auto_size_off_v1"
 # A stop saved on a checkpoint is derived again from this visit's plan and budgets.
 CORE_RESUME_STOP_RULE = "rederive_inherited_stops_v1"
+# Reuse counts are matches loaded for this run and not sent again.
+CORE_REUSE_ACCOUNTING_RULE = "loaded_unsent_and_final_usage_v1"
+# no_core_supported with an empty supported graph records that the axial evidence is thin.
+CORE_UPSTREAM_EVIDENCE_RULE = "note_thin_axial_evidence_v1"
+# Where a kept match came from. The label is written once and kept.
+CORE_PROVENANCE_REUSED_EXPORT = "reused_export"
+CORE_PROVENANCE_REUSED_CHECKPOINT = "reused_checkpoint"
+CORE_PROVENANCE_SENT_THIS_RUN = "sent_this_run"
 # A recorded condition must be a full clause. A bare pronoun is not a qualifier.
 CONDITION_COMPLETENESS_RULE = "full_clause_or_incomplete_v1"
 # A supported pattern under a complete condition stays eligible. Speculation does not.
@@ -252,6 +260,9 @@ CHUNKING_CHECKPOINT_MESSAGE = (
     "or before an inherited core stop was derived again from the current bracket "
     "and budgets, a reused match kept the chunk it was stamped with, a failed "
     "call was not counted as a compared seat, or the 0.9.38 rules, "
+    "or before a reused match kept the provenance it was loaded with, core usage "
+    "was closed at the end of the run, a thin axial graph was noted without "
+    "changing no_core_supported, or the 0.9.39 rules, "
     "or the stored chunk plan does not match this resume. Resume cannot continue "
     "that review. Start a new run."
 )
@@ -1051,6 +1062,8 @@ def review_procedure_fields() -> dict[str, str]:
         "core_match_reuse_rule": CORE_MATCH_REUSE_RULE,
         "core_auto_size_rule": CORE_AUTO_SIZE_RULE,
         "core_resume_stop_rule": CORE_RESUME_STOP_RULE,
+        "core_reuse_accounting_rule": CORE_REUSE_ACCOUNTING_RULE,
+        "core_upstream_evidence_rule": CORE_UPSTREAM_EVIDENCE_RULE,
         "reread_coverage_rule": REREAD_COVERAGE_RULE,
         "reread_bound_rule": REREAD_BOUND_RULE,
         "case_identity_source_rule": CASE_IDENTITY_SOURCE_RULE,
@@ -2029,6 +2042,8 @@ def same_chunking_fingerprint(saved: Any, current: Any) -> bool:
         "core_match_reuse_rule": CORE_MATCH_REUSE_RULE,
         "core_auto_size_rule": CORE_AUTO_SIZE_RULE,
         "core_resume_stop_rule": CORE_RESUME_STOP_RULE,
+        "core_reuse_accounting_rule": CORE_REUSE_ACCOUNTING_RULE,
+        "core_upstream_evidence_rule": CORE_UPSTREAM_EVIDENCE_RULE,
         "reread_coverage_rule": REREAD_COVERAGE_RULE,
         "reread_bound_rule": REREAD_BOUND_RULE,
         "case_identity_source_rule": CASE_IDENTITY_SOURCE_RULE,

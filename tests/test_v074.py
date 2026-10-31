@@ -27,8 +27,8 @@ from tests.test_v070 import _entry, _passages, _source
 
 
 def test_version_is_074():
-    assert __version__ == "0.9.38"
-    assert POLICY_VERSION == "0.9.38"
+    assert __version__ == "0.9.39"
+    assert POLICY_VERSION == "0.9.39"
     assert FocusedAlternativeReading.model_fields["alternative_fit"].is_required()
 
 

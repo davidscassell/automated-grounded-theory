@@ -192,8 +192,8 @@ def _cycle(match: list[str]) -> str:
 
 
 def test_version_fingerprint_and_unchanged_defaults():
-    assert __version__ == "0.9.38"
-    assert POLICY_VERSION == "0.9.38"
+    assert __version__ == "0.9.39"
+    assert POLICY_VERSION == "0.9.39"
     assert PATTERN_MIN_CASES == 2
     assert DEFAULT_MAX_AXIAL_REVIEW_TOKENS == 24000
     assert CORE_FINAL_DECISION_RULE == "final_assessment_only_v1"
@@ -210,6 +210,7 @@ def test_version_fingerprint_and_unchanged_defaults():
     assert "0.9.36" in CHUNKING_CHECKPOINT_MESSAGE
     assert "0.9.37" in CHUNKING_CHECKPOINT_MESSAGE
     assert "0.9.38" in CHUNKING_CHECKPOINT_MESSAGE
+    assert "0.9.39" in CHUNKING_CHECKPOINT_MESSAGE
     current = review_procedure_fields()
     assert current["core_final_decision_rule"] == CORE_FINAL_DECISION_RULE
     assert current["core_prompt_scope_rule"] == CORE_PROMPT_SCOPE_RULE
