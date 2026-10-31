@@ -96,7 +96,11 @@ from automated_grounded_theory.decision_review import (
     seal_budget_step,
     store_decision_report,
 )
-from automated_grounded_theory.category_state import plan_relation_pairs, property_stability
+from automated_grounded_theory.category_state import (
+    DEFAULT_PAIR_EXPLORATION_SHARE,
+    plan_relation_pairs,
+    property_stability,
+)
 from automated_grounded_theory.focused import _rationale_indicates_irrelevance, load_focused_export
 from automated_grounded_theory.gate_evaluation import stamp_relationship_assessment
 from automated_grounded_theory.retrieval import cosine
@@ -2999,6 +3003,250 @@ def _run_relationships(run: Any) -> list[Mapping[str, Any]]:
     return [row for row in (rows or []) if isinstance(row, Mapping)]
 
 
+def relationship_funnel_reconciles(stages: Sequence[Mapping[str, Any]]) -> bool:
+    """True only when counts, ids, and statuses describe the same drops.
+
+    A missing reason is a failure. A filler reason is not added to force a pass.
+    """
+    for index, stage in enumerate(stages):
+        count = int(stage.get("count") or 0)
+        ids = stage.get("ids")
+        if isinstance(ids, list) and len(ids) != count:
+            return False
+        if index == 0:
+            if int(stage.get("dropped_from_previous") or 0) != 0:
+                return False
+            continue
+        previous = stages[index - 1]
+        previous_count = int(previous.get("count") or 0)
+        dropped = int(stage.get("dropped_from_previous") or 0)
+        if count > previous_count or previous_count - count != dropped:
+            return False
+        dropped_ids = stage.get("dropped_ids")
+        previous_ids = previous.get("ids")
+        if isinstance(ids, list) and isinstance(previous_ids, list):
+            expected = [item for item in previous_ids if item not in set(ids)]
+            if not isinstance(dropped_ids, list) or len(dropped_ids) != dropped:
+                return False
+            if set(dropped_ids) != set(expected):
+                return False
+            reasons_by_id = stage.get("reasons_by_id") if isinstance(stage.get("reasons_by_id"), Mapping) else {}
+            for item in dropped_ids:
+                if not reasons_by_id.get(item):
+                    return False
+            continue
+        named = stage.get("reasons") if isinstance(stage.get("reasons"), Mapping) else {}
+        if sum(int(value or 0) for value in named.values()) != dropped:
+            return False
+    return True
+
+
+def _relationship_document_count(row: Mapping[str, Any], passages: Sequence[Any]) -> int | None:
+    """Distinct documents. A respondent id is not a document count."""
+    if row.get("document_count") is not None and not isinstance(row.get("document_count"), bool):
+        try:
+            return int(row.get("document_count") or 0)
+        except (TypeError, ValueError):
+            return None
+    passage_docs: dict[str, str] = {}
+    for item in passages:
+        if not isinstance(item, Mapping):
+            continue
+        passage_docs[str(item.get("passage_id") or "")] = str(item.get("doc_id") or item.get("document_id") or "")
+    docs: set[str] = set()
+    passage_ids: list[str] = []
+    if row.get("passage_id"):
+        passage_ids.append(str(row.get("passage_id")))
+    for case in row.get("supporting_cases") or []:
+        if not isinstance(case, Mapping):
+            continue
+        for key in ("doc_id", "document_id"):
+            if case.get(key):
+                docs.add(str(case.get(key)))
+        for passage_id in case.get("passage_ids") or []:
+            passage_ids.append(str(passage_id))
+    for passage_id in passage_ids:
+        doc = passage_docs.get(passage_id) or ""
+        if doc:
+            docs.add(doc)
+    if not docs:
+        return None
+    return len(docs)
+
+
+def build_relationship_funnel(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Pair counts and row counts for one axial run.
+
+    Stages are derived from pair, proposal, and relationship ids. Reconciliation
+    fails when a count and the ids disagree, or when a drop has no status.
+    Two documents are not two respondents. ``one_document_one_respondent`` stays
+    off unless the caller set it. This is an evidence trace, not a validity score.
+    """
+    metadata = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
+    procedure = metadata.get("procedure") if isinstance(metadata.get("procedure"), Mapping) else {}
+    coverage = metadata.get("pair_coverage") if isinstance(metadata.get("pair_coverage"), Mapping) else {}
+    book = state.get("codebook") if isinstance(state.get("codebook"), Mapping) else {}
+    code_count = len([item for item in book if str(item)])
+    possible = code_count * (code_count - 1) // 2
+    if coverage.get("pair_count") is not None:
+        try:
+            possible = int(coverage.get("pair_count") or 0)
+        except (TypeError, ValueError):
+            pass
+    plausible = coverage.get("plausible_count")
+    plausible_n = possible if plausible is None else int(plausible or 0)
+    selected = int(coverage.get("pairs_planned") or coverage.get("round_count") or 0)
+    accounting = metadata.get("pair_accounting") if isinstance(metadata.get("pair_accounting"), Mapping) else {}
+    sent_pairs = [item for item in (accounting.get("completed") or []) if isinstance(item, Mapping)]
+    requests_sent = len(sent_pairs)
+    relationships = [dict(row) for row in (state.get("relationships") or []) if isinstance(row, Mapping)]
+    diagnostics = metadata.get("proposal_diagnostics") if isinstance(metadata.get("proposal_diagnostics"), Mapping) else {}
+    reasons = diagnostics.get("rejection_reasons") if isinstance(diagnostics.get("rejection_reasons"), Mapping) else {}
+    rejected = sum(int(value or 0) for value in reasons.values())
+    proposals_returned = len(relationships) + rejected
+    grounded = sum(1 for row in relationships if int(row.get("evidence_tier") or 0) >= 2 and not isinstance(row.get("evidence_tier"), bool))
+    valid_grounded = grounded if grounded else sum(1 for row in relationships if str(row.get("statement") or "").strip())
+    consolidated = len(relationships)
+    reviewed = sum(
+        1
+        for row in relationships
+        if row.get("review_decision") or row.get("reviewer_disposition") or row.get("human_disposition")
+    )
+    eligible = sum(1 for row in relationships if row.get("downstream_eligible") is True)
+    exposure = metadata.get("proposal_evidence_exposure") if isinstance(metadata.get("proposal_evidence_exposure"), Mapping) else {}
+
+    def _count_stage(name: str, count: int, previous: int | None, drop_reasons: Mapping[str, int]) -> dict[str, Any]:
+        dropped = 0 if previous is None else max(0, int(previous) - int(count))
+        named = {str(key): int(value) for key, value in drop_reasons.items() if int(value or 0) > 0}
+        return {
+            "stage": name,
+            "count": int(count),
+            "dropped_from_previous": dropped,
+            "reasons": named,
+        }
+
+    plausible_count = int(plausible_n)
+    selected_count = int(selected)
+    sent_count = len({_pair_key(item) for item in sent_pairs if _pair_key(item)[0]})
+    outside = max(0, plausible_count - selected_count)
+    pair_stages = [
+        _count_stage("possible_pairs", possible, None, {}),
+        _count_stage("plausible_pairs", plausible_count, possible, {"no_plausible_evidence": max(0, possible - plausible_count)}),
+        _count_stage("selected_pairs", selected_count, plausible_count, {"outside_this_round": outside}),
+        _count_stage("requests_sent", sent_count, selected_count, {"not_sent": max(0, selected_count - sent_count)}),
+    ]
+    passages = [item for item in (state.get("passages") or []) if isinstance(item, Mapping)]
+    pattern_floor = max(1, int(procedure.get("pattern_min_cases") or 2))
+
+    def _reviewed(row: Mapping[str, Any]) -> bool:
+        return bool(row.get("review_decision") or row.get("reviewer_disposition") or row.get("human_disposition"))
+
+    def _row_reasons(row: Mapping[str, Any]) -> list[str]:
+        found: list[str] = []
+        disposition = str(row.get("human_disposition") or row.get("reviewer_disposition") or row.get("review_decision") or "").strip().casefold()
+        if disposition in {"rejected", "reject"}:
+            found.append("reviewer_rejected")
+        documents = _relationship_document_count(row, passages)
+        if documents is not None and documents < pattern_floor:
+            found.append("insufficient_document_count")
+        blocks = {str(item) for item in (row.get("eligibility_blocks") or [])}
+        flags = {str(item) for item in (row.get("flags") or [])}
+        if "hypothetical_link" in blocks or "participant_link_hypothetical" in flags:
+            found.append("hypothetical_only_evidence")
+        if not _reviewed(row):
+            found.append("incomplete_review")
+        elif row.get("downstream_eligible") is not True and not found:
+            found.append("deterministic_ineligible")
+        return found
+
+    rows = []
+    consolidated_ids: list[str] = []
+    reviewed_ids: list[str] = []
+    eligible_ids: list[str] = []
+    reasons_for: dict[str, list[str]] = {}
+    for row in relationships:
+        key = _pair_key(row)
+        relationship_id = str(row.get("relationship_id") or "") or "|".join(key)
+        consolidated_ids.append(relationship_id)
+        row_reasons = _row_reasons(row)
+        reasons_for[relationship_id] = row_reasons
+        if _reviewed(row):
+            reviewed_ids.append(relationship_id)
+        if _reviewed(row) and row.get("downstream_eligible") is True:
+            eligible_ids.append(relationship_id)
+        exposure_key = "|".join(key)
+        held = dict(exposure.get(exposure_key) or {})
+        rows.append({
+            "from_id": key[0],
+            "to_id": key[1],
+            "relationship_id": relationship_id,
+            "document_count": _relationship_document_count(row, passages),
+            "document_count_unit": "documents",
+            "reasons": row_reasons,
+            "evidence_exposure": {
+                "available": held.get("available"),
+                "included": held.get("included"),
+                "truncated": held.get("truncated"),
+                "never_sent": not bool(held),
+                "never_reread": True,
+            },
+        })
+
+    def _id_stage(name: str, ids: list[str], previous_ids: list[str] | None) -> dict[str, Any]:
+        if previous_ids is None:
+            dropped_ids: list[str] = []
+        else:
+            kept = set(ids)
+            dropped_ids = [item for item in previous_ids if item not in kept]
+        reasons_by_id = {item: list(reasons_for.get(item) or []) for item in dropped_ids}
+        tally: dict[str, int] = {}
+        for reasons_for_row in reasons_by_id.values():
+            for reason in reasons_for_row:
+                tally[reason] = tally.get(reason, 0) + 1
+        return {
+            "stage": name,
+            "count": len(ids),
+            "ids": list(ids),
+            "dropped_from_previous": len(dropped_ids),
+            "dropped_ids": dropped_ids,
+            "reasons_by_id": reasons_by_id,
+            "reasons": tally,
+        }
+
+    row_stages = [
+        _id_stage("consolidated", consolidated_ids, None),
+        _id_stage("reviewed", reviewed_ids, consolidated_ids),
+        _id_stage("eligible", eligible_ids, reviewed_ids),
+    ]
+    one_document = bool(procedure.get("one_document_one_respondent"))
+    multi_document_pairs = [
+        dict(item) for item in (metadata.get("multi_document_pairs") or coverage.get("multi_document_pairs") or [])
+        if isinstance(item, Mapping)
+    ]
+    return {
+        "pair_funnel": {"stages": pair_stages, "reconciles": relationship_funnel_reconciles(pair_stages)},
+        "row_funnel": {"stages": row_stages, "reconciles": relationship_funnel_reconciles(row_stages)},
+        "rows": rows,
+        "valid_grounded_count": int(valid_grounded),
+        "proposals_returned_count": int(proposals_returned),
+        "multi_document_pairs": multi_document_pairs,
+        "one_document_one_respondent": one_document,
+        "documents_are_not_respondents": not one_document,
+        "reason_note": (
+            "reviewer_rejected, insufficient_document_count, hypothetical_only_evidence, and "
+            "incomplete_review are kept independently. insufficient_document_count counts documents, "
+            "not respondents. A row is not described as failing to reach two cases unless its document "
+            "count was recorded and is short. Reconciliation fails when a count, an id list, or a status disagrees."
+        ),
+        "note": (
+            "Pair stages count unordered code pairs. Row stages are the relationship ids that were "
+            "consolidated, reviewed, and eligible. "
+            "Two documents are not two respondents unless one_document_one_respondent is set. "
+            "This is an engineering trace. Analytic accuracy is unmeasured."
+        ),
+    }
+
+
 def axial_attrition(state: Mapping[str, Any]) -> dict[str, Any]:
     """Counts from one axial run. A comparison set deduplicates repeated relationships.
 
@@ -3281,6 +3529,8 @@ def _plan_node(state: AxialState) -> dict:
         }
     examined_pairs = list(metadata.get("examined_pairs") or [])
     quotas = metadata.get("exploration_quotas")
+    raw_share = procedure.get("pair_exploration_share")
+    exploration_share = DEFAULT_PAIR_EXPLORATION_SHARE if raw_share is None else float(raw_share)
     plan = plan_relation_pairs(
         ids,
         examined=examined_pairs,
@@ -3289,6 +3539,8 @@ def _plan_node(state: AxialState) -> dict:
         seed=int(procedure.get("seed") or 0),
         evidence_classes=evidence_classes,
         exploration_quotas=quotas if isinstance(quotas, Mapping) else None,
+        exploration_share=exploration_share,
+        pattern_min_cases=_pattern_minimum(procedure),
     )
     # Planning does not examine a pair. examined_pairs stays the completed
     # history the caller passed in. This round is within_run_examined until
@@ -3299,6 +3551,10 @@ def _plan_node(state: AxialState) -> dict:
         if _pair_key(pair)[0] and _pair_key(pair)[1]
     ]
     metadata["examined_pair_count"] = len(metadata["examined_pairs"])
+    metadata["multi_document_pairs"] = _multi_document_pair_seed(
+        evidence_classes,
+        _pattern_minimum(procedure),
+    )
     metadata["within_run_examined"] = list(plan["round"])
     metadata["unique_pairs_explored"] = len(metadata["examined_pairs"])
     metadata["pairs_planned"] = len(plan["round"])
@@ -3397,6 +3653,49 @@ def _plan_node(state: AxialState) -> dict:
             "max_axial_review_calls defaults to 8, so a default series examines a small fraction of the pairs."
         ),
     }
+    plausible_pairs = plan.get("plausible_count")
+    universe = int(plan["pair_count"])
+    pairs_needed = int(plausible_pairs) if plausible_pairs else universe
+    planned_now = len(plan["round"])
+    unexamined_now = int(plan.get("unexamined_pair_count") or 0)
+    previously_completed = len(metadata.get("examined_pairs") or [])
+    metadata["pair_coverage"]["pairs_needed"] = pairs_needed
+    metadata["pair_coverage"]["plausible_pairs"] = None if plausible_pairs is None else int(plausible_pairs)
+    metadata["pair_coverage"]["candidate_universe"] = universe
+    metadata["pair_coverage"]["unexamined_pairs_this_series"] = unexamined_now
+    metadata["pair_coverage"]["previously_completed_pairs"] = previously_completed
+    metadata["pair_coverage"]["pair_exploration_share"] = float(exploration_share)
+    metadata["pair_coverage"]["qualifying_pair_note"] = plan.get("qualifying_pair_note")
+    metadata["pair_coverage"]["denominator_note"] = (
+        "candidate_universe is every unordered pair among this round's codes. "
+        "plausible_pairs is the subset with an evidence class, recomputed for this round's candidate universe. "
+        "It is not cumulative and it is not the unexamined count. "
+        "unexamined_pairs_this_series is the candidate universe minus pairs already completed and minus this round. "
+        "That count can be larger than plausible_pairs because pairs with no evidence class are still unexamined. "
+        "A saved investigation had 1,386 plausible pairs and 1,423 unexamined pairs for that reason. "
+        "pairs_planned is this round only. unique_pairs_completed counts distinct pairs across rounds, "
+        "so a repeated request does not raise coverage. "
+        "A plausible pair is not the corpus's total relationship potential. One pair can support several assertions."
+    )
+    token_plan = dict(metadata.get("axial_token_plan") or {})
+    token_plan["pairs_needed"] = pairs_needed
+    token_plan["pairs_planned_this_round"] = planned_now
+    token_plan["candidate_universe"] = universe
+    token_plan["unexamined_pairs_this_series"] = unexamined_now
+    metadata["axial_token_plan"] = token_plan
+    if calls > 0 and pairs_needed > planned_now:
+        low_coverage = (
+            f"Axial pair coverage is low: this round plans {planned_now} of {pairs_needed} plausible pairs "
+            f"in a candidate universe of {universe}. {unexamined_now} pairs in that universe are still unexamined. "
+            f"{pairs_needed} pairs are needed as the planning priority. They are not the corpus's total relationship potential. "
+            "One pair can support several assertions. "
+            "The call allowance and the proposal split are unchanged."
+        )
+        metadata["pair_coverage"]["low_coverage_warning"] = low_coverage
+        if low_coverage not in warnings:
+            warnings.append(low_coverage)
+    else:
+        metadata["pair_coverage"]["low_coverage_warning"] = ""
     return {
         "relation_round": list(plan["round"]),
         "unexamined_pairs": list(plan["unexamined_pairs"]),
@@ -3431,23 +3730,50 @@ def _axial_token_plan(
         proposal_requests = 0 if planned <= 0 else min(propose_allowance, math.ceil(planned / batch))
     counter_calls = int(procedure.get("counterexample_calls") or 0)
     memo_calls, storyline_calls = _selective_allowances(procedure)
-    planned_calls = proposal_requests + counter_calls + memo_calls + storyline_calls
+    # One possible quote-copy retry per proposal request. The preflight counts it.
+    # When the procedure already reserved those retries inside the call allowance,
+    # this is that reserve, not a second copy added on top.
+    statement_copy_retry_calls = proposal_requests
+    planned_calls = proposal_requests + statement_copy_retry_calls + counter_calls + memo_calls + storyline_calls
+    call_ceiling = procedure.get("max_axial_review_calls")
+    if call_ceiling is not None:
+        try:
+            call_ceiling_n = int(call_ceiling)
+        except (TypeError, ValueError):
+            call_ceiling_n = None
+        if call_ceiling_n is not None and planned_calls > call_ceiling_n:
+            overflow = planned_calls - call_ceiling_n
+            # Keep counterexample calls. Shrink proposal requests, and their retries, to fit.
+            drop_requests = min(proposal_requests, (overflow + 1) // 2)
+            proposal_requests -= drop_requests
+            statement_copy_retry_calls = proposal_requests
+            planned_calls = proposal_requests + statement_copy_retry_calls + counter_calls + memo_calls + storyline_calls
     estimate = planned_calls * per_request
     pool = int(pool_pairs if pool_pairs is not None else procedure.get("planned_pair_count") or 0)
     pool_requests = 0 if pool <= 0 else math.ceil(pool / batch)
-    pool_estimate = (pool_requests + counter_calls + memo_calls + storyline_calls) * per_request
+    pool_retry_calls = pool_requests
+    pool_estimate = (pool_requests + pool_retry_calls + counter_calls + memo_calls + storyline_calls) * per_request
     shortfall = max(0, estimate - ceiling) if ceiling else 0
-    # The old warning compared this planning figure with max_axial_review_tokens
-    # as if 24000 were one shared ceiling. That sentence is not emitted.
-    # Decision steps keep their own allowances. The coding calls are still
-    # capped when they are sent. This record is not that cap.
-    warning = ""
+    # Decision steps keep their own allowances. This shortfall is the coding
+    # pool only: proposals, reserved retries, counterexamples, memos, storyline.
+    if shortfall:
+        warning = (
+            f"Coding plan estimates {estimate} tokens against the coding ceiling of {ceiling}. "
+            f"The shortfall is {shortfall}. "
+            "The figure includes proposal requests and the quote-copy retries reserved inside the call allowance. "
+            "Relation review, saturation review, and core selection are not in this estimate. "
+            "The ceiling is not raised."
+        )
+    else:
+        warning = ""
     return {
         "ceiling": ceiling,
         "per_request_budget": per_request,
         "planned_pairs": planned,
         "pool_pairs": pool,
         "planned_calls": planned_calls,
+        "statement_copy_retry_calls_reserved": statement_copy_retry_calls,
+        "statement_copy_retry_included_in_estimate": True,
         "estimate": estimate,
         "pool_estimate": pool_estimate,
         "pool_estimate_label": "raw unordered pool, not compared with the ceiling",
@@ -3455,16 +3781,19 @@ def _axial_token_plan(
         "warning": warning,
         "changes_default": False,
         "coding_pool_bound_label": (
-            "Planning figure for proposal, counterexample, memo, and storyline calls. "
-            "It is not a warning, and it is not the per-step decision allowance."
+            "Planning figure for proposal, reserved retry, counterexample, memo, and storyline calls. "
+            "A shortfall against the coding ceiling is a warning. "
+            "It is not the per-step decision allowance."
         ),
         "note": (
-            "Planning estimate only. No ceiling warning is emitted. "
-            "max_axial_review_tokens stays 24000 per decision step. "
-            "Relation review, saturation review, and core selection are not in this estimate. "
+            "Planning estimate for the coding pool. "
+            "A shortfall against that ceiling is reported. The ceiling is not raised. "
+            "max_axial_review_tokens stays 24000 per decision step, and those steps are not in this estimate. "
             "The estimate uses pairs in this round. "
-            "pool_estimate is the raw full-pool figure and is not a cap warning."
+            "pool_estimate is the raw full-pool figure and is not a cap warning. "
+            "coding_tokens_used is filled from the coding-stage ledger after calls are sent."
         ),
+        "coding_pool_includes_retry_reserve": True,
     }
 
 
@@ -3626,6 +3955,14 @@ def _sync_allowance(metadata: dict[str, Any], runtime: AxialRuntime) -> None:
             "or a ratio above 3, stays at the raw heuristic. The 1.28 adjusted reading is not the stopper."
         ),
     }
+    coding_tokens = int(allowance.stage_tokens_used.get("coding", 0))
+    metadata["coding_tokens_used"] = coding_tokens
+    plan = metadata.get("axial_token_plan")
+    if isinstance(plan, Mapping):
+        updated = dict(plan)
+        updated["coding_tokens_used"] = coding_tokens
+        updated["tokens_used_source"] = "coding_stage_ledger"
+        metadata["axial_token_plan"] = updated
     step_names = ("axial_relation_review", "axial_saturation_review", "axial_core_review")
     if any(name in allowance.stage_ceilings for name in step_names):
         # Each decision step has its own call ceiling and its own token ceiling.
@@ -3663,14 +4000,18 @@ def _allowance_refuses(
     max_tokens: int,
     stage: str = "coding",
     apply_reserve: bool = True,
+    kind: str = "axial_proposal",
 ) -> bool:
     allowance = getattr(runtime.limiter, "provider_allowance", None)
     reserve = int(getattr(allowance, "token_reserve", 0) or 0) if allowance is not None else 0
+    counter_reserve = int(getattr(allowance, "counterexample_token_reserve", 0) or 0) if allowance is not None else 0
     ceiling = max_tokens
-    if apply_reserve and reserve and max_tokens:
-        ceiling = max(0, int(max_tokens) - reserve)
+    if apply_reserve and reserve and max_tokens and kind != "storyline":
+        ceiling = max(0, int(ceiling) - reserve)
+    if counter_reserve and kind not in {"axial_counterexample", "storyline"}:
+        ceiling = max(0, int(ceiling) - counter_reserve)
     if allowance is not None:
-        return allowance.would_refuse(estimate, stage=stage, apply_reserve=apply_reserve)
+        return allowance.would_refuse(estimate, stage=stage, kind=kind, apply_reserve=apply_reserve)
     return estimated + int(estimate) > int(ceiling)
 
 
@@ -4394,6 +4735,180 @@ def _excerpt_to_budget(payload: dict[str, Any], schema, request_budget: int) -> 
     return estimate, True
 
 
+def _calls_that_fit_remaining_allowance(
+    metadata: Mapping[str, Any],
+    *,
+    wanted: int,
+    per_request: int,
+    tokens_used: int,
+    token_ceiling: int,
+) -> tuple[int, dict[str, Any]]:
+    """How many returned calls still fit the token cap and a configured dollar cap.
+
+    An unset dollar allowance stays null. It does not raise the token cap.
+    """
+    wanted = max(0, int(wanted))
+    per_request = max(0, int(per_request))
+    if token_ceiling:
+        remaining_tokens = max(0, int(token_ceiling) - int(tokens_used))
+        token_calls = remaining_tokens // per_request if per_request else 0
+    else:
+        remaining_tokens = None
+        token_calls = wanted
+    token_calls = min(wanted, max(0, int(token_calls)))
+    prices = metadata.get("token_prices") if isinstance(metadata.get("token_prices"), Mapping) else {}
+    dollar_ceiling = metadata.get("max_dollar_allowance")
+    if dollar_ceiling is None and isinstance(metadata.get("procedure"), Mapping):
+        dollar_ceiling = metadata["procedure"].get("max_dollar_allowance")
+    in_rate = prices.get("input_usd_per_million")
+    prices_set = isinstance(in_rate, (int, float)) and not isinstance(in_rate, bool) and dollar_ceiling is not None
+    if not prices_set:
+        return token_calls, {
+            "remaining_tokens": remaining_tokens,
+            "token_calls_fit": token_calls,
+            "dollar_allowance": None,
+            "dollar_calls_fit": None,
+            "note": "Dollar allowance is unset, so it stays null and does not raise the token cap.",
+        }
+    spent = metadata.get("dollars_estimated")
+    spent_n = float(spent) if isinstance(spent, (int, float)) and not isinstance(spent, bool) else 0.0
+    remaining_dollars = max(0.0, float(dollar_ceiling) - spent_n)
+    cost_per_call = (per_request / 1_000_000) * float(in_rate) if per_request else 0.0
+    dollar_calls = int(remaining_dollars // cost_per_call) if cost_per_call else 0
+    returned = min(token_calls, max(0, dollar_calls))
+    return returned, {
+        "remaining_tokens": remaining_tokens,
+        "token_calls_fit": token_calls,
+        "dollar_allowance": float(dollar_ceiling),
+        "remaining_dollars": remaining_dollars,
+        "dollar_calls_fit": dollar_calls,
+        "note": "Returned calls fit both the remaining token allowance and the remaining dollar allowance.",
+    }
+
+
+def _shrink_counterexample_payload(payload: dict[str, Any], schema, request_budget: int) -> tuple[int, bool]:
+    """Shorten surplus passage text until the request fits, or report that it does not.
+
+    The proposed claim, category definitions, and provenance stay. Passage text
+    may be shortened. Fitting the cap does not mean the test is still adequate.
+    """
+
+    def estimate() -> int:
+        return request_input_tokens(_messages("axial_counterexample", payload), schema)
+
+    estimate_now = estimate()
+    omitted: list[dict[str, Any]] = []
+    if estimate_now <= int(request_budget):
+        return estimate_now, True
+
+    def passages() -> list[dict[str, Any]]:
+        found: list[dict[str, Any]] = []
+        for item in payload.get("counterexamples") or []:
+            if not isinstance(item, Mapping):
+                continue
+            passage = item.get("passage")
+            if isinstance(passage, dict):
+                found.append(passage)
+            for extra in item.get("complementary_passages") or []:
+                if isinstance(extra, dict):
+                    found.append(extra)
+        return found
+
+    guard = 0
+    while estimate_now > int(request_budget) and guard < 24:
+        guard += 1
+        rows = passages()
+        if not rows:
+            break
+        index = max(range(len(rows)), key=lambda item: len(str(rows[item].get("text") or "")))
+        row = rows[index]
+        text = str(row.get("text") or "")
+        if len(text) <= _MIN_EXCERPT:
+            break
+        original = len(text)
+        kept = text[: max(_MIN_EXCERPT, original // 2)]
+        row["text"] = kept
+        row["excerpt"] = True
+        row["evidence_truncated"] = True
+        row["source_length"] = int(row.get("source_length") or original)
+        omitted.append({
+            "field": "text",
+            "passage_id": str(row.get("passage_id") or ""),
+            "doc_id": str(row.get("doc_id") or row.get("document_id") or ""),
+            "original_chars": original,
+            "kept_chars": len(kept),
+        })
+        estimate_now = estimate()
+    if omitted:
+        payload["omitted_context"] = {
+            "omitted": omitted,
+            "kept": ["proposed_claim", "category_definitions", "relevant_passage_context", "provenance"],
+            "adequacy": "unassessed",
+            "note": (
+                "Fitting the per-request cap is not evidence that this negative-case test is still adequate. "
+                "Adequacy is unassessed."
+            ),
+        }
+        payload["counterexample_adequacy"] = "unassessed"
+    return estimate_now, estimate_now <= int(request_budget)
+
+
+def _counterexample_payload(window: Sequence[Mapping[str, Any]], by_id, passage_by_id) -> dict[str, Any]:
+    return {
+        "counterexamples": [
+            {
+                "relationship": _model_facing_relationship(by_id.get(item["relationship_id"])),
+                "passage": _model_facing_passage(passage_by_id.get(item["passage_id"])),
+                "complementary_passages": [
+                    _model_facing_passage(passage_by_id.get(str(passage_id)))
+                    for passage_id in (item.get("complementary_passage_ids") or [])
+                    if passage_by_id.get(str(passage_id)) is not None
+                ],
+                "respondent_id": str(item.get("respondent_id") or ""),
+                "source": _model_facing_source(str(item.get("source") or "")),
+                "comparison": str(item.get("comparison") or ""),
+            }
+            for item in window
+        ]
+    }
+
+
+def _record_proposal_exposure(metadata: dict[str, Any], sent_chunk: Sequence[Mapping[str, Any]], payload: Mapping[str, Any]) -> None:
+    """How much evidence a sent proposal request actually carried."""
+    stored = dict(metadata.get("proposal_evidence_exposure") or {})
+    passages = [item for item in (payload.get("passages") or []) if isinstance(item, Mapping)]
+    omitted = payload.get("omitted_evidence") if isinstance(payload.get("omitted_evidence"), Mapping) else {}
+    available = int(omitted.get("available") or 0) or (len(passages) + int(omitted.get("omitted_count") or 0))
+    included = len(passages)
+    truncated = sum(1 for item in passages if item.get("excerpt") or item.get("evidence_truncated"))
+    for pair in sent_chunk:
+        key = _pair_key(pair)
+        if not key[0] or not key[1]:
+            continue
+        stored["|".join(key)] = {
+            "available": available,
+            "included": included,
+            "truncated": truncated,
+            "never_sent": False,
+        }
+    metadata["proposal_evidence_exposure"] = stored
+
+
+def _remember_pair_status(metadata: dict[str, Any], pairs: Sequence[Mapping[str, Any]], status: str) -> None:
+    """Record a terminal pair status. A later status does not erase a more specific one."""
+    stored = dict(metadata.get("pair_terminal_status") or {})
+    for pair in pairs:
+        key = _pair_key(pair)
+        if not key[0] or not key[1]:
+            continue
+        label = "|".join(key)
+        current = str(stored.get(label) or "")
+        if current == "nothing_to_propose" and status != "nothing_to_propose":
+            continue
+        stored[label] = status
+    metadata["pair_terminal_status"] = stored
+
+
 def _remember_pairs(bucket: list, pairs: Sequence[Mapping[str, Any]]) -> None:
     seen = {_pair_key(item) for item in bucket}
     for pair in pairs:
@@ -4402,6 +4917,129 @@ def _remember_pairs(bucket: list, pairs: Sequence[Mapping[str, Any]]) -> None:
             continue
         seen.add(key)
         bucket.append(_pair_record(pair))
+
+
+def _unique_pair_rows(pairs: Sequence[Any]) -> list[dict[str, str]]:
+    """One row per unordered pair. A repeated request does not add a second row."""
+    found: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for pair in pairs:
+        if not isinstance(pair, Mapping):
+            continue
+        key = _pair_key(pair)
+        if not key[0] or not key[1] or key in seen:
+            continue
+        seen.add(key)
+        found.append({"from_id": key[0], "to_id": key[1]})
+    return found
+
+
+def _merge_unique_pairs(prior: Any, rows: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+    return _unique_pair_rows(list(prior or []) + list(rows))
+
+
+def _append_transfer(metadata: dict[str, Any], record: Mapping[str, Any]) -> None:
+    transfers = [dict(item) for item in (metadata.get("allowance_transfers") or []) if isinstance(item, Mapping)]
+    transfers.append(dict(record))
+    metadata["allowance_transfers"] = transfers
+
+
+def _transfer_unused_retries(metadata: dict[str, Any], procedure: Mapping[str, Any]) -> None:
+    """Move reserved quote-copy retries that were not sent onto counterexamples."""
+    if metadata.get("retry_allowance_transferred"):
+        return
+    reserved = int(procedure.get("statement_copy_retry_calls") or 0)
+    diagnostics = metadata.get("proposal_diagnostics") if isinstance(metadata.get("proposal_diagnostics"), Mapping) else {}
+    used_retries = int(diagnostics.get("statement_copy_retries") or 0)
+    unused = max(0, reserved - used_retries)
+    metadata["retry_allowance_transferred"] = True
+    if unused <= 0:
+        return
+    procedure_now = dict(metadata.get("procedure") or procedure)
+    procedure_now["counterexample_calls"] = int(procedure_now.get("counterexample_calls") or 0) + unused
+    metadata["procedure"] = procedure_now
+    _append_transfer(metadata, {
+        "from": "statement_copy_retry",
+        "to": "counterexamples",
+        "calls": unused,
+        "reason": "reserved quote-copy retries were not sent",
+    })
+
+
+def _multi_document_pair_seed(evidence_classes: Mapping[str, Any] | None, pattern_min_cases: int) -> list[dict[str, Any]]:
+    """One row per pair coded together in at least pattern_min_cases documents."""
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    if not isinstance(evidence_classes, Mapping):
+        return rows
+    floor = max(1, int(pattern_min_cases))
+    for class_rows in evidence_classes.values():
+        for item in class_rows or []:
+            if not isinstance(item, Mapping):
+                continue
+            key = _pair_key(item)
+            if not key[0] or not key[1] or key in seen:
+                continue
+            try:
+                documents = int(item.get("document_cooccurrence") or 0)
+            except (TypeError, ValueError):
+                documents = 0
+            if documents < floor:
+                continue
+            seen.add(key)
+            rows.append({
+                "from_id": key[0],
+                "to_id": key[1],
+                "document_count": documents,
+                "status": "unplanned",
+            })
+    return rows
+
+
+def _assign_multi_document_statuses(metadata: dict[str, Any]) -> None:
+    """Terminal status for every multi-document pair. Counts do not replace the row."""
+    seeded = [dict(item) for item in (metadata.get("multi_document_pairs") or []) if isinstance(item, Mapping)]
+    if not seeded:
+        return
+    accounting = metadata.get("pair_accounting") if isinstance(metadata.get("pair_accounting"), Mapping) else {}
+    planned = {_pair_key(item) for item in (metadata.get("within_run_examined") or []) if isinstance(item, Mapping)}
+    attempted = {_pair_key(item) for item in (accounting.get("attempted") or []) if isinstance(item, Mapping)}
+    completed = {_pair_key(item) for item in (accounting.get("completed") or []) if isinstance(item, Mapping)}
+    omitted = {_pair_key(item) for item in (accounting.get("omitted") or []) if isinstance(item, Mapping)}
+    terminals = metadata.get("pair_terminal_status") if isinstance(metadata.get("pair_terminal_status"), Mapping) else {}
+    relationships = []
+    stop = str(metadata.get("axial_stop") or "")
+    budget_stops = {"call_allowance", "token_allowance", "request_budget", "evidence_does_not_fit", "budget", "budget_limited"}
+    updated = []
+    for item in seeded:
+        key = _pair_key(item)
+        label = "|".join(key)
+        named = str(terminals.get(label) or "")
+        if named == "nothing_to_propose":
+            status = "nothing_to_propose"
+        elif named == "proposed":
+            status = "proposed"
+        elif key in omitted or (key in planned and key not in attempted and stop in budget_stops):
+            status = "budget_blocked"
+        elif key in attempted and key not in completed:
+            status = "failed"
+        elif key in completed:
+            status = "proposed"
+        elif key in planned:
+            status = "unplanned" if not stop else "budget_blocked"
+        else:
+            status = "unplanned"
+        row = dict(item)
+        row["document_count"] = int(item.get("document_count") or 0)
+        row["status"] = status
+        row["unit"] = "documents"
+        updated.append(row)
+    metadata["multi_document_pairs"] = updated
+    counts: dict[str, int] = {}
+    for row in updated:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    metadata["multi_document_pair_counts"] = counts
+    del relationships
 
 
 def _publish_exploration(metadata: dict[str, Any]) -> None:
@@ -4426,19 +5064,32 @@ def _publish_exploration(metadata: dict[str, Any]) -> None:
     metadata["examined_pairs"] = merged
     metadata["examined_pair_count"] = len(merged)
     metadata["unique_pairs_explored"] = len(merged)
-    attempted = accounting.get("attempted") or []
-    completed = accounting.get("completed") or []
+    attempted = _unique_pair_rows(accounting.get("attempted") or [])
+    completed = _unique_pair_rows(accounting.get("completed") or [])
     metadata["pairs_planned"] = len(metadata.get("within_run_examined") or [])
-    metadata["pairs_attempted"] = len([pair for pair in attempted if isinstance(pair, Mapping)])
-    metadata["pairs_completed"] = len([pair for pair in completed if isinstance(pair, Mapping)])
+    metadata["pairs_attempted"] = len(attempted)
+    metadata["pairs_completed"] = len(completed)
+    metadata["unique_pairs_attempted"] = _merge_unique_pairs(metadata.get("unique_pairs_attempted"), attempted)
+    metadata["unique_pairs_completed"] = _merge_unique_pairs(metadata.get("unique_pairs_completed"), completed)
+    metadata["unique_pairs_attempted_count"] = len(metadata["unique_pairs_attempted"])
+    metadata["unique_pairs_completed_count"] = len(metadata["unique_pairs_completed"])
     coverage = dict(metadata.get("pair_coverage") or {})
     coverage["unique_pairs_explored"] = len(merged)
     coverage["pairs_planned"] = metadata["pairs_planned"]
     coverage["pairs_attempted"] = metadata["pairs_attempted"]
     coverage["pairs_completed"] = metadata["pairs_completed"]
+    coverage["unique_pairs_attempted"] = list(metadata["unique_pairs_attempted"])
+    coverage["unique_pairs_completed"] = list(metadata["unique_pairs_completed"])
+    coverage["unique_pairs_attempted_count"] = len(metadata["unique_pairs_attempted"])
+    coverage["unique_pairs_completed_count"] = len(metadata["unique_pairs_completed"])
+    _assign_multi_document_statuses(metadata)
+    coverage["multi_document_pairs"] = list(metadata.get("multi_document_pairs") or [])
+    coverage["multi_document_pair_counts"] = dict(metadata.get("multi_document_pair_counts") or {})
     coverage["note"] = (
         "The same seed selects the same pairs. unique_pairs_explored counts completed examinations only. "
         "Planned, attempted, and completed counts are separate. "
+        "unique_pairs_attempted_count and unique_pairs_completed_count are distinct pairs across rounds. "
+        "Sending the same pair again does not increase them. "
         "A failed, timed-out, or unsent pair stays retryable. "
         "A valid empty response is completed. "
         "A 0.9.20 or 0.9.21 examined_pairs list was written when the round was planned and cannot be split. "
@@ -4692,6 +5343,8 @@ def _route_counterexamples(state: AxialState) -> str:
     progress = metadata.get("counterexample_progress")
     if (isinstance(progress, Mapping) and progress.get("open")) or _hold_is(metadata, "axial_counterexample"):
         return "counterexample_worker"
+    if metadata.get("counterexample_reallocation_pending"):
+        return "propose_relations"
     return "commit_relations"
 
 
@@ -4712,6 +5365,7 @@ def _route_storyline(state: AxialState) -> str:
 def _propose_node(runtime: AxialRuntime):
     async def propose_relations(state: AxialState) -> dict:
         metadata = dict(state.get("metadata") or {})
+        metadata.pop("counterexample_reallocation_pending", None)
         procedure = metadata.get("procedure") or {}
         passages = _by_passage(state)
         book = state.get("codebook") or {}
@@ -4810,6 +5464,9 @@ def _propose_node(runtime: AxialRuntime):
                     "omitted_evidence": omitted,
                     "paradigm_roles": list(PARADIGM_ROLES) if procedure.get("coding_lens") == "paradigm" else ["unspecified"],
                 }
+                evidence_note = dict(payload.get("omitted_evidence") or {})
+                evidence_note["available"] = len(evidence)
+                payload["omitted_evidence"] = evidence_note
                 supported, unsupported = _pairs_missing_evidence(window, evidence)
                 if unsupported:
                     metadata["axial_stop"] = "missing_category_evidence"
@@ -4995,6 +5652,7 @@ def _propose_node(runtime: AxialRuntime):
             used += 1
             _remember_pairs(accounting["attempted"], sent_chunk)
             _remember_pairs(accounting["completed"], sent_chunk)
+            _record_proposal_exposure(metadata, sent_chunk, payload)
             parsed = result["parsed"]
             requested = {(str(pair.get("from_id")), str(pair.get("to_id"))) for pair in sent_chunk}
             bands = {(str(pair.get("from_id")), str(pair.get("to_id"))): pair.get("band") for pair in sent_chunk}
@@ -5024,7 +5682,93 @@ def _propose_node(runtime: AxialRuntime):
             if parsed.get("nothing_to_propose") is True and not returned:
                 diagnostics["explicit_none"] = int(diagnostics["explicit_none"]) + 1
                 metadata["proposal_diagnostics"] = diagnostics
+                _remember_pair_status(metadata, sent_chunk, "nothing_to_propose")
                 returned = []
+            copied_statement = any(
+                isinstance(draft, Mapping) and _statement_is_only_quotes(draft) for draft in (returned or [])
+            )
+            if copied_statement and not payload.get("statement_copy_retry"):
+                # The retry spends one coding call. It is not a free call, and it
+                # is not limited to the pair-sized proposal count: that count is
+                # one request per planned pair, so a copied statement would
+                # otherwise have no call left. The preflight already reserved it.
+                rejected_response = [
+                    dict(draft) for draft in (returned or []) if isinstance(draft, Mapping) and _statement_is_only_quotes(draft)
+                ]
+                lineage = {
+                    "rejected_response": rejected_response,
+                    "retry_sent": False,
+                    "retry_response": None,
+                    "outcome": "unsent",
+                }
+                coding_ceiling = int(procedure.get("max_axial_review_calls") or 0)
+                tokens_now = int(metadata.get("axial_tokens_estimated") or 0)
+                token_ceiling = int(procedure.get("max_axial_review_tokens") or 0)
+                retry_estimate = request_input_tokens(_messages("axial_proposal", {**payload, "statement_copy_retry": True}), AxialProposalBatch)
+                allowance = getattr(runtime.limiter, "provider_allowance", None)
+                protected = int(getattr(allowance, "counterexample_token_reserve", 0) or 0) + int(getattr(allowance, "token_reserve", 0) or 0)
+                effective_ceiling = max(0, token_ceiling - protected) if token_ceiling else 0
+                token_room = not token_ceiling or tokens_now + retry_estimate <= effective_ceiling
+                if token_room and _allowance_refuses(
+                    runtime, retry_estimate, estimated=tokens_now, max_tokens=token_ceiling, stage="coding", kind="axial_proposal"
+                ):
+                    token_room = False
+                dollar_calls, _dollar_fit = _calls_that_fit_remaining_allowance(
+                    metadata,
+                    wanted=1,
+                    per_request=retry_estimate,
+                    tokens_used=tokens_now,
+                    token_ceiling=effective_ceiling or token_ceiling,
+                )
+                retry_slots = int(procedure.get("statement_copy_retry_calls") or 0)
+                proposal_slots = int(procedure.get("propose_calls") or 0)
+                retry_call_room = used < proposal_slots + retry_slots and (not coding_ceiling or used < coding_ceiling)
+                if retry_call_room and token_room and dollar_calls >= 1:
+                    retry_payload = dict(payload)
+                    retry_payload["statement_copy_retry"] = True
+                    retry_payload["instruction"] = (
+                        "The statement must not be a copy of the quote. "
+                        "Write a grounded statement, or set nothing_to_propose when no supported relationship is present."
+                    )
+                    retry_messages = _messages("axial_proposal", retry_payload)
+                    retry_result = await _structured_call(
+                        runtime,
+                        AxialProposalBatch,
+                        retry_messages,
+                        kind="axial_proposal",
+                        metadata=metadata,
+                        stage="coding",
+                        attempt_repair=False,
+                    )
+                    _log_call_audits(logs, retry_result["audits"])
+                    used += 1
+                    diagnostics["statement_copy_retries"] = int(diagnostics.get("statement_copy_retries") or 0) + 1
+                    lineage["retry_sent"] = True
+                    lineage["retry_response"] = retry_result.get("parsed")
+                    if retry_result["refused"] or retry_result["unparsed"]:
+                        lineage["outcome"] = "unsent"
+                    elif (retry_result.get("parsed") or {}).get("nothing_to_propose") is True or (
+                        retry_result.get("parsed") or {}
+                    ).get("no_supported_relationship") is True:
+                        returned = []
+                        lineage["outcome"] = "no_supported_relationship"
+                        _remember_pair_status(metadata, sent_chunk, "nothing_to_propose")
+                        payload = retry_payload
+                    else:
+                        returned = (retry_result["parsed"] or {}).get("relationships") or []
+                        lineage["outcome"] = "retried"
+                        payload = retry_payload
+                else:
+                    reason = "call_allowance" if not retry_call_room else (
+                        "token_allowance" if not token_room else "dollar_allowance"
+                    )
+                    diagnostics["statement_copy_retry_unsent_reason"] = reason
+                    lineage["outcome"] = "unsent"
+                    lineage["unsent_reason"] = reason
+                recorded_lineage = list(diagnostics.get("statement_copy_retry_lineage") or [])
+                recorded_lineage.append(lineage)
+                diagnostics["statement_copy_retry_lineage"] = recorded_lineage
+                metadata["proposal_diagnostics"] = diagnostics
             for draft in returned or []:
                 key = (str(draft.get("from_id") or ""), str(draft.get("to_id") or ""))
                 if key not in requested and (key[1], key[0]) not in requested:
@@ -5079,6 +5823,7 @@ def _propose_node(runtime: AxialRuntime):
             metadata["axial_tokens_estimated"] = estimated
         accounted = metadata.get("pair_accounting") or {}
         if not _proposals_continue(metadata, pending, used):
+            _transfer_unused_retries(metadata, procedure)
             propose_required = int(procedure.get("propose_calls") or 0) > 0 and int(accounted.get("planned_count") or 0) > 0
             propose_stop = str(metadata.get("axial_stop") or "")
             attempted_n = int(accounted.get("attempted_count") or 0)
@@ -5136,7 +5881,7 @@ _RELATION_REVIEW_KEYS = (
 _RELATION_REVIEW_INSTRUCTION = (
     "evidence_tier 0 is category evidence, not a relationship. "
     "Tier 1 is a hypothesis: wording is 'may be related', never 'supported'. Do not accept it. "
-    "Accepting tier 2 records pattern_supported. Wording is 'co-occurs in N respondents', not 'leads to'. "
+    "Accepting tier 2 records pattern_supported. Use the unit named in allowed_wording. A document count is not a respondent count. Do not say 'leads to' at tier 2. "
     "An analyst interpretation stays tier 2. Its wording is 'analyst interprets X as related to Y', not 'participants attribute X to Y'. "
     "Tier 3 is participant attribution. Only tier 3 or 4 may use causal wording. "
     "You cannot set verified. disposition verified is refused. "
@@ -5242,6 +5987,17 @@ async def _advance_relation_review(
     planned_chunks = list(progress.get("chunks") or [])
     call_limit = int(reviewer.max_calls)
     metadata["relation_unreviewed_rule"] = RELATION_UNREVIEWED_RULE
+    metadata["relation_review_assessment"] = {
+        "assessments_per_row": 1,
+        "distinct_assessments": ["disposition"],
+        "schema_repair": False,
+        "note": (
+            "Relation review sends one request per chunk. That request is one disposition "
+            "assessment of every relationship in the chunk. A second assessment is not required, "
+            "and this step does not send a schema repair. max_decision_calls is the limit and is not raised. "
+            "Calls equal chunks sent, not two calls per row."
+        ),
+    }
     metadata["relation_review_call_limit_raised"] = False
     if len(planned_chunks) > call_limit:
         metadata["relation_review_call_warning"] = (
@@ -5546,6 +6302,7 @@ def _counterexample_node(runtime: AxialRuntime):
                     }
                     return _messages("axial_counterexample", payload)
 
+                head = [dict(item) for item in pending[:1] if isinstance(item, Mapping)]
                 chunk, pending, messages, estimate, reason = _pack_window(
                     pending,
                     batch,
@@ -5553,9 +6310,72 @@ def _counterexample_node(runtime: AxialRuntime):
                     AxialCounterexampleBatch,
                     request_budget=token_budget,
                     fits_total=lambda estimate: not _allowance_refuses(
-                        runtime, estimate, estimated=estimated, max_tokens=max_tokens, stage="coding"
+                        runtime,
+                        estimate,
+                        estimated=estimated,
+                        max_tokens=max_tokens,
+                        stage="coding",
+                        kind="axial_counterexample",
                     ),
                 )
+                oversized = bool(head) and int(estimate or 0) > int(token_budget)
+                if head and (reason in {"request_budget", "token_allowance"} or oversized):
+                    shrunk_payload = _counterexample_payload(head, by_id, passage_by_id)
+                    shrunk_estimate, fitted = _shrink_counterexample_payload(
+                        shrunk_payload, AxialCounterexampleBatch, token_budget
+                    )
+                    shrunk_ok = fitted and not _allowance_refuses(
+                        runtime,
+                        shrunk_estimate,
+                        estimated=estimated,
+                        max_tokens=max_tokens,
+                        stage="coding",
+                        kind="axial_counterexample",
+                    )
+                    if shrunk_ok:
+                        chunk = head
+                        messages = _messages("axial_counterexample", shrunk_payload)
+                        estimate = shrunk_estimate
+                        reason = None
+                        metadata["counterexample_evidence_truncated"] = bool(shrunk_payload.get("omitted_context"))
+                        if shrunk_payload.get("omitted_context"):
+                            metadata["counterexample_omitted_context"] = shrunk_payload["omitted_context"]
+                            metadata["counterexample_adequacy"] = "unassessed"
+                    elif not fitted:
+                        reason = "request_budget"
+                        estimate = shrunk_estimate
+                        metadata["counterexample_unsent"] = {
+                            "reason": "request_budget",
+                            "estimate": shrunk_estimate,
+                            "per_request_cap": int(token_budget),
+                            "omitted_context": shrunk_payload.get("omitted_context"),
+                            "adequacy": "unassessed",
+                            "detail": (
+                                "The request is still over the per-request cap after shortening. "
+                                "The claim, category definitions, relevant passage context, and provenance were kept. "
+                                "Fitting the cap was not reached, and adequacy is unassessed."
+                            ),
+                        }
+                    else:
+                        reason = "token_allowance"
+                        estimate = shrunk_estimate
+                        metadata["counterexample_unsent"] = {
+                            "reason": "token_allowance",
+                            "estimate": shrunk_estimate,
+                            "tokens_used": int(estimated),
+                            "token_ceiling": int(max_tokens),
+                            "counterexample_token_reserve": int(procedure.get("counterexample_token_reserve") or 0),
+                            "omitted_context": shrunk_payload.get("omitted_context"),
+                            "adequacy": shrunk_payload.get("counterexample_adequacy") or "unassessed",
+                            "detail": (
+                                "The shortened request still does not fit the remaining counterexample token allowance. "
+                                "The claim, category definitions, relevant passage context, and provenance were kept. "
+                                "Adequacy is unassessed."
+                            ),
+                        }
+                        if shrunk_payload.get("omitted_context"):
+                            metadata["counterexample_omitted_context"] = shrunk_payload["omitted_context"]
+                            metadata["counterexample_adequacy"] = "unassessed"
                 if reason or not chunk:
                     metadata["axial_stop"] = reason or "request_budget"
                     if messages:
@@ -5564,10 +6384,60 @@ def _counterexample_node(runtime: AxialRuntime):
                                 "axial_counterexample",
                                 messages,
                                 {},
-                                extra={"status": "omitted", "reason": reason or "request_budget", "estimated_input_tokens": estimate},
+                                extra={
+                                    "status": "omitted",
+                                    "reason": reason or "request_budget",
+                                    "estimated_input_tokens": estimate,
+                                    "counterexample_unsent": metadata.get("counterexample_unsent"),
+                                },
                             )
                         )
-                    if reason == "token_allowance":
+                    if reason in {"request_budget", "token_allowance"} and not metadata.get("counterexample_reallocation_used"):
+                        wanted = max(0, int(allowance) - int(made))
+                        returned_calls, allowance_fit = _calls_that_fit_remaining_allowance(
+                            metadata,
+                            wanted=wanted,
+                            per_request=int(token_budget),
+                            tokens_used=int(estimated),
+                            token_ceiling=int(max_tokens),
+                        )
+                        if reason == "token_allowance":
+                            returned_calls = 0
+                        metadata["counterexample_reallocation"] = {
+                            "calls_returned": returned_calls,
+                            "calls_unsent": wanted,
+                            "reason": reason,
+                            "token_allowance": allowance_fit,
+                            "detail": (
+                                str((metadata.get("counterexample_unsent") or {}).get("detail") or "")
+                                or (
+                                    "Returned calls fit the remaining token allowance and, when a dollar allowance is set, that allowance too."
+                                )
+                            ),
+                        }
+                        procedure_now = dict(metadata.get("procedure") or {})
+                        procedure_now["propose_calls"] = int(procedure_now.get("propose_calls") or 0) + returned_calls
+                        procedure_now["counterexample_calls"] = max(0, int(procedure_now.get("counterexample_calls") or 0) - wanted)
+                        metadata["procedure"] = procedure_now
+                        procedure = procedure_now
+                        _append_transfer(metadata, {
+                            "from": "counterexamples",
+                            "to": "proposals",
+                            "calls": returned_calls,
+                            "calls_unsent": wanted,
+                            "reason": reason,
+                        })
+                        extra_pairs = [
+                            dict(item)
+                            for item in (state.get("unexamined_pairs") or [])
+                            if isinstance(item, Mapping)
+                        ][:returned_calls]
+                        if extra_pairs and returned_calls:
+                            metadata["counterexample_reallocation_pending"] = True
+                            metadata["counterexample_reallocation_pairs"] = extra_pairs
+                        metadata["counterexample_reallocation_used"] = True
+                        pending = []
+                    if reason == "token_allowance" or reason == "request_budget":
                         break
                     continue
                 result = await _structured_call(
@@ -5789,10 +6659,16 @@ def _counterexample_node(runtime: AxialRuntime):
                 )
             else:
                 _note_stage(metadata, "counterexamples", required=counter_required, status="complete" if counter_required else "skipped")
+        reallocated_pairs = [
+            dict(item)
+            for item in (metadata.get("counterexample_reallocation_pairs") or [])
+            if isinstance(item, Mapping)
+        ]
         return {
             "relationships": relationships,
             "passages": [item for item in passages if not item.get("synthetic")],
             "counterexample_queue": queued,
+            "relation_round": reallocated_pairs or list(state.get("relation_round") or []),
             "prompt_log": logs,
             "warnings": warnings,
             "metadata": metadata,
@@ -6246,6 +7122,7 @@ def _export_node(runtime_output: dict):
         metadata = dict(state.get("metadata") or {})
         _apply_run_status(metadata)
         metadata["saturation_judgment"] = None
+        metadata["relationship_funnel"] = build_relationship_funnel({**state, "metadata": metadata})
         held = {**state, "metadata": metadata, "saturation": state.get("saturation") or _saturation(state)}
         held["coverage"] = _coverage(held)
         paths = dict(state.get("export_paths") or {})
@@ -6286,7 +7163,7 @@ def build_axial_graph(runtime: AxialRuntime | None = None, *, output_dir: str | 
     builder.add_conditional_edges(
         "counterexample_worker",
         _route_counterexamples,
-        ["counterexample_worker", "commit_relations"],
+        ["counterexample_worker", "propose_relations", "commit_relations"],
     )
     builder.add_edge("commit_relations", "saturation_indicators")
     builder.add_edge("saturation_indicators", "saturation_checkpoint")
@@ -8413,6 +9290,29 @@ def _selective_split(ceiling: int, *, memos: bool, storyline: bool) -> tuple[int
     return 0, 0
 
 
+def _counterexample_token_reserve(
+    max_tokens: int,
+    *,
+    per_request: int,
+    storyline_reserve: int,
+    proposal_requests: int,
+    retry_calls: int,
+    counterexample_calls: int,
+) -> int:
+    """Tokens held for counterexample searches before proposals spend them.
+
+    The share follows the call split, including the reserved quote-copy retry.
+    It does not raise the coding ceiling.
+    """
+    available = max(0, int(max_tokens) - max(0, int(storyline_reserve)))
+    calls = max(0, int(counterexample_calls))
+    planned = max(0, int(proposal_requests)) + max(0, int(retry_calls)) + calls
+    if available <= 0 or calls <= 0 or planned <= 0:
+        return 0
+    proportional = available * calls // planned
+    return max(0, min(calls * max(0, int(per_request)), proportional))
+
+
 def _storyline_token_reserve(max_tokens: int, *, include_storyline: bool) -> int:
     """A share of the token ceiling held for the storyline.
 
@@ -9725,6 +10625,12 @@ def _procedure_from_kwargs(data: Mapping[str, Any], **kwargs: Any) -> dict[str, 
         raise AxialError("axial_share_propose must be between 0 and 1.")
     allocated_propose = int(round(max_calls * share))
     allocated_counter = max_calls - allocated_propose
+    # One quote-copy retry is reserved inside the propose share. It is not
+    # added on top of the call allowance. A leftover single slot is still a
+    # proposal request, and that request does not reserve a retry.
+    paired_requests = allocated_propose // 2
+    unpaired_requests = allocated_propose - (paired_requests * 2)
+    allowance_transfers: list[dict[str, Any]] = []
     book = data.get("codebook") or {}
     raw_seed = kwargs.get("seed", None)
     if raw_seed is None:
@@ -9737,14 +10643,33 @@ def _procedure_from_kwargs(data: Mapping[str, Any], **kwargs: Any) -> dict[str, 
     batch = max(1, int(kwargs["batch_size"]))
     if kwargs["axial_relations"]:
         required = 0 if pair_count <= 0 else math.ceil(pair_count / batch)
-        propose = min(allocated_propose, required)
-        unused = allocated_propose - propose
-        counter = allocated_counter + unused
-        transferred = unused > 0
+        propose = min(paired_requests + unpaired_requests, required)
+        retries = min(propose, paired_requests)
+        unused_slots = allocated_propose - (propose + retries)
+        if unused_slots:
+            allowance_transfers.append({
+                "from": "proposals",
+                "to": "counterexamples",
+                "calls": unused_slots,
+                "reason": (
+                    "Proposal requests that are not needed, and the retries reserved for them, "
+                    "move to counterexamples."
+                ),
+            })
+        counter = allocated_counter + unused_slots
+        transferred = unused_slots > 0
     else:
-        propose = allocated_propose
+        propose = paired_requests + unpaired_requests
+        retries = paired_requests
         counter = allocated_counter
         transferred = False
+    if propose > retries:
+        allowance_transfers.append({
+            "from": "statement_copy_retry",
+            "to": "unreserved",
+            "calls": propose - retries,
+            "reason": "Reserving a quote-copy retry for this request would exceed the call allowance.",
+        })
     if propose < 0 or counter < 0:
         raise AxialError("Axial call split produced a negative allowance.")
     procedure = {
@@ -9758,6 +10683,7 @@ def _procedure_from_kwargs(data: Mapping[str, Any], **kwargs: Any) -> dict[str, 
         "max_axial_review_calls": max_calls,
         "max_selective_review_calls": int(kwargs["max_selective_review_calls"]),
         "obvious_share": float(kwargs["obvious_share"]),
+        "pair_exploration_share": float(kwargs.get("pair_exploration_share", DEFAULT_PAIR_EXPLORATION_SHARE)),
         "axial_relations": bool(kwargs["axial_relations"]),
         "include_memos": bool(kwargs["include_memos"]),
         "include_storyline": bool(kwargs["include_storyline"]),
@@ -9767,9 +10693,26 @@ def _procedure_from_kwargs(data: Mapping[str, Any], **kwargs: Any) -> dict[str, 
         "max_axial_review_tokens": max_tokens,
         "storyline_token_reserve": _storyline_token_reserve(max_tokens, include_storyline=bool(kwargs["include_storyline"])),
         "propose_calls": propose,
+        "statement_copy_retry_calls": retries,
         "planned_pair_count": pair_count,
         "counterexample_calls": counter,
         "reallocated_propose_calls": transferred,
+        "allowance_transfers": allowance_transfers,
+        "counterexample_token_reserve": _counterexample_token_reserve(
+            max_tokens,
+            per_request=int(kwargs.get("axial_token_budget", DEFAULT_AXIAL_TOKEN_BUDGET) or 0),
+            storyline_reserve=_storyline_token_reserve(max_tokens, include_storyline=bool(kwargs["include_storyline"])),
+            proposal_requests=propose,
+            retry_calls=retries,
+            counterexample_calls=counter,
+        ),
+        "allowance_split_note": (
+            "Quote-copy retries are reserved inside max_axial_review_calls. "
+            "They are not added on top of the propose and counterexample split. "
+            "The default of 8 calls at share 0.5 is 2 proposal requests, 2 reserved retries, "
+            "and 4 counterexample calls. The 8-call default and the half split stay. "
+            "Counterexample tokens are reserved before proposals spend the coding pool."
+        ),
         "pattern_min_cases": max(1, int(kwargs.get("pattern_min_cases", 2) or 2)),
         "pattern_min_cases_note": (
             "A design choice for this package. It is not a quotation from the method literature."
@@ -10044,6 +10987,7 @@ def _runtime(
     core_review_tokens: int | None = None,
     tokens_already: int = 0,
     token_reserve: int = 0,
+    counterexample_token_reserve: int = 0,
     provider_max_attempts: int = 1,
     retry_backoff: float = 0.5,
     node_timeout: float | None = None,
@@ -10102,6 +11046,7 @@ def _runtime(
         tokens_estimated=max(0, int(tokens_already)),
         stages=stages or None,
         token_reserve=max(0, int(token_reserve)),
+        counterexample_token_reserve=max(0, int(counterexample_token_reserve)),
         stage_token_ceilings=stage_token_ceilings or None,
     )
     runtime.limiter.provider_allowance = allowance
@@ -10123,6 +11068,7 @@ async def aaxial_code(
     axial_share_propose: float = 0.5,
     axial_share_counterexample: float = 0.5,
     obvious_share: float = 0.5,
+    pair_exploration_share: float = DEFAULT_PAIR_EXPLORATION_SHARE,
     axial_relations: bool = True,
     axial_evidence_limit: int = 8,
     axial_synthetic_counterexample: bool = False,
@@ -10191,6 +11137,8 @@ async def aaxial_code(
         raise AxialError("provider_max_attempts includes the initial attempt and must be at least 1.")
     if abs((axial_share_propose + axial_share_counterexample) - 1) > 1e-9:
         raise AxialError("axial shares must sum to 1.")
+    if not 0 <= float(pair_exploration_share) <= 1:
+        raise AxialError("pair_exploration_share must be between 0 and 1.")
     installation_record()
     data = _source_mapping(source)
     procedure = _procedure_from_kwargs(
@@ -10202,6 +11150,7 @@ async def aaxial_code(
         max_axial_review_calls=max_axial_review_calls,
         axial_share_propose=axial_share_propose,
         obvious_share=obvious_share,
+        pair_exploration_share=pair_exploration_share,
         axial_relations=axial_relations,
         include_memos=include_memos,
         include_storyline=include_storyline,
@@ -10226,6 +11175,7 @@ async def aaxial_code(
     )
     metadata = {
         "procedure": procedure,
+        "allowance_transfers": [dict(item) for item in (procedure.get("allowance_transfers") or []) if isinstance(item, Mapping)],
         "stage": "axial",
         "performance": {
             "batch_size": batch_size,
@@ -10279,6 +11229,7 @@ async def aaxial_code(
             core_review_calls=procedure.get("max_core_review_calls"),
             core_review_tokens=procedure.get("max_core_review_tokens"),
             token_reserve=int(procedure.get("storyline_token_reserve") or 0),
+            counterexample_token_reserve=int(procedure.get("counterexample_token_reserve") or 0),
             provider_max_attempts=int(provider_max_attempts),
             retry_backoff=float(retry_backoff),
             node_timeout=node_timeout,
@@ -10534,6 +11485,7 @@ async def aselective_code(
             core_review_tokens=procedure.get("max_core_review_tokens"),
             tokens_already=int(metadata.get("axial_tokens_estimated") or 0),
             token_reserve=int(procedure.get("storyline_token_reserve") or 0),
+            counterexample_token_reserve=int(procedure.get("counterexample_token_reserve") or 0),
             node_timeout=node_timeout,
         )
         metadata["timeout_policy"] = timeout_policy(

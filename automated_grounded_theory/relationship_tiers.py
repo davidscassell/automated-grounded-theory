@@ -2526,8 +2526,24 @@ def classify_pair_evidence(
             elif stem_only:
                 lexical_only_pairs += 1
     single_document = sum(1 for code_id in ids if len(docs.get(code_id) or []) == 1)
+    doc_sets = {code_id: set(doc_ids) for code_id, doc_ids in docs.items()}
+
+    def _shared_documents(left: str, right: str) -> int:
+        # Documents, not respondents. Two documents stay two documents.
+        return len((doc_sets.get(left) or set()) & (doc_sets.get(right) or set()))
+
     return {
-        "by_class": {name: [{"from_id": left, "to_id": right} for left, right in rows] for name, rows in classes.items()},
+        "by_class": {
+            name: [
+                {
+                    "from_id": left,
+                    "to_id": right,
+                    "document_cooccurrence": _shared_documents(left, right),
+                }
+                for left, right in rows
+            ]
+            for name, rows in classes.items()
+        },
         "evidence_available": {name: len(rows) for name, rows in classes.items()},
         "plausible_count": sum(len(rows) for rows in classes.values()),
         "lexical_only_count": lexical_only_pairs,

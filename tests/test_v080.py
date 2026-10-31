@@ -328,8 +328,8 @@ def _run(model=None, **kwargs):
 
 
 def test_version_and_graphs():
-    assert __version__ == "0.9.39"
-    assert POLICY_VERSION == "0.9.39"
+    assert __version__ == "0.9.41"
+    assert POLICY_VERSION == "0.9.41"
     from automated_grounded_theory.axial import aaxial_code
 
     assert inspect.signature(aaxial_code).parameters["batch_size"].default == 1
@@ -445,7 +445,12 @@ def test_human_checkpoints_accept_and_record_saturation(tmp_path):
     relevance = reviewed.metadata["axial_counterexample_relevance"]
     assert relevance["candidates_considered"] >= 1
     assert relevance["skipped_no_relevant_passage"] >= 1
-    assert reviewed.metadata["procedure"]["reallocated_propose_calls"] is True
+    assert reviewed.metadata["procedure"]["propose_calls"] == 1
+    assert reviewed.metadata["procedure"]["statement_copy_retry_calls"] == 1
+    assert any(
+        item.get("from") == "statement_copy_retry" and item.get("to") == "counterexamples"
+        for item in reviewed.metadata.get("allowance_transfers") or []
+    )
     assert any("embedding" in json.dumps(entry) for entry in reviewed.prompt_log)
     empty_roles = {item["paradigm_role"] for item in reviewed.empty_slots if item["category_id"] == "c-prep"}
     assert "context" not in empty_roles
@@ -481,7 +486,7 @@ def test_reject_revise_and_merge_keep_both_rows():
     source = _corpus()
     source["codebook"]["c-other"] = _code("c-other", "other work")
     source["segments"].append({"segment_id": "s3", "code_id": "c-other", "passage_id": "p1"})
-    common = dict(model=FakeAxialCoder(), seed=3, max_axial_review_calls=4, checkpointer=saver, thread_id="axial-merge")
+    common = dict(model=FakeAxialCoder(), seed=3, max_axial_review_calls=8, checkpointer=saver, thread_id="axial-merge")
     paused = axial_code(source, interrupt=True, **common)
     assert len(paused.relationships) == 2
     merged = axial_code(

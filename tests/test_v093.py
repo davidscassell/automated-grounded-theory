@@ -19,8 +19,8 @@ from tests.test_v090 import _kwargs
 
 
 def test_version_is_093():
-    assert __version__ == "0.9.39"
-    assert POLICY_VERSION == "0.9.39"
+    assert __version__ == "0.9.41"
+    assert POLICY_VERSION == "0.9.41"
 
 
 def _book():
@@ -289,8 +289,11 @@ def test_axial_step_allowance_covers_the_old_fixed_limit_and_a_low_limit_is_inco
     )
     assert finished.metadata.get("stop") != "recursion_limit"
     assert int(finished.metadata["performance"]["recursion_limit"]) > 80
-    assert finished.metadata.get("provider_budget", {}).get("calls_used", 0) > 80
-    assert len(finished.prompt_log) > 80
+    # Half of the 100-call share is the reserved quote-copy retry, so 50 proposal requests are sent.
+    assert finished.metadata["procedure"]["propose_calls"] == 50
+    assert finished.metadata["procedure"]["statement_copy_retry_calls"] == 50
+    assert finished.metadata.get("provider_budget", {}).get("calls_used", 0) == 50
+    assert len(finished.prompt_log) == 50
     held = axial_code(
         _wide_corpus(),
         FakeAxialCoder(),
