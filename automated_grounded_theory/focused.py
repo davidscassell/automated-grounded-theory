@@ -3249,6 +3249,81 @@ def _claim_round_stage(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
     return {"required": True, "status": "complete", "reason": ""}
 
 
+def raised_code_document_reach(
+    passages: Sequence[Any],
+    segments: Sequence[Any],
+    raised_ids: Sequence[str] | None,
+) -> dict[str, Any]:
+    """How many documents each raised code reaches. Reporting only.
+
+    A document is ``doc_id`` or ``document_id``. Two documents that share a
+    respondent stay two documents. A missing raised list leaves the counts null.
+    """
+    if raised_ids is None:
+        return {
+            "codes": None,
+            "raised_code_count": None,
+            "single_document_code_count": None,
+            "note": None,
+        }
+    by_passage: dict[str, str] = {}
+    for item in passages or []:
+        if not isinstance(item, Mapping):
+            continue
+        passage_id = str(item.get("passage_id") or "")
+        if not passage_id:
+            continue
+        by_passage[passage_id] = str(item.get("doc_id") or item.get("document_id") or "")
+    docs_for: dict[str, set[str]] = {str(code_id): set() for code_id in raised_ids}
+    for segment in segments or []:
+        if not isinstance(segment, Mapping):
+            continue
+        code_id = str(segment.get("code_id") or "")
+        if code_id not in docs_for:
+            continue
+        document_id = by_passage.get(str(segment.get("passage_id") or ""))
+        if document_id:
+            docs_for[code_id].add(document_id)
+    codes = [
+        {
+            "code_id": code_id,
+            "document_count": len(docs_for[code_id]),
+            "document_ids": sorted(docs_for[code_id]),
+        }
+        for code_id in docs_for
+    ]
+    single = sum(1 for row in codes if row["document_count"] == 1)
+    total = len(codes)
+    return {
+        "codes": codes,
+        "raised_code_count": total,
+        "single_document_code_count": single,
+        "note": f"{single} of {total} raised codes appear in only one document.",
+    }
+
+
+def reread_queue_coverage(passages: Sequence[Any], queue: Sequence[Any]) -> dict[str, Any]:
+    """How much of the corpus the reread queue named. The queue itself is unchanged."""
+    corpus = [
+        str(item.get("passage_id") or "")
+        for item in (passages or [])
+        if isinstance(item, Mapping) and str(item.get("passage_id") or "") and not item.get("synthetic")
+    ]
+    queued: list[str] = []
+    for item in queue or []:
+        if isinstance(item, Mapping):
+            passage_id = str(item.get("passage_id") or "")
+        else:
+            passage_id = str(item or "")
+        if passage_id and passage_id not in queued:
+            queued.append(passage_id)
+    return {
+        "passages_in_corpus": len(corpus),
+        "passages_queued": len(queued),
+        "note": f"{len(queued)} of {len(corpus)} passages were queued.",
+    }
+
+
 def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
     procedure = (state.get("metadata") or {}).get("procedure") or {}
     stop = str(state.get("recode_stop") or "")
@@ -3336,6 +3411,16 @@ def _status_fields(state: Mapping[str, Any]) -> dict[str, Any]:
         "focused_not_queued": not_queued,
         "focused_reread": [str(item) for item in (state.get("focused_reread") or [])],
         "coverage": coverage,
+        "raised_code_document_reach": raised_code_document_reach(
+            state.get("passages") or [],
+            state.get("segments") or [],
+            None if "raised_code_ids" not in state and "raised_code_ids" not in (state.get("metadata") or {})
+            else list(state.get("raised_code_ids") or (state.get("metadata") or {}).get("raised_code_ids") or []),
+        ),
+        "reread_queue_coverage": reread_queue_coverage(
+            state.get("passages") or [],
+            state.get("recode_queue") or [],
+        ),
     }
 
 
@@ -4539,6 +4624,12 @@ def _prepare_node(state: FocusedState) -> dict:
         metadata["reread_reallocation"] = plan.get("reallocation") or {}
         metadata["reread_purpose_counts"] = plan.get("purpose_counts") or {}
         metadata["reread_call_targets"] = plan.get("call_targets") or {}
+        metadata["raised_code_document_reach"] = raised_code_document_reach(
+            state.get("passages") or [],
+            state.get("segments") or [],
+            list(state.get("raised_code_ids") or []),
+        )
+        metadata["reread_queue_coverage"] = reread_queue_coverage(state.get("passages") or [], queue)
         updates["warnings"] = warnings
         updates["metadata"] = metadata
         updates["recode_queue"] = queue

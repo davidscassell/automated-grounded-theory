@@ -174,6 +174,7 @@ class ProviderAllowance:
         tokens_estimated: int = 0,
         stages: Mapping[str, int | None] | None = None,
         token_reserve: int = 0,
+        counterexample_token_reserve: int = 0,
         stage_token_ceilings: Mapping[str, int | None] | None = None,
     ) -> None:
         self.max_calls = None if max_calls is None else max(0, int(max_calls))
@@ -181,6 +182,7 @@ class ProviderAllowance:
         self.calls_used = max(0, int(calls_used))
         self.tokens_estimated = max(0, int(tokens_estimated))
         self.token_reserve = max(0, int(token_reserve))
+        self.counterexample_token_reserve = max(0, int(counterexample_token_reserve))
         self.refusals: list[dict[str, Any]] = []
         self.stage_ceilings: dict[str, int | None] = {}
         self.stage_used: dict[str, int] = {}
@@ -242,6 +244,7 @@ class ProviderAllowance:
             "tokens_estimated_raw": self.tokens_estimated,
             "tokens_estimated_compared": self._guarded(self.tokens_estimated),
             "token_reserve": self.token_reserve,
+            "counterexample_token_reserve": self.counterexample_token_reserve,
             "ceiling_comparison": "guarded",
             "ceiling_note": (
                 "tokens_estimated is the raw heuristic accumulator. "
@@ -328,9 +331,15 @@ class ProviderAllowance:
     def _compared_ceiling(self, kind: str, *, apply_reserve: bool) -> int | None:
         if self.max_tokens is None:
             return None
-        if not apply_reserve or kind == "storyline" or self.token_reserve <= 0:
-            return self.max_tokens
-        return max(0, self.max_tokens - self.token_reserve)
+        ceiling = self.max_tokens
+        if apply_reserve and kind != "storyline" and self.token_reserve > 0:
+            ceiling -= self.token_reserve
+        # Proposals cannot spend the counterexample reserve. The counterexample
+        # call and the storyline call can. A schema repair stays on the side
+        # that originated it only when that side is named as the kind.
+        if self.counterexample_token_reserve > 0 and kind not in {"axial_counterexample", "storyline"}:
+            ceiling -= self.counterexample_token_reserve
+        return max(0, ceiling)
 
     def _decide(
         self,
@@ -403,6 +412,7 @@ class ProviderAllowance:
                     )
                 else:
                     self.tokens_estimated += raw_estimate
+                    self.stage_tokens_used[bucket] = int(self.stage_tokens_used.get(bucket, 0)) + raw_estimate
                     token_spent_reported = self.tokens_estimated
                     token_ceiling_reported = self.max_tokens
                 if stage_limited:

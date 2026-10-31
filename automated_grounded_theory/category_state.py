@@ -1323,6 +1323,9 @@ DEFAULT_EXPLORATION_QUOTAS = {
     "same_respondent": 1,
     "lexical_cross_case": 1,
 }
+# Share of a round kept for pairs that are not multi-document qualifying pairs.
+# A qualifying pair is planning priority, not a cap on how many assertions it can support.
+DEFAULT_PAIR_EXPLORATION_SHARE = 0.25
 _UNEXAMINED_MATERIALIZE_LIMIT = 256
 
 
@@ -1488,6 +1491,8 @@ def plan_relation_pairs(
     seed: int = 0,
     evidence_classes: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
     exploration_quotas: Mapping[str, int] | None = None,
+    exploration_share: float = DEFAULT_PAIR_EXPLORATION_SHARE,
+    pattern_min_cases: int = 2,
 ) -> dict[str, Any]:
     """Choose the next axial pairs and reserve slots across evidence classes.
 
@@ -1505,6 +1510,8 @@ def plan_relation_pairs(
         raise ValueError("round_size must be zero or more.")
     if not 0 <= obvious_share <= 1:
         raise ValueError("obvious_share must be between 0 and 1.")
+    if not 0 <= float(exploration_share) <= 1:
+        raise ValueError("exploration_share must be between 0 and 1.")
     quotas = dict(DEFAULT_EXPLORATION_QUOTAS if exploration_quotas is None else exploration_quotas)
     for name in _EVIDENCE_CLASS_ORDER:
         quotas.setdefault(name, 0)
@@ -1542,16 +1549,54 @@ def plan_relation_pairs(
                 if key in examined_keys:
                     continue
                 by_class[class_name].append(oriented[key])
+    document_spread: dict[tuple[str, str], int] = {}
+    if evidence_classes:
+        for class_name in _EVIDENCE_CLASS_ORDER:
+            for item in evidence_classes.get(class_name) or []:
+                if not isinstance(item, Mapping):
+                    continue
+                key = tuple(sorted((str(item.get("from_id") or ""), str(item.get("to_id") or ""))))
+                document_spread[key] = int(item.get("document_cooccurrence") or 0)
+
+    def _by_document_spread(rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """Pairs coded together in more documents come first. Seed rotates only ties.
+
+        ``pattern_min_cases`` documents outrank a single document. Two documents
+        are not two respondents.
+        """
+        ordered = [
+            pair
+            for _, pair in sorted(
+                enumerate(rows),
+                key=lambda item: (-document_spread.get(tuple(sorted(item[1])), 0), item[0]),
+            )
+        ]
+        if not int(seed) or not ordered:
+            return ordered
+        buckets: dict[int, list[tuple[str, str]]] = {}
+        spread_order: list[int] = []
+        for pair in ordered:
+            value = document_spread.get(tuple(sorted(pair)), 0)
+            if value not in buckets:
+                spread_order.append(value)
+                buckets[value] = []
+            buckets[value].append(pair)
+        rotated: list[tuple[str, str]] = []
+        for value in spread_order:
+            group = buckets[value]
+            if len(group) > 1 and int(seed) % len(group):
+                offset = int(seed) % len(group)
+                group = group[offset:] + group[:offset]
+            rotated.extend(group)
+        return rotated
+
     pending_counts = {name: len(rows) for name, rows in by_class.items()}
     slots = _class_slots(pending_counts, round_size, quotas) if evidence_classes else {name: 0 for name in _EVIDENCE_CLASS_ORDER}
     prioritized: list[tuple[str, tuple[str, str]]] = []
     prioritized_keys: set[tuple[str, str]] = set()
     for class_name in _EVIDENCE_CLASS_ORDER:
-        rows = list(by_class[class_name])
+        rows = _by_document_spread(list(by_class[class_name]))
         take = slots.get(class_name, 0)
-        if take < len(rows) and int(seed) % len(rows):
-            offset = int(seed) % len(rows)
-            rows = rows[offset:] + rows[:offset]
         for pair in rows[:take]:
             key = tuple(sorted(pair))
             if key in prioritized_keys:
@@ -1559,12 +1604,12 @@ def plan_relation_pairs(
             prioritized.append((class_name, pair))
             prioritized_keys.add(key)
     fill_size = max(0, round_size - len(prioritized))
-    obvious_pending = [pair for pair in pending(obvious) if tuple(sorted(pair)) not in prioritized_keys]
-    less_pending = [pair for pair in pending(less) if tuple(sorted(pair)) not in prioritized_keys]
-    if obvious_pending:
-        offset = int(seed) % len(obvious_pending)
-        if offset:
-            obvious_pending = obvious_pending[offset:] + obvious_pending[:offset]
+    obvious_pending = _by_document_spread(
+        [pair for pair in pending(obvious) if tuple(sorted(pair)) not in prioritized_keys]
+    )
+    less_pending = _by_document_spread(
+        [pair for pair in pending(less) if tuple(sorted(pair)) not in prioritized_keys]
+    )
     take_obvious = int(round(fill_size * obvious_share))
     take_less = fill_size - take_obvious
     chosen_obvious = obvious_pending[:take_obvious]
@@ -1576,6 +1621,79 @@ def plan_relation_pairs(
     if short_less > 0:
         chosen_obvious = obvious_pending[: take_obvious + short_less]
     chosen = list(prioritized) + [("obvious", pair) for pair in chosen_obvious] + [("less_obvious", pair) for pair in chosen_less]
+    minimum_documents = max(1, int(pattern_min_cases))
+
+    def _spread(pair: tuple[str, str]) -> int:
+        return document_spread.get(tuple(sorted(pair)), 0)
+
+    def _qualifying(pair: tuple[str, str]) -> bool:
+        return _spread(pair) >= minimum_documents
+
+    # Document spread outranks evidence class. A same-passage pair coded in one
+    # document does not keep a multi-document pair out of the round. Each class
+    # still keeps its minimum when that pair is the one meeting the quota.
+    quota_floor = {
+        name: min(int(quotas.get(name) or 0), len(by_class.get(name) or []))
+        for name in _EVIDENCE_CLASS_ORDER
+    }
+    selected_keys = {tuple(sorted(pair)) for _band, pair in chosen}
+    waiting: list[tuple[str, tuple[str, str]]] = []
+    for class_name in _EVIDENCE_CLASS_ORDER:
+        for pair in by_class[class_name]:
+            key = tuple(sorted(pair))
+            if key in selected_keys or not _qualifying(pair):
+                continue
+            selected_keys.add(key)
+            waiting.append((class_name, pair))
+    waiting.sort(key=lambda item: (-_spread(item[1]), _EVIDENCE_CLASS_ORDER.index(item[0])))
+    for class_name, pair in waiting:
+        counts: dict[str, int] = {}
+        for band, _held in chosen:
+            counts[band] = counts.get(band, 0) + 1
+        drop_at = None
+        for index, (band, held) in enumerate(chosen):
+            if _qualifying(held):
+                continue
+            floor = quota_floor.get(band, 0)
+            if floor and counts.get(band, 0) <= floor:
+                continue
+            if drop_at is None or _spread(held) < _spread(chosen[drop_at][1]):
+                drop_at = index
+        if drop_at is None:
+            continue
+        chosen.pop(drop_at)
+        chosen.append((class_name, pair))
+    explore_slots = int(round(float(exploration_share) * max(0, int(round_size))))
+    explore_slots = max(0, min(int(round_size), explore_slots))
+
+    # A multi-document pair qualifies for priority. It does not use up the
+    # round. pair_exploration_share keeps slots for other pairs.
+    other_in_round = [pair for _band, pair in chosen if not _qualifying(pair)]
+    if explore_slots > len(other_in_round):
+        need = explore_slots - len(other_in_round)
+        pool: list[tuple[str, str]] = []
+        seen_pool = {tuple(sorted(pair)) for _band, pair in chosen}
+        # Evidence-class pairs that are rare, contrasting, or coded in fewer
+        # documents come before adjacency fill, so the slot is not spent on an
+        # uncoded neighboring pair.
+        class_rows = [item for rows in by_class.values() for item in rows]
+        for pair in class_rows + list(less_pending) + list(obvious_pending):
+            key = tuple(sorted(pair))
+            if key in seen_pool or _qualifying(pair) or not key[0] or not key[1]:
+                continue
+            seen_pool.add(key)
+            pool.append(pair)
+        replacements = pool[:need]
+        if replacements:
+            kept: list[tuple[str, tuple[str, str]]] = []
+            removed = 0
+            for band, pair in reversed(chosen):
+                if removed < len(replacements) and _qualifying(pair):
+                    removed += 1
+                    continue
+                kept.append((band, pair))
+            kept.reverse()
+            chosen = kept + [("exploration", pair) for pair in replacements]
     chosen_keys = {tuple(sorted(pair)) for _band, pair in chosen}
     covered = {key for key in examined_keys if key in oriented} | chosen_keys
     unexamined_count = len(pairs) - len(covered)
@@ -1622,10 +1740,19 @@ def plan_relation_pairs(
             "seed": int(seed),
             "round_size": int(round_size),
             "obvious_share": float(obvious_share),
+            "pair_exploration_share": float(exploration_share),
+            "exploration_slots": explore_slots,
             "quotas": {name: int(quotas.get(name) or 0) for name in _EVIDENCE_CLASS_ORDER},
             "category_ids": list(seen_ids),
             "examined_pair_count": len(examined_keys),
         },
+        "pair_exploration_share": float(exploration_share),
+        "qualifying_pair_note": (
+            "A pair coded together in at least pattern_min_cases documents is a qualifying pair. "
+            "That is planning priority, not a ceiling. One pair can support several distinct assertions. "
+            "Coded co-occurrence does not set the corpus's total relationship potential. "
+            f"pair_exploration_share defaults to {DEFAULT_PAIR_EXPLORATION_SHARE} and keeps room for other pairs."
+        ),
         "allowance_note": "Call and token allowances are ceilings, not measured costs.",
     }
 

@@ -32,8 +32,8 @@ from tests.test_v080 import FakeAxialCoder, _corpus
 
 
 def test_version_is_0911():
-    assert __version__ == "0.9.39"
-    assert POLICY_VERSION == "0.9.39"
+    assert __version__ == "0.9.42"
+    assert POLICY_VERSION == "0.9.42"
     assert PATTERN_MIN_CASES == 2
     assert DEFAULT_AXIAL_TOKEN_BUDGET == 6000
     assert DEFAULT_MAX_AXIAL_REVIEW_TOKENS == 24000
@@ -443,7 +443,16 @@ def test_classify_pair_evidence_matches_the_0910_result():
     assert previous["lexical_only_count"] > 0
     assert previous["pairs_reaching_pattern_min_cases"] >= 1
     assert previous["single_document_code_count"] >= 1
-    assert current == previous
+    def _without_spread(report):
+        copied = dict(report)
+        copied["by_class"] = {
+            name: [{key: value for key, value in row.items() if key != "document_cooccurrence"} for row in rows]
+            for name, rows in report["by_class"].items()
+        }
+        return copied
+
+    assert _without_spread(current) == previous
+    assert all("document_cooccurrence" in row for rows in current["by_class"].values() for row in rows)
 
 
 def test_classify_pair_evidence_tokenizes_each_passage_once(monkeypatch):

@@ -192,8 +192,8 @@ def _cycle(match: list[str]) -> str:
 
 
 def test_version_fingerprint_and_unchanged_defaults():
-    assert __version__ == "0.9.39"
-    assert POLICY_VERSION == "0.9.39"
+    assert __version__ == "0.9.42"
+    assert POLICY_VERSION == "0.9.42"
     assert PATTERN_MIN_CASES == 2
     assert DEFAULT_MAX_AXIAL_REVIEW_TOKENS == 24000
     assert CORE_FINAL_DECISION_RULE == "final_assessment_only_v1"
