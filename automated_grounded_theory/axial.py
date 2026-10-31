@@ -3573,6 +3573,8 @@ def _plan_node(state: AxialState) -> dict:
         _pattern_minimum(procedure),
     )
     metadata["within_run_examined"] = list(plan["round"])
+    if "initial_relation_round" not in metadata:
+        metadata["initial_relation_round"] = list(plan["round"])
     metadata["unique_pairs_explored"] = len(metadata["examined_pairs"])
     metadata["pairs_planned"] = len(plan["round"])
     metadata["pairs_attempted"] = 0
@@ -5184,6 +5186,12 @@ def _permit_reallocated_proposals(
     return returned, fit
 
 
+def _append_axial_event(metadata: dict[str, Any], kind: str, **detail: Any) -> None:
+    events = [dict(item) for item in (metadata.get("axial_event_order") or []) if isinstance(item, Mapping)]
+    events.append({"kind": kind, **detail})
+    metadata["axial_event_order"] = events
+
+
 def _append_transfer(metadata: dict[str, Any], record: Mapping[str, Any]) -> None:
     transfers = [dict(item) for item in (metadata.get("allowance_transfers") or []) if isinstance(item, Mapping)]
     transfers.append(dict(record))
@@ -5544,6 +5552,35 @@ def _pairs_missing_evidence(
     return supported, missing
 
 
+def _reallocation_calls_remaining(metadata: Mapping[str, Any]) -> int:
+    """Transferred proposal calls that have not run yet."""
+    if not metadata.get("reallocation_open"):
+        return 0
+    record = metadata.get("counterexample_reallocation")
+    if not isinstance(record, Mapping):
+        return 0
+    transferred = int(record.get("calls_transferred") or record.get("calls_returned") or 0)
+    executed = int(record.get("calls_executed") or 0)
+    return max(0, transferred - executed)
+
+
+def _proposal_slot_open(metadata: Mapping[str, Any], used: int) -> bool:
+    """Whether another proposal request may be sent.
+
+    ``axial_calls_used`` also counts counterexample sends. Those sends are not
+    proposal slots. A transferred counterexample call stays open until
+    ``calls_executed`` reaches ``calls_transferred``, and it still has to fit
+    ``max_axial_review_calls``.
+    """
+    procedure = metadata.get("procedure") if isinstance(metadata.get("procedure"), Mapping) else {}
+    if _reallocation_calls_remaining(metadata):
+        coding_ceiling = int(procedure.get("max_axial_review_calls") or 0)
+        if coding_ceiling and used >= coding_ceiling:
+            return False
+        return True
+    return used < int(procedure.get("propose_calls") or 0)
+
+
 def _proposals_continue(metadata: Mapping[str, Any], pending: Sequence[Any], used: int) -> bool:
     """Another proposal request still fits this round and was not stopped.
 
@@ -5556,8 +5593,7 @@ def _proposals_continue(metadata: Mapping[str, Any], pending: Sequence[Any], use
         return True
     if str(metadata.get("axial_stop") or "") in {"timeout", "schema_unparsed"}:
         return False
-    procedure = metadata.get("procedure") or {}
-    return bool(pending) and used < int(procedure.get("propose_calls") or 0)
+    return bool(pending) and _proposal_slot_open(metadata, used)
 
 
 def _route_after_relations(state: AxialState) -> str:
@@ -5634,7 +5670,15 @@ def _propose_node(runtime: AxialRuntime):
         model_name = describe_model(runtime.coder)
         pending = list(state.get("relation_round") or [])
         if reallocated:
-            pending = reallocated + pending
+            def _pair_identity(item: Mapping[str, Any]) -> tuple[str, str]:
+                return (str(item.get("from_id") or ""), str(item.get("to_id") or ""))
+
+            realloc_keys = [_pair_identity(item) for item in reallocated]
+            pending_keys = [_pair_identity(item) for item in pending if isinstance(item, Mapping)]
+            # The counterexample worker already returns these pairs as relation_round.
+            if pending_keys[: len(realloc_keys)] != realloc_keys:
+                pending = reallocated + pending
+            metadata["reallocation_open"] = True
             if str(metadata.get("axial_stop") or "") in {"token_allowance", "request_budget", "required_but_blocked"}:
                 metadata["axial_stop"] = ""
         token_budget = _request_token_budget(metadata)
@@ -5671,7 +5715,7 @@ def _propose_node(runtime: AxialRuntime):
                 pending = list(supported_pending)
             metadata["unsupported_pairs_reconciled"] = True
         proposal_hold = _take_provider_hold(metadata, "axial_proposal")
-        while proposal_hold is not None or (pending and used < int(procedure.get("propose_calls") or 0)):
+        while proposal_hold is not None or (pending and _proposal_slot_open(metadata, used)):
             sent_chunk: list = []
             payload: dict[str, Any] = {}
             messages: list = []
@@ -5906,6 +5950,26 @@ def _propose_node(runtime: AxialRuntime):
                 break
             used += 1
             _remember_pairs(accounting["attempted"], sent_chunk)
+            from_transfer = bool(reallocated or metadata.get("reallocation_open"))
+            _append_axial_event(
+                metadata,
+                "proposal_sent",
+                pairs=[{"from_id": str(pair.get("from_id") or ""), "to_id": str(pair.get("to_id") or "")} for pair in sent_chunk],
+                reallocated=from_transfer,
+            )
+            if from_transfer:
+                reallocation = dict(metadata.get("counterexample_reallocation") or {})
+                executed = int(reallocation.get("calls_executed") or 0) + 1
+                reallocation["calls_executed"] = executed
+                metadata["counterexample_reallocation"] = reallocation
+                transfers = [dict(item) for item in (metadata.get("allowance_transfers") or []) if isinstance(item, Mapping)]
+                for item in reversed(transfers):
+                    if item.get("from") == "counterexamples" and item.get("to") == "proposals":
+                        item["calls_executed"] = executed
+                        break
+                metadata["allowance_transfers"] = transfers
+                if executed >= int(reallocation.get("calls_transferred") or reallocation.get("calls_returned") or 0):
+                    metadata["reallocation_open"] = False
             _remember_pairs(accounting["completed"], sent_chunk)
             _record_proposal_exposure(metadata, sent_chunk, payload)
             parsed = result["parsed"]
@@ -6347,6 +6411,16 @@ async def _advance_relation_review(
         progress["next_index"] = len(chunks)
         return _close(progress)
     note_chunk_send(progress, audit, estimate=int((audit or {}).get("estimated_input_tokens") or 0))
+    rounds = [dict(item) for item in (metadata.get("relation_review_rounds") or []) if isinstance(item, Mapping)]
+    if rounds:
+        rounds[-1]["review_calls"] = int(rounds[-1].get("review_calls") or 0) + 1
+        metadata["relation_review_rounds"] = rounds
+    _append_axial_event(
+        metadata,
+        "relation_review_sent",
+        relationship_ids=list(chunk_ids),
+        consolidated_rows=int((rounds[-1].get("consolidated_rows") if rounds else 0) or 0),
+    )
     returned = list(parsed.get("relationships") or [])
     got = [str(item.get("relationship_id") or "") for item in returned if isinstance(item, Mapping)]
     if len(got) != len(set(got)) or set(got) != set(chunk_ids):
@@ -6373,6 +6447,29 @@ def _relation_checkpoint(runtime: AxialRuntime):
         relationships = consolidate_duplicate_assertions(state.get("relationships") or [])
         metadata = dict(state.get("metadata") or {})
         _finalize_proposal_lineage(metadata, relationships)
+        progress_open = metadata.get("decision_chunk_state")
+        resuming_review = (
+            isinstance(progress_open, Mapping)
+            and progress_open.get("open")
+            and progress_open.get("kind") == "axial_relation_review"
+        )
+        if not resuming_review:
+            raw_members = 0
+            for row in relationships:
+                raw_members += len([item for item in (row.get("source_proposal_ids") or []) if item])
+            rounds = [dict(item) for item in (metadata.get("relation_review_rounds") or []) if isinstance(item, Mapping)]
+            rounds.append({
+                "consolidated_rows": len(relationships),
+                "raw_proposal_members": raw_members,
+                "review_calls": 0,
+            })
+            metadata["relation_review_rounds"] = rounds
+            _append_axial_event(
+                metadata,
+                "consolidation_before_review",
+                consolidated_rows=len(relationships),
+                raw_proposal_members=raw_members,
+            )
         if not relationships:
             return {"relationships": relationships, "metadata": metadata}
         logs = list(state.get("prompt_log") or [])
@@ -6585,6 +6682,7 @@ def _counterexample_node(runtime: AxialRuntime):
                         estimate = shrunk_estimate
                         reason = None
                         metadata["counterexample_token_breakdown"] = counterexample_token_breakdown(shrunk_payload)
+                        metadata["counterexample_active_payload"] = shrunk_payload
                         metadata["counterexample_evidence_truncated"] = bool(shrunk_payload.get("omitted_context"))
                         if shrunk_payload.get("omitted_context"):
                             metadata["counterexample_omitted_context"] = shrunk_payload["omitted_context"]
@@ -6596,6 +6694,20 @@ def _counterexample_node(runtime: AxialRuntime):
                         breakdown["per_request_cap"] = int(token_budget)
                         metadata["counterexample_token_breakdown"] = breakdown
                         metadata["counterexample_status"] = "required_but_blocked"
+                        requests = list(metadata.get("counterexample_requests") or [])
+                        requests.append({
+                            "status": "required_but_blocked",
+                            "relationship_id": str((head[0] if head else {}).get("relationship_id") or ""),
+                            "estimated_input_tokens": shrunk_estimate,
+                            "token_breakdown": breakdown,
+                        })
+                        metadata["counterexample_requests"] = requests
+                        _append_axial_event(
+                            metadata,
+                            "counterexample_blocked",
+                            relationship_id=str((head[0] if head else {}).get("relationship_id") or ""),
+                            estimated_input_tokens=shrunk_estimate,
+                        )
                         metadata["counterexample_unsent"] = {
                             "reason": "required_but_blocked",
                             "status": "required_but_blocked",
@@ -6656,15 +6768,20 @@ def _counterexample_node(runtime: AxialRuntime):
                             tokens_used=int(estimated),
                             token_ceiling=int(max_tokens),
                         )
+                        calls_unsent = max(0, wanted - returned_calls)
                         metadata["counterexample_reallocation"] = {
                             "calls_returned": returned_calls,
-                            "calls_unsent": wanted,
+                            "calls_transferred": returned_calls,
+                            "calls_unsent": calls_unsent,
+                            "calls_executed": 0,
                             "reason": reason,
                             "token_allowance": allowance_fit,
                             "detail": (
-                                str((metadata.get("counterexample_unsent") or {}).get("detail") or "")
-                                or (
-                                    "Returned calls fit the remaining token allowance and, when a dollar allowance is set, that allowance too."
+                                "calls_transferred moved onto the proposal queue and are not calls_unsent. "
+                                "calls_unsent were neither sent as counterexamples nor transferred. "
+                                + (
+                                    str((metadata.get("counterexample_unsent") or {}).get("detail") or "")
+                                    or "Returned calls fit the remaining token allowance and, when a dollar allowance is set, that allowance too."
                                 )
                             ),
                         }
@@ -6677,10 +6794,26 @@ def _counterexample_node(runtime: AxialRuntime):
                             "from": "counterexamples",
                             "to": "proposals",
                             "calls": returned_calls,
-                            "calls_unsent": wanted,
+                            "calls_transferred": returned_calls,
+                            "calls_unsent": calls_unsent,
+                            "calls_executed": 0,
                             "reason": reason,
+                            "note": (
+                                "calls_unsent were not sent and were not transferred. "
+                                "calls_transferred are the calls that may run as proposals."
+                            ),
                         })
+                        _append_axial_event(
+                            metadata,
+                            "allowance_transfer",
+                            calls_transferred=returned_calls,
+                            calls_unsent=calls_unsent,
+                            reason=reason,
+                        )
                         extra_pairs = _reallocation_pairs(metadata, state.get("unexamined_pairs") or [], returned_calls)
+                        reallocation_record = dict(metadata.get("counterexample_reallocation") or {})
+                        reallocation_record["pairs"] = extra_pairs
+                        metadata["counterexample_reallocation"] = reallocation_record
                         if extra_pairs and returned_calls:
                             metadata["counterexample_reallocation_pending"] = True
                             metadata["counterexample_reallocation_pairs"] = extra_pairs
@@ -6689,6 +6822,26 @@ def _counterexample_node(runtime: AxialRuntime):
                     if reason in {"token_allowance", "request_budget", "required_but_blocked"}:
                         break
                     continue
+                sent_payload = metadata.pop("counterexample_active_payload", None)
+                if not isinstance(sent_payload, Mapping):
+                    sent_payload = _counterexample_payload(chunk, by_id, passage_by_id, book)
+                sent_breakdown = counterexample_token_breakdown(sent_payload)
+                sent_breakdown["per_request_cap"] = int(token_budget)
+                metadata["counterexample_token_breakdown"] = sent_breakdown
+                sent_requests = list(metadata.get("counterexample_requests") or [])
+                sent_requests.append({
+                    "status": "sent",
+                    "relationship_id": str((chunk[0] if chunk else {}).get("relationship_id") or ""),
+                    "estimated_input_tokens": estimate,
+                    "token_breakdown": sent_breakdown,
+                })
+                metadata["counterexample_requests"] = sent_requests
+                _append_axial_event(
+                    metadata,
+                    "counterexample_sent",
+                    relationship_id=str((chunk[0] if chunk else {}).get("relationship_id") or ""),
+                    estimated_input_tokens=estimate,
+                )
                 result = await _structured_call(
                     runtime,
                     AxialCounterexampleBatch,

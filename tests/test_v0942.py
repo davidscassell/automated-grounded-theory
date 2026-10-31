@@ -115,6 +115,17 @@ def test_required_content_that_cannot_fit_is_blocked_not_truncated_or_skipped():
     assert estimate > 6000
     assert payload["counterexamples"][0]["relationship"]["statement"] == before
     assert payload["counterexamples"][0]["passage"]["text"].count("tools") >= 1
+    breakdown = counterexample_token_breakdown(payload)
+    required = (
+        breakdown["instructions"]
+        + breakdown["schema"]
+        + breakdown["claim"]
+        + breakdown["category_definitions"]
+        + breakdown["evidence"]
+        + breakdown["provenance"]
+    )
+    assert required > 6000
+    assert breakdown["claim"] > breakdown["other_context"]
 
 
 def test_consolidation_keeps_both_decisions_and_reviews_the_merged_row():
@@ -240,7 +251,7 @@ class _Sequence(FakeAxialCoder):
                 AxialRelationshipDraft(
                     from_id=pair.get("from_id") or "a",
                     to_id=pair.get("to_id") or "b",
-                    statement="Categories a and c co-occur across the two documents.",
+                    statement="Categories co-occur across the two documents.",
                     passage_id="p1",
                     quote=quote,
                 )
@@ -268,6 +279,21 @@ class _Sequence(FakeAxialCoder):
             ]
         )
 
+    def relation_review(self, body):
+        from automated_grounded_theory.axial import AxialRelationDecision, AxialRelationDecisions
+
+        return AxialRelationDecisions(
+            relationships=[
+                AxialRelationDecision(
+                    relationship_id=str(row.get("relationship_id") or ""),
+                    disposition="rejected",
+                    paradigm_role="context",
+                    rationale="The endpoints are not both anchored.",
+                )
+                for row in body.get("relationships") or []
+            ]
+        )
+
 
 def test_duplicate_proposals_consolidate_before_review_and_transferred_calls_run():
     codes = ["a", "b", "c", "d"]
@@ -284,9 +310,29 @@ def test_duplicate_proposals_consolidate_before_review_and_transferred_calls_run
         ],
         "relationships": [
             {
-                "relationship_id": "rel-huge",
+                "relationship_id": "rel-v46",
                 "from_id": "a",
                 "to_id": "b",
+                "statement": "Tools sit with the bench across these documents.",
+                "quote": "tools sit with the bench",
+                "passage_id": "p1",
+                "doc_id": "d1",
+                "disposition": "proposed",
+                "evidence_tier": 2,
+                "paradigm_role": "context",
+                "review_history": [
+                    {"actor": "llm", "disposition": "proposed", "rationale": "history " * 40}
+                    for _ in range(30)
+                ],
+                "derived_metadata": "m" * 24180,
+                "supporting_cases": [{"case_id": "r1", "quotes": ["tools sit with the bench"]}],
+                "cooccurrence_2x2": {"both": 2, "a_only": 0, "b_only": 0, "neither": 0},
+                "flags": ["endpoint_evidence_partial"],
+            },
+            {
+                "relationship_id": "rel-huge",
+                "from_id": "c",
+                "to_id": "d",
                 "statement": "The required counterexample claim. " * 700,
                 "quote": "tools sit with the bench",
                 "passage_id": "p1",
@@ -294,7 +340,8 @@ def test_duplicate_proposals_consolidate_before_review_and_transferred_calls_run
                 "disposition": "proposed",
                 "evidence_tier": 2,
                 "paradigm_role": "context",
-            }
+                "categories_note": "definitions stay on the codebook; the claim itself does not fit",
+            },
         ],
         "memos": [],
     }
@@ -313,39 +360,96 @@ def test_duplicate_proposals_consolidate_before_review_and_transferred_calls_run
         batch_size=1,
         negative_case_search=True,
     )
-    assert len(coder.proposal_pairs) >= 2
-    first = tuple(sorted(coder.proposal_pairs[0]))
-    later = {tuple(sorted(pair)) for pair in coder.proposal_pairs[1:]}
-    assert first not in later
-    assert later
+    initial = result.metadata["initial_relation_round"]
+    assert len(initial) == 1
+    initial_pair = tuple(sorted((initial[0]["from_id"], initial[0]["to_id"])))
+    assert tuple(sorted(coder.proposal_pairs[0])) == initial_pair
+    events = result.metadata["axial_event_order"]
+    kinds = [event["kind"] for event in events]
+    assert kinds.index("proposal_sent") < kinds.index("consolidation_before_review")
+    assert kinds.index("consolidation_before_review") < kinds.index("relation_review_sent")
+    assert kinds.index("relation_review_sent") < kinds.index("counterexample_sent")
+    assert kinds.index("counterexample_sent") < kinds.index("counterexample_blocked")
+    assert kinds.index("counterexample_blocked") < kinds.index("allowance_transfer")
+    transfer_at = kinds.index("allowance_transfer")
+    extra_events = [event for event in events[transfer_at + 1 :] if event["kind"] == "proposal_sent"]
+    assert extra_events
+    assert all(event["reallocated"] is True for event in extra_events)
+    assert events[kinds.index("proposal_sent")]["reallocated"] is False
+    reallocation = result.metadata["counterexample_reallocation"]
+    assert reallocation["calls_executed"] == reallocation["calls_transferred"] == len(extra_events)
+    assert reallocation["calls_unsent"] == 0
+    assert reallocation["calls_unsent"] != reallocation["calls_executed"]
+    queued = [tuple(sorted((pair["from_id"], pair["to_id"]))) for pair in reallocation["pairs"]]
+    executed = [tuple(sorted((pair["from_id"], pair["to_id"]))) for event in extra_events for pair in event["pairs"]]
+    assert executed == queued
+    assert initial_pair not in executed
+    multi = {
+        tuple(sorted((row["from_id"], row["to_id"])))
+        for row in result.metadata["multi_document_pairs"]
+        if int(row["document_count"]) >= 2
+    }
+    assert executed
+    assert all(pair in multi for pair in executed)
+    sent = next(row for row in result.metadata["counterexample_requests"] if row["status"] == "sent")
+    assert sent["relationship_id"] == "rel-v46"
+    assert sent["estimated_input_tokens"] <= 6000
+    assert sent["token_breakdown"]["total"] <= 6000
+    assert sent["token_breakdown"]["other_context"] < 1000
+    assert len(result.relationships[0]["derived_metadata"]) == 24180
+    blocked = next(row for row in result.metadata["counterexample_requests"] if row["status"] == "required_but_blocked")
+    blocked_parts = blocked["token_breakdown"]
+    required = (
+        blocked_parts["instructions"]
+        + blocked_parts["schema"]
+        + blocked_parts["claim"]
+        + blocked_parts["category_definitions"]
+        + blocked_parts["evidence"]
+        + blocked_parts["provenance"]
+    )
+    assert required > 6000
+    assert blocked["relationship_id"] == "rel-huge"
     stage = result.metadata["stage_outcomes"]["counterexamples"]
     assert stage["status"] == "required_but_blocked"
-    assert stage["status"] != "skipped"
-    assert result.metadata["counterexample_unsent"]["reason"] == "required_but_blocked"
-    assert result.metadata["counterexample_token_breakdown"]["total"] > 6000
+    assert stage["required"] is True
+    review = result.metadata["relation_review_rounds"][0]
+    assert review["review_calls"] <= review["consolidated_rows"]
+    assert review["raw_proposal_members"] == 5
+    assert review["review_calls"] < review["raw_proposal_members"]
     lineage = result.metadata["proposal_lineage"]
     assert lineage["reconciles"] is True
-    assert lineage["raw_count"] >= 5
     raw = result.metadata["raw_proposals"]
-    first_raw = [row for row in raw if {row["from_id"], row["to_id"]} == set(coder.proposal_pairs[0])]
+    first_raw = [row for row in raw if {row["from_id"], row["to_id"]} == set(initial_pair)]
     assert len(first_raw) == 5
     assert sum(1 for row in first_raw if row["disposition"] == "retained") == 2
     assert sum(1 for row in first_raw if str(row["disposition"]).startswith("merged_into:")) == 3
-    assert result.metadata["counterexample_unsent"]["token_breakdown"]["claim"] > 0
+    summary_codes = (
+        "reviewer_rejected",
+        "insufficient_document_count",
+        "hypothetical_only_evidence",
+        "incomplete_review",
+    )
+    funnel_rows = {row["relationship_id"]: row for row in result.metadata["relationship_funnel"]["rows"]}
     consolidated = [
         row for row in result.relationships
-        if {row.get("from_id"), row.get("to_id")} == set(coder.proposal_pairs[0])
+        if {row.get("from_id"), row.get("to_id")} == set(initial_pair)
     ]
     assert len(consolidated) == 2
     for row in consolidated:
-        assert row.get("reviewer_disposition") == "accepted"
+        assert row.get("reviewer_disposition") == "rejected"
+        assert "endpoint_evidence_partial" in (row.get("flags") or [])
+        funnel_row = funnel_rows[row["relationship_id"]]
+        assert funnel_row["summary_reasons"] == [code for code in summary_codes if code in funnel_row["reasons"]]
+        assert "reviewer_rejected" in funnel_row["summary_reasons"]
+        assert "partial_endpoint_evidence" in funnel_row["reasons"]
+        assert "partial_endpoint_evidence" not in funnel_row["summary_reasons"]
+        assert "incomplete_review" not in funnel_row["reasons"]
         if len(row.get("source_proposal_ids") or []) > 1:
             assert len(row["prior_decisions"]) == len(row["source_proposal_ids"])
+            assert {item["disposition"] for item in row["prior_decisions"]} == {"proposed"}
             assert row["review_history"]
     usage = result.metadata["call_usage"]
     assert usage["estimated_input_tokens"] is not None
-    assert usage["calls"]
-    assert all("provider_input_tokens" in row and "estimated_input_tokens" in row for row in usage["calls"])
-    assert any(row["provider_input_tokens"] is not None for row in usage["calls"])
-    transfers = result.metadata["allowance_transfers"]
-    assert any(item.get("to") == "proposals" and int(item.get("calls") or 0) >= 1 for item in transfers)
+    assert usage["provider_input_tokens"] is not None
+    assert usage["estimated_input_tokens"] != usage["provider_input_tokens"]
+    assert all(row["usage_completeness"] == "complete" for row in usage["calls"] if row["kind"] == "axial_proposal")

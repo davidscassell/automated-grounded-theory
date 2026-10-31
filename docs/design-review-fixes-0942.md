@@ -29,7 +29,7 @@ Other context is the defect. The evidence is not. Sending the full row cannot be
 
 3. Each returned draft receives `proposal_id` before it is accepted or rejected. The export says `invalid`, `retained`, or `merged_into:<relationship id>`. `proposal_lineage` fails when those dispositions do not account for the raw rows and the relationships.
 
-4. Calls moved off a blocked counterexample are queued. Unplanned multi-document pairs come first. The unused counterexample token reserve is released only as far as those calls need, and the call is not queued when the remaining allowance still refuses it. The graph routes back to proposals.
+4. Calls moved off a blocked counterexample are queued. Unplanned multi-document pairs come first. The unused counterexample token reserve is released only as far as those calls need, and the call is not queued when the remaining allowance still refuses it. The graph routes back to proposals and keeps sending until `calls_executed` equals `calls_transferred` or the coding-stage ceiling is reached. A counterexample that already ran does not consume a transferred proposal slot. `calls_unsent` counts calls that were neither sent as counterexamples nor transferred.
 
 5. `call_usage` keeps `estimated_input_tokens`, `provider_input_tokens`, `provider_output_tokens`, and `usage_completeness` separate. A missing provider count stays null.
 
