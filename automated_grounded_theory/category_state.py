@@ -1666,34 +1666,55 @@ def plan_relation_pairs(
     explore_slots = int(round(float(exploration_share) * max(0, int(round_size))))
     explore_slots = max(0, min(int(round_size), explore_slots))
 
-    # A multi-document pair qualifies for priority. It does not use up the
-    # round. pair_exploration_share keeps slots for other pairs.
-    other_in_round = [pair for _band, pair in chosen if not _qualifying(pair)]
-    if explore_slots > len(other_in_round):
-        need = explore_slots - len(other_in_round)
-        pool: list[tuple[str, str]] = []
-        seen_pool = {tuple(sorted(pair)) for _band, pair in chosen}
-        # Evidence-class pairs that are rare, contrasting, or coded in fewer
-        # documents come before adjacency fill, so the slot is not spent on an
-        # uncoded neighboring pair.
-        class_rows = [item for rows in by_class.values() for item in rows]
-        for pair in class_rows + list(less_pending) + list(obvious_pending):
+    # Every pair coded in at least pattern_min_cases documents is seated before
+    # a single-document pair. The exploration share does not remove one.
+    qualifying_pending: list[tuple[str, str]] = []
+    seen_qualifying: set[tuple[str, str]] = set()
+    for rows in by_class.values():
+        for pair in rows:
             key = tuple(sorted(pair))
-            if key in seen_pool or _qualifying(pair) or not key[0] or not key[1]:
+            if key in seen_qualifying or not _qualifying(pair):
                 continue
-            seen_pool.add(key)
-            pool.append(pair)
-        replacements = pool[:need]
-        if replacements:
-            kept: list[tuple[str, tuple[str, str]]] = []
-            removed = 0
-            for band, pair in reversed(chosen):
-                if removed < len(replacements) and _qualifying(pair):
-                    removed += 1
+            seen_qualifying.add(key)
+            qualifying_pending.append(pair)
+    seated_qualifying = {tuple(sorted(pair)) for _band, pair in chosen if _qualifying(pair)}
+    unseated = [pair for pair in qualifying_pending if tuple(sorted(pair)) not in seated_qualifying]
+    if unseated:
+        for pair in list(unseated):
+            drop_at = None
+            for index, (_band, held) in enumerate(chosen):
+                if not _qualifying(held):
+                    drop_at = index
+                    break
+            if drop_at is None:
+                break
+            chosen.pop(drop_at)
+            chosen.append(("multi_document", pair))
+        seated_now = {tuple(sorted(pair)) for _band, pair in chosen}
+        room = max(0, int(round_size) - len(chosen))
+        for pair in qualifying_pending:
+            if room <= 0:
+                break
+            key = tuple(sorted(pair))
+            if key in seated_now:
+                continue
+            chosen.append(("multi_document", pair))
+            seated_now.add(key)
+            room -= 1
+    else:
+        spare = max(0, int(round_size) - len(chosen))
+        take = min(explore_slots, spare)
+        if take > 0:
+            pool: list[tuple[str, str]] = []
+            seen_pool = {tuple(sorted(pair)) for _band, pair in chosen}
+            class_rows = [item for rows in by_class.values() for item in rows]
+            for pair in class_rows + list(less_pending) + list(obvious_pending):
+                key = tuple(sorted(pair))
+                if key in seen_pool or _qualifying(pair) or not key[0] or not key[1]:
                     continue
-                kept.append((band, pair))
-            kept.reverse()
-            chosen = kept + [("exploration", pair) for pair in replacements]
+                seen_pool.add(key)
+                pool.append(pair)
+            chosen = list(chosen) + [("exploration", pair) for pair in pool[:take]]
     chosen_keys = {tuple(sorted(pair)) for _band, pair in chosen}
     covered = {key for key in examined_keys if key in oriented} | chosen_keys
     unexamined_count = len(pairs) - len(covered)
@@ -1749,9 +1770,11 @@ def plan_relation_pairs(
         "pair_exploration_share": float(exploration_share),
         "qualifying_pair_note": (
             "A pair coded together in at least pattern_min_cases documents is a qualifying pair. "
-            "That is planning priority, not a ceiling. One pair can support several distinct assertions. "
+            "Examining every qualifying pair precedes a single-document pair. "
+            "That priority is not a ceiling on how many relationships one pair can support. "
+            "One pair can support several distinct assertions. "
             "Coded co-occurrence does not set the corpus's total relationship potential. "
-            f"pair_exploration_share defaults to {DEFAULT_PAIR_EXPLORATION_SHARE} and keeps room for other pairs."
+            f"pair_exploration_share defaults to {DEFAULT_PAIR_EXPLORATION_SHARE} and fills only slots that remain after every qualifying pair is seated or the round is full."
         ),
         "allowance_note": "Call and token allowances are ceilings, not measured costs.",
     }

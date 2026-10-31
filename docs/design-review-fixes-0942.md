@@ -1,6 +1,6 @@
 # 0.9.42 review fixes
 
-Status: current for package 0.9.42. The 0.9.41 note stays the record of retries inside the call allowance and the counterexample token reserve. This note does not change core selection, `pattern_min_cases` (2), `one_document_one_respondent` (off), the 6,000 request cap, or the 24,000 token ceiling. No LLM judge is added. Undefined metrics stay null. No Muse or TA data is in this package.
+Status: record of package 0.9.42. Package 0.9.43 is current. The 0.9.41 note stays the record of retries inside the call allowance and the counterexample token reserve. This note does not change core selection, `pattern_min_cases` (2), `one_document_one_respondent` (off), the 6,000 request cap, or the 24,000 token ceiling. No LLM judge is added. Undefined metrics stay null. No Muse or TA data is in this package.
 
 ## Why a compacted counterexample was 9,466 tokens
 

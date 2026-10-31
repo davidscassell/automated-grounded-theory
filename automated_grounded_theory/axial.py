@@ -532,6 +532,8 @@ _KIND_PROMPTS = {
         "When nothing in this request supports even a hypothesis, set nothing_to_propose true and return an empty relationships list. "
         "Do not return a row of empty strings. A blank or whitespace-only statement is not a relationship. "
         "Every relationship you return must include a nonempty statement. "
+        "The statement must not only restate the quote. "
+        "A statement that is the quote, or the quote with different punctuation, is invalid_restated_quote. "
         "A function word, or a generic stem such as work, job, or team, is not evidence by itself. "
         "When paradigm_roles lists roles, choose the role the passages support. "
         "Use unspecified when the passages support only an association. "
@@ -1027,6 +1029,27 @@ def _select_counterexamples(
     threshold. A cheap pre-filter holds the rest back. A call is skipped when
     nothing plausible remains. The only no-call fallback is an exhausted budget.
     """
+    applicable: list[Mapping[str, Any]] = []
+    skipped_rejected: list[str] = []
+    for row in relationships:
+        if not isinstance(row, Mapping):
+            continue
+        disposition = str(
+            row.get("reviewer_disposition") or row.get("review_decision") or row.get("human_disposition") or row.get("disposition") or ""
+        ).strip().casefold()
+        if disposition in {"rejected", "reject"}:
+            skipped_rejected.append(str(row.get("relationship_id") or ""))
+            continue
+        applicable.append(row)
+    targeting = {
+        "applicable_to_reviewer_rejected": False,
+        "decision": (
+            "A counterexample is not applicable to a row the reviewer has already rejected. "
+            "The rejection stands. The call is not spent, and it does not reopen the row."
+        ),
+        "skipped_relationship_ids": [item for item in skipped_rejected if item],
+        "selected_relationship_ids": [str(row.get("relationship_id") or "") for row in applicable if row.get("relationship_id")],
+    }
     if not enabled:
         return [], {
             "queued": 0,
@@ -1056,9 +1079,9 @@ def _select_counterexamples(
         }
     research_slots = slots
     synthetic_row = None
-    if synthetic and relationships and slots > 0:
+    if synthetic and applicable and slots > 0:
         research_slots = max(0, slots - 1)
-        relationship_id = str(relationships[0].get("relationship_id") or "")
+        relationship_id = str(applicable[0].get("relationship_id") or "")
         synthetic_row = {
             "relationship_id": relationship_id,
             "passage_id": SYNTHETIC_PASSAGE_ID,
@@ -1068,12 +1091,16 @@ def _select_counterexamples(
             "comparison": "",
         }
     queued, stats = search_relationships(
-        relationships,
+        applicable,
         passages,
         slots=research_slots,
         codebook=codebook,
         segments=segments,
     )
+    stats["counterexample_targeting"] = targeting
+    if skipped_rejected and not applicable:
+        stats["no_call_reason"] = "reviewer_rejected_not_applicable"
+        stats.setdefault("notes", []).append(targeting["decision"])
     if synthetic_row is not None:
         queued = [synthetic_row, *queued]
         stats["queued"] = len(queued)
@@ -1438,11 +1465,27 @@ def _endpoint_anchoring(
     return rows
 
 
+def _quote_fold(text: object) -> str:
+    """Whitespace and typographic punctuation folded. The words stay."""
+    folded = " ".join(str(text or "").split()).casefold()
+    for source, target in (
+        ("\u2018", "'"),
+        ("\u2019", "'"),
+        ("\u201c", '"'),
+        ("\u201d", '"'),
+        ("\u2013", "-"),
+        ("\u2014", "-"),
+        ("\u00a0", " "),
+    ):
+        folded = folded.replace(source, target)
+    return " ".join(folded.split())
+
+
 def _quote_found_in(quote: str, text: str) -> bool:
-    needle = " ".join(str(quote or "").split()).casefold()
+    needle = _quote_fold(quote)
     if len(needle) < 4:
         return False
-    return needle in " ".join(str(text or "").split()).casefold()
+    return needle in _quote_fold(text)
 
 
 def _locate_quote(quote: str, passages: Mapping[str, Mapping[str, Any]], cited: str) -> dict[str, Any]:
@@ -1558,6 +1601,17 @@ def _annotate_quote_scope(relationship: dict, passages: Mapping[str, Mapping[str
     if all(item.get("in_cited_passage") for item in fields):
         relationship["evidence_scope"] = "same_passage"
         relationship["quotes_share_passage"] = True
+        if "quotes_not_in_cited_passage" in {str(item) for item in (relationship.get("flags") or [])}:
+            relationship["quote_scope_cause"] = relationship.get("quote_scope_cause") or "flag_retained"
+            relationship["quote_scope_note"] = (
+                "The quotes checked now sit in the cited passage. "
+                "quotes_not_in_cited_passage was already on the row and is kept."
+            )
+        else:
+            relationship["quote_scope_cause"] = None
+            relationship["quote_scope_note"] = (
+                "Each quote is in the cited passage. Typographic punctuation and whitespace are folded before that check."
+            )
         return
     found = [item for item in fields if item.get("passage_id")]
     docs = {item.get("doc_id") for item in found if item.get("doc_id")}
@@ -1580,6 +1634,25 @@ def _annotate_quote_scope(relationship: dict, passages: Mapping[str, Mapping[str
             flags.append("cross_respondent_pattern")
         relationship["flags"] = flags
         relationship["needs_review"] = True
+        located_elsewhere = any(item.get("passage_id") and not item.get("in_cited_passage") for item in fields)
+        absent = any(not item.get("passage_id") for item in fields)
+        if located_elsewhere:
+            cause = "quote_found_in_other_passage"
+            note = (
+                "The quote is a verbatim span of a different passage, not the cited one. "
+                "That is a citation mismatch. The flag stays."
+            )
+        elif absent:
+            cause = "quote_absent_from_corpus"
+            note = (
+                "The quote is not a verbatim span of the cited passage or of any other passage. "
+                "The flag stays. Folding whitespace and typographic punctuation did not locate it."
+            )
+        else:
+            cause = "quote_not_in_cited_passage"
+            note = "The quote is not in the cited passage. The flag stays."
+        relationship["quote_scope_cause"] = cause
+        relationship["quote_scope_note"] = note
 
 
 def _annotate_endpoints(
@@ -2683,6 +2756,7 @@ def _apply_model_relations(
         history.append(
             {
                 "actor": "llm",
+                "stage": "axial_relation_review",
                 "disposition": decision.get("disposition"),
                 "paradigm_role": decision.get("paradigm_role"),
                 "rationale": decision.get("rationale"),
@@ -3136,6 +3210,28 @@ def build_relationship_funnel(state: Mapping[str, Any]) -> dict[str, Any]:
     selected_count = int(selected)
     sent_count = len({_pair_key(item) for item in sent_pairs if _pair_key(item)[0]})
     outside = max(0, plausible_count - selected_count)
+    lineage = [dict(item) for item in (diagnostics.get("statement_copy_retry_lineage") or []) if isinstance(item, Mapping)]
+    retry_calls = int(diagnostics.get("statement_copy_retries") or 0)
+    if retry_calls < sum(1 for item in lineage if item.get("retry_sent")):
+        retry_calls = sum(1 for item in lineage if item.get("retry_sent"))
+    proposal_events = [
+        item for item in (metadata.get("axial_event_order") or [])
+        if isinstance(item, Mapping) and item.get("kind") == "proposal_sent"
+    ]
+    proposal_requests = len(proposal_events) or sent_count
+    retries_by_pair: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for item in lineage:
+        pair_key = _pair_key(item) if item.get("from_id") or item.get("to_id") else ("", "")
+        if not pair_key[0] and item.get("rejected_response"):
+            first = item["rejected_response"][0] if isinstance(item["rejected_response"], list) and item["rejected_response"] else {}
+            if isinstance(first, Mapping):
+                pair_key = _pair_key(first)
+        record = {
+            "outcome": item.get("outcome"),
+            "reason": item.get("reason") or "invalid_restated_quote",
+            "retry_sent": bool(item.get("retry_sent")),
+        }
+        retries_by_pair.setdefault(pair_key, []).append(record)
     pair_stages = [
         _count_stage("possible_pairs", possible, None, {}),
         _count_stage("plausible_pairs", plausible_count, possible, {"no_plausible_evidence": max(0, possible - plausible_count)}),
@@ -3200,6 +3296,7 @@ def build_relationship_funnel(state: Mapping[str, Any]) -> dict[str, Any]:
             "document_count_unit": "documents",
             "summary_reasons": [reason for reason in _COUNTEREXAMPLE_SUMMARY_REASONS if reason in row_reasons],
             "reasons": row_reasons,
+            "retries": list(retries_by_pair.get(key) or []),
             "evidence_exposure": {
                 "available": held.get("available"),
                 "included": held.get("included"),
@@ -3241,7 +3338,24 @@ def build_relationship_funnel(state: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(item, Mapping)
     ]
     return {
-        "pair_funnel": {"stages": pair_stages, "reconciles": relationship_funnel_reconciles(pair_stages)},
+        "pair_funnel": {
+            "stages": pair_stages,
+            "reconciles": relationship_funnel_reconciles(pair_stages),
+            "proposal_calls": {
+                "proposal_requests": proposal_requests,
+                "statement_copy_retries": retry_calls,
+                "calls": proposal_requests + retry_calls,
+                "retries": [
+                    {"from_id": pair[0], "to_id": pair[1], **record}
+                    for pair, records in retries_by_pair.items()
+                    for record in records
+                ],
+                "note": (
+                    "proposal_requests counts proposal sends. statement_copy_retries counts the extra coding calls. "
+                    "A retry is not another pair. The pair stages stay pair counts so reconciliation does not treat the retry as a dropped pair."
+                ),
+            },
+        },
         "row_funnel": {"stages": row_stages, "reconciles": relationship_funnel_reconciles(row_stages)},
         "rows": rows,
         "valid_grounded_count": int(valid_grounded),
@@ -3497,6 +3611,76 @@ def _load_focused(state: AxialState) -> dict:
     return {}
 
 
+_MULTI_DOCUMENT_TERMINAL = frozenset({"proposed", "nothing_to_propose", "failed", "budget_blocked"})
+
+
+def _prefer_multi_document_calls(metadata: dict[str, Any], needed_requests: int) -> int:
+    """Move counterexample calls and unused retries onto proposals until every multi-document pair fits or the coding ceiling is reached.
+
+    The ceiling is not raised. A pair that still does not fit is budget-blocked later, with that reason.
+    """
+    procedure = dict(metadata.get("procedure") or {})
+    propose = int(procedure.get("propose_calls") or 0)
+    retries = int(procedure.get("statement_copy_retry_calls") or 0)
+    counter = int(procedure.get("counterexample_calls") or 0)
+    ceiling = int(procedure.get("max_axial_review_calls") or 0)
+    needed = max(0, int(needed_requests))
+    shortfall = max(0, needed - propose)
+    from_counter = min(counter, shortfall)
+    counter -= from_counter
+    shortfall -= from_counter
+    from_retry = min(retries, shortfall)
+    retries -= from_retry
+    shortfall -= from_retry
+    propose += from_counter + from_retry
+    if ceiling and propose + retries + counter > ceiling:
+        overflow = propose + retries + counter - ceiling
+        counter = max(0, counter - overflow)
+    procedure["propose_calls"] = propose
+    procedure["statement_copy_retry_calls"] = retries
+    procedure["counterexample_calls"] = counter
+    metadata["procedure"] = procedure
+    if from_counter:
+        _append_transfer(metadata, {
+            "from": "counterexamples",
+            "to": "proposals",
+            "calls": from_counter,
+            "calls_transferred": from_counter,
+            "calls_unsent": 0,
+            "reason": "multi_document_pairs_precede_counterexamples",
+            "note": (
+                "Counterexample calls moved onto proposals so every multi-document pair can be examined "
+                "before a counterexample is sent. The coding ceiling is not raised."
+            ),
+        })
+    if from_retry:
+        _append_transfer(metadata, {
+            "from": "statement_copy_retry",
+            "to": "proposals",
+            "calls": from_retry,
+            "calls_transferred": from_retry,
+            "calls_unsent": 0,
+            "reason": "multi_document_pairs_precede_unused_retries",
+            "note": "Unused quote-copy retries moved onto proposals while multi-document pairs remain. Validity is unchanged.",
+        })
+    reason = (
+        f"coding_call_ceiling: max_axial_review_calls is {ceiling}. "
+        f"{needed} multi-document proposal requests were needed and {propose} fit after counterexample calls "
+        "and unused retries moved to proposals. The ceiling is not raised."
+    )
+    metadata["multi_document_call_priority"] = {
+        "needed_requests": needed,
+        "propose_calls": propose,
+        "moved_from_counterexamples": from_counter,
+        "moved_from_retries": from_retry,
+        "counterexample_calls_remaining": counter,
+        "statement_copy_retry_calls_remaining": retries,
+        "still_short": shortfall,
+        "block_reason": reason if shortfall else "",
+    }
+    return propose
+
+
 def _plan_node(state: AxialState) -> dict:
     metadata = dict(state.get("metadata") or {})
     procedure = metadata.get("procedure") or {}
@@ -3548,6 +3732,14 @@ def _plan_node(state: AxialState) -> dict:
     quotas = metadata.get("exploration_quotas")
     raw_share = procedure.get("pair_exploration_share")
     exploration_share = DEFAULT_PAIR_EXPLORATION_SHARE if raw_share is None else float(raw_share)
+    metadata["multi_document_pairs"] = _multi_document_pair_seed(
+        evidence_classes,
+        _pattern_minimum(procedure),
+    )
+    multi_count = len(metadata["multi_document_pairs"])
+    if calls > 0 and multi_count:
+        calls = _prefer_multi_document_calls(metadata, math.ceil(multi_count / batch))
+        procedure = metadata.get("procedure") or procedure
     plan = plan_relation_pairs(
         ids,
         examined=examined_pairs,
@@ -3568,10 +3760,24 @@ def _plan_node(state: AxialState) -> dict:
         if _pair_key(pair)[0] and _pair_key(pair)[1]
     ]
     metadata["examined_pair_count"] = len(metadata["examined_pairs"])
-    metadata["multi_document_pairs"] = _multi_document_pair_seed(
-        evidence_classes,
-        _pattern_minimum(procedure),
-    )
+    seated = {_pair_key(pair) for pair in plan["round"] if isinstance(pair, Mapping)}
+    priority = metadata.get("multi_document_call_priority") if isinstance(metadata.get("multi_document_call_priority"), Mapping) else {}
+    block_reason = str(priority.get("block_reason") or "")
+    block_reasons: dict[str, str] = {}
+    for row in metadata.get("multi_document_pairs") or []:
+        if not isinstance(row, Mapping):
+            continue
+        key = _pair_key(row)
+        if key in seated:
+            row["status"] = "planned"
+            row["reason"] = "queued_for_proposal"
+            continue
+        row["status"] = "budget_blocked"
+        row["reason"] = block_reason or (
+            "coding_call_ceiling: the pair was not seated. The coding ceiling is not raised."
+        )
+        block_reasons["|".join(key)] = str(row["reason"])
+    metadata["multi_document_block_reasons"] = block_reasons
     metadata["within_run_examined"] = list(plan["round"])
     if "initial_relation_round" not in metadata:
         metadata["initial_relation_round"] = list(plan["round"])
@@ -5123,20 +5329,53 @@ def _merge_unique_pairs(prior: Any, rows: Sequence[Mapping[str, Any]]) -> list[d
     return _unique_pair_rows(list(prior or []) + list(rows))
 
 
+def _reopen_multi_document_pairs(metadata: dict[str, Any], limit: int) -> list[dict[str, str]]:
+    """Put budget-blocked multi-document pairs back on the proposal queue when calls were freed."""
+    if limit <= 0:
+        return []
+    reasons = dict(metadata.get("multi_document_block_reasons") or {})
+    opened: list[dict[str, str]] = []
+    rows = [dict(item) if isinstance(item, Mapping) else item for item in (metadata.get("multi_document_pairs") or [])]
+    updated: list[dict[str, Any]] = []
+    for item in rows:
+        if not isinstance(item, Mapping):
+            continue
+        row = dict(item)
+        key = _pair_key(row)
+        label = "|".join(key)
+        if (
+            len(opened) < limit
+            and str(row.get("status") or "") in {"budget_blocked", "planned", "unplanned"}
+            and label in reasons
+        ):
+            opened.append({"from_id": key[0], "to_id": key[1], "band": "multi_document"})
+            reasons.pop(label, None)
+            row["status"] = "planned"
+            row["reason"] = "queued_for_proposal"
+        updated.append(row)
+    metadata["multi_document_pairs"] = updated
+    metadata["multi_document_block_reasons"] = reasons
+    return opened
+
+
 def _reallocation_pairs(metadata: Mapping[str, Any], unexamined: Sequence[Any], limit: int) -> list[dict[str, str]]:
     """Unplanned multi-document pairs first, then any other unexamined pair."""
     if limit <= 0:
         return []
     multi = []
     seen: set[tuple[str, str]] = set()
+    reasons = dict(metadata.get("multi_document_block_reasons") or {})
     for row in metadata.get("multi_document_pairs") or []:
-        if not isinstance(row, Mapping) or str(row.get("status") or "") != "unplanned":
+        if not isinstance(row, Mapping) or str(row.get("status") or "") not in {"unplanned", "planned", "budget_blocked"}:
             continue
         key = _pair_key(row)
         if not key[0] or not key[1] or key in seen:
             continue
         seen.add(key)
+        reasons.pop("|".join(key), None)
         multi.append({"from_id": key[0], "to_id": key[1], "band": "multi_document"})
+    if isinstance(metadata, dict):
+        metadata["multi_document_block_reasons"] = reasons
     rest = []
     for item in unexamined:
         if not isinstance(item, Mapping):
@@ -5198,8 +5437,22 @@ def _append_transfer(metadata: dict[str, Any], record: Mapping[str, Any]) -> Non
     metadata["allowance_transfers"] = transfers
 
 
+def _multi_document_rows_open(metadata: Mapping[str, Any]) -> bool:
+    """True when a multi-document pair is not yet proposed, empty, failed, or budget-blocked."""
+    for row in metadata.get("multi_document_pairs") or []:
+        if not isinstance(row, Mapping):
+            continue
+        if str(row.get("status") or "") not in _MULTI_DOCUMENT_TERMINAL:
+            return True
+    return False
+
+
 def _transfer_unused_retries(metadata: dict[str, Any], procedure: Mapping[str, Any]) -> None:
-    """Move reserved quote-copy retries that were not sent onto counterexamples."""
+    """Move reserved quote-copy retries that were not sent.
+
+    While a multi-document pair is still open, the calls go to proposals.
+    Otherwise they go to counterexamples, as before.
+    """
     if metadata.get("retry_allowance_transferred"):
         return
     reserved = int(procedure.get("statement_copy_retry_calls") or 0)
@@ -5210,13 +5463,24 @@ def _transfer_unused_retries(metadata: dict[str, Any], procedure: Mapping[str, A
     if unused <= 0:
         return
     procedure_now = dict(metadata.get("procedure") or procedure)
-    procedure_now["counterexample_calls"] = int(procedure_now.get("counterexample_calls") or 0) + unused
+    destination = "proposals" if _multi_document_rows_open(metadata) else "counterexamples"
+    if destination == "proposals":
+        procedure_now["propose_calls"] = int(procedure_now.get("propose_calls") or 0) + unused
+        procedure_now["statement_copy_retry_calls"] = max(0, int(procedure_now.get("statement_copy_retry_calls") or 0) - unused)
+    else:
+        procedure_now["counterexample_calls"] = int(procedure_now.get("counterexample_calls") or 0) + unused
     metadata["procedure"] = procedure_now
     _append_transfer(metadata, {
         "from": "statement_copy_retry",
-        "to": "counterexamples",
+        "to": destination,
         "calls": unused,
-        "reason": "reserved quote-copy retries were not sent",
+        "calls_transferred": unused,
+        "calls_unsent": 0,
+        "reason": (
+            "multi_document_pairs_precede_unused_retries"
+            if destination == "proposals"
+            else "reserved quote-copy retries were not sent"
+        ),
     })
 
 
@@ -5250,10 +5514,11 @@ def _multi_document_pair_seed(evidence_classes: Mapping[str, Any] | None, patter
     return rows
 
 
-def _assign_multi_document_statuses(metadata: dict[str, Any]) -> None:
-    """Terminal status for every multi-document pair. Counts do not replace the row."""
+def _assign_multi_document_statuses(metadata: dict[str, Any], *, close: bool = False) -> None:
+    """Terminal status for every multi-document pair. An unplanned row without a reason cannot remain."""
     seeded = [dict(item) for item in (metadata.get("multi_document_pairs") or []) if isinstance(item, Mapping)]
     if not seeded:
+        metadata["multi_document_reconciles"] = True
         return
     accounting = metadata.get("pair_accounting") if isinstance(metadata.get("pair_accounting"), Mapping) else {}
     planned = {_pair_key(item) for item in (metadata.get("within_run_examined") or []) if isinstance(item, Mapping)}
@@ -5261,31 +5526,56 @@ def _assign_multi_document_statuses(metadata: dict[str, Any]) -> None:
     completed = {_pair_key(item) for item in (accounting.get("completed") or []) if isinstance(item, Mapping)}
     omitted = {_pair_key(item) for item in (accounting.get("omitted") or []) if isinstance(item, Mapping)}
     terminals = metadata.get("pair_terminal_status") if isinstance(metadata.get("pair_terminal_status"), Mapping) else {}
-    relationships = []
+    blocked = metadata.get("multi_document_block_reasons") if isinstance(metadata.get("multi_document_block_reasons"), Mapping) else {}
     stop = str(metadata.get("axial_stop") or "")
-    budget_stops = {"call_allowance", "token_allowance", "request_budget", "evidence_does_not_fit", "budget", "budget_limited"}
+    budget_stops = {"call_allowance", "token_allowance", "request_budget", "evidence_does_not_fit", "budget", "budget_limited", "required_but_blocked"}
+    ceiling_reason = str((metadata.get("multi_document_call_priority") or {}).get("block_reason") or "") or (
+        "coding_call_ceiling: the pair was not examined. The coding ceiling is not raised."
+    )
     updated = []
+    reconciles = True
     for item in seeded:
         key = _pair_key(item)
         label = "|".join(key)
         named = str(terminals.get(label) or "")
+        reason = str(item.get("reason") or "")
         if named == "nothing_to_propose":
             status = "nothing_to_propose"
-        elif named == "proposed":
-            status = "proposed"
-        elif key in omitted or (key in planned and key not in attempted and stop in budget_stops):
-            status = "budget_blocked"
+            reason = ""
+        elif named == "proposed" or key in completed:
+            status = "nothing_to_propose" if named == "nothing_to_propose" else "proposed"
+            reason = ""
         elif key in attempted and key not in completed:
             status = "failed"
-        elif key in completed:
-            status = "proposed"
-        elif key in planned:
-            status = "unplanned" if not stop else "budget_blocked"
+            reason = reason or stop or "no_completed_response"
+        elif label in blocked and key not in attempted:
+            status = "budget_blocked"
+            reason = str(blocked.get(label) or "") or ceiling_reason
+        elif key in omitted or (key in planned and key not in attempted and (close or stop in budget_stops)):
+            status = "budget_blocked"
+            reason = reason or stop or ceiling_reason
+        elif key in planned and not close:
+            status = "planned"
+            reason = "queued_for_proposal"
         else:
-            status = "unplanned"
+            status = "budget_blocked"
+            reason = reason or ceiling_reason
+        if status not in _MULTI_DOCUMENT_TERMINAL:
+            if close:
+                status = "budget_blocked"
+                reason = reason or "unexamined_without_a_recorded_reason"
+            elif status == "unplanned" or not reason:
+                status = "budget_blocked"
+                reason = reason or "unexamined_without_a_recorded_reason"
+        if status in {"budget_blocked", "failed"} and not reason:
+            reason = "unexamined_without_a_recorded_reason"
+            reconciles = False
+        if status not in _MULTI_DOCUMENT_TERMINAL:
+            reconciles = False
         row = dict(item)
         row["document_count"] = int(item.get("document_count") or 0)
         row["status"] = status
+        row["reason"] = reason
         row["unit"] = "documents"
         updated.append(row)
     metadata["multi_document_pairs"] = updated
@@ -5293,7 +5583,10 @@ def _assign_multi_document_statuses(metadata: dict[str, Any]) -> None:
     for row in updated:
         counts[row["status"]] = counts.get(row["status"], 0) + 1
     metadata["multi_document_pair_counts"] = counts
-    del relationships
+    metadata["multi_document_reconciles"] = reconciles and not any(
+        row["status"] not in _MULTI_DOCUMENT_TERMINAL or (row["status"] in {"budget_blocked", "failed"} and not row["reason"])
+        for row in updated
+    )
 
 
 def _publish_exploration(metadata: dict[str, Any]) -> None:
@@ -5654,6 +5947,20 @@ def _propose_node(runtime: AxialRuntime):
         ]
         metadata.pop("counterexample_reallocation_pending", None)
         procedure = metadata.get("procedure") or {}
+        if not metadata.get("multi_document_reserve_released"):
+            priority = metadata.get("multi_document_call_priority") if isinstance(metadata.get("multi_document_call_priority"), Mapping) else {}
+            moved = int(priority.get("moved_from_counterexamples") or 0) + int(priority.get("moved_from_retries") or 0)
+            if moved:
+                _permit_reallocated_proposals(
+                    runtime,
+                    metadata,
+                    wanted=moved,
+                    per_request=_request_token_budget(metadata),
+                    tokens_used=int(metadata.get("axial_tokens_estimated") or 0),
+                    token_ceiling=int(procedure.get("max_axial_review_tokens") or 0),
+                )
+            metadata["multi_document_reserve_released"] = True
+            procedure = metadata.get("procedure") or procedure
         passages = _by_passage(state)
         book = state.get("codebook") or {}
         assigned: dict[str, list[str]] = {}
@@ -6017,9 +6324,12 @@ def _propose_node(runtime: AxialRuntime):
                 ]
                 lineage = {
                     "rejected_response": rejected_response,
+                    "from_id": str((sent_chunk[0] if sent_chunk else {}).get("from_id") or ""),
+                    "to_id": str((sent_chunk[0] if sent_chunk else {}).get("to_id") or ""),
                     "retry_sent": False,
                     "retry_response": None,
                     "outcome": "unsent",
+                    "reason": "invalid_restated_quote",
                 }
                 coding_ceiling = int(procedure.get("max_axial_review_calls") or 0)
                 tokens_now = int(metadata.get("axial_tokens_estimated") or 0)
@@ -6047,8 +6357,11 @@ def _propose_node(runtime: AxialRuntime):
                     retry_payload = dict(payload)
                     retry_payload["statement_copy_retry"] = True
                     retry_payload["instruction"] = (
-                        "The statement must not be a copy of the quote. "
-                        "Write a grounded statement, or set nothing_to_propose when no supported relationship is present."
+                        "invalid_restated_quote: the statement only repeated the quote. That row is invalid. "
+                        "Do not return the quote, a shorter copy of the quote, or the quote with different punctuation. "
+                        "Write a statement that says how the two categories are related, using words that remain after the quote is removed. "
+                        "If the passages do not support that statement, set nothing_to_propose true and return no relationship. "
+                        "A restated quote is still invalid."
                     )
                     retry_messages = _messages("axial_proposal", retry_payload)
                     retry_result = await _structured_call(
@@ -6070,15 +6383,20 @@ def _propose_node(runtime: AxialRuntime):
                     elif (retry_result.get("parsed") or {}).get("nothing_to_propose") is True or (
                         retry_result.get("parsed") or {}
                     ).get("no_supported_relationship") is True:
-                        _mark_raw_proposals(metadata, returned, "invalid", "verbatim_quote_statement")
+                        _mark_raw_proposals(metadata, returned, "invalid", "invalid_restated_quote")
                         returned = []
                         lineage["outcome"] = "no_supported_relationship"
+                        lineage["reason"] = "invalid_restated_quote"
                         _remember_pair_status(metadata, sent_chunk, "nothing_to_propose")
                         payload = retry_payload
                     else:
-                        _mark_raw_proposals(metadata, returned, "invalid", "verbatim_quote_statement")
+                        _mark_raw_proposals(metadata, returned, "invalid", "invalid_restated_quote")
                         returned = _stamp_raw_proposals(metadata, (retry_result["parsed"] or {}).get("relationships") or [])
-                        lineage["outcome"] = "retried"
+                        still_restated = any(
+                            isinstance(draft, Mapping) and _statement_is_only_quotes(draft) for draft in (returned or [])
+                        )
+                        lineage["outcome"] = "retry_still_invalid" if still_restated else "retried"
+                        lineage["reason"] = "invalid_restated_quote"
                         payload = retry_payload
                 else:
                     reason = "call_allowance" if not retry_call_room else (
@@ -6116,7 +6434,7 @@ def _propose_node(runtime: AxialRuntime):
                     _reject("empty_statement", draft)
                     continue
                 if _statement_is_only_quotes(draft):
-                    _reject("verbatim_quote_statement", draft)
+                    _reject("invalid_restated_quote", draft)
                     continue
                 diagnostics["rejection_reasons"] = reasons
                 metadata["proposal_diagnostics"] = diagnostics
@@ -6145,7 +6463,20 @@ def _propose_node(runtime: AxialRuntime):
             metadata["axial_tokens_estimated"] = estimated
         accounted = metadata.get("pair_accounting") or {}
         if not _proposals_continue(metadata, pending, used):
+            propose_before = int(procedure.get("propose_calls") or 0)
             _transfer_unused_retries(metadata, procedure)
+            procedure = metadata.get("procedure") or procedure
+            added = int(procedure.get("propose_calls") or 0) - propose_before
+            if added > 0 and _multi_document_rows_open(metadata):
+                reopened = _reopen_multi_document_pairs(metadata, added)
+                if reopened:
+                    pending = reopened + list(pending)
+                    metadata["reallocation_open"] = True
+                    if str(metadata.get("axial_stop") or "") in {"token_allowance", "request_budget", "required_but_blocked"}:
+                        metadata["axial_stop"] = ""
+        _publish_exploration(metadata)
+        if not _proposals_continue(metadata, pending, used):
+            _assign_multi_document_statuses(metadata, close=True)
             propose_required = int(procedure.get("propose_calls") or 0) > 0 and int(accounted.get("planned_count") or 0) > 0
             propose_stop = str(metadata.get("axial_stop") or "")
             attempted_n = int(accounted.get("attempted_count") or 0)
@@ -6158,7 +6489,6 @@ def _propose_node(runtime: AxialRuntime):
                 _note_stage(metadata, "proposals", required=True, status="budget_limited", reason=propose_stop or "budget_limited")
             else:
                 _note_stage(metadata, "proposals", required=True, status="complete")
-        _publish_exploration(metadata)
         return {
             "relationships": relationships,
             "prompt_log": logs,
@@ -6557,6 +6887,69 @@ def _counterexample_node(runtime: AxialRuntime):
         allowance = int(procedure.get("counterexample_calls") or 0)
         batch = max(1, int((metadata.get("performance") or {}).get("batch_size") or 1))
         slots = allowance * batch
+        if _multi_document_rows_open(metadata) and not _hold_is(metadata, "axial_counterexample"):
+            _assign_multi_document_statuses(metadata, close=False)
+            if _multi_document_rows_open(metadata) and allowance > 0 and not metadata.get("counterexample_reallocation_used"):
+                returned_calls, allowance_fit = _permit_reallocated_proposals(
+                    runtime,
+                    metadata,
+                    wanted=allowance,
+                    per_request=_request_token_budget(metadata),
+                    tokens_used=int(metadata.get("axial_tokens_estimated") or 0),
+                    token_ceiling=int(procedure.get("max_axial_review_tokens") or 0),
+                )
+                calls_unsent = max(0, allowance - returned_calls)
+                procedure_now = dict(metadata.get("procedure") or {})
+                procedure_now["propose_calls"] = int(procedure_now.get("propose_calls") or 0) + returned_calls
+                procedure_now["counterexample_calls"] = max(0, int(procedure_now.get("counterexample_calls") or 0) - allowance)
+                metadata["procedure"] = procedure_now
+                metadata["counterexample_reallocation"] = {
+                    "calls_returned": returned_calls,
+                    "calls_transferred": returned_calls,
+                    "calls_unsent": calls_unsent,
+                    "calls_executed": 0,
+                    "reason": "multi_document_examination_open",
+                    "token_allowance": allowance_fit,
+                }
+                _append_transfer(metadata, {
+                    "from": "counterexamples",
+                    "to": "proposals",
+                    "calls": returned_calls,
+                    "calls_transferred": returned_calls,
+                    "calls_unsent": calls_unsent,
+                    "reason": "multi_document_examination_open",
+                })
+                _append_axial_event(
+                    metadata,
+                    "allowance_transfer",
+                    calls_transferred=returned_calls,
+                    calls_unsent=calls_unsent,
+                    reason="multi_document_examination_open",
+                )
+                extra_pairs = _reallocation_pairs(metadata, state.get("unexamined_pairs") or [], returned_calls)
+                record = dict(metadata.get("counterexample_reallocation") or {})
+                record["pairs"] = extra_pairs
+                metadata["counterexample_reallocation"] = record
+                if extra_pairs and returned_calls:
+                    metadata["counterexample_reallocation_pending"] = True
+                    metadata["counterexample_reallocation_pairs"] = extra_pairs
+                metadata["counterexample_reallocation_used"] = True
+                metadata["counterexample_targeting"] = {
+                    "spent": False,
+                    "reason": "multi_document_examination_open",
+                    "note": "Counterexample allowance is not spent while a multi-document pair is still unexamined or not yet budget-blocked.",
+                }
+                return {
+                    "relationships": relationships,
+                    "passages": [item for item in passages if not item.get("synthetic")],
+                    "counterexample_queue": [],
+                    "relation_round": extra_pairs,
+                    "prompt_log": list(state.get("prompt_log") or []),
+                    "warnings": warnings,
+                    "metadata": metadata,
+                    "axial_calls_used": int(state.get("axial_calls_used") or 0),
+                }
+            _assign_multi_document_statuses(metadata, close=True)
         search_enabled = procedure.get("negative_case_search", True) is not False
         by_id = {str(row.get("relationship_id") or ""): row for row in relationships}
         logs = list(state.get("prompt_log") or [])
@@ -6589,6 +6982,7 @@ def _counterexample_node(runtime: AxialRuntime):
                 if note not in warnings:
                     warnings.append(note)
             metadata["axial_counterexample_relevance"] = {key: value for key, value in stats.items() if key != "notes"}
+            metadata["counterexample_targeting"] = dict(stats.get("counterexample_targeting") or {})
             pending = list(queued)
             made = 0
             attempted_keys = set()
@@ -7041,6 +7435,14 @@ def _counterexample_node(runtime: AxialRuntime):
                 status="required_but_blocked",
                 reason=str((metadata.get("counterexample_unsent") or {}).get("reason") or "required_but_blocked"),
             )
+        elif stats.get("no_call_reason") == "reviewer_rejected_not_applicable":
+            _note_stage(
+                metadata,
+                "counterexamples",
+                required=True,
+                status="complete_no_negative_search",
+                reason="reviewer_rejected_not_applicable",
+            )
         elif not search_enabled:
             _note_stage(metadata, "counterexamples", required=False, status="skipped", reason="negative_case_search_disabled")
         elif not counter_required and stats.get("no_call_reason") != "budget":
@@ -7285,14 +7687,36 @@ def _finalize_proposal_lineage(metadata: dict[str, Any], relationships: Sequence
     metadata["proposal_lineage"] = reconcile_proposal_lineage(updated, relationships)
 
 
-def _call_usage_report(logs: Sequence[Any]) -> dict[str, Any]:
+def _usage_stage_name(row: Mapping[str, Any]) -> str:
+    """Ledger stage for one prompt-log row. Core, relation review, and saturation stay separate from coding."""
+    checkpoint = str(row.get("checkpoint") or "")
+    kind = str(row.get("kind") or "")
+    if checkpoint in {"axial_core_review", "axial_relation_review", "axial_saturation_review"}:
+        return checkpoint
+    if kind in {"axial_proposal", "axial_counterexample", "schema_repair"}:
+        return "coding"
+    if kind in {"theoretical_memo", "storyline"}:
+        return kind
+    if kind == "decision_review" and checkpoint:
+        return checkpoint
+    return str(row.get("stage") or kind or "unknown")
+
+
+def _call_usage_report(logs: Sequence[Any], provider_budget: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Estimates and provider-reported tokens stay in different fields.
 
-    A missing provider count stays null. It is not replaced by the estimate.
+    Every stage in the log or the allowance ledger is listed. A missing provider
+    count stays null. Completeness is partial when any sent call is absent or
+    lacks a provider count. It is not complete just because the calls that were
+    listed happened to have tokens.
     """
     rows = []
+    by_stage: dict[str, dict[str, int]] = {}
     for row in logs or []:
         if not isinstance(row, Mapping):
+            continue
+        status = str(row.get("status") or "")
+        if status in {"omitted", "deferred", "refused", "not_sent"}:
             continue
         usage = row.get("usage") if isinstance(row.get("usage"), Mapping) else {}
         has_input = "input_tokens" in usage and usage.get("input_tokens") is not None
@@ -7304,26 +7728,84 @@ def _call_usage_report(logs: Sequence[Any]) -> dict[str, Any]:
         else:
             completeness = "unknown"
         estimate = row.get("estimated_input_tokens")
-        rows.append({
+        stage = _usage_stage_name(row)
+        recorded = {
             "kind": row.get("kind"),
+            "stage": stage,
             "checkpoint": row.get("checkpoint"),
             "estimated_input_tokens": None if estimate is None else int(estimate),
             "provider_input_tokens": int(usage["input_tokens"]) if has_input else None,
             "provider_output_tokens": int(usage["output_tokens"]) if has_output else None,
             "usage_completeness": completeness,
+        }
+        rows.append(recorded)
+        bucket = by_stage.setdefault(stage, {"calls": 0, "provider_input_tokens": 0, "known": 0})
+        bucket["calls"] += 1
+        if completeness == "complete":
+            bucket["known"] += 1
+            bucket["provider_input_tokens"] += int(recorded["provider_input_tokens"] or 0)
+    ledger = {}
+    if isinstance(provider_budget, Mapping):
+        raw_stages = provider_budget.get("stages") if isinstance(provider_budget.get("stages"), Mapping) else {}
+        for name, item in raw_stages.items():
+            if str(name) == "review":
+                continue
+            if isinstance(item, Mapping):
+                ledger[str(name)] = int(item.get("calls_used") or 0)
+            else:
+                ledger[str(name)] = int(item or 0)
+    stage_names = list(dict.fromkeys([*by_stage.keys(), *ledger.keys()]))
+    stages = []
+    missing_call = False
+    for name in stage_names:
+        logged = int(by_stage.get(name, {}).get("calls") or 0)
+        ledger_calls = int(ledger.get(name) or 0)
+        missing = max(0, ledger_calls - logged)
+        if missing:
+            missing_call = True
+        known = int(by_stage.get(name, {}).get("known") or 0)
+        if logged and known < logged:
+            stage_completeness = "partial" if known else "unknown"
+        elif missing:
+            stage_completeness = "partial"
+        elif logged:
+            stage_completeness = "complete"
+        else:
+            stage_completeness = "unknown"
+        stages.append({
+            "stage": name,
+            "calls": logged,
+            "calls_in_ledger": ledger_calls,
+            "missing_calls": missing,
+            "provider_input_tokens": None if known == 0 else int(by_stage.get(name, {}).get("provider_input_tokens") or 0),
+            "usage_completeness": stage_completeness,
         })
-    known = [row for row in rows if row["usage_completeness"] == "complete"]
+    known_rows = [row for row in rows if row["usage_completeness"] == "complete"]
+    if not rows and not missing_call:
+        overall = "unknown"
+    elif missing_call or any(row["usage_completeness"] != "complete" for row in rows) or any(
+        item["usage_completeness"] != "complete" for item in stages if item["calls"] or item["calls_in_ledger"]
+    ):
+        overall = "partial" if (rows or missing_call) else "unknown"
+        if rows and all(row["usage_completeness"] == "unknown" for row in rows) and not missing_call:
+            overall = "unknown"
+        elif missing_call or any(row["usage_completeness"] != "complete" for row in rows):
+            overall = "partial"
+    else:
+        overall = "complete"
     return {
         "calls": rows,
+        "stages": stages,
         "estimated_input_tokens": None if not rows else sum(int(row["estimated_input_tokens"] or 0) for row in rows),
-        "provider_input_tokens": None if not known else sum(int(row["provider_input_tokens"] or 0) for row in known),
-        "provider_output_tokens": None if not known else sum(int(row["provider_output_tokens"] or 0) for row in known),
-        "usage_completeness": (
-            "unknown" if not rows or all(row["usage_completeness"] == "unknown" for row in rows)
-            else "complete" if all(row["usage_completeness"] == "complete" for row in rows)
-            else "partial"
+        "provider_input_tokens": None if not known_rows else sum(int(row["provider_input_tokens"] or 0) for row in known_rows),
+        "provider_output_tokens": None if not known_rows else sum(int(row["provider_output_tokens"] or 0) for row in known_rows),
+        "usage_completeness": overall,
+        "complete": overall == "complete",
+        "note": (
+            "estimated_input_tokens is the character heuristic. Provider tokens are null when the provider did not report them. "
+            "usage_completeness is partial when any stage in the allowance ledger has a call that is not in this list. "
+            "A summary of the calls that were logged is not complete while another stage is missing."
         ),
-        "note": "estimated_input_tokens is the character heuristic. Provider tokens are null when the provider did not report them.",
     }
 
 
@@ -7730,7 +8212,11 @@ def _export_node(runtime_output: dict):
         _apply_run_status(metadata)
         metadata["saturation_judgment"] = None
         _finalize_proposal_lineage(metadata, state.get("relationships") or [])
-        metadata["call_usage"] = _call_usage_report(state.get("prompt_log") or [])
+        _assign_multi_document_statuses(metadata, close=True)
+        metadata["call_usage"] = _call_usage_report(
+            state.get("prompt_log") or [],
+            provider_budget=metadata.get("provider_budget") if isinstance(metadata.get("provider_budget"), Mapping) else None,
+        )
         metadata["relationship_funnel"] = build_relationship_funnel({**state, "metadata": metadata})
         held = {**state, "metadata": metadata, "saturation": state.get("saturation") or _saturation(state)}
         held["coverage"] = _coverage(held)
@@ -10759,6 +11245,11 @@ def _export_selective(output_dir: str | Path | None):
         metadata = dict(state.get("metadata") or {})
         _apply_run_status(metadata)
         metadata["saturation_judgment"] = None
+        _assign_multi_document_statuses(metadata, close=True)
+        metadata["call_usage"] = _call_usage_report(
+            state.get("prompt_log") or [],
+            provider_budget=metadata.get("provider_budget") if isinstance(metadata.get("provider_budget"), Mapping) else None,
+        )
         held = {**state, "metadata": metadata}
         held["coverage"] = state.get("coverage") or _coverage(held)
         paths = dict(state.get("export_paths") or {})

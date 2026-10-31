@@ -26,8 +26,8 @@ from tests.test_v080 import FakeAxialCoder
 
 
 def test_version_is_0942():
-    assert __version__ == "0.9.42"
-    assert POLICY_VERSION == "0.9.42"
+    assert __version__ == "0.9.43"
+    assert POLICY_VERSION == "0.9.43"
     assert PATTERN_MIN_CASES == 2
 
 
@@ -286,9 +286,9 @@ class _Sequence(FakeAxialCoder):
             relationships=[
                 AxialRelationDecision(
                     relationship_id=str(row.get("relationship_id") or ""),
-                    disposition="rejected",
+                    disposition="accepted" if str(row.get("relationship_id") or "") in {"rel-v46", "rel-huge"} else "rejected",
                     paradigm_role="context",
-                    rationale="The endpoints are not both anchored.",
+                    rationale="The pre-seeded claim stays in play." if str(row.get("relationship_id") or "") in {"rel-v46", "rel-huge"} else "The endpoints are not both anchored.",
                 )
                 for row in body.get("relationships") or []
             ]
@@ -304,9 +304,11 @@ def test_duplicate_proposals_consolidate_before_review_and_transferred_calls_run
             {"passage_id": "p2", "doc_id": "d2", "respondent_id": "r2", "text": "tools sit with the bench"},
         ],
         "segments": [
-            {"segment_id": f"s{doc}{code}", "code_id": code, "passage_id": passage}
-            for doc, passage in (("1", "p1"), ("2", "p2"))
+            {"segment_id": f"s1{code}", "code_id": code, "passage_id": "p1"}
             for code in codes
+        ] + [
+            {"segment_id": "s2a", "code_id": "a", "passage_id": "p2"},
+            {"segment_id": "s2c", "code_id": "c", "passage_id": "p2"},
         ],
         "relationships": [
             {
@@ -390,7 +392,8 @@ def test_duplicate_proposals_consolidate_before_review_and_transferred_calls_run
         if int(row["document_count"]) >= 2
     }
     assert executed
-    assert all(pair in multi for pair in executed)
+    assert initial_pair in multi
+    assert all(pair == initial_pair or pair not in multi for pair in executed)
     sent = next(row for row in result.metadata["counterexample_requests"] if row["status"] == "sent")
     assert sent["relationship_id"] == "rel-v46"
     assert sent["estimated_input_tokens"] <= 6000

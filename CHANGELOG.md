@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.43
+
+- Every pair coded together in at least `pattern_min_cases` documents is examined, or `budget_blocked` with that reason, before a single-document pair and before a counterexample. Spare counterexample calls and unused quote-copy retries move onto those proposals. The coding ceiling is not raised. An unplanned multi-document pair without a reason does not remain.
+- A counterexample is not sent for a row the reviewer has already rejected. The rejection stands. The targeting decision is recorded.
+- `call_usage` lists every stage, including core. `complete` is false and `usage_completeness` is partial when a ledger call is missing from the log.
+- The pair funnel counts statement-copy retries. Each row shows that retry's outcome. A retry is not another pair.
+- A statement that only repeats its quote is `invalid_restated_quote`. The retry asks for words that remain after the quote is removed. A restated quote stays invalid.
+- `quotes_not_in_cited_passage` stays. `quote_scope_cause` says whether the quote was found in another passage or is absent from the corpus. Typographic punctuation is folded before the check.
+- Review history records `stage`.
+- Core selection is unchanged. `pattern_min_cases` stays 2. `one_document_one_respondent` stays off. The 6,000 cap stays. No LLM judge is added. Undefined metrics stay null. The review note is [docs/design-review-fixes-0943.md](docs/design-review-fixes-0943.md). `policy_version` is `0.9.43`.
+
 ## 0.9.42
 
 - A counterexample request no longer sends the whole relationship row. After the passage was compacted, a request could still be 9,466 tokens: instructions 407, schema 241, claim 17, evidence 14, provenance 27, and other context 8,760. That other context was derived metadata and review history. The request now sends the claim, the two category definitions, readable passage context, and provenance. The 6,000 cap is not raised. Passage text is not cut below the quote context. If that required content still exceeds the cap, the stage is `required_but_blocked` with the token breakdown. It is not `skipped` and it is not `not_required`.

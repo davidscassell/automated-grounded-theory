@@ -24,8 +24,8 @@ from tests.test_v081 import _procedure
 
 
 def test_version_is_0941_and_the_minimum_stays_two():
-    assert __version__ == "0.9.42"
-    assert POLICY_VERSION == "0.9.42"
+    assert __version__ == "0.9.43"
+    assert POLICY_VERSION == "0.9.43"
     assert PATTERN_MIN_CASES == 2
 
 

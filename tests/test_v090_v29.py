@@ -427,7 +427,7 @@ def test_blank_rows_are_counted_separately_from_unknown_passages():
     diagnostics = result.metadata["proposal_diagnostics"]
     assert diagnostics["blank_rows"] == 0
     assert diagnostics["empty_statements"] == 0
-    assert diagnostics["rejection_reasons"]["verbatim_quote_statement"] == 1
+    assert diagnostics["rejection_reasons"]["invalid_restated_quote"] == 1
     assert diagnostics["rejection_reasons"]["unknown_passage"] == 1
     assert result.relationships == []
     counts = _coverage(

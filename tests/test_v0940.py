@@ -26,8 +26,8 @@ from tests.test_v080 import FakeAxialCoder
 
 
 def test_version_is_0940_and_pattern_minimum_stays_two():
-    assert __version__ == "0.9.42"
-    assert POLICY_VERSION == "0.9.42"
+    assert __version__ == "0.9.43"
+    assert POLICY_VERSION == "0.9.43"
     assert PATTERN_MIN_CASES == 2
 
 
@@ -319,7 +319,11 @@ def test_exploration_share_keeps_a_non_qualifying_pair_in_the_round():
         ]
     }
     ids = ["q1", "q2", "q3", "q4", "n1", "n2"]
-    reserved = plan_relation_pairs(ids, round_size=4, seed=0, evidence_classes=evidence, exploration_share=0.25)
+    full = plan_relation_pairs(ids, round_size=4, seed=0, evidence_classes=evidence, exploration_share=0.25)
+    full_pairs = [{row["from_id"], row["to_id"]} for row in full["round"]]
+    assert {"n1", "n2"} not in full_pairs
+    assert {"q1", "q2"} in full_pairs
+    reserved = plan_relation_pairs(ids, round_size=5, seed=0, evidence_classes=evidence, exploration_share=0.25)
     pairs = [{row["from_id"], row["to_id"]} for row in reserved["round"]]
     assert {"n1", "n2"} in pairs
     assert reserved["pair_exploration_share"] == 0.25

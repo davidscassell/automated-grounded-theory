@@ -179,7 +179,7 @@ def test_statement_schema_rejects_blanks_and_one_repair_stays_grounded():
     assert verbatim.call_count == 2
     assert quoted.relationships == []
     assert quoted.metadata["proposal_diagnostics"]["schema_repairs"] == 1
-    assert quoted.metadata["proposal_diagnostics"]["rejection_reasons"]["verbatim_quote_statement"] == 1
+    assert quoted.metadata["proposal_diagnostics"]["rejection_reasons"]["invalid_restated_quote"] == 1
     _repair_row(quoted)
 
     grounded = _RepairCoder(outcome="grounded")
@@ -188,7 +188,7 @@ def test_statement_schema_rejects_blanks_and_one_repair_stays_grounded():
     assert len(kept.relationships) == 1
     assert kept.relationships[0]["statement"] == "Packing may be related to the trip."
     assert kept.relationships[0]["endpoint_anchoring"]
-    assert "verbatim_quote_statement" not in kept.metadata["proposal_diagnostics"]["rejection_reasons"]
+    assert "invalid_restated_quote" not in kept.metadata["proposal_diagnostics"]["rejection_reasons"]
 
     stitched = _RepairCoder(outcome="stitched")
     dropped = axial_code(_corpus(), stitched, **_COMMON)
