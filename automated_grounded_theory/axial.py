@@ -47,7 +47,12 @@ from automated_grounded_theory.backends import (
     model_configuration_record,
     record_model_determinism,
 )
-from automated_grounded_theory.batching import request_input_tokens, shrink_repair_messages
+from automated_grounded_theory.batching import (
+    estimate_tokens,
+    request_input_tokens,
+    schema_token_count,
+    shrink_repair_messages,
+)
 from automated_grounded_theory.decision_review import (
     CORE_AUTO_SIZE_RULE,
     CORE_BRACKET_INCOMPLETE,
@@ -2084,7 +2089,7 @@ def _new_relationship(
     if not anchored:
         flags.append("unanchored_quote")
     row = {
-        "relationship_id": f"rel-{index:04d}",
+        "relationship_id": _next_relationship_id(metadata, index),
         "from_id": str(draft.get("from_id") or ""),
         "to_id": str(draft.get("to_id") or ""),
         "paradigm_role": role,
@@ -2118,6 +2123,8 @@ def _new_relationship(
         "negative_case_search": False,
         "synthetic": False,
         "merged_into": None,
+        "proposal_id": str(draft.get("proposal_id") or ""),
+        "source_proposal_ids": [str(draft.get("proposal_id"))] if draft.get("proposal_id") else [],
     }
     stamp_focus_review(row, metadata)
     _annotate_endpoints(row, codebook, segments, passages)
@@ -3153,6 +3160,15 @@ def build_relationship_funnel(state: Mapping[str, Any]) -> dict[str, Any]:
         flags = {str(item) for item in (row.get("flags") or [])}
         if "hypothetical_link" in blocks or "participant_link_hypothetical" in flags:
             found.append("hypothetical_only_evidence")
+        ends = [item for item in (row.get("endpoint_anchoring") or []) if isinstance(item, Mapping)]
+        anchored = [item for item in ends if item.get("anchored") is True or item.get("grounded") is True]
+        partial = (
+            "endpoint_evidence_partial" in flags
+            or row.get("endpoint_evidence_partial") is True
+            or (len(ends) >= 2 and len(anchored) < len(ends))
+        )
+        if partial:
+            found.append("partial_endpoint_evidence")
         if not _reviewed(row):
             found.append("incomplete_review")
         elif row.get("downstream_eligible") is not True and not found:
@@ -3182,6 +3198,7 @@ def build_relationship_funnel(state: Mapping[str, Any]) -> dict[str, Any]:
             "relationship_id": relationship_id,
             "document_count": _relationship_document_count(row, passages),
             "document_count_unit": "documents",
+            "summary_reasons": [reason for reason in _COUNTEREXAMPLE_SUMMARY_REASONS if reason in row_reasons],
             "reasons": row_reasons,
             "evidence_exposure": {
                 "available": held.get("available"),
@@ -4021,6 +4038,7 @@ _STAGE_RANK = {
     "complete_no_negative_search": 1,
     "budget_limited": 2,
     "incomplete": 3,
+    "required_but_blocked": 4,
 }
 _BUDGET_STOPS = {
     "token_allowance",
@@ -4786,15 +4804,172 @@ def _calls_that_fit_remaining_allowance(
     }
 
 
-def _shrink_counterexample_payload(payload: dict[str, Any], schema, request_budget: int) -> tuple[int, bool]:
-    """Shorten surplus passage text until the request fits, or report that it does not.
+_MIN_MEANINGFUL_PASSAGE = 240
+_COUNTEREXAMPLE_SUMMARY_REASONS = (
+    "reviewer_rejected",
+    "insufficient_document_count",
+    "hypothetical_only_evidence",
+    "incomplete_review",
+)
 
-    The proposed claim, category definitions, and provenance stay. Passage text
-    may be shortened. Fitting the cap does not mean the test is still adequate.
+
+def _json_tokens(value: Any) -> int:
+    if isinstance(value, str):
+        return estimate_tokens(value)
+    return estimate_tokens(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str))
+
+
+def counterexample_token_breakdown(payload: Mapping[str, Any], schema=None) -> dict[str, Any]:
+    """Split one counterexample request into the parts that consume the cap.
+
+    ``other_context`` is derived metadata, histories, and JSON framing. It is
+    not the claim, the two category definitions, the passage evidence, or the
+    provenance. The parts sum to the request total. Provider usage is not here.
+    """
+    schema = AxialCounterexampleBatch if schema is None else schema
+    claim = 0
+    definitions = 0
+    evidence = 0
+    provenance = 0
+    other = 0
+    provenance_keys = {
+        "relationship_id",
+        "passage_id",
+        "doc_id",
+        "document_id",
+        "quote",
+        "quote_from",
+        "quote_to",
+        "from_id",
+        "to_id",
+        "provenance",
+    }
+    claim_keys = {"statement", "claim", "model_statement", "presented_statement"}
+    for item in payload.get("counterexamples") or []:
+        if not isinstance(item, Mapping):
+            other += _json_tokens(item)
+            continue
+        relationship = item.get("relationship") if isinstance(item.get("relationship"), Mapping) else {}
+        for key, value in relationship.items():
+            tokens = _json_tokens(value)
+            if key in claim_keys:
+                claim += tokens
+            elif key == "categories":
+                definitions += tokens
+            elif key in provenance_keys:
+                provenance += tokens
+            else:
+                other += tokens
+        if item.get("claim") and "claim" not in relationship and "statement" not in relationship:
+            claim += _json_tokens(item.get("claim"))
+        if item.get("categories"):
+            definitions += _json_tokens(item.get("categories"))
+        for passage in [item.get("passage"), *(item.get("complementary_passages") or [])]:
+            if not isinstance(passage, Mapping):
+                continue
+            evidence += _json_tokens(passage.get("text") or "")
+            provenance += _json_tokens({
+                "passage_id": passage.get("passage_id"),
+                "doc_id": passage.get("doc_id") or passage.get("document_id"),
+            })
+        for key in ("respondent_id", "source", "comparison"):
+            if item.get(key):
+                other += _json_tokens(item.get(key))
+        if isinstance(item.get("provenance"), Mapping):
+            provenance += _json_tokens(item.get("provenance"))
+    instructions = estimate_tokens(_KIND_PROMPTS["axial_counterexample"])
+    schema_tokens = schema_token_count(schema)
+    total = request_input_tokens(_messages("axial_counterexample", payload), schema)
+    named = instructions + schema_tokens + claim + definitions + evidence + provenance + other
+    other += max(0, total - named)
+    return {
+        "instructions": instructions,
+        "schema": schema_tokens,
+        "claim": claim,
+        "category_definitions": definitions,
+        "evidence": evidence,
+        "provenance": provenance,
+        "other_context": other,
+        "total": instructions + schema_tokens + claim + definitions + evidence + provenance + other,
+        "per_request_cap": None,
+        "note": (
+            "Estimates use the character heuristic. They are not provider-reported usage. "
+            "other_context is derived metadata, review history, and message framing. "
+            "A compacted passage does not remove that context."
+        ),
+    }
+
+
+def _category_definitions(codebook: Mapping[str, Any] | None, *code_ids: str) -> list[dict[str, str]]:
+    book = codebook if isinstance(codebook, Mapping) else {}
+    rows = []
+    seen: set[str] = set()
+    for code_id in code_ids:
+        code_id = str(code_id or "")
+        if not code_id or code_id in seen:
+            continue
+        seen.add(code_id)
+        entry = book.get(code_id) if isinstance(book.get(code_id), Mapping) else {}
+        rows.append({
+            "code_id": code_id,
+            "code": str(entry.get("code") or entry.get("label") or code_id),
+            "definition": str(entry.get("definition") or ""),
+        })
+    return rows
+
+
+def _slim_counterexample_relationship(row: Mapping[str, Any] | None, codebook: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The claim, its two categories, and provenance. Not the derived row."""
+    if not isinstance(row, Mapping):
+        return {}
+    statement = str(row.get("statement") or row.get("model_statement") or "")
+    return {
+        "relationship_id": str(row.get("relationship_id") or ""),
+        "from_id": str(row.get("from_id") or ""),
+        "to_id": str(row.get("to_id") or ""),
+        "statement": statement,
+        "categories": _category_definitions(codebook, str(row.get("from_id") or ""), str(row.get("to_id") or "")),
+        "provenance": {
+            "relationship_id": str(row.get("relationship_id") or ""),
+            "passage_id": str(row.get("passage_id") or ""),
+            "doc_id": str(row.get("doc_id") or row.get("document_id") or ""),
+            "quote": str(row.get("quote") or ""),
+        },
+    }
+
+
+def _passage_context_floor(text: str, quote: str) -> str:
+    """Enough passage text to keep the claim's quote, or a short readable span."""
+    text = str(text or "")
+    quote = str(quote or "").strip()
+    if quote and quote in text:
+        start = text.find(quote)
+        left = max(0, start - 80)
+        right = min(len(text), start + len(quote) + 80)
+        return text[left:right]
+    if len(text) <= _MIN_MEANINGFUL_PASSAGE:
+        return text
+    return text[:_MIN_MEANINGFUL_PASSAGE]
+
+
+def _shrink_counterexample_payload(payload: dict[str, Any], schema, request_budget: int) -> tuple[int, bool]:
+    """Shorten surplus passage text down to a readable floor.
+
+    The claim, category definitions, and provenance are not cut. Passage text
+    is not cut below the quote context. Stopping there is not a successful test.
     """
 
     def estimate() -> int:
         return request_input_tokens(_messages("axial_counterexample", payload), schema)
+
+    def quote_for(passage: Mapping[str, Any]) -> str:
+        for item in payload.get("counterexamples") or []:
+            if not isinstance(item, Mapping):
+                continue
+            relationship = item.get("relationship") if isinstance(item.get("relationship"), Mapping) else {}
+            if item.get("passage") is passage or passage in (item.get("complementary_passages") or []):
+                return str(relationship.get("provenance", {}).get("quote") or relationship.get("statement") or "")
+        return ""
 
     estimate_now = estimate()
     omitted: list[dict[str, Any]] = []
@@ -4818,15 +4993,21 @@ def _shrink_counterexample_payload(payload: dict[str, Any], schema, request_budg
     while estimate_now > int(request_budget) and guard < 24:
         guard += 1
         rows = passages()
-        if not rows:
+        candidates = []
+        for row in rows:
+            text = str(row.get("text") or "")
+            floor = _passage_context_floor(text, quote_for(row))
+            if len(text) > len(floor):
+                candidates.append((row, floor, text))
+        if not candidates:
             break
-        index = max(range(len(rows)), key=lambda item: len(str(rows[item].get("text") or "")))
-        row = rows[index]
-        text = str(row.get("text") or "")
-        if len(text) <= _MIN_EXCERPT:
-            break
+        row, floor, text = max(candidates, key=lambda item: len(item[2]))
         original = len(text)
-        kept = text[: max(_MIN_EXCERPT, original // 2)]
+        kept = text[: max(len(floor), original // 2)]
+        if len(kept) < len(floor):
+            kept = floor
+        if kept == text:
+            break
         row["text"] = kept
         row["excerpt"] = True
         row["evidence_truncated"] = True
@@ -4837,6 +5018,7 @@ def _shrink_counterexample_payload(payload: dict[str, Any], schema, request_budg
             "doc_id": str(row.get("doc_id") or row.get("document_id") or ""),
             "original_chars": original,
             "kept_chars": len(kept),
+            "meaningful_floor_chars": len(floor),
         })
         estimate_now = estimate()
     if omitted:
@@ -4853,11 +5035,12 @@ def _shrink_counterexample_payload(payload: dict[str, Any], schema, request_budg
     return estimate_now, estimate_now <= int(request_budget)
 
 
-def _counterexample_payload(window: Sequence[Mapping[str, Any]], by_id, passage_by_id) -> dict[str, Any]:
+def _counterexample_payload(window: Sequence[Mapping[str, Any]], by_id, passage_by_id, codebook=None) -> dict[str, Any]:
+    """One target relationship and its two categories. Not the codebook or the derived row."""
     return {
         "counterexamples": [
             {
-                "relationship": _model_facing_relationship(by_id.get(item["relationship_id"])),
+                "relationship": _slim_counterexample_relationship(by_id.get(item["relationship_id"]), codebook),
                 "passage": _model_facing_passage(passage_by_id.get(item["passage_id"])),
                 "complementary_passages": [
                     _model_facing_passage(passage_by_id.get(str(passage_id)))
@@ -4936,6 +5119,69 @@ def _unique_pair_rows(pairs: Sequence[Any]) -> list[dict[str, str]]:
 
 def _merge_unique_pairs(prior: Any, rows: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
     return _unique_pair_rows(list(prior or []) + list(rows))
+
+
+def _reallocation_pairs(metadata: Mapping[str, Any], unexamined: Sequence[Any], limit: int) -> list[dict[str, str]]:
+    """Unplanned multi-document pairs first, then any other unexamined pair."""
+    if limit <= 0:
+        return []
+    multi = []
+    seen: set[tuple[str, str]] = set()
+    for row in metadata.get("multi_document_pairs") or []:
+        if not isinstance(row, Mapping) or str(row.get("status") or "") != "unplanned":
+            continue
+        key = _pair_key(row)
+        if not key[0] or not key[1] or key in seen:
+            continue
+        seen.add(key)
+        multi.append({"from_id": key[0], "to_id": key[1], "band": "multi_document"})
+    rest = []
+    for item in unexamined:
+        if not isinstance(item, Mapping):
+            continue
+        key = _pair_key(item)
+        if not key[0] or not key[1] or key in seen:
+            continue
+        seen.add(key)
+        rest.append({"from_id": key[0], "to_id": key[1], "band": str(item.get("band") or "reallocated")})
+    return (multi + rest)[: int(limit)]
+
+
+def _permit_reallocated_proposals(
+    runtime: AxialRuntime,
+    metadata: dict[str, Any],
+    *,
+    wanted: int,
+    per_request: int,
+    tokens_used: int,
+    token_ceiling: int,
+) -> tuple[int, dict[str, Any]]:
+    """Release unused counterexample token reserve, then count calls that fit."""
+    wanted = max(0, int(wanted))
+    per_request = max(1, int(per_request))
+    allowance = getattr(getattr(runtime, "limiter", None), "provider_allowance", None)
+    reserve = int(getattr(allowance, "counterexample_token_reserve", 0) or 0)
+    release = min(reserve, wanted * per_request)
+    if allowance is not None:
+        allowance.counterexample_token_reserve = reserve - release
+    procedure = dict(metadata.get("procedure") or {})
+    procedure["counterexample_token_reserve"] = reserve - release
+    metadata["procedure"] = procedure
+    returned, fit = _calls_that_fit_remaining_allowance(
+        metadata,
+        wanted=wanted,
+        per_request=per_request,
+        tokens_used=tokens_used,
+        token_ceiling=token_ceiling,
+    )
+    if allowance is not None and returned:
+        probe = allowance.preview(per_request, stage="coding", kind="axial_proposal")
+        if probe.get("status") != "acquired":
+            returned = 0
+    fit = dict(fit)
+    fit["counterexample_tokens_released"] = release
+    fit["calls_permitted"] = returned
+    return returned, fit
 
 
 def _append_transfer(metadata: dict[str, Any], record: Mapping[str, Any]) -> None:
@@ -5365,6 +5611,11 @@ def _route_storyline(state: AxialState) -> str:
 def _propose_node(runtime: AxialRuntime):
     async def propose_relations(state: AxialState) -> dict:
         metadata = dict(state.get("metadata") or {})
+        reallocated = [
+            dict(item)
+            for item in (metadata.pop("counterexample_reallocation_pairs", None) or [])
+            if isinstance(item, Mapping)
+        ]
         metadata.pop("counterexample_reallocation_pending", None)
         procedure = metadata.get("procedure") or {}
         passages = _by_passage(state)
@@ -5382,6 +5633,10 @@ def _propose_node(runtime: AxialRuntime):
         batch = max(1, int((metadata.get("performance") or {}).get("batch_size") or 1))
         model_name = describe_model(runtime.coder)
         pending = list(state.get("relation_round") or [])
+        if reallocated:
+            pending = reallocated + pending
+            if str(metadata.get("axial_stop") or "") in {"token_allowance", "request_budget", "required_but_blocked"}:
+                metadata["axial_stop"] = ""
         token_budget = _request_token_budget(metadata)
         max_tokens = int(procedure.get("max_axial_review_tokens") or 0)
         estimated = int(metadata.get("axial_tokens_estimated") or 0)
@@ -5666,6 +5921,7 @@ def _propose_node(runtime: AxialRuntime):
                 reasons[reason] = int(reasons.get(reason) or 0) + 1
                 diagnostics["rejection_reasons"] = reasons
                 metadata["proposal_diagnostics"] = diagnostics
+                _mark_raw_proposals(metadata, [draft], "invalid", reason)
                 logs[-1].setdefault("rejections", []).append({"reason": reason, "draft": dict(draft)})
 
             if recovered_drops:
@@ -5678,7 +5934,7 @@ def _propose_node(runtime: AxialRuntime):
                 diagnostics["dropped_relationships"] = recorded
                 metadata["proposal_diagnostics"] = diagnostics
 
-            returned = parsed.get("relationships")
+            returned = _stamp_raw_proposals(metadata, parsed.get("relationships") or [])
             if parsed.get("nothing_to_propose") is True and not returned:
                 diagnostics["explicit_none"] = int(diagnostics["explicit_none"]) + 1
                 metadata["proposal_diagnostics"] = diagnostics
@@ -5750,12 +6006,14 @@ def _propose_node(runtime: AxialRuntime):
                     elif (retry_result.get("parsed") or {}).get("nothing_to_propose") is True or (
                         retry_result.get("parsed") or {}
                     ).get("no_supported_relationship") is True:
+                        _mark_raw_proposals(metadata, returned, "invalid", "verbatim_quote_statement")
                         returned = []
                         lineage["outcome"] = "no_supported_relationship"
                         _remember_pair_status(metadata, sent_chunk, "nothing_to_propose")
                         payload = retry_payload
                     else:
-                        returned = (retry_result["parsed"] or {}).get("relationships") or []
+                        _mark_raw_proposals(metadata, returned, "invalid", "verbatim_quote_statement")
+                        returned = _stamp_raw_proposals(metadata, (retry_result["parsed"] or {}).get("relationships") or [])
                         lineage["outcome"] = "retried"
                         payload = retry_payload
                 else:
@@ -6112,10 +6370,11 @@ async def _advance_relation_review(
 
 def _relation_checkpoint(runtime: AxialRuntime):
     async def relation_checkpoint(state: AxialState) -> dict:
-        relationships = [dict(row) for row in (state.get("relationships") or [])]
-        if not relationships:
-            return {"relationships": relationships}
+        relationships = consolidate_duplicate_assertions(state.get("relationships") or [])
         metadata = dict(state.get("metadata") or {})
+        _finalize_proposal_lineage(metadata, relationships)
+        if not relationships:
+            return {"relationships": relationships, "metadata": metadata}
         logs = list(state.get("prompt_log") or [])
         if runtime.decision_mode == "llm":
             if runtime.reviewer is None:
@@ -6131,7 +6390,7 @@ def _relation_checkpoint(runtime: AxialRuntime):
             )
         _note_stage(metadata, "decision_review", required=False, status="skipped")
         if not state.get("interrupt_enabled", True):
-            return {"relationships": relationships}
+            return {"relationships": relationships, "metadata": metadata}
         # Resume restarts this node. The stage note above is local until the
         # node returns, and _note_stage is safe to apply again.
         decision = interrupt(
@@ -6282,25 +6541,13 @@ def _counterexample_node(runtime: AxialRuntime):
                 estimate = 0
                 result = None
             if result is None:
-                def _render(window, _by_id=by_id, _passages=passage_by_id):
-                    payload = {
-                        "counterexamples": [
-                            {
-                                "relationship": _model_facing_relationship(_by_id.get(item["relationship_id"])),
-                                "passage": _model_facing_passage(_passages.get(item["passage_id"])),
-                                "complementary_passages": [
-                                    _model_facing_passage(_passages.get(str(passage_id)))
-                                    for passage_id in (item.get("complementary_passage_ids") or [])
-                                    if _passages.get(str(passage_id)) is not None
-                                ],
-                                "respondent_id": str(item.get("respondent_id") or ""),
-                                "source": _model_facing_source(str(item.get("source") or "")),
-                                "comparison": str(item.get("comparison") or ""),
-                            }
-                            for item in window
-                        ]
-                    }
-                    return _messages("axial_counterexample", payload)
+                book = state.get("codebook") if isinstance(state.get("codebook"), Mapping) else {}
+
+                def _render(window, _by_id=by_id, _passages=passage_by_id, _book=book):
+                    return _messages(
+                        "axial_counterexample",
+                        _counterexample_payload(window, _by_id, _passages, _book),
+                    )
 
                 head = [dict(item) for item in pending[:1] if isinstance(item, Mapping)]
                 chunk, pending, messages, estimate, reason = _pack_window(
@@ -6320,7 +6567,7 @@ def _counterexample_node(runtime: AxialRuntime):
                 )
                 oversized = bool(head) and int(estimate or 0) > int(token_budget)
                 if head and (reason in {"request_budget", "token_allowance"} or oversized):
-                    shrunk_payload = _counterexample_payload(head, by_id, passage_by_id)
+                    shrunk_payload = _counterexample_payload(head, by_id, passage_by_id, book)
                     shrunk_estimate, fitted = _shrink_counterexample_payload(
                         shrunk_payload, AxialCounterexampleBatch, token_budget
                     )
@@ -6337,23 +6584,30 @@ def _counterexample_node(runtime: AxialRuntime):
                         messages = _messages("axial_counterexample", shrunk_payload)
                         estimate = shrunk_estimate
                         reason = None
+                        metadata["counterexample_token_breakdown"] = counterexample_token_breakdown(shrunk_payload)
                         metadata["counterexample_evidence_truncated"] = bool(shrunk_payload.get("omitted_context"))
                         if shrunk_payload.get("omitted_context"):
                             metadata["counterexample_omitted_context"] = shrunk_payload["omitted_context"]
                             metadata["counterexample_adequacy"] = "unassessed"
                     elif not fitted:
-                        reason = "request_budget"
+                        reason = "required_but_blocked"
                         estimate = shrunk_estimate
+                        breakdown = counterexample_token_breakdown(shrunk_payload)
+                        breakdown["per_request_cap"] = int(token_budget)
+                        metadata["counterexample_token_breakdown"] = breakdown
+                        metadata["counterexample_status"] = "required_but_blocked"
                         metadata["counterexample_unsent"] = {
-                            "reason": "request_budget",
+                            "reason": "required_but_blocked",
+                            "status": "required_but_blocked",
                             "estimate": shrunk_estimate,
                             "per_request_cap": int(token_budget),
+                            "token_breakdown": breakdown,
                             "omitted_context": shrunk_payload.get("omitted_context"),
                             "adequacy": "unassessed",
                             "detail": (
-                                "The request is still over the per-request cap after shortening. "
-                                "The claim, category definitions, relevant passage context, and provenance were kept. "
-                                "Fitting the cap was not reached, and adequacy is unassessed."
+                                "The claim, the two category definitions, readable passage context, and provenance "
+                                f"still take {shrunk_estimate} tokens against the {int(token_budget)} cap. "
+                                "The passage was not cut below that context. The test was not sent and is not skipped."
                             ),
                         }
                     else:
@@ -6392,17 +6646,16 @@ def _counterexample_node(runtime: AxialRuntime):
                                 },
                             )
                         )
-                    if reason in {"request_budget", "token_allowance"} and not metadata.get("counterexample_reallocation_used"):
+                    if reason in {"request_budget", "token_allowance", "required_but_blocked"} and not metadata.get("counterexample_reallocation_used"):
                         wanted = max(0, int(allowance) - int(made))
-                        returned_calls, allowance_fit = _calls_that_fit_remaining_allowance(
+                        returned_calls, allowance_fit = _permit_reallocated_proposals(
+                            runtime,
                             metadata,
                             wanted=wanted,
                             per_request=int(token_budget),
                             tokens_used=int(estimated),
                             token_ceiling=int(max_tokens),
                         )
-                        if reason == "token_allowance":
-                            returned_calls = 0
                         metadata["counterexample_reallocation"] = {
                             "calls_returned": returned_calls,
                             "calls_unsent": wanted,
@@ -6427,17 +6680,13 @@ def _counterexample_node(runtime: AxialRuntime):
                             "calls_unsent": wanted,
                             "reason": reason,
                         })
-                        extra_pairs = [
-                            dict(item)
-                            for item in (state.get("unexamined_pairs") or [])
-                            if isinstance(item, Mapping)
-                        ][:returned_calls]
+                        extra_pairs = _reallocation_pairs(metadata, state.get("unexamined_pairs") or [], returned_calls)
                         if extra_pairs and returned_calls:
                             metadata["counterexample_reallocation_pending"] = True
                             metadata["counterexample_reallocation_pairs"] = extra_pairs
                         metadata["counterexample_reallocation_used"] = True
                         pending = []
-                    if reason == "token_allowance" or reason == "request_budget":
+                    if reason in {"token_allowance", "request_budget", "required_but_blocked"}:
                         break
                     continue
                 result = await _structured_call(
@@ -6631,7 +6880,15 @@ def _counterexample_node(runtime: AxialRuntime):
         proposals_done = (metadata.get("stage_outcomes") or {}).get("proposals") or {}
         # A stop recorded by proposals is not a counterexample failure.
         counter_failed = counter_stop if proposals_done.get("status") == "complete" else ""
-        if not search_enabled:
+        if metadata.get("counterexample_status") == "required_but_blocked":
+            _note_stage(
+                metadata,
+                "counterexamples",
+                required=True,
+                status="required_but_blocked",
+                reason=str((metadata.get("counterexample_unsent") or {}).get("reason") or "required_but_blocked"),
+            )
+        elif not search_enabled:
             _note_stage(metadata, "counterexamples", required=False, status="skipped", reason="negative_case_search_disabled")
         elif not counter_required and stats.get("no_call_reason") != "budget":
             _note_stage(metadata, "counterexamples", required=False, status="skipped")
@@ -6742,6 +6999,181 @@ def _assertion_provenance(row: Mapping[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _next_relationship_id(metadata: Mapping[str, Any] | None, fallback_index: int) -> str:
+    """An id that stays unique after consolidation removes earlier rows."""
+    if not isinstance(metadata, dict):
+        return f"rel-{int(fallback_index):04d}"
+    used = {str(item) for item in (metadata.get("relationship_ids_issued") or []) if str(item)}
+    number = int(metadata.get("relationship_seq") or 0)
+    while True:
+        number += 1
+        candidate = f"rel-{number:04d}"
+        if candidate not in used:
+            break
+    metadata["relationship_seq"] = number
+    used.add(candidate)
+    metadata["relationship_ids_issued"] = sorted(used)
+    return candidate
+
+
+def _next_raw_proposal_id(metadata: dict[str, Any]) -> str:
+    number = int(metadata.get("raw_proposal_seq") or 0) + 1
+    metadata["raw_proposal_seq"] = number
+    return f"prop-{number:04d}"
+
+
+def _stamp_raw_proposals(metadata: dict[str, Any], drafts: Sequence[Any]) -> list[dict[str, Any]]:
+    """Give every returned draft an id that consolidation does not rewrite."""
+    stamped: list[dict[str, Any]] = []
+    rows = [dict(item) for item in (metadata.get("raw_proposals") or []) if isinstance(item, Mapping)]
+    for draft in drafts or []:
+        if not isinstance(draft, Mapping):
+            continue
+        item = dict(draft)
+        if not item.get("proposal_id"):
+            item["proposal_id"] = _next_raw_proposal_id(metadata)
+        rows.append({
+            "proposal_id": str(item["proposal_id"]),
+            "from_id": str(item.get("from_id") or ""),
+            "to_id": str(item.get("to_id") or ""),
+            "statement": str(item.get("statement") or ""),
+            "disposition": "retained",
+            "reason": "",
+            "relationship_id": None,
+        })
+        stamped.append(item)
+    metadata["raw_proposals"] = rows
+    return stamped
+
+
+def _mark_raw_proposals(metadata: dict[str, Any], drafts: Sequence[Any], disposition: str, reason: str) -> None:
+    ids = {str(item.get("proposal_id") or "") for item in drafts or [] if isinstance(item, Mapping) and item.get("proposal_id")}
+    rows = []
+    for row in metadata.get("raw_proposals") or []:
+        item = dict(row)
+        if str(item.get("proposal_id") or "") in ids:
+            item["disposition"] = disposition
+            item["reason"] = reason
+        rows.append(item)
+    metadata["raw_proposals"] = rows
+
+
+def reconcile_proposal_lineage(raw: Sequence[Mapping[str, Any]], relationships: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Raw drafts become invalid, retained, or merged_into a relationship.
+
+    A merged id is not counted as its own proposal. The check fails when the
+    dispositions do not account for every raw row, or when retained rows and
+    relationships disagree.
+    """
+    rows = [dict(item) for item in raw or [] if isinstance(item, Mapping)]
+    produced = [
+        row for row in relationships or []
+        if isinstance(row, Mapping) and (row.get("proposal_id") or row.get("source_proposal_ids"))
+    ]
+    invalid = [row for row in rows if row.get("disposition") == "invalid"]
+    retained = [row for row in rows if row.get("disposition") == "retained"]
+    merged = [row for row in rows if str(row.get("disposition") or "").startswith("merged_into:")]
+    rel_ids = {str(row.get("relationship_id") or "") for row in produced}
+    retained_ids = {str(row.get("relationship_id") or "") for row in retained}
+    targets_ok = True
+    for row in retained + merged:
+        if str(row.get("relationship_id") or "") not in rel_ids:
+            targets_ok = False
+    for row in merged:
+        target = str(row.get("disposition") or "").split(":", 1)[1]
+        if target not in retained_ids:
+            targets_ok = False
+    accounted = len(invalid) + len(retained) + len(merged) == len(rows)
+    one_retained_each = len(retained_ids) == len(retained) and len(retained) == len(produced)
+    return {
+        "raw_count": len(rows),
+        "invalid_count": len(invalid),
+        "retained_count": len(retained),
+        "merged_count": len(merged),
+        "relationship_count": len(produced),
+        "reconciles": bool(accounted and targets_ok and one_retained_each),
+    }
+
+
+def _finalize_proposal_lineage(metadata: dict[str, Any], relationships: Sequence[Mapping[str, Any]]) -> None:
+    by_proposal: dict[str, Mapping[str, Any]] = {}
+    for row in relationships:
+        if not isinstance(row, Mapping):
+            continue
+        ids = [str(item) for item in (row.get("source_proposal_ids") or []) if str(item)]
+        if row.get("proposal_id"):
+            ids.append(str(row.get("proposal_id")))
+        for proposal_id in ids:
+            by_proposal[proposal_id] = row
+    updated = []
+    for raw in metadata.get("raw_proposals") or []:
+        if not isinstance(raw, Mapping):
+            continue
+        item = dict(raw)
+        if item.get("disposition") == "invalid":
+            updated.append(item)
+            continue
+        target = by_proposal.get(str(item.get("proposal_id") or ""))
+        if target is None:
+            item["disposition"] = "invalid"
+            item["reason"] = str(item.get("reason") or "not_in_a_relationship")
+            updated.append(item)
+            continue
+        relationship_id = str(target.get("relationship_id") or "")
+        item["relationship_id"] = relationship_id
+        if str(item.get("proposal_id") or "") == str(target.get("proposal_id") or ""):
+            item["disposition"] = "retained"
+            item["reason"] = ""
+        else:
+            item["disposition"] = f"merged_into:{relationship_id}"
+            item["reason"] = ""
+        updated.append(item)
+    metadata["raw_proposals"] = updated
+    metadata["proposal_lineage"] = reconcile_proposal_lineage(updated, relationships)
+
+
+def _call_usage_report(logs: Sequence[Any]) -> dict[str, Any]:
+    """Estimates and provider-reported tokens stay in different fields.
+
+    A missing provider count stays null. It is not replaced by the estimate.
+    """
+    rows = []
+    for row in logs or []:
+        if not isinstance(row, Mapping):
+            continue
+        usage = row.get("usage") if isinstance(row.get("usage"), Mapping) else {}
+        has_input = "input_tokens" in usage and usage.get("input_tokens") is not None
+        has_output = "output_tokens" in usage and usage.get("output_tokens") is not None
+        if has_input and has_output:
+            completeness = "complete"
+        elif has_input or has_output:
+            completeness = "partial"
+        else:
+            completeness = "unknown"
+        estimate = row.get("estimated_input_tokens")
+        rows.append({
+            "kind": row.get("kind"),
+            "checkpoint": row.get("checkpoint"),
+            "estimated_input_tokens": None if estimate is None else int(estimate),
+            "provider_input_tokens": int(usage["input_tokens"]) if has_input else None,
+            "provider_output_tokens": int(usage["output_tokens"]) if has_output else None,
+            "usage_completeness": completeness,
+        })
+    known = [row for row in rows if row["usage_completeness"] == "complete"]
+    return {
+        "calls": rows,
+        "estimated_input_tokens": None if not rows else sum(int(row["estimated_input_tokens"] or 0) for row in rows),
+        "provider_input_tokens": None if not known else sum(int(row["provider_input_tokens"] or 0) for row in known),
+        "provider_output_tokens": None if not known else sum(int(row["provider_output_tokens"] or 0) for row in known),
+        "usage_completeness": (
+            "unknown" if not rows or all(row["usage_completeness"] == "unknown" for row in rows)
+            else "complete" if all(row["usage_completeness"] == "complete" for row in rows)
+            else "partial"
+        ),
+        "note": "estimated_input_tokens is the character heuristic. Provider tokens are null when the provider did not report them.",
+    }
+
+
 def consolidate_duplicate_assertions(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """One row per identical statement on a directed pair.
 
@@ -6833,8 +7265,30 @@ def consolidate_duplicate_assertions(rows: Sequence[Mapping[str, Any]]) -> list[
         base["review_history"] = history
         base["assertion_provenance"] = provenance
         base["merged_relationship_ids"] = [str(item.get("relationship_id") or "") for item in provenance]
+        proposal_ids = [str(item.get("proposal_id") or "") for item in ordered if item.get("proposal_id")]
+        base["source_proposal_ids"] = proposal_ids
+        base["proposal_id"] = proposal_ids[0] if proposal_ids else base.get("proposal_id")
+        base["merged_proposal_ids"] = proposal_ids[1:]
+        base["prior_decisions"] = [
+            {
+                "relationship_id": str(item.get("relationship_id") or ""),
+                "proposal_id": str(item.get("proposal_id") or ""),
+                "disposition": item.get("disposition"),
+                "reviewer_disposition": item.get("reviewer_disposition"),
+                "review_decision": item.get("review_decision"),
+            }
+            for item in ordered
+        ]
         signatures = {_evidence_signature(item) for item in ordered}
         base["conflicting_evidence"] = list(provenance) if len(signatures) > 1 else None
+        # Neither an accepted member nor a rejected member decides the merged row.
+        # The consolidated assertion is reviewed against the combined evidence.
+        base["disposition"] = "proposed"
+        base["model_disposition"] = None
+        base["reviewer_disposition"] = None
+        base["human_disposition"] = None
+        base["review_decision"] = None
+        base["reviewer_decided"] = False
         merged.append(base)
     return merged
 
@@ -7122,6 +7576,8 @@ def _export_node(runtime_output: dict):
         metadata = dict(state.get("metadata") or {})
         _apply_run_status(metadata)
         metadata["saturation_judgment"] = None
+        _finalize_proposal_lineage(metadata, state.get("relationships") or [])
+        metadata["call_usage"] = _call_usage_report(state.get("prompt_log") or [])
         metadata["relationship_funnel"] = build_relationship_funnel({**state, "metadata": metadata})
         held = {**state, "metadata": metadata, "saturation": state.get("saturation") or _saturation(state)}
         held["coverage"] = _coverage(held)

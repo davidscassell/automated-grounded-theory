@@ -1,6 +1,6 @@
 # 0.9.39 review fixes
 
-Status: record of package 0.9.39. Package 0.9.41 is current. The 0.9.38 note stays the record of inherited core stops, frozen chunk identity for an unfingerprinted match, and compared seats. This note does not change `pattern_min_cases` (2), the axial token number (24000 per step), `batch_size` (1), or the 6000 request budgets. `auto_size_decision_calls` stays off. `auto_size_core_review` stays off. `allow_partial_core_review` stays off. `selection_consolidation` stays off. Tier 4 stays human-only. Undefined metrics stay null. Human input still arrives through `interrupt()` and `Command(resume=...)`. No paid call is added. No LLM judge is added. No live evaluation was run. No adjudications are added.
+Status: record of package 0.9.39. Package 0.9.42 is current. The 0.9.38 note stays the record of inherited core stops, frozen chunk identity for an unfingerprinted match, and compared seats. This note does not change `pattern_min_cases` (2), the axial token number (24000 per step), `batch_size` (1), or the 6000 request budgets. `auto_size_decision_calls` stays off. `auto_size_core_review` stays off. `allow_partial_core_review` stays off. `selection_consolidation` stays off. Tier 4 stays human-only. Undefined metrics stay null. Human input still arrives through `interrupt()` and `Command(resume=...)`. No paid call is added. No LLM judge is added. No live evaluation was run. No adjudications are added.
 
 ## What was going wrong
 

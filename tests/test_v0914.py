@@ -19,8 +19,8 @@ from tests.test_v090 import FakeSamplingCoder, _kwargs
 
 
 def test_version_is_0914():
-    assert __version__ == "0.9.41"
-    assert POLICY_VERSION == "0.9.41"
+    assert __version__ == "0.9.42"
+    assert POLICY_VERSION == "0.9.42"
     assert PATTERN_MIN_CASES == 2
     assert DEFAULT_MAX_AXIAL_REVIEW_TOKENS == 24000
 

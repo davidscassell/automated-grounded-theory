@@ -33,8 +33,8 @@ from tests.test_v090 import FakeSamplingCoder, _kwargs, _payload
 
 
 def test_version_is_098():
-    assert __version__ == "0.9.41"
-    assert POLICY_VERSION == "0.9.41"
+    assert __version__ == "0.9.42"
+    assert POLICY_VERSION == "0.9.42"
 
 
 def _prep_group(groups, directions):

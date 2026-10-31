@@ -26,8 +26,8 @@ from tests.test_v080 import FakeAxialCoder
 
 
 def test_version_is_0940_and_pattern_minimum_stays_two():
-    assert __version__ == "0.9.41"
-    assert POLICY_VERSION == "0.9.41"
+    assert __version__ == "0.9.42"
+    assert POLICY_VERSION == "0.9.42"
     assert PATTERN_MIN_CASES == 2
 
 

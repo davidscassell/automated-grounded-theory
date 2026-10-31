@@ -16,8 +16,8 @@ from tests.test_v082 import _install_estimates
 
 
 def test_version_is_084():
-    assert __version__ == "0.9.41"
-    assert POLICY_VERSION == "0.9.41"
+    assert __version__ == "0.9.42"
+    assert POLICY_VERSION == "0.9.42"
 
 
 def _three_codes():
