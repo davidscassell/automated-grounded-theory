@@ -104,17 +104,25 @@ def test_frequency_shift_is_total_variation_not_presence():
 
 def test_call_budget_uses_ceil_of_pairs_and_never_goes_negative():
     procedure = _procedure()
-    assert procedure["propose_calls"] == 4
+    assert procedure["propose_calls"] == 2
+    assert procedure["statement_copy_retry_calls"] == 2
     assert procedure["counterexample_calls"] == 4
-    assert procedure["propose_calls"] + procedure["counterexample_calls"] == 8
+    assert (
+        procedure["propose_calls"]
+        + procedure["statement_copy_retry_calls"]
+        + procedure["counterexample_calls"]
+    ) == 8
     assert procedure["reallocated_propose_calls"] is False
     odd = _procedure(max_axial_review_calls=7)
     assert odd["propose_calls"] >= 0
     assert odd["counterexample_calls"] >= 0
-    assert odd["propose_calls"] + odd["counterexample_calls"] == 7
+    assert (
+        odd["propose_calls"] + odd["statement_copy_retry_calls"] + odd["counterexample_calls"]
+    ) == 7
     small = _procedure(categories=2, batch_size=3, max_axial_review_calls=8)
     assert small["propose_calls"] == 1
-    assert small["counterexample_calls"] == 7
+    assert small["statement_copy_retry_calls"] == 1
+    assert small["counterexample_calls"] == 6
     assert small["reallocated_propose_calls"] is True
     with pytest.raises(Exception, match="zero or more"):
         _procedure(max_axial_review_calls=-1)
