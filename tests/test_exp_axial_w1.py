@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -80,7 +81,28 @@ def _corpus():
         "respondent_id": "r-cross",
         "text": "A third respondent mentions " + " ".join(cross_terms) + ".",
     })
-    return {"codebook": codebook, "passages": passages, "segments": segments, "memos": []}, quotes
+    raised = list(codebook)
+    codebook["not-raised"] = _code("not-raised", "unused", "label")
+    passages.append({
+        "passage_id": "p-counter",
+        "doc_id": "d-counter",
+        "respondent_id": "r-counter",
+        "text": "however amber0 basalt0 showed up without the other pole.",
+    })
+    source = {
+        "codebook": list(codebook.values()),
+        "passages": passages,
+        "segments": segments,
+        "memos": [],
+        "raised_code_ids": raised,
+        "metadata": {
+            "raised_code_ids": raised,
+            "selection_review_complete": True,
+            "selection_status": "applied",
+            "selection_withheld": False,
+        },
+    }
+    return source, quotes
 
 
 class _RejectingCoder(FakeAxialCoder):
@@ -93,6 +115,17 @@ class _RejectingCoder(FakeAxialCoder):
         passage = passages[0] if passages else {"passage_id": "ps00", "text": "Marker sits alone here"}
         text = str(passage.get("text") or "")
         quote = text[:22] if len(text) >= 8 else "Marker sits alone here"
+        if self.mode == "accept" and not body.get("statement_copy_retry") and self.proposal_calls == 1:
+            return AxialProposalBatch(relationships=[
+                AxialRelationshipDraft(
+                    from_id=str(pair.get("from_id") or ""),
+                    to_id=str(pair.get("to_id") or ""),
+                    statement=quote,
+                    passage_id=str(passage.get("passage_id") or ""),
+                    quote=quote,
+                    paradigm_role="context",
+                )
+            ])
         return AxialProposalBatch(relationships=[
             AxialRelationshipDraft(
                 from_id=str(pair.get("from_id") or ""),
@@ -107,11 +140,17 @@ class _RejectingCoder(FakeAxialCoder):
     def relation_review(self, body):
         from automated_grounded_theory.axial import AxialRelationDecision, AxialRelationDecisions
 
+        disposition = "accepted" if self.mode == "accept" else "rejected"
+        rationale = (
+            "The cited quote is enough to keep the row in play."
+            if disposition == "accepted"
+            else "The row does not meet the reviewer standard."
+        )
         return AxialRelationDecisions(relationships=[
             AxialRelationDecision(
                 relationship_id=str(row.get("relationship_id") or ""),
-                disposition="rejected",
-                rationale="The row does not meet the reviewer standard.",
+                disposition=disposition,
+                rationale=rationale,
             )
             for row in body.get("relationships") or []
         ])
@@ -189,11 +228,24 @@ def test_a_short_class_stops_without_substitution():
     assert draw["round"] == []
 
 
-def test_core_deferral_compares_the_eligible_set_and_the_category_counts():
-    baseline = {"eligible_ids": [], "category_counts": {"a": 0}}
-    assert core_differs({"eligible_ids": [], "category_counts": {"a": 0}}, baseline) is False
-    assert core_differs({"eligible_ids": ["rel-1"], "category_counts": {"a": 1}}, baseline) is True
-    assert core_differs({"eligible_ids": [], "category_counts": {"a": 0}}, None) is None
+def test_core_deferral_compares_content_not_run_ids():
+    same = {
+        "from_id": "a",
+        "to_id": "b",
+        "statement": "One claim.",
+        "quote": "A quote.",
+        "evidence_tier": 2,
+        "downstream_eligible": True,
+        "paradigm_role": "context",
+        "document_count": 1,
+    }
+    baseline = {"eligible_relationships": [same], "category_counts": {"a": 1, "b": 1}}
+    renamed = dict(same)
+    assert core_differs({"eligible_relationships": [renamed], "category_counts": {"a": 1, "b": 1}}, baseline) is False
+    changed = dict(same)
+    changed["statement"] = "A different claim."
+    assert core_differs({"eligible_relationships": [changed], "category_counts": {"a": 1, "b": 1}}, baseline) is True
+    assert core_differs({"eligible_relationships": [], "category_counts": {}}, None) is None
 
 
 def test_kill_guard_refuses_before_the_call():
@@ -216,13 +268,31 @@ def test_kill_guard_refuses_before_the_call():
     assert gated["audits"][0]["status"] == "not_sent"
 
 
+def _book(source):
+    return {row["code_id"]: row for row in source["codebook"]}
+
+
+def _evidence_for(source, code_id):
+    passage_ids = [
+        str(row.get("passage_id") or "")
+        for row in source["segments"]
+        if str(row.get("code_id") or "") == code_id
+    ]
+    return [
+        row for row in source["passages"]
+        if str(row.get("passage_id") or "") in passage_ids
+    ]
+
+
 def test_exp_axial_w1_unexamined_single_document_round(tmp_path):
     source, quotes = _corpus()
+    raised = source["raised_code_ids"]
+    book = _book(source)
     evidence = classify_pair_evidence(
-        list(source["codebook"]),
+        raised,
         source["passages"],
         source["segments"],
-        source["codebook"],
+        book,
     )
     examined = [{"from_id": "s00", "to_id": "s01"}]
     draw = select_unexamined_draw(evidence, examined, seed=4401)
@@ -239,55 +309,81 @@ def test_exp_axial_w1_unexamined_single_document_round(tmp_path):
     assert ("s00", "s01") not in {
         tuple(sorted((row["from_id"], row["to_id"]))) for row in draw["round"]
     }
-    scope = reduce_scope()["reduced_scope"]
-    chosen = (
-        draw["sampled"][CLASS_SAME][: scope["same_respondent"]]
-        + draw["sampled"][CLASS_LEXICAL][: scope["lexical_cross_case"]]
+    scope = reduce_scope(core_candidates=len(raised))["reduced_scope"]
+    direct = select_unexamined_draw(
+        evidence,
+        examined,
+        seed=4401,
+        same_count=scope["same_respondent"],
+        lexical_count=scope["lexical_cross_case"],
     )
+    assert direct["status"] == "selected"
+    chosen = direct["round"]
     assert {row["evidence_class"] for row in chosen} == {CLASS_SAME, CLASS_LEXICAL}
     accepted = chosen[0]
-    rejected = chosen[1]
+    rejected_reuse = chosen[1]
+    coder_for_fp = _RejectingCoder()
+    accepted_evidence = _evidence_for(source, accepted["from_id"]) + _evidence_for(source, accepted["to_id"])
     accepted_passage, accepted_quote = quotes[accepted["from_id"]]
+    second_passage, second_quote = quotes[accepted["to_id"]]
     history = tmp_path / "examined-history.json"
     _history(history, examined, [
         {
             "from_id": accepted["from_id"],
             "to_id": accepted["to_id"],
-            "request_fingerprint": proposal_request_fingerprint(accepted["from_id"], accepted["to_id"]),
-            "policy_fingerprint": policy_fingerprint(),
-            "relationship": {
-                "from_id": accepted["from_id"],
-                "to_id": accepted["to_id"],
-                "statement": "A stored proposal kept because the fingerprints match.",
-                "passage_id": accepted_passage,
-                "quote": accepted_quote,
-                "paradigm_role": "context",
-            },
+            "request_fingerprint": proposal_request_fingerprint(
+                accepted["from_id"],
+                accepted["to_id"],
+                evidence=accepted_evidence,
+                model=coder_for_fp,
+                passage_ids=[row["passage_id"] for row in accepted_evidence],
+            ),
+            "policy_fingerprint": policy_fingerprint(coder_for_fp),
+            "relationships": [
+                {
+                    "from_id": accepted["from_id"],
+                    "to_id": accepted["to_id"],
+                    "statement": "A stored proposal kept because the fingerprints match.",
+                    "passage_id": accepted_passage,
+                    "quote": accepted_quote,
+                    "paradigm_role": "context",
+                },
+                {
+                    "from_id": accepted["from_id"],
+                    "to_id": accepted["to_id"],
+                    "statement": "A second stored claim on the same endpoints.",
+                    "passage_id": second_passage,
+                    "quote": second_quote,
+                    "paradigm_role": "context",
+                },
+            ],
         },
         {
-            "from_id": rejected["from_id"],
-            "to_id": rejected["to_id"],
+            "from_id": rejected_reuse["from_id"],
+            "to_id": rejected_reuse["to_id"],
             "request_fingerprint": "not-the-request",
-            "policy_fingerprint": policy_fingerprint(),
-            "relationship": {
-                "from_id": rejected["from_id"],
-                "to_id": rejected["to_id"],
+            "policy_fingerprint": policy_fingerprint(coder_for_fp),
+            "relationships": [{
+                "from_id": rejected_reuse["from_id"],
+                "to_id": rejected_reuse["to_id"],
                 "statement": "This stored proposal must not be reused.",
-                "passage_id": quotes[rejected["from_id"]][0],
-                "quote": quotes[rejected["from_id"]][1],
+                "passage_id": quotes[rejected_reuse["from_id"]][0],
+                "quote": quotes[rejected_reuse["from_id"]][1],
                 "paradigm_role": "context",
-            },
+            }],
         },
     ])
     coder = _RejectingCoder()
-    frozen = startup_fingerprint(source, coder, commit="offline-fixture")
+    frozen = json.loads(Path("tests/fixtures/exp_axial_w1_freeze.json").read_text(encoding="utf-8"))
+    assert frozen["commit"] == "offline-fixture"
+    assert len(frozen["prompts"]) == 64
     with pytest.raises(AxialError, match="refused to start"):
         exp_axial_w1(
             source,
             coder,
             history_path=history,
             frozen_fingerprints={**frozen, "commit": "different-commit"},
-            baseline_core={"eligible_ids": [], "category_counts": {code_id: 0 for code_id in source["codebook"]}},
+            baseline_core={"eligible_relationships": [], "category_counts": {code_id: 0 for code_id in raised}},
             token_prices=FROZEN_TOKEN_PRICES,
             seed=4401,
             commit="offline-fixture",
@@ -300,7 +396,7 @@ def test_exp_axial_w1_unexamined_single_document_round(tmp_path):
         coder,
         history_path=history,
         frozen_fingerprints=frozen,
-        baseline_core={"eligible_ids": [], "category_counts": {code_id: 0 for code_id in source["codebook"]}},
+        baseline_core={"eligible_relationships": [], "category_counts": {code_id: 0 for code_id in raised}},
         token_prices=FROZEN_TOKEN_PRICES,
         seed=4401,
         commit="offline-fixture",
@@ -310,9 +406,14 @@ def test_exp_axial_w1_unexamined_single_document_round(tmp_path):
     assert report["status"] == "completed"
     assert report["preflight"]["original"]["pairs"] == 24
     assert report["preflight"]["original"]["coding_calls"] == 36
-    assert report["preflight"]["original"]["total_input_tokens"] == 366_000
-    assert report["preflight"]["original"]["output_dollars"] == pytest.approx(0.138917)
+    assert report["preflight"]["original"]["calls"]["axial_core_review"] == len(raised) - 1
+    assert report["preflight"]["original"]["total_input_tokens"] == 366_000 + (len(raised) - 1) * 6000
+    assert report["preflight"]["original"]["output_dollars"] is not None
     assert report["preflight"]["original"]["prices"]["output_usd_per_million"] == 2.50
+    assert report["preflight"]["reduced"]["coding_calls"] == 30
+    assert report["preflight"]["reduced"]["coding_input_tokens"] == 180_000
+    assert report["preflight"]["reduced"]["total_calls"] > 36
+    assert report["preflight"]["reduced"]["total_input_tokens"] > 216_000
     assert report["preflight"]["reduced_scope"]["same_respondent"] == 8
     assert report["preflight"]["reduced_scope"]["lexical_cross_case"] == 4
     assert report["allowances"]["axial_proposal"] == 12
@@ -327,7 +428,12 @@ def test_exp_axial_w1_unexamined_single_document_round(tmp_path):
     assert reviewed
     assert all(row.get("reviewer_disposition") for row in reviewed)
     assert report["historical_expenditure"]["dollars"] == 0.02
-    assert report["new_spend"]["note"]
+    assert report["new_spend"]["calls"] > report["metrics"]["overall"]["new_pairs_examined"]
+    assert report["universe"]["codebook_codes"] == len(raised) + 1
+    assert report["universe"]["pair_universe"] == len(raised) * (len(raised) - 1) // 2
+    assert report["universe"]["restricted_to_raised"] is True
+    assert report["draw_method"] == "direct_seeded_draw"
+    assert "not-raised" not in {row["from_id"] for row in report["round"]}
     assert coder.proposal_calls == len(chosen) - 1
     decisions = {row["decision"] for row in report["reuse_ledger"]}
     assert decisions == {"accepted", "rejected"}
@@ -357,8 +463,8 @@ def test_exp_axial_w1_unexamined_single_document_round(tmp_path):
         source,
         rerun,
         history_path=history,
-        frozen_fingerprints=startup_fingerprint(source, rerun, commit="offline-fixture"),
-        baseline_core={"eligible_ids": ["baseline-only"], "category_counts": {code_id: 0 for code_id in source["codebook"]}},
+        frozen_fingerprints=frozen,
+        baseline_core={"eligible_relationships": [], "category_counts": {code_id: 1 for code_id in raised}},
         token_prices=FROZEN_TOKEN_PRICES,
         seed=4401,
         commit="offline-fixture",
@@ -367,3 +473,145 @@ def test_exp_axial_w1_unexamined_single_document_round(tmp_path):
     )
     assert differed["core"]["status"] == "ran"
     assert differed["core"]["calls"] > 0
+    assert differed["preflight"]["reduced"]["calls"]["axial_core_review"] == len(raised) - 1
+
+
+def test_the_package_does_not_shadow_the_experiment_module():
+    import automated_grounded_theory as pkg
+    import automated_grounded_theory.exp_axial_w1 as mod
+
+    assert pkg.exp_axial_w1 is mod
+    assert callable(mod.exp_axial_w1)
+
+
+def test_lexical_eligibility_can_fail_without_substitution(tmp_path):
+    source, _quotes = _corpus()
+    examined = [{"from_id": f"x{i}", "to_id": f"y{j}"} for i in range(4) for j in range(2)]
+    history = tmp_path / "examined-history.json"
+    _history(history, examined, [])
+    coder = _RejectingCoder()
+    frozen = json.loads(Path("tests/fixtures/exp_axial_w1_freeze.json").read_text(encoding="utf-8"))
+    report = exp_axial_w1(
+        source,
+        coder,
+        history_path=history,
+        frozen_fingerprints=frozen,
+        baseline_core={"eligible_relationships": [], "category_counts": {}},
+        seed=4401,
+        commit="offline-fixture",
+        decision_mode="llm",
+        interrupt=False,
+    )
+    assert report["status"] == "stopped"
+    assert report["model_calls"] == 0
+    assert coder.proposal_calls == 0
+    assert report["draw"]["lexical_eligibility"]["eligible"] is False
+    assert report["round"] if "round" in report else [] == []
+
+
+def test_kill_guard_stops_relation_review_before_the_model():
+    import asyncio
+
+    from automated_grounded_theory.axial import AxialDecisionReviewer, AxialRelationDecisions
+
+    reviewer = AxialDecisionReviewer(_RejectingCoder(), max_calls=4, max_tokens=24000, token_budget=6000)
+    metadata = {
+        "procedure": {"exp_axial_w1": {"enabled": True}},
+        "exp_possible_dollars": 0.55,
+        "decision_calls_used": 0,
+        "decision_calls_by_step": {},
+    }
+    payload = {
+        "kind": "axial_relation_review",
+        "relationships": [{"relationship_id": "rel-1", "statement": "A claim."}],
+    }
+    parsed, audit = asyncio.run(reviewer.decide(payload, AxialRelationDecisions, metadata))
+    assert parsed is None
+    assert audit["reason"] == "kill_guard"
+    assert reviewer.model.call_count == 0
+
+
+def test_unknown_and_timed_out_usage_stays_unmeasured():
+    from automated_grounded_theory.exp_axial_w1 import account_call_spend, dispatch_spend_gate
+
+    metadata = {"procedure": {"exp_axial_w1": {"enabled": True}}}
+    account_call_spend(metadata, "axial_counterexample", None, known=False, timed_out=True)
+    assert metadata["exp_spend_unknown"] is True
+    assert "exp_dollars_spent" not in metadata
+    assert metadata["exp_possible_dollars"] > 0
+    metadata["exp_possible_dollars"] = 0.55
+    assert dispatch_spend_gate(metadata, "axial_saturation_review", 6000) == "kill_guard"
+
+
+def test_accepted_rows_send_counterexamples_and_a_malformed_proposal_retries(tmp_path):
+    source, _quotes = _corpus()
+    history = tmp_path / "examined-history.json"
+    _history(history, [{"from_id": "s00", "to_id": "s01"}], [])
+    coder = _RejectingCoder(mode="accept")
+    frozen = json.loads(Path("tests/fixtures/exp_axial_w1_freeze.json").read_text(encoding="utf-8"))
+    report = exp_axial_w1(
+        source,
+        coder,
+        history_path=history,
+        frozen_fingerprints=frozen,
+        baseline_core={"eligible_relationships": [], "category_counts": {code_id: 0 for code_id in source["raised_code_ids"]}},
+        seed=4401,
+        commit="offline-fixture",
+        decision_mode="llm",
+        interrupt=False,
+    )
+    assert report["status"] == "completed"
+    sent = [
+        row for row in report["result"].prompt_log
+        if row.get("kind") == "axial_counterexample" and row.get("status") not in {"omitted", "not_sent", "refused"}
+    ]
+    assert sent
+    retries = [
+        row for row in report["result"].prompt_log
+        if row.get("statement_copy_retry") is True and row.get("status") not in {"omitted", "not_sent"}
+    ]
+    assert retries
+    assert report["preflight"]["original"]["counterexample_required_but_blocked"] == 18
+
+
+def test_an_interrupted_experiment_can_resume(tmp_path):
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    source, _quotes = _corpus()
+    history = tmp_path / "examined-history.json"
+    _history(history, [{"from_id": "s00", "to_id": "s01"}], [])
+    coder = _RejectingCoder()
+    frozen = json.loads(Path("tests/fixtures/exp_axial_w1_freeze.json").read_text(encoding="utf-8"))
+    saver = InMemorySaver()
+    common = dict(
+        history_path=history,
+        frozen_fingerprints=frozen,
+        baseline_core={"eligible_relationships": [], "category_counts": {code_id: 0 for code_id in source["raised_code_ids"]}},
+        seed=4401,
+        commit="offline-fixture",
+        decision_mode="human",
+        interrupt=True,
+        checkpointer=saver,
+        thread_id="exp-axial-w1-resume",
+    )
+    paused = exp_axial_w1(source, coder, **common)
+    assert paused["result"].interrupted is True
+    resumed = exp_axial_w1(
+        source,
+        coder,
+        resuming=True,
+        resume={"relationships": [{
+            "relationship_id": paused["result"].relationships[0]["relationship_id"],
+            "action": "reject",
+        }]},
+        **common,
+    )
+    assert resumed["result"].interrupted is True
+    finished = exp_axial_w1(
+        source,
+        coder,
+        resuming=True,
+        resume={"decision": "not_saturated", "rationale": "Another document could still add a code."},
+        **common,
+    )
+    assert finished["result"].interrupted is False

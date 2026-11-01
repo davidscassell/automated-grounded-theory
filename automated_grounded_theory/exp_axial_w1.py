@@ -63,9 +63,13 @@ FROZEN_TOKEN_PRICES = {
 }
 
 
+def _canonical(payload: Any) -> str:
+    """Same JSON encoding as a core match fingerprint."""
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
 def _sha(payload: Any) -> str:
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()
 
 
 def _pair_key(row: Mapping[str, Any] | Sequence[str]) -> tuple[str, str]:
@@ -77,38 +81,75 @@ def _pair_key(row: Mapping[str, Any] | Sequence[str]) -> tuple[str, str]:
     return tuple(sorted((left, right)))
 
 
-def policy_fingerprint() -> str:
-    """Eligibility and experiment policy. A change here rejects reuse."""
+def _package_repo() -> Path:
+    """The repository that contains this package, not the process working directory."""
+    return Path(__file__).resolve().parents[1]
+
+
+def _all_prompts() -> dict[str, str]:
+    from automated_grounded_theory.axial import _AXIAL_REVIEW_SYSTEM, _RELATION_REVIEW_INSTRUCTION
+    from automated_grounded_theory.decision_review import SYSTEM as DECISION_SYSTEM
+
+    prompts = {str(name): str(text) for name, text in _KIND_PROMPTS.items()}
+    prompts["axial_review_system"] = _AXIAL_REVIEW_SYSTEM
+    prompts["relation_review_instruction"] = _RELATION_REVIEW_INSTRUCTION
+    prompts["decision_review_system"] = DECISION_SYSTEM
+    return prompts
+
+
+def policy_fingerprint(model: Any = None) -> str:
+    """Eligibility, model, and prompts. A change here rejects reuse."""
     return _sha({
         "experiment": EXPERIMENT_ID,
         "policy_version": POLICY_VERSION,
         "pattern_min_cases": PATTERN_MIN_CASES,
         "one_document_one_respondent": False,
         "same_respondent_rule": "single_document_cooccurrence_1",
-        "lexical_rule": "lexical_cross_case",
+        "lexical_rule": LEXICAL_ELIGIBILITY_RULE,
         "evidence_order": ["same_passage", "same_respondent", "lexical_cross_case"],
+        "model": describe_model(model) if model is not None else "",
+        "prompts": _all_prompts(),
     })
 
 
-def proposal_request_fingerprint(from_id: str, to_id: str) -> str:
-    """The proposal request identity: the pair and the proposal prompt.
+def proposal_request_fingerprint(
+    from_id: str,
+    to_id: str,
+    *,
+    evidence: Sequence[Any] | None = None,
+    model: Any = None,
+    passage_ids: Sequence[str] | None = None,
+) -> str:
+    """Pair, evidence payload, model, and passage set.
 
-    Passage text is not part of the hash. A different prompt, or a different
-    pair, is a different request.
+    The evidence rows are the passages that would be sent. A different passage
+    set or a different model is a different request.
     """
     left, right = _pair_key({"from_id": from_id, "to_id": to_id})
+    rows = []
+    for item in evidence or []:
+        if isinstance(item, Mapping):
+            rows.append({
+                "passage_id": item.get("passage_id"),
+                "doc_id": item.get("doc_id"),
+                "text": item.get("text"),
+            })
+    rows.sort(key=lambda row: str(row.get("passage_id") or ""))
+    ids = sorted({str(item) for item in (passage_ids or []) if str(item)} | {str(row.get("passage_id") or "") for row in rows if row.get("passage_id")})
     return _sha({
         "experiment": EXPERIMENT_ID,
         "from_id": left,
         "to_id": right,
-        "prompt_sha256": hashlib.sha256(_KIND_PROMPTS["axial_proposal"].encode("utf-8")).hexdigest(),
+        "evidence": rows,
+        "model": describe_model(model) if model is not None else "",
+        "passage_ids": ids,
     })
 
 
 def _git_commit() -> str:
     try:
         return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
+            ["git", "-C", str(_package_repo()), "rev-parse", "HEAD"],
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()
@@ -116,30 +157,36 @@ def _git_commit() -> str:
         return ""
 
 
+def _as_book(codebook: Any) -> dict[str, dict]:
+    from automated_grounded_theory.axial import _book
+
+    return _book(codebook)
+
+
 def startup_fingerprint(source: Mapping[str, Any], model: Any, *, commit: str | None = None) -> dict[str, Any]:
     """Commit, export manifest, model config, prompts, and eligibility rules.
 
-    The manifest hashes ids only. Passage text is not in the fingerprint.
+    The export manifest is the axial evidence hash, which already accepts a
+    list codebook. Prompts include the review prompts. The commit is read
+    from this package's repository.
     """
-    codebook = source.get("codebook") if isinstance(source.get("codebook"), Mapping) else {}
-    passages = [row for row in (source.get("passages") or []) if isinstance(row, Mapping)]
-    segments = [row for row in (source.get("segments") or []) if isinstance(row, Mapping)]
+    from automated_grounded_theory.axial import _evidence_source_hash
+
+    book = _as_book(source.get("codebook"))
+    normalized = dict(source)
+    normalized["codebook"] = book
+    raised = [str(item) for item in (source.get("raised_code_ids") or (source.get("metadata") or {}).get("raised_code_ids") or [])]
     manifest = _sha({
-        "code_ids": sorted(str(item) for item in codebook),
-        "passage_ids": sorted(str(row.get("passage_id") or "") for row in passages),
-        "segments": sorted(
-            f"{row.get('code_id')}|{row.get('passage_id')}" for row in segments
-        ),
-    })
-    prompts = _sha({
-        name: _KIND_PROMPTS[name]
-        for name in ("axial_proposal", "axial_counterexample")
+        "evidence": _evidence_source_hash(normalized),
+        "raised_code_ids": sorted(raised),
+        "code_ids": sorted(book),
     })
     eligibility = _sha({
         "pattern_min_cases": PATTERN_MIN_CASES,
         "one_document_one_respondent": False,
         "policy_version": POLICY_VERSION,
         "experiment": EXPERIMENT_ID,
+        "lexical_rule": LEXICAL_ELIGIBILITY_RULE,
     })
     return {
         "commit": _git_commit() if commit is None else str(commit),
@@ -147,8 +194,12 @@ def startup_fingerprint(source: Mapping[str, Any], model: Any, *, commit: str | 
         "model_config": _sha({
             "model": describe_model(model),
             "settings": chat_model_settings(model),
+            "prices": {
+                "input_usd_per_million": FROZEN_TOKEN_PRICES["input_usd_per_million"],
+                "output_usd_per_million": FROZEN_TOKEN_PRICES["output_usd_per_million"],
+            },
         }),
-        "prompts": prompts,
+        "prompts": _sha(_all_prompts()),
         "eligibility_rules": eligibility,
     }
 
@@ -226,6 +277,12 @@ def _stage_max_output() -> dict[str, int]:
             "assessment": "not_saturated",
             "rationale": blob,
         },
+        "axial_core_review": {
+            "decision": "select",
+            "abstention_reason": "insufficient_evidence",
+            "core_id": "c" * 32,
+            "rationale": blob,
+        },
     }
     payloads["statement_copy_retry"] = payloads["axial_proposal"]
     return {name: estimate_tokens(json.dumps(body, ensure_ascii=False)) for name, body in payloads.items()}
@@ -249,9 +306,10 @@ def workload_calls(same: int, lexical: int) -> dict[str, Any]:
     token_room = max(0, (CODING_TOKENS // REQUEST_INPUT_CAP) - pairs - retries) if REQUEST_INPUT_CAP else 0
     counter_fit = min(counter_required, call_room, token_room)
     blocked = max(0, counter_required - counter_fit)
-    relation_token_room = CODING_TOKENS // REQUEST_INPUT_CAP if REQUEST_INPUT_CAP else 0
-    relation_fit = min(relation, relation_token_room)
-    relation_shortfall = max(0, relation - relation_fit)
+    # Relation review is not part of the coding ceiling. Its allowance is the
+    # row count, so a fat row still has its own call.
+    relation_fit = relation
+    relation_shortfall = 0
     return {
         "axial_proposal": pairs,
         "statement_copy_retry": retries,
@@ -271,6 +329,7 @@ def preflight_workload(
     *,
     token_prices: Mapping[str, Any] | None = None,
     per_call_input: int = REQUEST_INPUT_CAP,
+    core_candidates: int = 0,
 ) -> dict[str, Any]:
     """Worst case against the coding ceiling and the frozen dollar cap.
 
@@ -280,12 +339,16 @@ def preflight_workload(
     """
     del token_prices
     calls = workload_calls(same, lexical)
+    core_calls = max(0, int(core_candidates) - 1) if int(core_candidates) else 0
+    calls = dict(calls)
+    calls["axial_core_review"] = core_calls
     sent = {
         "axial_proposal": int(calls["axial_proposal"]),
         "statement_copy_retry": int(calls["statement_copy_retry"]),
         "axial_counterexample": int(calls["axial_counterexample"]),
         "axial_relation_review": int(calls["axial_relation_review"]),
         "axial_saturation_review": int(calls["axial_saturation_review"]),
+        "axial_core_review": core_calls,
     }
     per_call = max(0, int(per_call_input))
     input_tokens = {name: count * per_call for name, count in sent.items()}
@@ -347,8 +410,10 @@ def preflight_workload(
             "Worst case prices every sent call at the 6000-token input cap and at that "
             "stage's max output. Rates are the frozen model config: $1.25 per million "
             "input tokens and $2.50 per million output tokens. A counterexample that "
-            "does not fit is required_but_blocked. Relation review is one call per row. "
-            "A shortfall there reduces the draw. The run does not leave a row unreviewed."
+            "does not fit the coding ceiling is required_but_blocked. Relation review "
+            "is one call per row and is not limited by the coding ceiling. Core, when "
+            "priced, is one match per candidate after the first. The call total can "
+            "exceed the coding-only ceiling because review and core are separate."
         ),
     }
 
@@ -357,6 +422,7 @@ def reduce_scope(
     token_prices: Mapping[str, Any] | None = None,
     *,
     per_call_input: int = REQUEST_INPUT_CAP,
+    core_candidates: int = 0,
 ) -> dict[str, Any]:
     """Shrink the 16+8 draw by four pairs until the worst case fits.
 
@@ -364,13 +430,17 @@ def reduce_scope(
     original 16+8 preflight is kept either way.
     """
     same, lexical = DRAW_SAME_RESPONDENT, DRAW_LEXICAL
-    original = preflight_workload(same, lexical, token_prices=token_prices, per_call_input=per_call_input)
+    original = preflight_workload(
+        same, lexical, token_prices=token_prices, per_call_input=per_call_input, core_candidates=core_candidates,
+    )
     steps = [original]
     current = original
     while current["fits"] is False and (same + lexical) >= REDUCE_STEP:
         total = same + lexical - REDUCE_STEP
         same, lexical = split_preserving_ratio(total)
-        current = preflight_workload(same, lexical, token_prices=token_prices, per_call_input=per_call_input)
+        current = preflight_workload(
+            same, lexical, token_prices=token_prices, per_call_input=per_call_input, core_candidates=core_candidates,
+        )
         steps.append(current)
         if total == 0:
             break
@@ -599,33 +669,52 @@ def _take_prefix(draw: Mapping[str, Any], same: int, lexical: int) -> list[dict[
     return same_rows + lexical_rows
 
 
+def _content_identity(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Stable relationship identity. Per-run relationship ids are not part of it."""
+    return {
+        "from_id": str(row.get("from_id") or ""),
+        "to_id": str(row.get("to_id") or ""),
+        "statement": str(row.get("statement") or ""),
+        "quote": str(row.get("quote") or ""),
+        "evidence_tier": row.get("evidence_tier"),
+        "downstream_eligible": row.get("downstream_eligible") is True,
+        "paradigm_role": str(row.get("paradigm_role") or ""),
+        "document_count": row.get("document_count"),
+    }
+
+
 def core_snapshot(relationships: Sequence[Any], codebook: Mapping[str, Any] | None) -> dict[str, Any]:
-    """The eligible set and the per-category counts core selection uses."""
+    """Eligible content identities and the per-category counts core selection uses."""
     rows = [row for row in relationships if isinstance(row, Mapping) and not row.get("synthetic")]
-    eligible = sorted(
-        str(row.get("relationship_id") or "")
-        for row in rows
-        if row.get("downstream_eligible") is True and row.get("relationship_id")
-    )
-    codes = [str(code_id) for code_id in (codebook or {})]
+    eligible = [_content_identity(row) for row in rows if row.get("downstream_eligible") is True]
+    eligible.sort(key=_canonical)
+    book = _as_book(codebook)
     counts = {}
-    for code_id in codes:
-        counts[code_id] = sum(
+    for code_id in book:
+        counts[str(code_id)] = sum(
             1
             for row in rows
             if row.get("downstream_eligible") is True
-            and code_id in {str(row.get("from_id") or ""), str(row.get("to_id") or "")}
+            and str(code_id) in {str(row.get("from_id") or ""), str(row.get("to_id") or "")}
         )
-    return {"eligible_ids": eligible, "category_counts": counts}
+    return {"eligible_relationships": eligible, "category_counts": counts}
 
 
 def core_differs(current: Mapping[str, Any], baseline: Mapping[str, Any] | None) -> bool | None:
-    """Null when no baseline was supplied. True when either core input changed."""
+    """Null when no baseline was supplied. True when content or counts changed.
+
+    ``eligible_ids`` is ignored. Identity is endpoints, assertion content, and
+    the eligibility inputs on the row.
+    """
     if not isinstance(baseline, Mapping):
         return None
-    baseline_ids = [str(item) for item in (baseline.get("eligible_ids") or [])]
-    current_ids = [str(item) for item in (current.get("eligible_ids") or [])]
-    if baseline_ids != current_ids:
+    baseline_rows = baseline.get("eligible_relationships")
+    current_rows = current.get("eligible_relationships")
+    if not isinstance(baseline_rows, list):
+        baseline_rows = []
+    if not isinstance(current_rows, list):
+        current_rows = []
+    if [_canonical(row) for row in baseline_rows] != [_canonical(row) for row in current_rows]:
         return True
     base_counts = baseline.get("category_counts") if isinstance(baseline.get("category_counts"), Mapping) else {}
     current_counts = current.get("category_counts") if isinstance(current.get("category_counts"), Mapping) else {}
@@ -668,6 +757,7 @@ def build_metrics(
                 original_cases[key] = {str(item) for item in row["original_case_ids"] if str(item)}
     classes = (CLASS_SAME, CLASS_LEXICAL)
     examined = {name: 0 for name in classes}
+    seen_pairs: set[tuple[str, str]] = set()
     grounded = {name: 0 for name in classes}
     additional = {name: 0 for name in classes}
     additional_known = {name: False for name in classes}
@@ -677,8 +767,9 @@ def build_metrics(
             continue
         key = _pair_key(row)
         evidence_class = by_pair.get(key)
-        if evidence_class not in examined:
+        if evidence_class not in examined or key in seen_pairs:
             continue
+        seen_pairs.add(key)
         examined[evidence_class] += 1
         if row.get("downstream_eligible") is True:
             grounded[evidence_class] += 1
@@ -816,6 +907,70 @@ def apply_experiment_procedure(procedure: dict[str, Any], spec: Mapping[str, Any
     return procedure
 
 
+def _worst_case_call_cost(stage: str, input_estimate: int) -> float:
+    in_rate, out_rate = _prices()
+    output = int(STAGE_MAX_OUTPUT.get(stage) or STAGE_MAX_OUTPUT["axial_proposal"])
+    return max(0, int(input_estimate)) / 1_000_000 * in_rate + output / 1_000_000 * out_rate
+
+
+def _experiment_spec(metadata: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    procedure = metadata.get("procedure") if isinstance(metadata.get("procedure"), Mapping) else {}
+    spec = procedure.get("exp_axial_w1")
+    if isinstance(spec, Mapping) and spec.get("enabled"):
+        return spec
+    return None
+
+
+def dispatch_spend_gate(metadata: Mapping[str, Any], stage: str, input_estimate: int) -> str | None:
+    """Stop before a call when the kill guard or the hard cap would be crossed.
+
+    This is the one check for every experiment stage. Known spend uses reported
+    tokens. Unknown or timed-out usage adds that call's worst case to the
+    possible total and leaves the measured dollars unknown.
+    """
+    if _experiment_spec(metadata) is None:
+        return None
+    possible = metadata.get("exp_possible_dollars")
+    possible_n = float(possible) if isinstance(possible, (int, float)) and not isinstance(possible, bool) else 0.0
+    known = metadata.get("exp_dollars_spent")
+    known_n = float(known) if isinstance(known, (int, float)) and not isinstance(known, bool) else 0.0
+    possible_n = max(possible_n, known_n)
+    nxt = _worst_case_call_cost(stage, input_estimate)
+    if possible_n + nxt > HARD_CAP_USD:
+        return "hard_cap"
+    if possible_n + nxt > KILL_GUARD_USD:
+        return "kill_guard"
+    return None
+
+
+def account_call_spend(
+    metadata: dict[str, Any],
+    stage: str,
+    usage: Mapping[str, Any] | None,
+    *,
+    known: bool,
+    timed_out: bool = False,
+    input_estimate: int = REQUEST_INPUT_CAP,
+) -> None:
+    """Record a sent call. A timeout is possible spend. Missing usage stays unknown."""
+    if _experiment_spec(metadata) is None:
+        return
+    possible = metadata.get("exp_possible_dollars")
+    possible_n = float(possible) if isinstance(possible, (int, float)) and not isinstance(possible, bool) else 0.0
+    if timed_out or not known:
+        metadata["exp_spend_unknown"] = True
+        metadata["exp_possible_dollars"] = round(possible_n + _worst_case_call_cost(stage, input_estimate), 6)
+        return
+    in_rate, out_rate = _prices()
+    spent = metadata.get("exp_dollars_spent")
+    spent_n = float(spent) if isinstance(spent, (int, float)) and not isinstance(spent, bool) else 0.0
+    input_n = int((usage or {}).get("input_tokens") or 0)
+    output_n = int((usage or {}).get("output_tokens") or 0)
+    added = input_n / 1_000_000 * in_rate + output_n / 1_000_000 * out_rate
+    metadata["exp_dollars_spent"] = round(spent_n + added, 6)
+    metadata["exp_possible_dollars"] = round(possible_n + added, 6)
+
+
 def proposal_gate(metadata: Mapping[str, Any], payload: Mapping[str, Any], estimate: int) -> dict[str, Any] | None:
     """Reuse a matching proposal, or refuse when the kill guard would trip.
 
@@ -829,8 +984,16 @@ def proposal_gate(metadata: Mapping[str, Any], payload: Mapping[str, Any], estim
     if len(pairs) != 1:
         return None
     pair = pairs[0]
-    request_fp = proposal_request_fingerprint(str(pair.get("from_id") or ""), str(pair.get("to_id") or ""))
-    policy_fp = policy_fingerprint()
+    passages = [row for row in (payload.get("passages") or []) if isinstance(row, Mapping)]
+    model_name = str(spec.get("model") or "")
+    request_fp = proposal_request_fingerprint(
+        str(pair.get("from_id") or ""),
+        str(pair.get("to_id") or ""),
+        evidence=passages,
+        model=model_name,
+        passage_ids=[str(row.get("passage_id") or "") for row in passages],
+    )
+    policy_fp = str(spec.get("policy_fingerprint") or policy_fingerprint(model_name))
     ledger = metadata.get("exp_axial_w1_reuse_ledger")
     if not isinstance(ledger, list):
         ledger = []
@@ -851,15 +1014,24 @@ def proposal_gate(metadata: Mapping[str, Any], payload: Mapping[str, Any], estim
                 "request_fingerprint": request_fp,
                 "policy_fingerprint": policy_fp,
             })
-            draft = dict(record.get("relationship") or {})
-            draft.setdefault("from_id", pair.get("from_id"))
-            draft.setdefault("to_id", pair.get("to_id"))
+            stored = record.get("relationships")
+            if not isinstance(stored, list):
+                one = record.get("relationship")
+                stored = [one] if isinstance(one, Mapping) else []
+            drafts = []
+            for item in stored:
+                if not isinstance(item, Mapping):
+                    continue
+                draft = dict(item)
+                draft.setdefault("from_id", pair.get("from_id"))
+                draft.setdefault("to_id", pair.get("to_id"))
+                drafts.append(draft)
             return {
                 "refused": False,
                 "unparsed": False,
                 "repair_pending": False,
                 "reason": "",
-                "parsed": {"relationships": [draft], "nothing_to_propose": False},
+                "parsed": {"relationships": drafts, "nothing_to_propose": not drafts},
                 "usage": {},
                 "sent": [],
                 "audits": [{
@@ -867,7 +1039,7 @@ def proposal_gate(metadata: Mapping[str, Any], payload: Mapping[str, Any], estim
                     "status": "reused",
                     "reason": "request_and_policy_fingerprints_match",
                     "messages": [],
-                    "parsed": {"relationships": [draft]},
+                    "parsed": {"relationships": drafts},
                     "usage": {},
                     "estimated_input_tokens": 0,
                     "pairs": [_pair_record(pair)],
@@ -881,28 +1053,23 @@ def proposal_gate(metadata: Mapping[str, Any], payload: Mapping[str, Any], estim
             "policy_match": policy_ok,
             "request_fingerprint": request_fp,
             "policy_fingerprint": policy_fp,
+            "passage_ids": [str(row.get("passage_id") or "") for row in passages],
         })
         break
-    in_rate, out_rate = _prices()
-    spent = metadata.get("exp_dollars_spent")
-    spent_n = float(spent) if isinstance(spent, (int, float)) and not isinstance(spent, bool) else 0.0
-    next_cost = (
-        max(0, int(estimate)) / 1_000_000 * in_rate
-        + STAGE_MAX_OUTPUT["axial_proposal"] / 1_000_000 * out_rate
-    )
-    if spent_n + next_cost > KILL_GUARD_USD:
+    stop = dispatch_spend_gate(metadata, "axial_proposal", estimate)
+    if stop:
         return {
             "refused": True,
             "unparsed": False,
             "repair_pending": False,
-            "reason": "kill_guard",
+            "reason": stop,
             "parsed": {},
             "usage": {},
             "sent": [],
             "audits": [{
                 "kind": "axial_proposal",
                 "status": "not_sent",
-                "reason": "kill_guard",
+                "reason": stop,
                 "messages": [],
                 "parsed": {},
                 "usage": {},
@@ -917,22 +1084,11 @@ def _pair_record(pair: Mapping[str, Any]) -> dict[str, str]:
     return {"from_id": key[0], "to_id": key[1]}
 
 
-def note_provider_spend(metadata: dict[str, Any], usage: Mapping[str, Any] | None) -> None:
-    procedure = metadata.get("procedure") if isinstance(metadata.get("procedure"), Mapping) else {}
-    spec = procedure.get("exp_axial_w1")
-    if not isinstance(spec, Mapping) or not spec.get("enabled"):
-        return
-    in_rate, out_rate = _prices()
-    if not isinstance(usage, Mapping) or usage.get("input_tokens") is None:
-        return
-    output = usage.get("output_tokens")
-    output_n = int(output) if isinstance(output, (int, float)) and not isinstance(output, bool) else 0
-    spent = metadata.get("exp_dollars_spent")
-    spent_n = float(spent) if isinstance(spent, (int, float)) and not isinstance(spent, bool) else 0.0
-    metadata["exp_dollars_spent"] = round(
-        spent_n + int(usage["input_tokens"]) / 1_000_000 * in_rate + output_n / 1_000_000 * out_rate,
-        6,
+def note_provider_spend(metadata: dict[str, Any], usage: Mapping[str, Any] | None, *, stage: str = "axial_proposal") -> None:
+    known = isinstance(usage, Mapping) and (
+        usage.get("input_tokens") not in (None, 0) or usage.get("output_tokens") not in (None, 0)
     )
+    account_call_spend(metadata, stage, usage, known=known)
 
 
 def _allowances_for(same: int, lexical: int) -> dict[str, int]:
@@ -944,6 +1100,19 @@ def _allowances_for(same: int, lexical: int) -> dict[str, int]:
         "axial_relation_review": int(calls["axial_relation_review_required"]),
         "axial_saturation_review": int(calls["axial_saturation_review"]),
     }
+
+
+def _sent_call_count(prompt_log: Sequence[Any]) -> int:
+    skip = {"omitted", "deferred", "refused", "not_sent", "reused"}
+    count = 0
+    for row in prompt_log:
+        if not isinstance(row, Mapping):
+            continue
+        if str(row.get("status") or "") in skip:
+            continue
+        if row.get("kind") or row.get("checkpoint"):
+            count += 1
+    return count
 
 
 def exp_axial_w1(
@@ -974,26 +1143,49 @@ def exp_axial_w1(
             "exp-axial-w1 refused to start. Frozen fingerprints differ: " + ", ".join(mismatched)
         )
     history = load_examined_history(history_path)
+    from automated_grounded_theory.relationship_tiers import selection_restricts_to_raised
+
+    book = _as_book(source.get("codebook"))
+    meta = source.get("metadata") if isinstance(source.get("metadata"), Mapping) else {}
+    if source.get("raised_code_ids") is not None and "raised_code_ids" not in meta:
+        meta = dict(meta)
+        meta["raised_code_ids"] = list(source.get("raised_code_ids") or [])
+    category_ids = list(book)
+    restricted = selection_restricts_to_raised(meta)
+    if restricted:
+        raised = {str(item) for item in (meta.get("raised_code_ids") or [])}
+        category_ids = [item for item in category_ids if item in raised]
     evidence = classify_pair_evidence(
-        list((source.get("codebook") or {}).keys()),
+        category_ids,
         source.get("passages") or [],
         source.get("segments") or [],
-        source.get("codebook") if isinstance(source.get("codebook"), Mapping) else {},
+        book,
         pattern_min_cases=PATTERN_MIN_CASES,
     )
+    universe_n = len(category_ids)
     draw = select_unexamined_draw(evidence, history["examined_pairs"], seed=int(seed))
-    reduction = reduce_scope(token_prices)
+    reduction = reduce_scope(token_prices, core_candidates=universe_n)
     report = {
         "experiment": EXPERIMENT_ID,
         "seed": int(seed),
         "history_path": history["path"],
         "historical_expenditure": history["historical_expenditure"],
         "preflight": reduction,
+        "universe": {
+            "codebook_codes": len(book),
+            "raised_codes": universe_n if restricted else None,
+            "restricted_to_raised": restricted,
+            "pair_universe": universe_n * (universe_n - 1) // 2,
+            "same_respondent_unexamined": (draw.get("available") or {}).get(CLASS_SAME),
+            "lexical_unexamined": (draw.get("available") or {}).get(CLASS_LEXICAL),
+            "note": "pair_universe is raised_codes * (raised_codes - 1) / 2 when the selection limits the pool, otherwise the codebook size.",
+        },
         "draw": {
             key: draw[key]
             for key in ("status", "reason", "shortfall", "available", "seed", "lexical_eligibility")
             if key in draw
         },
+        "draw_method": "direct_seeded_draw",
         "new_spend": {"calls": None, "input_tokens": None, "dollars": None, "elapsed_seconds": None},
     }
     if draw["status"] != "selected":
@@ -1006,10 +1198,33 @@ def exp_axial_w1(
         report["reason"] = "workload_does_not_fit"
         report["model_calls"] = 0
         return report
-    chosen = _with_original_cases(
-        _take_prefix(draw, scope["same_respondent"], scope["lexical_cross_case"]),
-        _endpoint_cases(source),
+    direct = select_unexamined_draw(
+        evidence,
+        history["examined_pairs"],
+        seed=int(seed),
+        same_count=int(scope["same_respondent"]),
+        lexical_count=int(scope["lexical_cross_case"]),
     )
+    if direct["status"] != "selected":
+        report["status"] = "stopped"
+        report["reason"] = direct.get("reason") or "class_shortfall"
+        report["draw"] = {
+            key: direct[key]
+            for key in ("status", "reason", "shortfall", "available", "seed", "lexical_eligibility")
+            if key in direct
+        }
+        report["model_calls"] = 0
+        return report
+    chosen = _with_original_cases(list(direct.get("round") or []), _endpoint_cases({**source, "codebook": book}))
+    report["executed_draw"] = {
+        "method": "direct_seeded_draw",
+        "seed": int(seed),
+        "lexical_eligibility": direct.get("lexical_eligibility"),
+        "note": (
+            "The executed round is a seeded sample of the fitting scope. "
+            "It is not a prefix of the 16+8 sample."
+        ),
+    }
     allowances = _allowances_for(scope["same_respondent"], scope["lexical_cross_case"])
     spec = {
         "id": EXPERIMENT_ID,
@@ -1018,6 +1233,8 @@ def exp_axial_w1(
         "round": chosen,
         "allowances": allowances,
         "reuse": history["reuse"],
+        "model": describe_model(model),
+        "policy_fingerprint": policy_fingerprint(model),
         "token_prices": dict(FROZEN_TOKEN_PRICES),
         "hard_cap_usd": HARD_CAP_USD,
         "kill_guard_usd": KILL_GUARD_USD,
@@ -1116,11 +1333,11 @@ def exp_axial_w1(
         "core_snapshot": snapshot,
         "result": result,
         "new_spend": {
-            "calls": metrics["overall"]["new_pairs_examined"],
+            "calls": _sent_call_count(list(result.prompt_log or [])),
             "input_tokens": new_tokens,
-            "dollars": metrics["overall"]["dollars"],
+            "dollars": None if result.metadata.get("exp_spend_unknown") else result.metadata.get("exp_dollars_spent"),
             "elapsed_seconds": metrics["overall"]["elapsed_seconds"],
-            "note": "New spend does not include historical_expenditure.",
+            "note": "calls counts provider calls sent. It is not the pair count. Historical expenditure is separate. Unknown usage leaves dollars null.",
         },
     })
     return report

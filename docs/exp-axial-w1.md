@@ -6,15 +6,15 @@ Status: opt-in. Package `policy_version` stays `0.9.44`. The default axial plann
 
 ## Draw
 
-The draw is 16 previously unexamined same-respondent pairs whose document co-occurrence is 1, plus 8 previously unexamined lexical cross-case pairs. The sample is `random.Random(seed)` over each class in that order. The default seed is 4401 and the seed is stored. If either class has fewer pairs that meet its rule, the run stops and names the shortfall. It does not take pairs from the other class.
+The draw uses the same category universe as axial pair planning. When a finished focused selection limits later stages to raised codes, both classes are drawn from those codes only. The codebook may be the list `load_focused_export` returns. A list is not treated as empty. `pair_universe` is `n * (n - 1) / 2` for that n. The sample is `random.Random(seed)` over each class. The default seed is 4401. The executed round is a direct seeded draw of the scope that fits the caps. It is not a prefix of the 16+8 sample. If either class has fewer pairs that meet its rule, the run stops and names the shortfall. It does not take pairs from the other class.
 
 ## History and reuse
 
-The examined-pair file is a local path the caller passes. The package does not write that file and it is not part of the repository. Prior outcomes in that file are an exclusion list. A stored proposal is applied only when its request fingerprint and its policy fingerprint both match the pair and the current prompt and eligibility policy. A mismatch is recorded on the reuse ledger and the pair is sent. Request fingerprints cover the pair and the axial proposal prompt. Policy fingerprints cover `pattern_min_cases`, `one_document_one_respondent`, `policy_version`, and this experiment id. Prior spend is `historical_expenditure`. It is not added to this run's tokens or dollars.
+The examined-pair file is a local path the caller passes. The package does not write that file and it is not part of the repository. Prior outcomes in that file are an exclusion list. A stored proposal is applied only when its request fingerprint and its policy fingerprint both match. The request fingerprint covers the evidence payload, the model, and the passage set. The policy fingerprint covers the model and every prompt, including review. A match keeps every relationship on the stored proposal. A mismatch is recorded on the reuse ledger and the pair is sent. Prior spend is `historical_expenditure`. It is not added to this run. `new_spend.calls` counts calls sent, not pairs.
 
 ## Allowances
 
-Proposals, quote-copy retries, counterexamples, relation review, and saturation review each have their own allowance. Calls are not moved between them. Retries are a shared pool of 6, not one retry per proposal. For this experiment the coding ceiling is 36 calls and 216,000 input tokens. The package defaults stay 8 and 24,000. Worst case is one proposal per pair, 6 retries, one counterexample per row, one relation-review call per row, and 1 saturation-review call. A counterexample that does not fit the coding ceiling is `required_but_blocked`. Relation review is sized to the row count. A shortfall reduces the draw. The run does not finish with a row left unreviewed.
+Proposals, quote-copy retries, counterexamples, relation review, and saturation review each have their own allowance. Calls are not moved between them. Retries are a shared pool of 6, not one retry per proposal. For this experiment the coding ceiling is 36 calls and 216,000 input tokens. It bounds proposals, retries, and counterexamples. Relation review is not under that ceiling. Its allowance is one call per row. The package defaults stay 8 and 24,000. Worst case is one proposal per pair, 6 retries, one counterexample per row, one relation-review call per row, and 1 saturation-review call. A counterexample that does not fit the coding ceiling is `required_but_blocked`. The run does not finish with a row left unreviewed. The 8+4 workload is 30 coding calls and 180,000 coding input tokens, inside that ceiling. The 43-call and 258,000-input-token total for 8+4 includes relation review and saturation, so it is larger than the coding-only ceiling on purpose. Core, priced when the raised set is known, is additional.
 
 ## Lexical eligibility
 
@@ -26,11 +26,11 @@ Prices are the frozen model config: $1.25 per million input tokens and $2.50 per
 
 The 16+8 worst case does not fit. Coding calls that can be sent are 36 (24 proposals, 6 retries, and 6 of the 24 required counterexamples). The other 18 counterexamples are `required_but_blocked`. Relation review is 24 calls. With saturation, that is 61 sent calls, 366,000 input tokens, 55,567 output tokens, and $0.596417. That is under the $0.60 hard cap and over the counterexample fit, so the draw still shrinks.
 
-The hard cap is $0.60. The runtime kill guard is $0.55. The draw shrinks by 4 pairs and the 2:1 class ratio is kept as nearly as the integer split allows. The reduced scope is recorded before the run. The scope that fits is 8 same-respondent pairs and 4 lexical pairs: 12 proposals, 6 retries, 12 counterexamples, 12 relation reviews, and 1 saturation review. That is 43 calls, 258,000 input tokens, 37,681 output tokens, and $0.416702. No counterexample is `required_but_blocked` and the relation-review shortfall is 0.
+The hard cap is $0.60. The kill guard is $0.55. Both apply at the common dispatch, before a proposal, retry, counterexample, relation review, saturation review, or core call. Known input and output tokens are priced. A timeout counts as that stage's worst-case possible spend. Usage the provider did not report stays unknown, and the measured dollar figure stays null. The draw shrinks by 4 pairs until the worst case fits. The scope that fits without core is 8 same-respondent pairs and 4 lexical pairs: 12 proposals, 6 retries, 12 counterexamples, 12 relation reviews, and 1 saturation review. That is 43 calls, 258,000 input tokens, 37,681 output tokens, and $0.416702. No counterexample is `required_but_blocked`. Core calls, one per candidate after the first, are added when the raised-set size is known.
 
 ## Core
 
-Core selection stays deferred when the downstream-eligible relationship ids and the per-category eligible counts match the baseline the caller supplies. That deferral is recorded at $0. A missing baseline leaves the dollar figure null and does not run core. A difference runs core selection and is not described as deferred.
+Core selection stays deferred when the eligible relationships match the baseline by content, not by per-run id: endpoints, statement, quote, tier, eligibility, role, and document count, plus the per-category eligible counts. That deferral is recorded at $0. A missing baseline leaves the dollar figure null and does not run core. A difference runs core selection, and that call is under the same cap and kill guard.
 
 ## Metrics
 
@@ -45,4 +45,4 @@ Each figure is null when it was not computed. The report breaks these out for sa
 
 ## Startup
 
-The run refuses to start when the commit, the export manifest, the model config, the prompts, or the eligibility rules differ from the frozen fingerprints. The manifest hashes code, passage, and segment ids. It does not hash passage text.
+The run refuses to start when the commit, the export manifest, the model config, the prompts, or the eligibility rules differ from the frozen fingerprints. The manifest uses the axial evidence hash, so a list codebook is read as codes rather than as an empty mapping. Prompts include proposal, counterexample, memo, storyline, and review. The commit is `git rev-parse HEAD` in this package's repository, not the process working directory.

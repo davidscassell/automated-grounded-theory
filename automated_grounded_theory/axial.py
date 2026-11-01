@@ -4774,6 +4774,30 @@ async def _structured_call(
     """
     audits: list[dict[str, Any]] = []
     origin = repairs_kind or (None if kind == "schema_repair" else kind)
+    guard_stage = str(origin or kind or stage)
+    from automated_grounded_theory.exp_axial_w1 import account_call_spend, dispatch_spend_gate
+
+    guard_estimate = request_input_tokens(messages, schema) if messages else 0
+    blocked = dispatch_spend_gate(metadata, guard_stage, guard_estimate)
+    if blocked:
+        return {
+            "refused": True,
+            "unparsed": False,
+            "repair_pending": False,
+            "reason": blocked,
+            "parsed": {},
+            "usage": {},
+            "sent": list(messages),
+            "audits": [{
+                "kind": kind,
+                "status": "not_sent",
+                "reason": blocked,
+                "messages": list(messages),
+                "parsed": {},
+                "usage": {},
+                "estimated_input_tokens": guard_estimate,
+            }],
+        }
     try:
         (parsed, usage), sent = await ainvoke_structured(
             runtime.coder,
@@ -4789,6 +4813,11 @@ async def _structured_call(
             allowance_stage=stage,
             call_audits=audits,
         )
+    except TimeoutError:
+        account_call_spend(
+            metadata, guard_stage, None, known=False, timed_out=True, input_estimate=guard_estimate,
+        )
+        raise
     except AllowanceExhausted as exc:
         _sync_allowance(metadata, runtime)
         metadata["axial_stop"] = exc.reason
@@ -4806,6 +4835,10 @@ async def _structured_call(
     _sync_allowance(metadata, runtime)
     _account_responses(metadata, audits)
     _stamp_repair_stage(audits, origin)
+    known_usage = isinstance(usage, Mapping) and (
+        int(usage.get("input_tokens") or 0) > 0 or int(usage.get("output_tokens") or 0) > 0
+    )
+    account_call_spend(metadata, guard_stage, usage if isinstance(usage, Mapping) else None, known=known_usage)
     repair_pending = bool(isinstance(parsed, Mapping) and parsed.get("needs_repair"))
     unparsed = bool(isinstance(parsed, Mapping) and parsed.get("_agt_unparsed")) and not repair_pending
     if unparsed:
@@ -7225,7 +7258,8 @@ def _counterexample_node(runtime: AxialRuntime):
         allowance = int(procedure.get("counterexample_calls") or 0)
         batch = max(1, int((metadata.get("performance") or {}).get("batch_size") or 1))
         slots = allowance * batch
-        if _multi_document_rows_open(metadata) and not _hold_is(metadata, "axial_counterexample"):
+        experiment_on = isinstance(procedure.get("exp_axial_w1"), Mapping) and procedure["exp_axial_w1"].get("enabled")
+        if _multi_document_rows_open(metadata) and not _hold_is(metadata, "axial_counterexample") and not experiment_on:
             _assign_multi_document_statuses(metadata, close=False)
             if _multi_document_rows_open(metadata) and allowance > 0 and not metadata.get("counterexample_reallocation_used"):
                 returned_calls, allowance_fit = _permit_reallocated_proposals(
@@ -12550,6 +12584,14 @@ class AxialDecisionReviewer:
             metadata["decision_stop"] = stop
             audit.update(status="omitted", reason=stop, needs_review=True, flagged=True)
             return None, audit
+        from automated_grounded_theory.exp_axial_w1 import account_call_spend, dispatch_spend_gate
+
+        guard_stage = str(checkpoint or "decision_review")
+        blocked = dispatch_spend_gate(metadata, guard_stage, estimate)
+        if blocked:
+            metadata["decision_stop"] = blocked
+            audit.update(status="not_sent", reason=blocked, needs_review=True, flagged=True)
+            return None, audit
         calls = int(metadata.get("decision_calls_used", 0))
         tokens = int(metadata.get("axial_tokens_estimated") or metadata.get("decision_tokens_used") or 0)
         shared = getattr(self.limiter, "provider_allowance", None)
@@ -12568,6 +12610,8 @@ class AxialDecisionReviewer:
                 allowance_stage=stage,
             )
             audit["usage"] = usage_from_result(response)
+            known_usage = int(audit["usage"].get("input_tokens") or 0) > 0 or int(audit["usage"].get("output_tokens") or 0) > 0
+            account_call_spend(metadata, guard_stage, audit["usage"], known=known_usage, input_estimate=estimate)
             raw = response.get("raw") if isinstance(response, dict) else None
             audit["raw_response"] = str(getattr(raw, "content", ""))
             parsed, _usage = parse_structured(response, schema)
@@ -12587,6 +12631,9 @@ class AxialDecisionReviewer:
             else:
                 metadata["decision_tokens_used"] = tokens + estimate
             return parsed, audit
+        except TimeoutError:
+            account_call_spend(metadata, guard_stage, None, known=False, timed_out=True, input_estimate=estimate)
+            raise
         except AllowanceExhausted as exc:
             metadata["decision_stop"] = exc.reason
             audit.update(status="omitted", reason=exc.reason, needs_review=True, flagged=True)
