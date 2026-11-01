@@ -26,6 +26,8 @@ from automated_grounded_theory.axial import (
     selective_code,
 )
 from automated_grounded_theory.backends import chat_model_settings, describe_model
+from automated_grounded_theory.batching import estimate_tokens
+from automated_grounded_theory.evaluation_plan import INPUT_USD_PER_MILLION, OUTPUT_USD_PER_MILLION
 from automated_grounded_theory.records import POLICY_VERSION
 from automated_grounded_theory.relationship_tiers import PATTERN_MIN_CASES, classify_pair_evidence
 
@@ -36,14 +38,29 @@ DEFAULT_SEED = 4401
 CODING_CALLS = 36
 CODING_TOKENS = 216_000
 REQUEST_INPUT_CAP = 6000
-COUNTEREXAMPLE_CALLS = 4
-RELATION_REVIEW_CALLS = 4
+SHARED_RETRY_CALLS = 6
 SATURATION_REVIEW_CALLS = 1
 HARD_CAP_USD = 0.60
 KILL_GUARD_USD = 0.55
 REDUCE_STEP = 4
 CLASS_SAME = "same_respondent"
 CLASS_LEXICAL = "lexical_cross_case"
+# Quotes and rationales in review payloads are already cut at 800 characters.
+FIELD_CHAR_CAP = 800
+LEXICAL_ELIGIBILITY_RULE = "lexical_cross_case_v1"
+LEXICAL_ELIGIBILITY_STATEMENT = (
+    "A lexical pair is eligible for this draw when it is absent from the examined-pair "
+    "history and classify_pair_evidence places it in lexical_cross_case. That class requires "
+    "a passage whose respondent is not an endpoint case and whose text contains at least two "
+    "distinctive stems of each endpoint. pattern_min_cases does not admit or exclude the class. "
+    "It still governs whether a finished relationship is downstream-eligible."
+)
+FROZEN_TOKEN_PRICES = {
+    "input_usd_per_million": INPUT_USD_PER_MILLION,
+    "output_usd_per_million": OUTPUT_USD_PER_MILLION,
+    "model": "grok-4.20-0309-non-reasoning",
+    "source": "evaluation_plan.LIVE_PLAN prices",
+}
 
 
 def _sha(payload: Any) -> str:
@@ -159,30 +176,91 @@ def split_preserving_ratio(total: int) -> tuple[int, int]:
     return same, lexical
 
 
-def _prices(token_prices: Mapping[str, Any] | None) -> tuple[float | None, float | None]:
-    if not isinstance(token_prices, Mapping):
-        return None, None
-    def _rate(name: str) -> float | None:
-        value = token_prices.get(name)
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return None
-        return float(value)
-    return _rate("input_usd_per_million"), _rate("output_usd_per_million")
+def _prices(token_prices: Mapping[str, Any] | None = None) -> tuple[float, float]:
+    """Frozen model rates. A caller price does not replace them."""
+    del token_prices
+    return float(FROZEN_TOKEN_PRICES["input_usd_per_million"]), float(FROZEN_TOKEN_PRICES["output_usd_per_million"])
 
 
-def workload_calls(same: int, lexical: int) -> dict[str, int]:
-    """Worst-case calls for one draw. Each stage keeps its own allowance.
+def _stage_max_output() -> dict[str, int]:
+    """Worst-case output of one call, in the character heuristic.
 
-    Proposals and retries are one each per pair. They are not transferred.
-    Counterexamples stay at the experiment allowance. Relation review is
-    capped at its own allowance. Saturation review is one call.
+    Each text field is the 800-character cap already used when a review quote
+    is truncated. The figure is that stage's max output for the preflight.
+    """
+    blob = "m" * FIELD_CHAR_CAP
+    payloads = {
+        "axial_proposal": {
+            "relationships": [{
+                "from_id": "c" * 32,
+                "to_id": "c" * 32,
+                "paradigm_role": "intervening_condition",
+                "statement": blob,
+                "passage_id": "p" * 32,
+                "quote": blob,
+                "quote_from": blob,
+                "quote_to": blob,
+                "case_quotes": [{"passage_id": "p" * 32, "quote": blob, "endpoint": "both"}],
+            }],
+            "nothing_to_propose": False,
+        },
+        "statement_copy_retry": None,
+        "axial_counterexample": {
+            "counterexamples": [{
+                "relationship_id": "r" * 32,
+                "passage_id": "p" * 32,
+                "judgment": "contradicts",
+                "quote": blob,
+                "rationale": blob,
+            }],
+        },
+        "axial_relation_review": {
+            "relationships": [{
+                "relationship_id": "r" * 32,
+                "disposition": "accepted",
+                "paradigm_role": "intervening_condition",
+                "rationale": blob,
+            }],
+        },
+        "axial_saturation_review": {
+            "assessment": "not_saturated",
+            "rationale": blob,
+        },
+    }
+    payloads["statement_copy_retry"] = payloads["axial_proposal"]
+    return {name: estimate_tokens(json.dumps(body, ensure_ascii=False)) for name, body in payloads.items()}
+
+
+STAGE_MAX_OUTPUT = _stage_max_output()
+
+
+def workload_calls(same: int, lexical: int) -> dict[str, Any]:
+    """Worst-case calls. Retries are one shared pool of six.
+
+    Relation review is one call per proposed row, because a row that fills the
+    request is not packed with another. Counterexamples are one per row. A
+    counterexample that does not fit the coding ceiling is required_but_blocked.
     """
     pairs = max(0, int(same)) + max(0, int(lexical))
+    retries = SHARED_RETRY_CALLS if pairs else 0
+    relation = pairs
+    counter_required = pairs
+    call_room = max(0, CODING_CALLS - pairs - retries)
+    token_room = max(0, (CODING_TOKENS // REQUEST_INPUT_CAP) - pairs - retries) if REQUEST_INPUT_CAP else 0
+    counter_fit = min(counter_required, call_room, token_room)
+    blocked = max(0, counter_required - counter_fit)
+    relation_token_room = CODING_TOKENS // REQUEST_INPUT_CAP if REQUEST_INPUT_CAP else 0
+    relation_fit = min(relation, relation_token_room)
+    relation_shortfall = max(0, relation - relation_fit)
     return {
         "axial_proposal": pairs,
-        "statement_copy_retry": pairs,
-        "axial_counterexample": COUNTEREXAMPLE_CALLS if pairs else 0,
-        "axial_relation_review": min(RELATION_REVIEW_CALLS, pairs),
+        "statement_copy_retry": retries,
+        "axial_counterexample": counter_fit,
+        "axial_counterexample_required": counter_required,
+        "axial_counterexample_required_but_blocked": blocked,
+        "axial_relation_review": relation_fit,
+        "axial_relation_review_required": relation,
+        "axial_relation_review_shortfall": relation_shortfall,
         "axial_saturation_review": SATURATION_REVIEW_CALLS if pairs else 0,
     }
 
@@ -194,34 +272,46 @@ def preflight_workload(
     token_prices: Mapping[str, Any] | None = None,
     per_call_input: int = REQUEST_INPUT_CAP,
 ) -> dict[str, Any]:
-    """Worst case of one draw against the coding ceiling and the dollar cap.
+    """Worst case against the coding ceiling and the frozen dollar cap.
 
-    Each call is priced at the per-request input cap. Output dollars stay null
-    when no output price is configured. An unset input price leaves dollars
-    null and does not count as fitting the cap.
+    Input is the per-request cap. Output is that stage's max output. Dollars
+    use the frozen model rates, $1.25 per million input and $2.50 per million
+    output. ``token_prices`` does not replace those rates.
     """
+    del token_prices
     calls = workload_calls(same, lexical)
-    coding_calls = calls["axial_proposal"] + calls["statement_copy_retry"] + calls["axial_counterexample"]
-    decision_calls = calls["axial_relation_review"] + calls["axial_saturation_review"]
-    total_calls = coding_calls + decision_calls
+    sent = {
+        "axial_proposal": int(calls["axial_proposal"]),
+        "statement_copy_retry": int(calls["statement_copy_retry"]),
+        "axial_counterexample": int(calls["axial_counterexample"]),
+        "axial_relation_review": int(calls["axial_relation_review"]),
+        "axial_saturation_review": int(calls["axial_saturation_review"]),
+    }
     per_call = max(0, int(per_call_input))
-    coding_tokens = coding_calls * per_call
-    total_tokens = total_calls * per_call
-    in_rate, out_rate = _prices(token_prices)
-    if in_rate is None:
-        dollars = None
-    else:
-        dollars = round(total_tokens / 1_000_000 * in_rate, 6)
-    output_dollars = None if out_rate is None else round(total_calls * per_call / 1_000_000 * out_rate, 6)
-    coding_ok = coding_calls <= CODING_CALLS and coding_tokens <= CODING_TOKENS
-    dollar_ok = None if dollars is None else dollars <= HARD_CAP_USD
-    fits = bool(coding_ok and dollar_ok is True)
+    input_tokens = {name: count * per_call for name, count in sent.items()}
+    output_tokens = {name: count * int(STAGE_MAX_OUTPUT[name]) for name, count in sent.items()}
+    coding_names = ("axial_proposal", "statement_copy_retry", "axial_counterexample")
+    coding_calls = sum(sent[name] for name in coding_names)
+    coding_input = sum(input_tokens[name] for name in coding_names)
+    total_input = sum(input_tokens.values())
+    total_output = sum(output_tokens.values())
+    in_rate, out_rate = _prices()
+    input_dollars = round(total_input / 1_000_000 * in_rate, 6)
+    output_dollars = round(total_output / 1_000_000 * out_rate, 6)
+    dollars = round(input_dollars + output_dollars, 6)
+    coding_ok = coding_calls <= CODING_CALLS and coding_input <= CODING_TOKENS
+    blocked = int(calls["axial_counterexample_required_but_blocked"])
+    relation_shortfall = int(calls["axial_relation_review_shortfall"])
+    dollar_ok = dollars <= HARD_CAP_USD
+    fits = bool(coding_ok and dollar_ok and blocked == 0 and relation_shortfall == 0)
     reasons = []
     if not coding_ok:
         reasons.append("coding_ceiling")
-    if dollar_ok is None:
-        reasons.append("dollar_prices_unset")
-    elif dollar_ok is False:
+    if blocked:
+        reasons.append("counterexample_required_but_blocked")
+    if relation_shortfall:
+        reasons.append("relation_review_shortfall")
+    if not dollar_ok:
         reasons.append("dollar_hard_cap")
     return {
         "experiment": EXPERIMENT_ID,
@@ -229,25 +319,36 @@ def preflight_workload(
         "lexical_cross_case": int(lexical),
         "pairs": int(same) + int(lexical),
         "calls": calls,
+        "calls_sent": sent,
         "coding_calls": coding_calls,
-        "coding_input_tokens": coding_tokens,
-        "total_calls": total_calls,
-        "total_input_tokens": total_tokens,
+        "coding_input_tokens": coding_input,
+        "input_tokens_by_stage": input_tokens,
+        "output_tokens_by_stage": output_tokens,
+        "stage_max_output": dict(STAGE_MAX_OUTPUT),
+        "total_calls": sum(sent.values()),
+        "total_input_tokens": total_input,
+        "total_output_tokens": total_output,
         "per_call_input_tokens": per_call,
-        "dollars": dollars,
+        "prices": dict(FROZEN_TOKEN_PRICES),
+        "input_dollars": input_dollars,
         "output_dollars": output_dollars,
+        "dollars": dollars,
         "hard_cap_usd": HARD_CAP_USD,
         "kill_guard_usd": KILL_GUARD_USD,
         "coding_call_ceiling": CODING_CALLS,
         "coding_token_ceiling": CODING_TOKENS,
         "fits_coding_ceiling": coding_ok,
         "fits_dollar_cap": dollar_ok,
+        "counterexample_required_but_blocked": blocked,
+        "relation_review_shortfall": relation_shortfall,
         "fits": fits,
         "reasons": reasons,
         "note": (
-            "Worst case prices every planned call at the per-request input cap. "
-            "Output dollars are null unless an output price is set. "
-            "A null dollar figure does not mean the workload fits the hard cap."
+            "Worst case prices every sent call at the 6000-token input cap and at that "
+            "stage's max output. Rates are the frozen model config: $1.25 per million "
+            "input tokens and $2.50 per million output tokens. A counterexample that "
+            "does not fit is required_but_blocked. Relation review is one call per row. "
+            "A shortfall there reduces the draw. The run does not leave a row unreviewed."
         ),
     }
 
@@ -383,6 +484,45 @@ def _eligible_pools(
     return {CLASS_SAME: same, CLASS_LEXICAL: lexical}
 
 
+def lexical_eligibility_report(
+    evidence: Mapping[str, Any],
+    examined_pairs: Sequence[Mapping[str, Any]],
+    lexical_rows: Sequence[Mapping[str, Any]],
+    *,
+    required: int = DRAW_LEXICAL,
+) -> dict[str, Any]:
+    """Whether each lexical pair is unexamined and in the existing class.
+
+    The rule is ``lexical_cross_case_v1``. A pair that fails it is listed.
+    The caller does not replace it with another class.
+    """
+    examined = {_pair_key(row) for row in examined_pairs if isinstance(row, Mapping)}
+    by_class = evidence.get("by_class") if isinstance(evidence.get("by_class"), Mapping) else {}
+    class_keys = {_pair_key(row) for row in (by_class.get(CLASS_LEXICAL) or []) if isinstance(row, Mapping)}
+    meeting = []
+    failed = []
+    for row in lexical_rows:
+        if not isinstance(row, Mapping):
+            continue
+        key = _pair_key(row)
+        unexamined = key not in examined
+        in_class = key in class_keys
+        record = {"from_id": key[0], "to_id": key[1], "previously_unexamined": unexamined, "in_class": in_class}
+        if unexamined and in_class:
+            meeting.append(record)
+        else:
+            failed.append(record)
+    return {
+        "rule": LEXICAL_ELIGIBILITY_RULE,
+        "statement": LEXICAL_ELIGIBILITY_STATEMENT,
+        "pattern_min_cases_is_the_rule": False,
+        "required": int(required),
+        "meeting_rule": len(meeting),
+        "eligible": len(meeting) >= int(required) and not failed,
+        "failed": failed,
+    }
+
+
 def select_unexamined_draw(
     evidence: Mapping[str, Any],
     examined_pairs: Sequence[Mapping[str, Any]],
@@ -408,27 +548,44 @@ def select_unexamined_draw(
             "needed": int(lexical_count),
             "available": len(pools[CLASS_LEXICAL]),
         }
-    if shortfall:
+    lexical_report = lexical_eligibility_report(
+        evidence, examined_pairs, pools[CLASS_LEXICAL], required=int(lexical_count),
+    )
+    if shortfall or lexical_report["eligible"] is False:
         return {
             "status": "stopped",
-            "reason": "class_shortfall",
+            "reason": "class_shortfall" if shortfall else "lexical_ineligible",
             "seed": int(seed),
             "shortfall": shortfall,
+            "lexical_eligibility": lexical_report,
             "available": {name: len(rows) for name, rows in pools.items()},
             "round": [],
             "note": (
-                "A class had fewer unexamined eligible pairs than the draw. "
-                "The run stops. Pairs are not taken from the other class."
+                "A class had fewer unexamined eligible pairs than the draw, or a lexical "
+                "pair missed lexical_cross_case_v1. The run stops. Pairs are not taken from the other class."
             ),
         }
     rng = random.Random(int(seed))
     same = rng.sample(pools[CLASS_SAME], int(same_count))
     lexical = rng.sample(pools[CLASS_LEXICAL], int(lexical_count))
+    drawn_report = lexical_eligibility_report(evidence, examined_pairs, lexical, required=int(lexical_count))
+    if drawn_report["eligible"] is False:
+        return {
+            "status": "stopped",
+            "reason": "lexical_ineligible",
+            "seed": int(seed),
+            "shortfall": {},
+            "lexical_eligibility": drawn_report,
+            "available": {name: len(rows) for name, rows in pools.items()},
+            "round": [],
+            "note": "A drawn lexical pair is not unexamined and eligible. It is not replaced.",
+        }
     return {
         "status": "selected",
         "reason": "",
         "seed": int(seed),
         "shortfall": {},
+        "lexical_eligibility": drawn_report,
         "available": {name: len(rows) for name, rows in pools.items()},
         "sampled": {CLASS_SAME: same, CLASS_LEXICAL: lexical},
         "round": list(same) + list(lexical),
@@ -726,12 +883,13 @@ def proposal_gate(metadata: Mapping[str, Any], payload: Mapping[str, Any], estim
             "policy_fingerprint": policy_fp,
         })
         break
-    in_rate, _out_rate = _prices(spec.get("token_prices") if isinstance(spec.get("token_prices"), Mapping) else None)
-    if in_rate is None:
-        return None
+    in_rate, out_rate = _prices()
     spent = metadata.get("exp_dollars_spent")
     spent_n = float(spent) if isinstance(spent, (int, float)) and not isinstance(spent, bool) else 0.0
-    next_cost = max(0, int(estimate)) / 1_000_000 * in_rate
+    next_cost = (
+        max(0, int(estimate)) / 1_000_000 * in_rate
+        + STAGE_MAX_OUTPUT["axial_proposal"] / 1_000_000 * out_rate
+    )
     if spent_n + next_cost > KILL_GUARD_USD:
         return {
             "refused": True,
@@ -764,22 +922,27 @@ def note_provider_spend(metadata: dict[str, Any], usage: Mapping[str, Any] | Non
     spec = procedure.get("exp_axial_w1")
     if not isinstance(spec, Mapping) or not spec.get("enabled"):
         return
-    in_rate, _out_rate = _prices(spec.get("token_prices") if isinstance(spec.get("token_prices"), Mapping) else None)
-    if in_rate is None or not isinstance(usage, Mapping) or usage.get("input_tokens") is None:
+    in_rate, out_rate = _prices()
+    if not isinstance(usage, Mapping) or usage.get("input_tokens") is None:
         return
+    output = usage.get("output_tokens")
+    output_n = int(output) if isinstance(output, (int, float)) and not isinstance(output, bool) else 0
     spent = metadata.get("exp_dollars_spent")
     spent_n = float(spent) if isinstance(spent, (int, float)) and not isinstance(spent, bool) else 0.0
-    metadata["exp_dollars_spent"] = round(spent_n + int(usage["input_tokens"]) / 1_000_000 * in_rate, 6)
+    metadata["exp_dollars_spent"] = round(
+        spent_n + int(usage["input_tokens"]) / 1_000_000 * in_rate + output_n / 1_000_000 * out_rate,
+        6,
+    )
 
 
 def _allowances_for(same: int, lexical: int) -> dict[str, int]:
     calls = workload_calls(same, lexical)
     return {
-        "axial_proposal": calls["axial_proposal"],
-        "statement_copy_retry": calls["statement_copy_retry"],
-        "axial_counterexample": calls["axial_counterexample"],
-        "axial_relation_review": RELATION_REVIEW_CALLS,
-        "axial_saturation_review": RELATION_REVIEW_CALLS,
+        "axial_proposal": int(calls["axial_proposal"]),
+        "statement_copy_retry": int(calls["statement_copy_retry"]),
+        "axial_counterexample": int(calls["axial_counterexample_required"]),
+        "axial_relation_review": int(calls["axial_relation_review_required"]),
+        "axial_saturation_review": int(calls["axial_saturation_review"]),
     }
 
 
@@ -826,7 +989,11 @@ def exp_axial_w1(
         "history_path": history["path"],
         "historical_expenditure": history["historical_expenditure"],
         "preflight": reduction,
-        "draw": {key: draw[key] for key in ("status", "reason", "shortfall", "available", "seed")},
+        "draw": {
+            key: draw[key]
+            for key in ("status", "reason", "shortfall", "available", "seed", "lexical_eligibility")
+            if key in draw
+        },
         "new_spend": {"calls": None, "input_tokens": None, "dollars": None, "elapsed_seconds": None},
     }
     if draw["status"] != "selected":
@@ -851,7 +1018,7 @@ def exp_axial_w1(
         "round": chosen,
         "allowances": allowances,
         "reuse": history["reuse"],
-        "token_prices": None if token_prices is None else dict(token_prices),
+        "token_prices": dict(FROZEN_TOKEN_PRICES),
         "hard_cap_usd": HARD_CAP_USD,
         "kill_guard_usd": KILL_GUARD_USD,
         "baseline_core": None if baseline_core is None else dict(baseline_core),
@@ -868,8 +1035,9 @@ def exp_axial_w1(
         one_document_one_respondent=False,
         batch_size=1,
         examined_pairs=history["examined_pairs"],
+        max_decision_calls=int(allowances["axial_relation_review"]),
         experiment=spec,
-        **axial_kwargs,
+        **{key: value for key, value in axial_kwargs.items() if key != "max_decision_calls"},
     )
     elapsed = time.perf_counter() - started
     relationships = list(result.relationships or [])
@@ -878,7 +1046,7 @@ def exp_axial_w1(
         relationships=relationships,
         prompt_log=list(result.prompt_log or []),
         elapsed_seconds=elapsed,
-        token_prices=token_prices,
+        token_prices=FROZEN_TOKEN_PRICES,
     )
     judgments = []
     for row in result.metadata.get("counterexample_requests") or []:
@@ -890,7 +1058,8 @@ def exp_axial_w1(
     metrics["overall"]["counterexample_relevance"] = relevance.get("overall")
     snapshot = core_snapshot(relationships, source.get("codebook") if isinstance(source.get("codebook"), Mapping) else {})
     differs = core_differs(snapshot, baseline_core)
-    in_rate, _output_rate = _prices(token_prices)
+    in_rate, out_rate = _prices()
+    del out_rate
     if differs is False:
         core = {
             "status": "deferred",

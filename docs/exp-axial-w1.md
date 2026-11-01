@@ -6,7 +6,7 @@ Status: opt-in. Package `policy_version` stays `0.9.44`. The default axial plann
 
 ## Draw
 
-The draw is 16 previously unexamined same-respondent pairs whose document co-occurrence is 1, plus 8 previously unexamined lexical cross-case pairs. Both classes use `classify_pair_evidence`. A pair that is not in that class, or that is already in the examined-pair file, is not eligible. The sample is `random.Random(seed)` over each class in that order. The default seed is 4401 and the seed is stored. If either class has fewer eligible pairs than the draw, the run stops and names the shortfall. It does not take pairs from the other class.
+The draw is 16 previously unexamined same-respondent pairs whose document co-occurrence is 1, plus 8 previously unexamined lexical cross-case pairs. The sample is `random.Random(seed)` over each class in that order. The default seed is 4401 and the seed is stored. If either class has fewer pairs that meet its rule, the run stops and names the shortfall. It does not take pairs from the other class.
 
 ## History and reuse
 
@@ -14,13 +14,19 @@ The examined-pair file is a local path the caller passes. The package does not w
 
 ## Allowances
 
-Proposals, quote-copy retries, counterexamples, relation review, and saturation review each have their own allowance. Calls are not moved between them. For this experiment the coding ceiling is 36 calls and 216,000 tokens. The package defaults stay 8 and 24,000. The worst-case plan is one proposal and one retry per pair, 4 counterexample calls, up to 4 relation-review calls, and 1 saturation-review call. Each of those calls is priced at the 6,000-token request cap.
+Proposals, quote-copy retries, counterexamples, relation review, and saturation review each have their own allowance. Calls are not moved between them. Retries are a shared pool of 6, not one retry per proposal. For this experiment the coding ceiling is 36 calls and 216,000 input tokens. The package defaults stay 8 and 24,000. Worst case is one proposal per pair, 6 retries, one counterexample per row, one relation-review call per row, and 1 saturation-review call. A counterexample that does not fit the coding ceiling is `required_but_blocked`. Relation review is sized to the row count. A shortfall reduces the draw. The run does not finish with a row left unreviewed.
+
+## Lexical eligibility
+
+The rule is `lexical_cross_case_v1`. A lexical pair is eligible when it is absent from the examined-pair history and `classify_pair_evidence` places it in `lexical_cross_case`: a passage whose respondent is not an endpoint case contains at least two distinctive stems of each endpoint. `pattern_min_cases` does not admit or exclude that class. It still decides whether a finished relationship is downstream-eligible. If fewer than 8 pairs meet the rule, the run stops and reports the shortfall. It does not take pairs from the same-respondent class to fill the gap.
 
 ## Preflight
 
-The 16+8 draw is priced before any model call. With an input price configured, that worst case is 57 calls and 342,000 input tokens: 24 proposals, 24 retries, 4 counterexamples, 4 relation reviews, and 1 saturation review. Coding calls are 52, above the 36-call ceiling. Output dollars stay null unless an output price is set. A missing input price leaves dollars null and does not count as fitting the cap.
+Prices are the frozen model config: $1.25 per million input tokens and $2.50 per million output tokens. Each call's input is the 6,000-token request cap. Each call's output is that stage's max output, the character heuristic of one response whose quotes, statements, and rationales are at the 800-character cap. Output dollars are part of the total.
 
-The hard cap is $0.60. The runtime kill guard is $0.55. If the worst case does not fit the coding ceiling or the hard cap, the draw shrinks by 4 pairs and the 2:1 class ratio is kept as nearly as the integer split allows. The reduced scope is recorded before the run. At $3 per million input tokens the scope that fits is 8 same-respondent pairs and 4 lexical pairs: 33 calls, 198,000 input tokens, and $0.594.
+The 16+8 worst case does not fit. Coding calls that can be sent are 36 (24 proposals, 6 retries, and 6 of the 24 required counterexamples). The other 18 counterexamples are `required_but_blocked`. Relation review is 24 calls. With saturation, that is 61 sent calls, 366,000 input tokens, 55,567 output tokens, and $0.596417. That is under the $0.60 hard cap and over the counterexample fit, so the draw still shrinks.
+
+The hard cap is $0.60. The runtime kill guard is $0.55. The draw shrinks by 4 pairs and the 2:1 class ratio is kept as nearly as the integer split allows. The reduced scope is recorded before the run. The scope that fits is 8 same-respondent pairs and 4 lexical pairs: 12 proposals, 6 retries, 12 counterexamples, 12 relation reviews, and 1 saturation review. That is 43 calls, 258,000 input tokens, 37,681 output tokens, and $0.416702. No counterexample is `required_but_blocked` and the relation-review shortfall is 0.
 
 ## Core
 

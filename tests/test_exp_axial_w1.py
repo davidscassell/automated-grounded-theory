@@ -12,6 +12,8 @@ from automated_grounded_theory.exp_axial_w1 import (
     CLASS_SAME,
     DRAW_LEXICAL,
     DRAW_SAME_RESPONDENT,
+    FROZEN_TOKEN_PRICES,
+    LEXICAL_ELIGIBILITY_RULE,
     counterexample_relevance_by_class,
     core_differs,
     exp_axial_w1,
@@ -26,7 +28,6 @@ from automated_grounded_theory.exp_axial_w1 import (
 from automated_grounded_theory.relationship_tiers import classify_pair_evidence
 from tests.test_v080 import FakeAxialCoder
 
-PRICE = {"input_usd_per_million": 3.0}
 
 
 def _code(code_id: str, word_a: str, word_b: str) -> dict:
@@ -125,29 +126,50 @@ def _history(path, examined, reuse):
 
 
 def test_preflight_for_the_full_draw_and_the_reduction():
-    original = preflight_workload(DRAW_SAME_RESPONDENT, DRAW_LEXICAL, token_prices=PRICE)
+    original = preflight_workload(DRAW_SAME_RESPONDENT, DRAW_LEXICAL)
+    assert original["prices"]["input_usd_per_million"] == 1.25
+    assert original["prices"]["output_usd_per_million"] == 2.50
+    assert FROZEN_TOKEN_PRICES["input_usd_per_million"] == 1.25
     assert original["calls"]["axial_proposal"] == 24
-    assert original["calls"]["statement_copy_retry"] == 24
-    assert original["calls"]["axial_counterexample"] == 4
-    assert original["calls"]["axial_relation_review"] == 4
+    assert original["calls"]["statement_copy_retry"] == 6
+    assert original["calls"]["axial_counterexample_required"] == 24
+    assert original["calls"]["axial_counterexample"] == 6
+    assert original["counterexample_required_but_blocked"] == 18
+    assert original["calls"]["axial_relation_review_required"] == 24
+    assert original["calls"]["axial_relation_review"] == 24
+    assert original["relation_review_shortfall"] == 0
     assert original["calls"]["axial_saturation_review"] == 1
-    assert original["coding_calls"] == 52
-    assert original["coding_input_tokens"] == 312_000
-    assert original["total_calls"] == 57
-    assert original["total_input_tokens"] == 342_000
-    assert original["dollars"] == pytest.approx(1.026)
+    assert original["coding_calls"] == 36
+    assert original["coding_input_tokens"] == 216_000
+    assert original["total_calls"] == 61
+    assert original["total_input_tokens"] == 366_000
+    assert original["total_output_tokens"] == 55_567
+    assert original["output_dollars"] is not None
+    assert original["output_dollars"] == pytest.approx(0.138917)
+    assert original["input_dollars"] == pytest.approx(0.4575)
+    assert original["dollars"] == pytest.approx(0.596417)
     assert original["fits"] is False
+    assert "counterexample_required_but_blocked" in original["reasons"]
     assert original["hard_cap_usd"] == 0.60
     assert original["kill_guard_usd"] == 0.55
-    reduced = reduce_scope(PRICE)
+    reduced = reduce_scope()
     assert reduced["reduced_scope"] == {
         "same_respondent": 8,
         "lexical_cross_case": 4,
         "pairs": 12,
     }
-    assert reduced["reduced"]["fits"] is True
-    assert reduced["reduced"]["dollars"] == pytest.approx(0.594)
-    assert reduced["reduced"]["coding_calls"] == 28
+    fitted = reduced["reduced"]
+    assert fitted["fits"] is True
+    assert fitted["calls"]["statement_copy_retry"] == 6
+    assert fitted["calls"]["axial_relation_review"] == 12
+    assert fitted["counterexample_required_but_blocked"] == 0
+    assert fitted["relation_review_shortfall"] == 0
+    assert fitted["coding_calls"] == 30
+    assert fitted["total_calls"] == 43
+    assert fitted["total_input_tokens"] == 258_000
+    assert fitted["total_output_tokens"] == 37_681
+    assert fitted["output_dollars"] == pytest.approx(0.094202)
+    assert fitted["dollars"] == pytest.approx(0.416702)
     assert reduced["original"]["pairs"] == 24
 
 
@@ -162,6 +184,9 @@ def test_a_short_class_stops_without_substitution():
     assert draw["round"] == []
     assert draw["shortfall"][CLASS_SAME]["available"] == 1
     assert draw["shortfall"][CLASS_LEXICAL]["available"] == 1
+    assert draw["lexical_eligibility"]["rule"] == LEXICAL_ELIGIBILITY_RULE
+    assert draw["lexical_eligibility"]["eligible"] is False
+    assert draw["round"] == []
 
 
 def test_core_deferral_compares_the_eligible_set_and_the_category_counts():
@@ -176,7 +201,7 @@ def test_kill_guard_refuses_before_the_call():
         "exp_dollars_spent": 0.54,
         "procedure": {"exp_axial_w1": {
             "enabled": True,
-            "token_prices": PRICE,
+            "token_prices": FROZEN_TOKEN_PRICES,
             "reuse": [],
         }},
     }
@@ -204,10 +229,17 @@ def test_exp_axial_w1_unexamined_single_document_round(tmp_path):
     assert draw["status"] == "selected"
     assert draw["available"][CLASS_SAME] >= 16
     assert draw["available"][CLASS_LEXICAL] >= 8
+    lexical = draw["lexical_eligibility"]
+    assert lexical["rule"] == LEXICAL_ELIGIBILITY_RULE
+    assert lexical["pattern_min_cases_is_the_rule"] is False
+    assert lexical["eligible"] is True
+    assert lexical["meeting_rule"] == 8
+    assert lexical["failed"] == []
+    assert "two distinctive stems" in lexical["statement"]
     assert ("s00", "s01") not in {
         tuple(sorted((row["from_id"], row["to_id"]))) for row in draw["round"]
     }
-    scope = reduce_scope(PRICE)["reduced_scope"]
+    scope = reduce_scope()["reduced_scope"]
     chosen = (
         draw["sampled"][CLASS_SAME][: scope["same_respondent"]]
         + draw["sampled"][CLASS_LEXICAL][: scope["lexical_cross_case"]]
@@ -256,7 +288,7 @@ def test_exp_axial_w1_unexamined_single_document_round(tmp_path):
             history_path=history,
             frozen_fingerprints={**frozen, "commit": "different-commit"},
             baseline_core={"eligible_ids": [], "category_counts": {code_id: 0 for code_id in source["codebook"]}},
-            token_prices=PRICE,
+            token_prices=FROZEN_TOKEN_PRICES,
             seed=4401,
             commit="offline-fixture",
             decision_mode="llm",
@@ -269,7 +301,7 @@ def test_exp_axial_w1_unexamined_single_document_round(tmp_path):
         history_path=history,
         frozen_fingerprints=frozen,
         baseline_core={"eligible_ids": [], "category_counts": {code_id: 0 for code_id in source["codebook"]}},
-        token_prices=PRICE,
+        token_prices=FROZEN_TOKEN_PRICES,
         seed=4401,
         commit="offline-fixture",
         decision_mode="llm",
@@ -277,15 +309,23 @@ def test_exp_axial_w1_unexamined_single_document_round(tmp_path):
     )
     assert report["status"] == "completed"
     assert report["preflight"]["original"]["pairs"] == 24
-    assert report["preflight"]["original"]["coding_calls"] == 52
-    assert report["preflight"]["original"]["total_input_tokens"] == 342_000
+    assert report["preflight"]["original"]["coding_calls"] == 36
+    assert report["preflight"]["original"]["total_input_tokens"] == 366_000
+    assert report["preflight"]["original"]["output_dollars"] == pytest.approx(0.138917)
+    assert report["preflight"]["original"]["prices"]["output_usd_per_million"] == 2.50
     assert report["preflight"]["reduced_scope"]["same_respondent"] == 8
     assert report["preflight"]["reduced_scope"]["lexical_cross_case"] == 4
     assert report["allowances"]["axial_proposal"] == 12
-    assert report["allowances"]["statement_copy_retry"] == 12
-    assert report["allowances"]["axial_counterexample"] == 4
-    assert report["allowances"]["axial_relation_review"] == 4
-    assert report["allowances"]["axial_saturation_review"] == 4
+    assert report["allowances"]["statement_copy_retry"] == 6
+    assert report["allowances"]["axial_counterexample"] == 12
+    assert report["allowances"]["axial_relation_review"] == 12
+    assert report["allowances"]["axial_saturation_review"] == 1
+    assert report["preflight"]["reduced"]["counterexample_required_but_blocked"] == 0
+    assert report["preflight"]["reduced"]["relation_review_shortfall"] == 0
+    assert report["preflight"]["original"]["counterexample_required_but_blocked"] == 18
+    reviewed = [row for row in report["result"].relationships if not row.get("synthetic")]
+    assert reviewed
+    assert all(row.get("reviewer_disposition") for row in reviewed)
     assert report["historical_expenditure"]["dollars"] == 0.02
     assert report["new_spend"]["note"]
     assert coder.proposal_calls == len(chosen) - 1
@@ -319,7 +359,7 @@ def test_exp_axial_w1_unexamined_single_document_round(tmp_path):
         history_path=history,
         frozen_fingerprints=startup_fingerprint(source, rerun, commit="offline-fixture"),
         baseline_core={"eligible_ids": ["baseline-only"], "category_counts": {code_id: 0 for code_id in source["codebook"]}},
-        token_prices=PRICE,
+        token_prices=FROZEN_TOKEN_PRICES,
         seed=4401,
         commit="offline-fixture",
         decision_mode="llm",
