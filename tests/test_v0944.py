@@ -31,14 +31,14 @@ def test_a_core_on_one_eligible_relationship_is_provisional():
 
     metadata = {"core_outcome": "core_selected"}
     _note_core_provisional(metadata, [
-        {"relationship_id": "rel-0003", "downstream_eligible": True},
-        {"relationship_id": "rel-0004", "downstream_eligible": False},
+        {"relationship_id": "rel-1", "downstream_eligible": True},
+        {"relationship_id": "rel-2", "downstream_eligible": False},
         {"relationship_id": "rel-synthetic", "downstream_eligible": True, "synthetic": True},
     ])
     assert metadata["core_provisional"] is True
-    assert metadata["core_eligible_relationship_ids"] == ["rel-0003"]
+    assert metadata["core_eligible_relationship_ids"] == ["rel-1"]
     assert metadata["core_support_note"] == (
-        "The core is provisional. It rests on one eligible relationship (rel-0003)."
+        "The core is provisional. It rests on one eligible relationship (rel-1)."
     )
     several = {"core_outcome": "core_selected"}
     _note_core_provisional(several, [
@@ -48,7 +48,7 @@ def test_a_core_on_one_eligible_relationship_is_provisional():
     assert several["core_provisional"] is False
     assert several["core_support_note"] is None
     unresolved = {"core_outcome": "selection_unresolved"}
-    _note_core_provisional(unresolved, [{"relationship_id": "rel-0003", "downstream_eligible": True}])
+    _note_core_provisional(unresolved, [{"relationship_id": "rel-1", "downstream_eligible": True}])
     assert unresolved["core_provisional"] is None
     assert unresolved["core_support_note"] is None
     accounting = {}
@@ -101,6 +101,7 @@ def test_stage_usage_reconciles_without_double_counting():
     assert coding["calls"] == 3
     assert coding["estimated_input_tokens"] == 230
     assert coding["provider_input_tokens"] == 23
+    assert coding["usage_completeness"] == "complete"
     assert report["estimated_input_tokens"] == 100 + 80 + 50 + 40 + 30 + 70
     assert report["provider_input_tokens"] == 10 + 8 + 5 + 4 + 3 + 7
     assert report["provider_output_tokens"] == 7
@@ -123,6 +124,8 @@ def test_stage_usage_reconciles_without_double_counting():
     assert proposal["provider_input_tokens"] is None
     assert proposal["provider_output_tokens"] is None
     assert missing["provider_input_tokens"] is None
+    coding_missing = next(row for row in missing["stages"] if row["stage"] == "coding")
+    assert coding_missing["usage_completeness"] == "partial"
 
 
 def test_a_returned_role_is_kept_and_an_omitted_role_stays_unspecified():
@@ -136,6 +139,51 @@ def test_a_returned_role_is_kept_and_an_omitted_role_stays_unspecified():
     assert explicit.paradigm_role_origin == "model_unspecified"
 
 
+def test_an_omitted_reviewer_role_does_not_replace_the_proposal_role():
+    from automated_grounded_theory.axial import AxialProposalBatch, AxialRelationDecision, AxialRelationDecisions
+    from tests.test_v080 import QUOTE, STATEMENT, _run
+
+    class _ReviewOmitsRole(FakeAxialCoder):
+        def proposals(self, body):
+            pair = (body.get("pairs") or [{"from_id": "c-prep", "to_id": "c-return"}])[0]
+            draft = AxialRelationshipDraft(
+                from_id=str(pair["from_id"]),
+                to_id=str(pair["to_id"]),
+                statement=STATEMENT,
+                passage_id="p1",
+                quote=QUOTE,
+            )
+            if self.mode != "omit_proposal_role":
+                draft = AxialRelationshipDraft(
+                    from_id=str(pair["from_id"]),
+                    to_id=str(pair["to_id"]),
+                    paradigm_role="context",
+                    statement=STATEMENT,
+                    passage_id="p1",
+                    quote=QUOTE,
+                )
+            return AxialProposalBatch(relationships=[draft])
+
+        def relation_review(self, body):
+            return AxialRelationDecisions(relationships=[
+                AxialRelationDecision(
+                    relationship_id=str(row.get("relationship_id") or ""),
+                    disposition="accepted",
+                    rationale="The cited quote supports the link.",
+                )
+                for row in body.get("relationships") or []
+            ])
+
+    _coder, kept = _run(_ReviewOmitsRole(), decision_mode="llm", interrupt=False)
+    row = next(item for item in kept.relationships if item.get("from_id") == "c-prep")
+    assert row["paradigm_role"] == "context"
+    assert row["paradigm_role_origin"] == "model_returned"
+    _coder, omitted = _run(_ReviewOmitsRole(mode="omit_proposal_role"), decision_mode="llm", interrupt=False)
+    blank = next(item for item in omitted.relationships if item.get("from_id") == "c-prep")
+    assert blank["paradigm_role"] == "unspecified"
+    assert blank["paradigm_role_origin"] == "schema_default_unspecified"
+
+
 def test_accepted_rows_keep_empty_reasons_and_separate_limitations():
     funnel = build_relationship_funnel({
         "metadata": {"procedure": {"pattern_min_cases": 2}},
@@ -145,7 +193,7 @@ def test_accepted_rows_keep_empty_reasons_and_separate_limitations():
             {"passage_id": "p2", "doc_id": "d2"},
         ],
         "relationships": [{
-            "relationship_id": "rel-0003",
+            "relationship_id": "rel-1",
             "from_id": "a",
             "to_id": "b",
             "statement": "One claim.",
@@ -163,6 +211,31 @@ def test_accepted_rows_keep_empty_reasons_and_separate_limitations():
     assert row["evidence_limitations"] == ["tentative"]
     assert "tentative" not in row["reasons"]
     assert "limited_document_support" not in row["reasons"]
+
+
+def test_limited_document_support_is_an_evidence_limitation():
+    funnel = build_relationship_funnel({
+        "metadata": {"procedure": {"pattern_min_cases": 2}},
+        "codebook": {},
+        "passages": [{"passage_id": "p1", "doc_id": "d1"}],
+        "relationships": [{
+            "relationship_id": "rel-1",
+            "from_id": "a",
+            "to_id": "b",
+            "statement": "One claim.",
+            "disposition": "accepted",
+            "reviewer_disposition": "accepted",
+            "downstream_eligible": True,
+            "evidence_tier": 3,
+            "paradigm_role": "context",
+            "passage_id": "p1",
+            "document_count": 1,
+        }],
+    })
+    row = funnel["rows"][0]
+    assert "limited_document_support" in row["evidence_limitations"]
+    assert "limited_document_support" not in row["reasons"]
+    assert "insufficient_document_count" in row["reasons"]
 
 
 def test_different_statements_stay_separate_assertions():
@@ -208,6 +281,101 @@ def test_unused_allowance_does_not_mean_a_request_was_available():
     assert by_stage["axial_counterexample"]["unused"] == 1
     assert "does not mean" in by_stage["statement_copy_retry"]["unused_reason"]
     assert "tokens" in report["note"]
+
+
+def test_a_missing_reservation_stays_unknown():
+    report = build_allowance_accounting(
+        {"procedure": {"propose_calls": 4, "max_core_review_calls": 6}},
+        {"stages": [
+            {"stage": "axial_proposal", "calls": 2},
+            {"stage": "axial_core_review", "calls": 7},
+        ]},
+    )
+    by_stage = {row["stage"]: row for row in report["stages"]}
+    assert by_stage["axial_proposal"]["reserved"] is None
+    assert by_stage["axial_proposal"]["consumed"] == 2
+    assert by_stage["axial_proposal"]["unused"] is None
+    assert by_stage["axial_core_review"]["reserved"] is None
+    assert by_stage["axial_core_review"]["consumed"] == 7
+    assert by_stage["axial_core_review"]["unused"] is None
+    assert "unknown" in by_stage["axial_core_review"]["reserved_note"]
+    assert "not zero" in report["note"]
+    assert "overspending" in report["note"]
+    partial = build_allowance_accounting(
+        {"allowance_reserved": {
+            "axial_proposal": 0,
+            "statement_copy_retry": 1,
+            "axial_counterexample": 1,
+            "axial_relation_review": 4,
+            "axial_saturation_review": 4,
+        }},
+        {"stages": [{"stage": "axial_core_review", "calls": 7}]},
+    )
+    core = next(row for row in partial["stages"] if row["stage"] == "axial_core_review")
+    proposal = next(row for row in partial["stages"] if row["stage"] == "axial_proposal")
+    assert proposal["reserved"] == 0
+    assert core["reserved"] is None
+    assert core["consumed"] == 7
+    assert core["unused"] is None
+
+
+def test_schema_repair_follows_the_stage_it_repairs():
+    report = _call_usage_report([
+        {"kind": "axial_counterexample", "estimated_input_tokens": 40, "usage": {"input_tokens": 4, "output_tokens": 1}},
+        {
+            "kind": "schema_repair",
+            "repairs_kind": "axial_counterexample",
+            "estimated_input_tokens": 20,
+            "usage": {"input_tokens": 2, "output_tokens": 1},
+        },
+        {"kind": "axial_proposal", "estimated_input_tokens": 10, "usage": {"input_tokens": 1, "output_tokens": 1}},
+        {
+            "kind": "schema_repair",
+            "repairs_kind": "theoretical_memo",
+            "estimated_input_tokens": 15,
+            "usage": {"input_tokens": 3, "output_tokens": 1},
+        },
+        {"kind": "schema_repair", "estimated_input_tokens": 5, "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ])
+    by_stage = {row["stage"]: row for row in report["stages"]}
+    assert by_stage["axial_counterexample"]["calls"] == 2
+    assert by_stage["axial_counterexample"]["provider_input_tokens"] == 6
+    assert by_stage["axial_proposal"]["calls"] == 1
+    assert by_stage["theoretical_memo"]["calls"] == 1
+    assert by_stage["schema_repair"]["calls"] == 1
+    coding = by_stage["coding"]
+    assert coding["calls"] == 3
+    assert coding["usage_completeness"] == "complete"
+    assert coding["provider_input_tokens"] == 7
+    assert report["reconciles"] is True
+    assert report["provider_input_tokens"] == 4 + 2 + 1 + 3 + 1
+    leaf_calls = sum(
+        int(row["calls"]) for row in report["stages"] if not row.get("subtotal") and not row.get("ownership")
+    )
+    assert leaf_calls == 5
+    assert report["estimated_input_tokens"] == 40 + 20 + 10 + 15 + 5
+
+
+def test_selective_incomplete_when_required_work_is_blocked():
+    report = _call_usage_report(
+        [
+            {
+                "kind": "decision_review",
+                "checkpoint": "axial_core_review",
+                "estimated_input_tokens": 10,
+                "usage": {"input_tokens": 3, "output_tokens": 1},
+            },
+            {"kind": "theoretical_memo", "status": "omitted", "reason": "call_allowance", "estimated_input_tokens": 80},
+            {"kind": "storyline", "estimated_input_tokens": 12, "usage": {"input_tokens": 4, "output_tokens": 1}},
+        ],
+        procedure={"include_memos": True, "include_storyline": True},
+    )
+    selective = report["selective"]
+    assert selective["status"] == "incomplete"
+    assert selective["calls"] == 1
+    assert selective["referenced_core_calls"] == 1
+    assert selective["core_usage_stage"] == "axial_core_review"
+    assert "blocked" in selective["note"]
 
 
 class _AdvanceFirst(FakeAxialCoder):

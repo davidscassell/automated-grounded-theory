@@ -358,7 +358,14 @@ class AxialRelationshipDraft(BaseModel):
 
     @model_validator(mode="after")
     def _mark_role_origin(self):
-        """A missing role stays unspecified. It is not replaced with another role."""
+        """A missing role stays unspecified. It is not replaced with another role.
+
+        A later ``model_validate`` of ``model_dump`` still carries the origin
+        from the first reading. That origin stays, so an omitted role is not
+        reread as an explicit ``unspecified``.
+        """
+        if "paradigm_role_origin" in self.model_fields_set:
+            return self
         if "paradigm_role" not in self.model_fields_set:
             origin = "schema_default_unspecified"
         elif self.paradigm_role == "unspecified":
@@ -435,6 +442,8 @@ class AxialRelationDecision(BaseModel):
 
     @model_validator(mode="after")
     def _mark_role_origin(self):
+        if "paradigm_role_origin" in self.model_fields_set:
+            return self
         if "paradigm_role" not in self.model_fields_set:
             origin = "schema_default_unspecified"
         elif self.paradigm_role == "unspecified":
@@ -3255,9 +3264,10 @@ def build_allowance_accounting(metadata: Mapping[str, Any], usage: Mapping[str, 
     """Reserved, consumed, released, and unused calls. Unused is not spare capacity.
 
     An unused call does not mean tokens, dollars, or a suitable request were available.
+    A missing reservation record stays null. It is not stored as zero.
     """
-    procedure = metadata.get("procedure") if isinstance(metadata.get("procedure"), Mapping) else {}
-    reserved_source = metadata.get("allowance_reserved") if isinstance(metadata.get("allowance_reserved"), Mapping) else {}
+    has_reservation = isinstance(metadata.get("allowance_reserved"), Mapping)
+    reserved_source = metadata.get("allowance_reserved") if has_reservation else {}
     consumed = {
         str(row.get("stage") or ""): int(row.get("calls") or 0)
         for row in (usage.get("stages") or [])
@@ -3278,40 +3288,60 @@ def build_allowance_accounting(metadata: Mapping[str, Any], usage: Mapping[str, 
             }[source]
         released[source] = released.get(source, 0) + calls
         release_reasons.setdefault(source, []).append(str(item.get("reason") or item.get("note") or "transferred"))
-    defaults = {
-        "axial_proposal": int(reserved_source.get("axial_proposal") or procedure.get("propose_calls") or 0),
-        "statement_copy_retry": int(reserved_source.get("statement_copy_retry") or procedure.get("statement_copy_retry_calls") or 0),
-        "axial_counterexample": int(reserved_source.get("axial_counterexample") or procedure.get("counterexample_calls") or 0),
-        "axial_relation_review": int(reserved_source.get("axial_relation_review") or procedure.get("max_decision_calls") or 0),
-        "axial_saturation_review": int(reserved_source.get("axial_saturation_review") or procedure.get("max_decision_calls") or 0),
-        "axial_core_review": reserved_source.get("axial_core_review", procedure.get("max_core_review_calls")),
-    }
+    stage_names = (
+        "axial_proposal",
+        "statement_copy_retry",
+        "axial_counterexample",
+        "axial_relation_review",
+        "axial_saturation_review",
+        "axial_core_review",
+    )
+    unknown_reserve = (
+        "No reservation record for this stage. reserved is unknown, not zero. "
+        "Consumption against an unknown reserve is not overspending."
+    )
     stages = []
-    for name, reserved in defaults.items():
-        reserved_n = None if reserved is None else int(reserved)
+    any_unknown = False
+    for name in stage_names:
+        if not has_reservation or name not in reserved_source or reserved_source.get(name) is None:
+            reserved_n = None
+            any_unknown = True
+            reserved_note = unknown_reserve
+        else:
+            reserved_n = int(reserved_source.get(name))
+            reserved_note = None
         used = int(consumed.get(name) or 0)
         moved = int(released.get(name) or 0)
         unused = None if reserved_n is None else max(0, reserved_n - used - moved)
         stages.append({
             "stage": name,
             "reserved": reserved_n,
+            "reserved_known": reserved_n is not None,
             "consumed": used,
             "released": moved,
             "unused": unused,
             "release_reasons": release_reasons.get(name) or [],
+            "reserved_note": reserved_note,
             "unused_reason": (
                 None
                 if not unused
                 else "Calls remained in this stage. That does not mean tokens, dollars, or a suitable request were available."
             ),
         })
+    note = (
+        "reserved is the stage allowance recorded at the start of the run. "
+        "consumed is calls sent. released is calls moved to another stage. "
+        "unused is what remained. Unused calls are not evidence that tokens, dollars, or a suitable request were available."
+    )
+    if any_unknown:
+        note += (
+            " A stage with no reservation record, including an export from before 0.9.44, "
+            "has reserved null. That unknown reserve is not zero, and consumption is not overspending."
+        )
     return {
         "stages": stages,
-        "note": (
-            "reserved is the stage allowance at the start of the run. "
-            "consumed is calls sent. released is calls moved to another stage. "
-            "unused is what remained. Unused calls are not evidence that tokens, dollars, or a suitable request were available."
-        ),
+        "reservation_recorded": has_reservation and not any_unknown,
+        "note": note,
     }
 
 
@@ -4681,6 +4711,15 @@ def _note_proposal_repairs(metadata: dict[str, Any], audits: Sequence[Mapping[st
     metadata["proposal_diagnostics"] = diagnostics
 
 
+def _stamp_repair_stage(audits: Sequence[Any], repairs_kind: str | None) -> None:
+    """A schema repair belongs to the stage whose output it repairs."""
+    if not repairs_kind:
+        return
+    for audit in audits or []:
+        if isinstance(audit, dict) and str(audit.get("kind") or "") == "schema_repair":
+            audit["repairs_kind"] = repairs_kind
+
+
 def _log_call_audits(logs: list, audits: Sequence[Mapping[str, Any]], *, extra: Mapping[str, Any] | None = None) -> None:
     for audit in audits:
         status = str(audit.get("status") or "")
@@ -4692,6 +4731,8 @@ def _log_call_audits(logs: list, audits: Sequence[Mapping[str, Any]], *, extra: 
             "needs_review": flagged,
             "flagged": flagged,
         }
+        if audit.get("repairs_kind"):
+            row_extra["repairs_kind"] = audit.get("repairs_kind")
         if audit.get("raw_response"):
             row_extra["raw_response"] = audit.get("raw_response")
         if "received" in audit:
@@ -4718,14 +4759,17 @@ async def _structured_call(
     metadata: dict[str, Any],
     stage: str,
     attempt_repair: bool = True,
+    repairs_kind: str | None = None,
 ) -> dict[str, Any]:
     """One structured provider call.
 
     ``attempt_repair=False`` returns a parse failure as ``repair_pending``
     and does not spend a second call. The caller checkpoints that response
-    before the repair visit.
+    before the repair visit. A schema repair is stamped with the stage whose
+    output it repairs.
     """
     audits: list[dict[str, Any]] = []
+    origin = repairs_kind or (None if kind == "schema_repair" else kind)
     try:
         (parsed, usage), sent = await ainvoke_structured(
             runtime.coder,
@@ -4744,6 +4788,7 @@ async def _structured_call(
     except AllowanceExhausted as exc:
         _sync_allowance(metadata, runtime)
         metadata["axial_stop"] = exc.reason
+        _stamp_repair_stage(audits, origin)
         return {
             "refused": True,
             "unparsed": False,
@@ -4756,6 +4801,7 @@ async def _structured_call(
         }
     _sync_allowance(metadata, runtime)
     _account_responses(metadata, audits)
+    _stamp_repair_stage(audits, origin)
     repair_pending = bool(isinstance(parsed, Mapping) and parsed.get("needs_repair"))
     unparsed = bool(isinstance(parsed, Mapping) and parsed.get("_agt_unparsed")) and not repair_pending
     if unparsed:
@@ -5053,10 +5099,12 @@ async def _repair_visit(
     *,
     stage: str,
     original_raw: str,
+    repairs_kind: str,
 ) -> dict[str, Any]:
     """One repair visit. An over-budget or refused repair does not call the model."""
     fitted, local = _repair_over_request_budget(metadata, schema, messages, original_raw=original_raw)
     if local is not None:
+        _stamp_repair_stage(local.get("audits"), repairs_kind)
         return local
     result = await _structured_call(
         runtime,
@@ -5066,6 +5114,7 @@ async def _repair_visit(
         metadata=metadata,
         stage=stage,
         attempt_repair=False,
+        repairs_kind=repairs_kind,
     )
     if getattr(schema, "__name__", "") == "AxialProposalBatch":
         recovered = _recovered_proposal_batch(result)
@@ -6318,6 +6367,7 @@ def _propose_node(runtime: AxialRuntime):
                     messages,
                     stage="coding",
                     original_raw=original_raw,
+                    repairs_kind="axial_proposal",
                 )
             else:
                 window = list(pending[:batch])
@@ -7301,6 +7351,7 @@ def _counterexample_node(runtime: AxialRuntime):
                     messages,
                     stage="coding",
                     original_raw=original_raw,
+                    repairs_kind="axial_counterexample",
                 )
             else:
                 chunk = []
@@ -7976,25 +8027,62 @@ _USAGE_LEAVES = (
 _CODING_LEAVES = ("axial_proposal", "statement_copy_retry", "axial_counterexample")
 
 
+_REPAIR_STAGES = {
+    "axial_proposal": "axial_proposal",
+    "statement_copy_retry": "statement_copy_retry",
+    "axial_counterexample": "axial_counterexample",
+    "axial_relation_review": "axial_relation_review",
+    "axial_saturation_review": "axial_saturation_review",
+    "axial_core_review": "axial_core_review",
+    "theoretical_memo": "theoretical_memo",
+    "storyline": "storyline",
+}
+
+
 def _usage_stage_name(row: Mapping[str, Any]) -> str:
-    """One leaf stage. A coding subtotal is not a leaf and is not counted twice."""
+    """One leaf stage. A coding subtotal is not a leaf and is not counted twice.
+
+    A schema repair is counted on the stage whose output it repairs. It is not
+    forced onto proposals.
+    """
     checkpoint = str(row.get("checkpoint") or "")
     kind = str(row.get("kind") or "")
     if row.get("statement_copy_retry") is True or kind == "statement_copy_retry":
         return "statement_copy_retry"
+    if kind == "schema_repair":
+        repaired = str(row.get("repairs_kind") or "")
+        if repaired in _REPAIR_STAGES:
+            return _REPAIR_STAGES[repaired]
+        if checkpoint in _REPAIR_STAGES:
+            return checkpoint
+        return "schema_repair"
     if checkpoint in {"axial_core_review", "axial_relation_review", "axial_saturation_review"}:
         return checkpoint
     if kind == "axial_proposal":
         return "axial_proposal"
     if kind == "axial_counterexample":
         return "axial_counterexample"
-    if kind == "schema_repair":
-        return "axial_proposal"
     if kind in {"theoretical_memo", "storyline"}:
         return kind
     if kind == "decision_review" and checkpoint:
         return checkpoint
     return str(row.get("stage") or kind or "unknown")
+
+
+def _rollup_completeness(parts: Sequence[Mapping[str, Any]]) -> str:
+    """Coding completeness follows the member stages that sent or missed a call."""
+    active = [
+        row for row in parts
+        if int(row.get("calls") or 0) or int(row.get("missing_calls") or 0)
+    ]
+    if not active:
+        return "unknown"
+    states = [str(row.get("usage_completeness") or "unknown") for row in active]
+    if all(state == "complete" for state in states):
+        return "complete"
+    if all(state == "unknown" for state in states):
+        return "unknown"
+    return "partial"
 
 
 def _sum_or_null(values: Sequence[int | None]) -> int | None:
@@ -8108,7 +8196,8 @@ def _call_usage_report(
         "estimated_input_tokens": _sum_or_null([row["estimated_input_tokens"] for row in coding_parts]) if coding_parts else 0,
         "provider_input_tokens": _sum_or_null([row["provider_input_tokens"] for row in coding_parts]) if coding_parts else None,
         "provider_output_tokens": _sum_or_null([row["provider_output_tokens"] for row in coding_parts]) if coding_parts else None,
-        "note": "Rollup of proposal, quote-copy retry, and counterexample calls. These calls are not counted again.",
+        "usage_completeness": _rollup_completeness(coding_parts),
+        "note": "Rollup of proposal, quote-copy retry, and counterexample calls. These calls are not counted again. Completeness follows those member stages.",
     }
     core_calls = next((int(row["calls"]) for row in stages if row["stage"] == "axial_core_review"), 0)
     memo_calls = next((int(row["calls"]) for row in stages if row["stage"] == "theoretical_memo"), 0)
@@ -8136,7 +8225,7 @@ def _call_usage_report(
         "note": (
             "Core selection calls belong to axial_core_review and are not counted here. "
             "not_requested means memos and the storyline were disabled. "
-            "incomplete means requested selective work sent no call."
+            "incomplete means required memo or storyline work was blocked and sent no call."
         ),
     }
     leaf_rows = [row for row in stages if row["stage"] != "coding"]
@@ -11051,6 +11140,7 @@ def _memo_node(runtime: AxialRuntime):
                     messages,
                     stage="selective",
                     original_raw=original_raw,
+                    repairs_kind="theoretical_memo",
                 )
             else:
                 chunk, pending, messages, estimate, reason = _pack_window(
@@ -11455,6 +11545,7 @@ def _story_node(runtime: AxialRuntime):
                 messages,
                 stage="selective",
                 original_raw=original_raw,
+                repairs_kind="storyline",
             )
             emphasis = bool(metadata.get("storyline_core_emphasis"))
         else:
