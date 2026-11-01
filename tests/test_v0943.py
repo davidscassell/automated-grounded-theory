@@ -19,8 +19,8 @@ from tests.test_v080 import FakeAxialCoder
 
 
 def test_version_is_0943():
-    assert __version__ == "0.9.43"
-    assert POLICY_VERSION == "0.9.43"
+    assert __version__ == "0.9.44"
+    assert POLICY_VERSION == "0.9.44"
 
 
 def test_a_punctuation_only_difference_is_not_a_missing_quote():
@@ -368,8 +368,10 @@ def test_overflow_blocks_multi_document_pairs_then_sends_a_single_document_pair_
             logged_tokens[stage] = logged_tokens.get(stage, 0) + int(usage_row["input_tokens"])
     usage = result.metadata["call_usage"]
     for stage in usage["stages"]:
+        if stage.get("subtotal") or stage.get("ownership"):
+            continue
         assert stage["calls"] == logged_counts.get(stage["stage"], 0)
-        assert stage["missing_calls"] == 0
+        assert stage.get("missing_calls", 0) == 0
     core_tokens = logged_tokens.get("axial_core_review", 0)
     assert core_tokens > 0
     core_stage = next(row for row in usage["stages"] if row["stage"] == "axial_core_review")

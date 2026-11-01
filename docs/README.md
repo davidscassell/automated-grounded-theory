@@ -1,6 +1,6 @@
 # Design notes
 
-Package `policy_version` is `0.9.43`. This index says which notes describe the package now and which notes are the record of an earlier version. A historical note can disagree with the code. The code, the README, and the current notes below win. A count of every item reviewed, including 355 of 355, and a passing synthetic fixture establish processing coverage only. They do not establish that a selection is valid.
+Package `policy_version` is `0.9.44`. This index says which notes describe the package now and which notes are the record of an earlier version. A historical note can disagree with the code. The code, the README, and the current notes below win. A count of every item reviewed, including 355 of 355, and a passing synthetic fixture establish processing coverage only. They do not establish that a selection is valid.
 
 Axial coding, selective coding, and theoretical sampling are experimental. No study adjudication file is included. The discovery example is synthetic. Live evaluation runs through v31, on package 0.9.9, did not measure analytic accuracy.
 
@@ -10,7 +10,7 @@ Axial coding, selective coding, and theoretical sampling are experimental. No st
 | --- | --- |
 | [../README.md](../README.md) | The pipeline, the defaults, the evidence tiers, quiet rounds, timeouts, and gate scoring. |
 | [methodology.md](methodology.md) | How the open-coding default maps onto the sources already named there. |
-| [design.md](design.md) | The open-coding engineering design, plus a version log through `0.9.43`. The early sections are the 0.6 run. |
+| [design.md](design.md) | The open-coding engineering design, plus a version log through `0.9.44`. The early sections are the 0.6 run. |
 | [design-relationship-tiers.md](design-relationship-tiers.md) | Evidence tiers. `pattern_min_cases` is 2. Tier labels are `category_evidence`, `hypothesis`, `pattern_supported`, `attribution`, and `verified`. |
 | [design-negative-cases-092.md](design-negative-cases-092.md) | Negative-case search at respondent level, and a core that needs tier 2. Later search corrections are in the 0.9.3 review note. |
 | [design-gate-evaluation.md](design-gate-evaluation.md) | `export_gate_relationships`, `load_adjudications`, and `score_gate_adjudications`, including `downstream_precision` and `downstream_withheld_supported_recall`. |
@@ -19,10 +19,11 @@ Axial coding, selective coding, and theoretical sampling are experimental. No st
 | [focused-evaluation.md](focused-evaluation.md) | The offline focused comparison and its live-cost estimate. It does not call an API. |
 | [design-review-fixes-0940.md](design-review-fixes-0940.md) | Selection response hashes name flipped codes. Axial planning warns when pair coverage is low. Counterexample evidence is shortened to the request cap or its calls return to proposals. Multi-document pairs are planned first. A copied statement is retried once. Raised-code document reach, reread-queue coverage, and a reconciling relationship funnel are recorded. Core selection is unchanged. |
 | [design-review-fixes-0943.md](design-review-fixes-0943.md) | Every multi-document pair is examined or budget-blocked before a single-document pair or a counterexample. A reviewer-rejected row is not a counterexample target. Usage lists every stage, including core, and is partial when a call is missing. Retries are counted. A restated quote stays invalid. Quote-scope flags keep a cause. Review history records its stage. |
+| [design-review-fixes-0944.md](design-review-fixes-0944.md) | Stage usage separates proposal, retry, counterexample, relation review, saturation review, and core selection. A coding subtotal is not counted twice. A core on one eligible relationship is provisional. Returned paradigm roles are kept. Empty acceptance reasons stay empty. Unused allowances are reported and do not imply spare capacity. Pair assertions stay separate. The core final assessment consumes the call allowance. Quote anchoring stays an offline check. |
 
 ## Historical
 
-These notes stay so a reader can see what a version changed. They are not the current contract. `design-review-fixes-*` through 0.9.42 are in this list. `design-review-fixes-0943.md` is the current review note, listed above.
+These notes stay so a reader can see what a version changed. They are not the current contract. `design-review-fixes-*` through 0.9.42 are in this list. `design-review-fixes-0944.md` is the current review note, listed above. `design-review-fixes-0943.md` stays above as well: its examination order is still the package behavior.
 
 | Note | Version it records |
 | --- | --- |
@@ -69,7 +70,7 @@ These notes stay so a reader can see what a version changed. They are not the cu
 | [design-review-fixes-0941.md](design-review-fixes-0941.md) | 0.9.41. Retries and counterexample tokens stay inside the existing allowances. 0.9.42 slims the counterexample request, consolidates identical assertions before review, and reconciles raw proposal ids. |
 | [design-review-fixes-0942.md](design-review-fixes-0942.md) | 0.9.42. The counterexample request is the claim, definitions, passage context, and provenance. Identical assertions are consolidated before review. 0.9.43 examines every multi-document pair before a single-document pair or a counterexample, and it keeps usage, retries, and quote-scope causes in the export. |
 
-`design-review-fixes-0942.md` records the 0.9.42 request shape. `design-review-fixes-0943.md` is the current review note.
+`design-review-fixes-0942.md` records the 0.9.42 request shape. `design-review-fixes-0943.md` records the 0.9.43 examination order. `design-review-fixes-0944.md` is the current review note.
 
 ## Defaults the tests check
 

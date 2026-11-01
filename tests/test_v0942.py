@@ -26,8 +26,8 @@ from tests.test_v080 import FakeAxialCoder
 
 
 def test_version_is_0942():
-    assert __version__ == "0.9.43"
-    assert POLICY_VERSION == "0.9.43"
+    assert __version__ == "0.9.44"
+    assert POLICY_VERSION == "0.9.44"
     assert PATTERN_MIN_CASES == 2
 
 
@@ -202,7 +202,10 @@ def test_missing_provider_usage_stays_null():
     assert report["calls"][1]["provider_output_tokens"] == 12
     assert report["usage_completeness"] == "partial"
     assert report["estimated_input_tokens"] == 200
-    assert report["provider_input_tokens"] == 30
+    assert report["provider_input_tokens"] is None
+    proposal = next(row for row in report["stages"] if row["stage"] == "axial_proposal")
+    assert proposal["provider_input_tokens"] is None
+    assert proposal["provider_output_tokens"] is None
 
 
 def test_summary_reasons_do_not_drop_partial_endpoint_evidence():

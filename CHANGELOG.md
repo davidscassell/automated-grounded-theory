@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.44
+
+- `call_usage` separates proposal, quote-copy retry, counterexample, relation review, saturation review, and core selection. Coding is the subtotal of proposal, retry, and counterexample calls and is not added into the overall totals a second time. Estimated input, provider input, and provider output are independent. A missing provider count stays null. A stage total stays null when any call in that stage lacks the count. Overall provider totals stay null when any leaf stage that sent a call has a null provider total.
+- The selective usage row owns memos and the storyline. Core calls stay on `axial_core_review` and are referenced from that row. Disabled memo and storyline work is `not_requested`. Requested selective work that sent no call is `incomplete`.
+- The core final assessment is part of the contingent plan. Before each core call, the run refuses the call when the progress counter or the stage ledger has already reached `max_core_review_calls`. A six-call allowance does not send the seventh call. Raising the allowance to seven sends that final assessment, including on resume from the six-call export. `core_call_accounting.layer` is `enforcement`.
+- A selected core supported by exactly one eligible relationship sets `core_provisional` and `core_support_note`. The note names that relationship.
+- A paradigm role the model returns is kept. An omitted role stays `unspecified` with origin `schema_default_unspecified`. An explicit `unspecified` is `model_unspecified`. A reviewer role replaces the proposal role only when the reviewer returned one. The package does not invent a role.
+- An accepted row can have an empty reason list. That withholds rejection reasons. `evidence_limitations` carries `tentative` and `limited_document_support` separately.
+- Allowance accounting records reserved, consumed, released, and unused calls per stage, with the release reason. Unused calls are what remained. They are not evidence that tokens, dollars, or a suitable request were available. Spending rules are unchanged.
+- `pair_assertions` groups one directed pair and keeps each assertion's id, statement, evidence, and decision. Different claims on the same endpoints stay separate.
+- Quote-anchoring checks stay offline. `quote_anchoring_live_exercise` is false.
+- Evidence exposure, eligibility, reviewer standards, `pattern_min_cases` (2), and the 6,000 counterexample cap are unchanged. No LLM judge is added. Undefined metrics stay null. The review note is [docs/design-review-fixes-0944.md](docs/design-review-fixes-0944.md). `policy_version` is `0.9.44`.
+
 ## 0.9.43
 
 - Every pair coded together in at least `pattern_min_cases` documents is examined, or `budget_blocked` with that reason, before a single-document pair and before a counterexample. Spare counterexample calls and unused quote-copy retries move onto those proposals, and those moved calls run. One counterexample call stays so a row still in play can be tested after the multi-document proposals. When some multi-document pairs do not fit, the last proposal slot is the first single-document pair and it is sent after those proposals. The coding ceiling is not raised. An unplanned multi-document pair without a reason does not remain.

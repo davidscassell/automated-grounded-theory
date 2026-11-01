@@ -333,6 +333,11 @@ class AxialRelationshipDraft(BaseModel):
         "consequence",
         "unspecified",
     ] = "unspecified"
+    paradigm_role_origin: Literal[
+        "schema_default_unspecified",
+        "model_unspecified",
+        "model_returned",
+    ] = "schema_default_unspecified"
     statement: str
     passage_id: str | None = None
     quote: str | None = None
@@ -350,6 +355,18 @@ class AxialRelationshipDraft(BaseModel):
         if not text.strip():
             raise ValueError("A blank statement is not a relationship.")
         return text
+
+    @model_validator(mode="after")
+    def _mark_role_origin(self):
+        """A missing role stays unspecified. It is not replaced with another role."""
+        if "paradigm_role" not in self.model_fields_set:
+            origin = "schema_default_unspecified"
+        elif self.paradigm_role == "unspecified":
+            origin = "model_unspecified"
+        else:
+            origin = "model_returned"
+        object.__setattr__(self, "paradigm_role_origin", origin)
+        return self
 
 
 class AxialProposalBatch(BaseModel):
@@ -409,7 +426,23 @@ class AxialRelationDecision(BaseModel):
         "consequence",
         "unspecified",
     ] = "unspecified"
+    paradigm_role_origin: Literal[
+        "schema_default_unspecified",
+        "model_unspecified",
+        "model_returned",
+    ] = "schema_default_unspecified"
     rationale: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _mark_role_origin(self):
+        if "paradigm_role" not in self.model_fields_set:
+            origin = "schema_default_unspecified"
+        elif self.paradigm_role == "unspecified":
+            origin = "model_unspecified"
+        else:
+            origin = "model_returned"
+        object.__setattr__(self, "paradigm_role_origin", origin)
+        return self
 
 
 class AxialRelationDecisions(BaseModel):
@@ -2173,6 +2206,9 @@ def _new_relationship(
     text = str(passage.get("text") or "")
     anchored = _anchored(quote, text)
     role = str(draft.get("paradigm_role") or "unspecified")
+    role_origin = str(draft.get("paradigm_role_origin") or "schema_default_unspecified")
+    if role_origin not in {"schema_default_unspecified", "model_unspecified", "model_returned"}:
+        role_origin = "schema_default_unspecified"
     if lens != "paradigm":
         role = role if role == "unspecified" else role
     flags = []
@@ -2183,6 +2219,7 @@ def _new_relationship(
         "from_id": str(draft.get("from_id") or ""),
         "to_id": str(draft.get("to_id") or ""),
         "paradigm_role": role,
+        "paradigm_role_origin": role_origin,
         "model_paradigm_role": role,
         "human_paradigm_role": None,
         "statement": str(draft.get("statement") or ""),
@@ -2755,14 +2792,21 @@ def _apply_model_relations(
         if "proposal_paradigm_role" not in row:
             row["proposal_paradigm_role"] = row.get("paradigm_role")
         reviewer_role = decision.get("paradigm_role")
+        reviewer_origin = str(decision.get("paradigm_role_origin") or "schema_default_unspecified")
         row["model_disposition"] = requested
         # The evidence gate may later rewrite model_disposition. This is the
         # reviewer's own decision and is not rewritten.
         row["reviewer_disposition"] = requested
         row["model_paradigm_role"] = reviewer_role
         row["reviewer_paradigm_role"] = reviewer_role
-        if not str(row.get("human_paradigm_role") or "").strip() and str(reviewer_role or "").strip():
+        # An omitted reviewer role is the schema default. It does not replace
+        # a role the proposal actually returned.
+        if reviewer_origin == "model_returned" and str(reviewer_role or "").strip():
             row["paradigm_role"] = str(reviewer_role)
+            row["paradigm_role_origin"] = "reviewer"
+        elif reviewer_origin == "model_unspecified":
+            row["paradigm_role"] = "unspecified"
+            row["paradigm_role_origin"] = "reviewer_unspecified"
         row["model_rationale"] = decision.get("rationale")
         _flag_same_passage_claim(row, str(decision.get("rationale") or ""), flag="reviewer_same_passage_mismatch")
         _flag_reviewer_causal_claim(row, str(decision.get("rationale") or ""))
@@ -3172,6 +3216,153 @@ def _relationship_document_count(row: Mapping[str, Any], passages: Sequence[Any]
     return len(docs)
 
 
+def _evidence_limitations(row: Mapping[str, Any], passages: Sequence[Any], pattern_floor: int) -> list[str]:
+    """Tentative status and thin document support. These are not rejection reasons.
+
+    An accepted row with an empty reason list is withholding reasons. That is
+    correct. These limitations stay beside that list.
+    """
+    found: list[str] = []
+    try:
+        tier = int(row.get("evidence_tier"))
+    except (TypeError, ValueError):
+        tier = None
+    disposition = str(row.get("disposition") or "")
+    if tier is None or tier < 3 or disposition in {"proposed", "provisional"} or str(row.get("paradigm_role") or "") == "unspecified":
+        found.append("tentative")
+    documents = _relationship_document_count(row, passages)
+    if documents is None or documents < int(pattern_floor):
+        found.append("limited_document_support")
+    return found
+
+
+def _attach_run_accounting(metadata: dict[str, Any], state: Mapping[str, Any]) -> None:
+    procedure = metadata.get("procedure") if isinstance(metadata.get("procedure"), Mapping) else {}
+    metadata["call_usage"] = _call_usage_report(
+        state.get("prompt_log") or [],
+        provider_budget=metadata.get("provider_budget") if isinstance(metadata.get("provider_budget"), Mapping) else None,
+        procedure=procedure,
+    )
+    metadata["allowance_accounting"] = build_allowance_accounting(metadata, metadata["call_usage"])
+    metadata["pair_assertions"] = build_pair_assertions(state.get("relationships") or [])
+    metadata["quote_anchoring_live_exercise"] = False
+    metadata["quote_anchoring_note"] = (
+        "Quote-anchoring fixes are covered by offline tests. They were not exercised on a live provider run."
+    )
+
+
+def build_allowance_accounting(metadata: Mapping[str, Any], usage: Mapping[str, Any]) -> dict[str, Any]:
+    """Reserved, consumed, released, and unused calls. Unused is not spare capacity.
+
+    An unused call does not mean tokens, dollars, or a suitable request were available.
+    """
+    procedure = metadata.get("procedure") if isinstance(metadata.get("procedure"), Mapping) else {}
+    reserved_source = metadata.get("allowance_reserved") if isinstance(metadata.get("allowance_reserved"), Mapping) else {}
+    consumed = {
+        str(row.get("stage") or ""): int(row.get("calls") or 0)
+        for row in (usage.get("stages") or [])
+        if isinstance(row, Mapping) and not row.get("subtotal") and not row.get("ownership")
+    }
+    released: dict[str, int] = {}
+    release_reasons: dict[str, list[str]] = {}
+    for item in metadata.get("allowance_transfers") or []:
+        if not isinstance(item, Mapping):
+            continue
+        source = str(item.get("from") or "")
+        calls = int(item.get("calls") or item.get("calls_transferred") or 0)
+        if source in {"counterexamples", "statement_copy_retry", "proposals"}:
+            source = {
+                "counterexamples": "axial_counterexample",
+                "statement_copy_retry": "statement_copy_retry",
+                "proposals": "axial_proposal",
+            }[source]
+        released[source] = released.get(source, 0) + calls
+        release_reasons.setdefault(source, []).append(str(item.get("reason") or item.get("note") or "transferred"))
+    defaults = {
+        "axial_proposal": int(reserved_source.get("axial_proposal") or procedure.get("propose_calls") or 0),
+        "statement_copy_retry": int(reserved_source.get("statement_copy_retry") or procedure.get("statement_copy_retry_calls") or 0),
+        "axial_counterexample": int(reserved_source.get("axial_counterexample") or procedure.get("counterexample_calls") or 0),
+        "axial_relation_review": int(reserved_source.get("axial_relation_review") or procedure.get("max_decision_calls") or 0),
+        "axial_saturation_review": int(reserved_source.get("axial_saturation_review") or procedure.get("max_decision_calls") or 0),
+        "axial_core_review": reserved_source.get("axial_core_review", procedure.get("max_core_review_calls")),
+    }
+    stages = []
+    for name, reserved in defaults.items():
+        reserved_n = None if reserved is None else int(reserved)
+        used = int(consumed.get(name) or 0)
+        moved = int(released.get(name) or 0)
+        unused = None if reserved_n is None else max(0, reserved_n - used - moved)
+        stages.append({
+            "stage": name,
+            "reserved": reserved_n,
+            "consumed": used,
+            "released": moved,
+            "unused": unused,
+            "release_reasons": release_reasons.get(name) or [],
+            "unused_reason": (
+                None
+                if not unused
+                else "Calls remained in this stage. That does not mean tokens, dollars, or a suitable request were available."
+            ),
+        })
+    return {
+        "stages": stages,
+        "note": (
+            "reserved is the stage allowance at the start of the run. "
+            "consumed is calls sent. released is calls moved to another stage. "
+            "unused is what remained. Unused calls are not evidence that tokens, dollars, or a suitable request were available."
+        ),
+    }
+
+
+def build_pair_assertions(relationships: Sequence[Any]) -> dict[str, Any]:
+    """One group per directed pair. Different statements stay separate assertions."""
+    order: list[tuple[str, str]] = []
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in relationships:
+        if not isinstance(row, Mapping) or row.get("synthetic"):
+            continue
+        key = (str(row.get("from_id") or ""), str(row.get("to_id") or ""))
+        if key not in groups:
+            order.append(key)
+            groups[key] = []
+        groups[key].append({
+            "relationship_id": str(row.get("relationship_id") or ""),
+            "statement": str(row.get("statement") or ""),
+            "evidence": {
+                "quote": row.get("quote"),
+                "passage_id": row.get("passage_id"),
+                "doc_id": row.get("doc_id"),
+                "evidence_tier": row.get("evidence_tier"),
+                "document_count": row.get("document_count"),
+            },
+            "decision": {
+                "disposition": row.get("disposition"),
+                "reviewer_disposition": row.get("reviewer_disposition"),
+                "review_decision": row.get("review_decision"),
+                "paradigm_role": row.get("paradigm_role"),
+                "paradigm_role_origin": row.get("paradigm_role_origin"),
+                "downstream_eligible": row.get("downstream_eligible"),
+            },
+        })
+    return {
+        "pairs": [
+            {
+                "from_id": key[0],
+                "to_id": key[1],
+                "assertion_count": len(groups[key]),
+                "assertions": groups[key],
+            }
+            for key in order
+        ],
+        "note": (
+            "Each assertion keeps its own id, statement, evidence, and decision. "
+            "A different claim on the same endpoints is not merged. "
+            "Identical statements may already have been consolidated before review."
+        ),
+    }
+
+
 def build_relationship_funnel(state: Mapping[str, Any]) -> dict[str, Any]:
     """Pair counts and row counts for one axial run.
 
@@ -3313,6 +3504,7 @@ def build_relationship_funnel(state: Mapping[str, Any]) -> dict[str, Any]:
             "document_count_unit": "documents",
             "summary_reasons": [reason for reason in _COUNTEREXAMPLE_SUMMARY_REASONS if reason in row_reasons],
             "reasons": row_reasons,
+            "evidence_limitations": _evidence_limitations(row, passages, pattern_floor),
             "retries": list(retries_by_pair.get(key) or []),
             "evidence_exposure": {
                 "available": held.get("available"),
@@ -6457,7 +6649,7 @@ def _propose_node(runtime: AxialRuntime):
                         stage="coding",
                         attempt_repair=False,
                     )
-                    _log_call_audits(logs, retry_result["audits"])
+                    _log_call_audits(logs, retry_result["audits"], extra={"statement_copy_retry": True})
                     used += 1
                     diagnostics["statement_copy_retries"] = int(diagnostics.get("statement_copy_retries") or 0) + 1
                     lineage["retry_sent"] = True
@@ -7771,14 +7963,33 @@ def _finalize_proposal_lineage(metadata: dict[str, Any], relationships: Sequence
     metadata["proposal_lineage"] = reconcile_proposal_lineage(updated, relationships)
 
 
+_USAGE_LEAVES = (
+    "axial_proposal",
+    "statement_copy_retry",
+    "axial_counterexample",
+    "axial_relation_review",
+    "axial_saturation_review",
+    "axial_core_review",
+    "theoretical_memo",
+    "storyline",
+)
+_CODING_LEAVES = ("axial_proposal", "statement_copy_retry", "axial_counterexample")
+
+
 def _usage_stage_name(row: Mapping[str, Any]) -> str:
-    """Ledger stage for one prompt-log row. Core, relation review, and saturation stay separate from coding."""
+    """One leaf stage. A coding subtotal is not a leaf and is not counted twice."""
     checkpoint = str(row.get("checkpoint") or "")
     kind = str(row.get("kind") or "")
+    if row.get("statement_copy_retry") is True or kind == "statement_copy_retry":
+        return "statement_copy_retry"
     if checkpoint in {"axial_core_review", "axial_relation_review", "axial_saturation_review"}:
         return checkpoint
-    if kind in {"axial_proposal", "axial_counterexample", "schema_repair"}:
-        return "coding"
+    if kind == "axial_proposal":
+        return "axial_proposal"
+    if kind == "axial_counterexample":
+        return "axial_counterexample"
+    if kind == "schema_repair":
+        return "axial_proposal"
     if kind in {"theoretical_memo", "storyline"}:
         return kind
     if kind == "decision_review" and checkpoint:
@@ -7786,16 +7997,25 @@ def _usage_stage_name(row: Mapping[str, Any]) -> str:
     return str(row.get("stage") or kind or "unknown")
 
 
-def _call_usage_report(logs: Sequence[Any], provider_budget: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Estimates and provider-reported tokens stay in different fields.
+def _sum_or_null(values: Sequence[int | None]) -> int | None:
+    if any(value is None for value in values):
+        return None
+    return sum(int(value or 0) for value in values)
 
-    Every stage in the log or the allowance ledger is listed. A missing provider
-    count stays null. Completeness is partial when any sent call is absent or
-    lacks a provider count. It is not complete just because the calls that were
-    listed happened to have tokens.
+
+def _call_usage_report(
+    logs: Sequence[Any],
+    provider_budget: Mapping[str, Any] | None = None,
+    procedure: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Leaf stages and one coding subtotal. The subtotal is not added again.
+
+    Estimated input, provider input, and provider output are separate. A missing
+    provider count stays null. A stage total is null when any of its calls is
+    missing that count, so a partial sum is not treated as the total.
     """
     rows = []
-    by_stage: dict[str, dict[str, int]] = {}
+    buckets: dict[str, dict[str, Any]] = {}
     for row in logs or []:
         if not isinstance(row, Mapping):
             continue
@@ -7805,55 +8025,66 @@ def _call_usage_report(logs: Sequence[Any], provider_budget: Mapping[str, Any] |
         usage = row.get("usage") if isinstance(row.get("usage"), Mapping) else {}
         has_input = "input_tokens" in usage and usage.get("input_tokens") is not None
         has_output = "output_tokens" in usage and usage.get("output_tokens") is not None
+        estimate = row.get("estimated_input_tokens")
+        estimate_n = None if estimate is None else int(estimate)
         if has_input and has_output:
             completeness = "complete"
         elif has_input or has_output:
             completeness = "partial"
         else:
             completeness = "unknown"
-        estimate = row.get("estimated_input_tokens")
         stage = _usage_stage_name(row)
         recorded = {
             "kind": row.get("kind"),
             "stage": stage,
             "checkpoint": row.get("checkpoint"),
-            "estimated_input_tokens": None if estimate is None else int(estimate),
+            "statement_copy_retry": row.get("statement_copy_retry") is True,
+            "estimated_input_tokens": estimate_n,
             "provider_input_tokens": int(usage["input_tokens"]) if has_input else None,
             "provider_output_tokens": int(usage["output_tokens"]) if has_output else None,
             "usage_completeness": completeness,
         }
         rows.append(recorded)
-        bucket = by_stage.setdefault(stage, {"calls": 0, "provider_input_tokens": 0, "known": 0})
+        bucket = buckets.setdefault(
+            stage,
+            {"calls": 0, "estimates": [], "inputs": [], "outputs": []},
+        )
         bucket["calls"] += 1
-        if completeness == "complete":
-            bucket["known"] += 1
-            bucket["provider_input_tokens"] += int(recorded["provider_input_tokens"] or 0)
-    ledger = {}
+        bucket["estimates"].append(estimate_n)
+        bucket["inputs"].append(recorded["provider_input_tokens"])
+        bucket["outputs"].append(recorded["provider_output_tokens"])
+    ledger: dict[str, int] = {}
     if isinstance(provider_budget, Mapping):
         raw_stages = provider_budget.get("stages") if isinstance(provider_budget.get("stages"), Mapping) else {}
         for name, item in raw_stages.items():
-            if str(name) == "review":
+            if str(name) in {"review", "coding", "selective"}:
                 continue
             if isinstance(item, Mapping):
                 ledger[str(name)] = int(item.get("calls_used") or 0)
             else:
                 ledger[str(name)] = int(item or 0)
-    stage_names = list(dict.fromkeys([*by_stage.keys(), *ledger.keys()]))
+    names = list(_USAGE_LEAVES)
+    for name in list(buckets) + list(ledger):
+        if name not in names:
+            names.append(name)
     stages = []
     missing_call = False
-    for name in stage_names:
-        logged = int(by_stage.get(name, {}).get("calls") or 0)
+    for name in names:
+        bucket = buckets.get(name) or {"calls": 0, "estimates": [], "inputs": [], "outputs": []}
+        logged = int(bucket["calls"])
+        if logged == 0 and name not in ledger and name not in buckets:
+            continue
         ledger_calls = int(ledger.get(name) or 0)
         missing = max(0, ledger_calls - logged)
         if missing:
             missing_call = True
-        known = int(by_stage.get(name, {}).get("known") or 0)
-        if logged and known < logged:
-            stage_completeness = "partial" if known else "unknown"
-        elif missing:
-            stage_completeness = "partial"
-        elif logged:
+        estimated = _sum_or_null(bucket["estimates"]) if logged else (0 if name in buckets else None)
+        provider_in = _sum_or_null(bucket["inputs"]) if logged else None
+        provider_out = _sum_or_null(bucket["outputs"]) if logged else None
+        if logged and estimated is not None and provider_in is not None and provider_out is not None and not missing:
             stage_completeness = "complete"
+        elif logged or missing:
+            stage_completeness = "partial" if (provider_in is not None or provider_out is not None or estimated is not None) else "unknown"
         else:
             stage_completeness = "unknown"
         stages.append({
@@ -7861,34 +8092,101 @@ def _call_usage_report(logs: Sequence[Any], provider_budget: Mapping[str, Any] |
             "calls": logged,
             "calls_in_ledger": ledger_calls,
             "missing_calls": missing,
-            "provider_input_tokens": None if known == 0 else int(by_stage.get(name, {}).get("provider_input_tokens") or 0),
+            "estimated_input_tokens": estimated if logged else (0 if logged == 0 and name in buckets else estimated),
+            "provider_input_tokens": provider_in,
+            "provider_output_tokens": provider_out,
             "usage_completeness": stage_completeness,
+            "subtotal": False,
         })
-    known_rows = [row for row in rows if row["usage_completeness"] == "complete"]
+    leaves = [row for row in stages if row["stage"] in _CODING_LEAVES or not row.get("subtotal")]
+    coding_parts = [row for row in stages if row["stage"] in _CODING_LEAVES]
+    coding = {
+        "stage": "coding",
+        "subtotal": True,
+        "calls": sum(int(row["calls"]) for row in coding_parts),
+        "missing_calls": sum(int(row["missing_calls"]) for row in coding_parts),
+        "estimated_input_tokens": _sum_or_null([row["estimated_input_tokens"] for row in coding_parts]) if coding_parts else 0,
+        "provider_input_tokens": _sum_or_null([row["provider_input_tokens"] for row in coding_parts]) if coding_parts else None,
+        "provider_output_tokens": _sum_or_null([row["provider_output_tokens"] for row in coding_parts]) if coding_parts else None,
+        "note": "Rollup of proposal, quote-copy retry, and counterexample calls. These calls are not counted again.",
+    }
+    core_calls = next((int(row["calls"]) for row in stages if row["stage"] == "axial_core_review"), 0)
+    memo_calls = next((int(row["calls"]) for row in stages if row["stage"] == "theoretical_memo"), 0)
+    story_calls = next((int(row["calls"]) for row in stages if row["stage"] == "storyline"), 0)
+    include_memos = bool((procedure or {}).get("include_memos"))
+    include_story = bool((procedure or {}).get("include_storyline"))
+    if not include_memos and not include_story:
+        selective_status = "not_requested"
+    elif (include_memos and memo_calls == 0) or (include_story and story_calls == 0):
+        selective_status = "incomplete"
+    else:
+        selective_status = "complete"
+    selective = {
+        "stage": "selective",
+        "ownership": True,
+        "subtotal": False,
+        "calls": memo_calls + story_calls,
+        "missing_calls": 0,
+        "status": selective_status,
+        "core_usage_stage": "axial_core_review",
+        "referenced_core_calls": core_calls,
+        "estimated_input_tokens": None,
+        "provider_input_tokens": None,
+        "provider_output_tokens": None,
+        "note": (
+            "Core selection calls belong to axial_core_review and are not counted here. "
+            "not_requested means memos and the storyline were disabled. "
+            "incomplete means requested selective work sent no call."
+        ),
+    }
+    leaf_rows = [row for row in stages if row["stage"] != "coding"]
+    overall_calls = sum(int(row["calls"]) for row in leaf_rows)
+    overall_estimate = _sum_or_null([row["estimated_input_tokens"] for row in leaf_rows if row["calls"]]) if any(row["calls"] for row in leaf_rows) else (0 if rows else None)
+    overall_in = _sum_or_null([row["provider_input_tokens"] for row in leaf_rows if row["calls"]]) if any(row["calls"] for row in leaf_rows) else None
+    overall_out = _sum_or_null([row["provider_output_tokens"] for row in leaf_rows if row["calls"]]) if any(row["calls"] for row in leaf_rows) else None
+    coding_ok = coding["calls"] == sum(int(row["calls"]) for row in coding_parts)
+    estimate_ok = overall_estimate == _sum_or_null([row["estimated_input_tokens"] for row in leaf_rows if row["calls"]]) if any(row["calls"] for row in leaf_rows) else True
+    reconciles = bool(coding_ok and estimate_ok and overall_calls == sum(int(row["calls"]) for row in leaf_rows))
     if not rows and not missing_call:
         overall = "unknown"
-    elif missing_call or any(row["usage_completeness"] != "complete" for row in rows) or any(
-        item["usage_completeness"] != "complete" for item in stages if item["calls"] or item["calls_in_ledger"]
-    ):
-        overall = "partial" if (rows or missing_call) else "unknown"
+    elif missing_call or any(row["usage_completeness"] != "complete" for row in rows):
+        overall = "partial" if rows or missing_call else "unknown"
         if rows and all(row["usage_completeness"] == "unknown" for row in rows) and not missing_call:
             overall = "unknown"
-        elif missing_call or any(row["usage_completeness"] != "complete" for row in rows):
-            overall = "partial"
     else:
         overall = "complete"
+    stages_out = []
+    inserted = False
+    for row in stages:
+        stages_out.append(row)
+        if row["stage"] in _CODING_LEAVES:
+            inserted = True
+        elif inserted and row["stage"] not in _CODING_LEAVES:
+            stages_out.append(coding)
+            inserted = False
+    if inserted:
+        stages_out.append(coding)
+    if not any(row["stage"] == "coding" for row in stages_out):
+        stages_out.append(coding)
+    stages_out.append(selective)
     return {
         "calls": rows,
-        "stages": stages,
-        "estimated_input_tokens": None if not rows else sum(int(row["estimated_input_tokens"] or 0) for row in rows),
-        "provider_input_tokens": None if not known_rows else sum(int(row["provider_input_tokens"] or 0) for row in known_rows),
-        "provider_output_tokens": None if not known_rows else sum(int(row["provider_output_tokens"] or 0) for row in known_rows),
+        "stages": stages_out,
+        "coding": coding,
+        "selective": selective,
+        "estimated_input_tokens": overall_estimate,
+        "provider_input_tokens": overall_in,
+        "provider_output_tokens": overall_out,
         "usage_completeness": overall,
         "complete": overall == "complete",
+        "reconciles": reconciles,
+        "quote_anchoring_note": (
+            "Quote-anchoring checks are offline tests. They were not exercised on a live provider run."
+        ),
         "note": (
             "estimated_input_tokens is the character heuristic. Provider tokens are null when the provider did not report them. "
-            "usage_completeness is partial when any stage in the allowance ledger has a call that is not in this list. "
-            "A summary of the calls that were logged is not complete while another stage is missing."
+            "The coding figure is the sum of proposal, retry, and counterexample calls. It is not a second copy of those calls. "
+            "usage_completeness is partial when any sent call is missing from a stage or lacks a provider count."
         ),
     }
 
@@ -7988,6 +8286,14 @@ def consolidate_duplicate_assertions(rows: Sequence[Mapping[str, Any]]) -> list[
         base["source_proposal_ids"] = proposal_ids
         base["proposal_id"] = proposal_ids[0] if proposal_ids else base.get("proposal_id")
         base["merged_proposal_ids"] = proposal_ids[1:]
+        base["paradigm_role_records"] = [
+            {
+                "relationship_id": str(item.get("relationship_id") or ""),
+                "paradigm_role": item.get("paradigm_role"),
+                "paradigm_role_origin": item.get("paradigm_role_origin"),
+            }
+            for item in ordered
+        ]
         base["prior_decisions"] = [
             {
                 "relationship_id": str(item.get("relationship_id") or ""),
@@ -8297,10 +8603,7 @@ def _export_node(runtime_output: dict):
         metadata["saturation_judgment"] = None
         _finalize_proposal_lineage(metadata, state.get("relationships") or [])
         _assign_multi_document_statuses(metadata, close=True)
-        metadata["call_usage"] = _call_usage_report(
-            state.get("prompt_log") or [],
-            provider_budget=metadata.get("provider_budget") if isinstance(metadata.get("provider_budget"), Mapping) else None,
-        )
+        _attach_run_accounting(metadata, state)
         metadata["relationship_funnel"] = build_relationship_funnel({**state, "metadata": metadata})
         held = {**state, "metadata": metadata, "saturation": state.get("saturation") or _saturation(state)}
         held["coverage"] = _coverage(held)
@@ -9159,6 +9462,28 @@ def _remember_inherited_core_usage(runtime: AxialRuntime, progress: Mapping[str,
     )
 
 
+def _note_core_provisional(metadata: dict[str, Any], relationships: Sequence[Any]) -> None:
+    """Say when a selected core rests on one eligible relationship."""
+    eligible = [
+        str(row.get("relationship_id") or "")
+        for row in relationships
+        if isinstance(row, Mapping) and row.get("downstream_eligible") is True and not row.get("synthetic")
+    ]
+    metadata["core_eligible_relationship_count"] = len(eligible)
+    metadata["core_eligible_relationship_ids"] = eligible
+    if metadata.get("core_outcome") == "core_selected" and len(eligible) == 1:
+        metadata["core_provisional"] = True
+        metadata["core_support_note"] = (
+            f"The core is provisional. It rests on one eligible relationship ({eligible[0]})."
+        )
+    elif metadata.get("core_outcome") == "core_selected":
+        metadata["core_provisional"] = False
+        metadata["core_support_note"] = None
+    else:
+        metadata["core_provisional"] = None
+        metadata["core_support_note"] = None
+
+
 def _core_usage_account(progress: Mapping[str, Any], prior: tuple[int, int] | None = None) -> dict[str, int]:
     """Closed core usage: inherited work plus what this run sent."""
     if prior is None:
@@ -9448,6 +9773,7 @@ def _project_core_costs(
     field.sort(key=lambda item: order.get(item, 10**9))
     contingent: list[int] = []
     contingent_too_large: list[list[str]] = []
+    final_assessment_calls = 0
     already_final = bool(whole_set)
     guard = 0
     while field and guard <= len(ordered_ids) + 1:
@@ -9455,6 +9781,7 @@ def _project_core_costs(
         if len(field) == 1:
             if already_final:
                 break
+            final_assessment_calls += 1
             payload = _core_live_payload(
                 by_id,
                 field,
@@ -9512,6 +9839,8 @@ def _project_core_costs(
             )
             estimate = _core_live_estimate(reviewer, payload, metadata)
             contingent.append(estimate)
+            if role == "final" or partitioned.get("whole_set"):
+                final_assessment_calls += 1
             if per_request and estimate > per_request:
                 contingent_too_large.append([str(item) for item in match])
             priors.append(_reserved_core_prior(match))
@@ -9530,6 +9859,8 @@ def _project_core_costs(
         "opening_request_too_large": bool(opening_too_large),
         "opening_requests_too_large": opening_too_large,
         "contingent_calls": len(contingent),
+        "final_assessment_calls": final_assessment_calls,
+        "final_assessment_in_plan": final_assessment_calls > 0,
         "contingent_tokens": sum(contingent),
         "contingent_match_tokens": contingent,
         "contingent_request_too_large": bool(contingent_too_large),
@@ -9857,6 +10188,24 @@ async def _advance_core_review(
         else:
             metadata["core_selection_complete"] = True
             metadata["core_coverage_note"] = ""
+        _note_core_provisional(metadata, state.get("relationships") or [])
+        projection_now = metadata.get("core_cost_projection") if isinstance(metadata.get("core_cost_projection"), Mapping) else {}
+        preflight_now = metadata.get("core_bracket_preflight") if isinstance(metadata.get("core_bracket_preflight"), Mapping) else {}
+        sent_calls = int(progress_row.get("calls") or 0)
+        allowance_calls = preflight_now.get("calls_available")
+        metadata["core_call_accounting"] = {
+            "allowance": allowance_calls,
+            "planned_opening_calls": projection_now.get("opening_calls"),
+            "planned_contingent_calls": projection_now.get("contingent_calls"),
+            "planned_final_assessment": bool(projection_now.get("final_assessment_in_plan")),
+            "sent_calls": sent_calls,
+            "sent_within_allowance": None if allowance_calls is None else sent_calls <= int(allowance_calls),
+            "layer": "enforcement",
+            "note": (
+                "Every sent core call consumes the core allowance. "
+                "The final assessment is planned with the later rounds and is refused when the allowance is already spent."
+            ),
+        }
         loaded = [
             item
             for item in records
@@ -10009,6 +10358,16 @@ async def _advance_core_review(
         ordered_ids=ordered_ids,
         metadata=metadata,
     )
+    metadata["core_cost_projection"] = {
+        "opening_calls": int(projection.get("opening_calls") or 0),
+        "contingent_calls": int(projection.get("contingent_calls") or 0),
+        "final_assessment_calls": int(projection.get("final_assessment_calls") or 0),
+        "final_assessment_in_plan": bool(projection.get("final_assessment_in_plan")),
+        "note": (
+            "The final assessment is part of contingent later calls when a sole survivor still needs one. "
+            "It is not an extra call outside the allowance."
+        ),
+    }
     auto_size = _apply_core_auto_size(runtime, procedure, projection)
     _sync_core_consumption(runtime, metadata, progress)
     call_ceiling = _core_call_ceiling(runtime, reviewer)
@@ -10171,8 +10530,13 @@ async def _advance_core_review(
         round_role=role,
         prior_rationales=priors,
     )
-    stop, _estimate = reviewer.refusal_reason(payload, ModelCoreDecision, metadata)
-    calls_sent = int(progress.get("calls") or 0)
+    stage_sent = _decision_step_calls(runtime, "axial_core_review")
+    calls_already = max(int(progress.get("calls") or 0), stage_sent)
+    if call_ceiling and calls_already >= int(call_ceiling):
+        stop, _estimate = CORE_CALL_ALLOWANCE_INSUFFICIENT, 0
+    else:
+        stop, _estimate = reviewer.refusal_reason(payload, ModelCoreDecision, metadata)
+    calls_sent = calls_already
     tokens_sent = int(progress.get("tokens_estimated") or 0)
     resource_stop = _core_resource_stop(
         stop,
@@ -11330,10 +11694,7 @@ def _export_selective(output_dir: str | Path | None):
         _apply_run_status(metadata)
         metadata["saturation_judgment"] = None
         _assign_multi_document_statuses(metadata, close=True)
-        metadata["call_usage"] = _call_usage_report(
-            state.get("prompt_log") or [],
-            provider_budget=metadata.get("provider_budget") if isinstance(metadata.get("provider_budget"), Mapping) else None,
-        )
+        _attach_run_accounting(metadata, state)
         held = {**state, "metadata": metadata}
         held["coverage"] = state.get("coverage") or _coverage(held)
         paths = dict(state.get("export_paths") or {})
@@ -12359,6 +12720,14 @@ async def aaxial_code(
     )
     metadata = {
         "procedure": procedure,
+        "allowance_reserved": {
+            "axial_proposal": int(procedure.get("propose_calls") or 0),
+            "statement_copy_retry": int(procedure.get("statement_copy_retry_calls") or 0),
+            "axial_counterexample": int(procedure.get("counterexample_calls") or 0),
+            "axial_relation_review": int(procedure.get("max_decision_calls") or 0),
+            "axial_saturation_review": int(procedure.get("max_decision_calls") or 0),
+            "axial_core_review": procedure.get("max_core_review_calls"),
+        },
         "allowance_transfers": [dict(item) for item in (procedure.get("allowance_transfers") or []) if isinstance(item, Mapping)],
         "stage": "axial",
         "performance": {
@@ -12622,6 +12991,11 @@ async def aselective_code(
     if metadata.get("performance") and "axial_performance" not in metadata:
         metadata["axial_performance"] = dict(metadata["performance"])
     metadata["procedure"] = procedure
+    reserved = dict(metadata.get("allowance_reserved") or {})
+    reserved["axial_relation_review"] = int(procedure.get("max_decision_calls") or reserved.get("axial_relation_review") or 0)
+    reserved["axial_saturation_review"] = int(procedure.get("max_decision_calls") or reserved.get("axial_saturation_review") or 0)
+    reserved["axial_core_review"] = procedure.get("max_core_review_calls")
+    metadata["allowance_reserved"] = reserved
     metadata["stage"] = "selective"
     metadata["performance"] = {
         "batch_size": batch_size,
