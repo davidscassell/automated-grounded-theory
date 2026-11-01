@@ -4764,6 +4764,7 @@ async def _structured_call(
     stage: str,
     attempt_repair: bool = True,
     repairs_kind: str | None = None,
+    spend_stage: str | None = None,
 ) -> dict[str, Any]:
     """One structured provider call.
 
@@ -4775,11 +4776,34 @@ async def _structured_call(
     audits: list[dict[str, Any]] = []
     origin = repairs_kind or (None if kind == "schema_repair" else kind)
     guard_stage = str(origin or kind or stage)
-    from automated_grounded_theory.exp_axial_w1 import account_call_spend, dispatch_spend_gate
+    from automated_grounded_theory.exp_axial_w1 import _output_allowance, payload_fingerprint, reserve_attempt, settle_attempt
 
     guard_estimate = request_input_tokens(messages, schema) if messages else 0
-    blocked = dispatch_spend_gate(metadata, guard_stage, guard_estimate)
-    if blocked:
+    ledger_stage = "schema_repair" if kind == "schema_repair" else str(spend_stage or guard_stage)
+    pricing_stage = str(repairs_kind or guard_stage) if kind == "schema_repair" else ledger_stage
+    fingerprint_rows = []
+    for message in messages or []:
+        if isinstance(message, Mapping):
+            fingerprint_rows.append({
+                "role": str(message.get("role") or message.get("type") or ""),
+                "content": str(message.get("content") or ""),
+            })
+        else:
+            fingerprint_rows.append({
+                "role": str(getattr(message, "type", "")),
+                "content": str(getattr(message, "content", "")),
+            })
+    held = reserve_attempt(
+        metadata,
+        ledger_stage,
+        guard_estimate,
+        payload_fingerprint=payload_fingerprint({"stage": ledger_stage, "messages": fingerprint_rows}),
+        output_allowance=_output_allowance(pricing_stage),
+    )
+    attempt_id = str(held.get("attempt_id") or "")
+    tracked = str(held.get("status") or "") == "reserved"
+    if str(held.get("status") or "") == "budget_blocked":
+        blocked = str(held.get("reason") or "kill_guard")
         return {
             "refused": True,
             "unparsed": False,
@@ -4814,11 +4838,12 @@ async def _structured_call(
             call_audits=audits,
         )
     except TimeoutError:
-        account_call_spend(
-            metadata, guard_stage, None, known=False, timed_out=True, input_estimate=guard_estimate,
-        )
+        if tracked:
+            settle_attempt(metadata, attempt_id, known=False, timed_out=True)
         raise
     except AllowanceExhausted as exc:
+        if tracked:
+            settle_attempt(metadata, attempt_id, released=True)
         _sync_allowance(metadata, runtime)
         metadata["axial_stop"] = exc.reason
         _stamp_repair_stage(audits, origin)
@@ -4838,7 +4863,13 @@ async def _structured_call(
     known_usage = isinstance(usage, Mapping) and (
         int(usage.get("input_tokens") or 0) > 0 or int(usage.get("output_tokens") or 0) > 0
     )
-    account_call_spend(metadata, guard_stage, usage if isinstance(usage, Mapping) else None, known=known_usage)
+    if tracked:
+        settle_attempt(
+            metadata,
+            attempt_id,
+            usage=usage if isinstance(usage, Mapping) else None,
+            known=known_usage,
+        )
     repair_pending = bool(isinstance(parsed, Mapping) and parsed.get("needs_repair"))
     unparsed = bool(isinstance(parsed, Mapping) and parsed.get("_agt_unparsed")) and not repair_pending
     if unparsed:
@@ -6742,6 +6773,7 @@ def _propose_node(runtime: AxialRuntime):
                         metadata=metadata,
                         stage="coding",
                         attempt_repair=False,
+                        spend_stage="statement_copy_retry",
                     )
                     _log_call_audits(logs, retry_result["audits"], extra={"statement_copy_retry": True})
                     used += 1
@@ -12584,11 +12616,20 @@ class AxialDecisionReviewer:
             metadata["decision_stop"] = stop
             audit.update(status="omitted", reason=stop, needs_review=True, flagged=True)
             return None, audit
-        from automated_grounded_theory.exp_axial_w1 import account_call_spend, dispatch_spend_gate
+        from automated_grounded_theory.exp_axial_w1 import _output_allowance, payload_fingerprint, reserve_attempt, settle_attempt
 
         guard_stage = str(checkpoint or "decision_review")
-        blocked = dispatch_spend_gate(metadata, guard_stage, estimate)
-        if blocked:
+        held = reserve_attempt(
+            metadata,
+            guard_stage,
+            estimate,
+            payload_fingerprint=payload_fingerprint(audit["messages"]),
+            output_allowance=_output_allowance(guard_stage),
+        )
+        attempt_id = str(held.get("attempt_id") or "")
+        tracked = str(held.get("status") or "") == "reserved"
+        if str(held.get("status") or "") == "budget_blocked":
+            blocked = str(held.get("reason") or "kill_guard")
             metadata["decision_stop"] = blocked
             audit.update(status="not_sent", reason=blocked, needs_review=True, flagged=True)
             return None, audit
@@ -12611,7 +12652,8 @@ class AxialDecisionReviewer:
             )
             audit["usage"] = usage_from_result(response)
             known_usage = int(audit["usage"].get("input_tokens") or 0) > 0 or int(audit["usage"].get("output_tokens") or 0) > 0
-            account_call_spend(metadata, guard_stage, audit["usage"], known=known_usage, input_estimate=estimate)
+            if tracked:
+                settle_attempt(metadata, attempt_id, usage=audit["usage"], known=known_usage)
             raw = response.get("raw") if isinstance(response, dict) else None
             audit["raw_response"] = str(getattr(raw, "content", ""))
             parsed, _usage = parse_structured(response, schema)
@@ -12632,13 +12674,18 @@ class AxialDecisionReviewer:
                 metadata["decision_tokens_used"] = tokens + estimate
             return parsed, audit
         except TimeoutError:
-            account_call_spend(metadata, guard_stage, None, known=False, timed_out=True, input_estimate=estimate)
+            if tracked:
+                settle_attempt(metadata, attempt_id, known=False, timed_out=True)
             raise
         except AllowanceExhausted as exc:
+            if tracked:
+                settle_attempt(metadata, attempt_id, released=True)
             metadata["decision_stop"] = exc.reason
             audit.update(status="omitted", reason=exc.reason, needs_review=True, flagged=True)
             return None, audit
         except Exception as exc:
+            if tracked:
+                settle_attempt(metadata, attempt_id, known=False, failed=True)
             metadata["decision_stop"] = "review_error"
             audit.update(status="error", error=f"{type(exc).__name__}: {exc}")
             return None, audit

@@ -23,7 +23,6 @@ from automated_grounded_theory.axial import (
     AxialError,
     _KIND_PROMPTS,
     axial_code,
-    selective_code,
 )
 from automated_grounded_theory.backends import chat_model_settings, describe_model
 from automated_grounded_theory.batching import estimate_tokens
@@ -335,20 +334,18 @@ def preflight_workload(
 
     Input is the per-request cap. Output is that stage's max output. Dollars
     use the frozen model rates, $1.25 per million input and $2.50 per million
-    output. ``token_prices`` does not replace those rates.
+    output. ``token_prices`` does not replace those rates. Core selection is
+    not part of this experiment, so ``core_candidates`` is ignored and the
+    preflight has no core line.
     """
-    del token_prices
-    calls = workload_calls(same, lexical)
-    core_calls = max(0, int(core_candidates) - 1) if int(core_candidates) else 0
-    calls = dict(calls)
-    calls["axial_core_review"] = core_calls
+    del token_prices, core_candidates
+    calls = dict(workload_calls(same, lexical))
     sent = {
         "axial_proposal": int(calls["axial_proposal"]),
         "statement_copy_retry": int(calls["statement_copy_retry"]),
         "axial_counterexample": int(calls["axial_counterexample"]),
         "axial_relation_review": int(calls["axial_relation_review"]),
         "axial_saturation_review": int(calls["axial_saturation_review"]),
-        "axial_core_review": core_calls,
     }
     per_call = max(0, int(per_call_input))
     input_tokens = {name: count * per_call for name, count in sent.items()}
@@ -411,9 +408,9 @@ def preflight_workload(
             "stage's max output. Rates are the frozen model config: $1.25 per million "
             "input tokens and $2.50 per million output tokens. A counterexample that "
             "does not fit the coding ceiling is required_but_blocked. Relation review "
-            "is one call per row and is not limited by the coding ceiling. Core, when "
-            "priced, is one match per candidate after the first. The call total can "
-            "exceed the coding-only ceiling because review and core are separate."
+            "is one call per row and is not limited by the coding ceiling. Core "
+            "selection is not requested. The call total can exceed the coding-only "
+            "ceiling because relation review and saturation are separate."
         ),
     }
 
@@ -701,10 +698,10 @@ def core_snapshot(relationships: Sequence[Any], codebook: Mapping[str, Any] | No
 
 
 def core_differs(current: Mapping[str, Any], baseline: Mapping[str, Any] | None) -> bool | None:
-    """Null when no baseline was supplied. True when content or counts changed.
+    """Content comparison kept for inspection. This experiment does not call it.
 
-    ``eligible_ids`` is ignored. Identity is endpoints, assertion content, and
-    the eligibility inputs on the row.
+    Core selection is not requested. A difference here does not reserve a core
+    call or start selective coding. ``eligible_ids`` is ignored.
     """
     if not isinstance(baseline, Mapping):
         return None
@@ -730,12 +727,40 @@ def _class_metrics() -> dict[str, Any]:
         "new_pairs_examined": None,
         "grounded_assertions_per_pair": None,
         "additional_supporting_cases": None,
+        "reviewer_accepted": None,
+        "reviewer_rejected": None,
         "eligibility_failures_by_reason": None,
+        "counterexample_calls": None,
+        "counterexample_returned": None,
+        "counterexample_relevant": None,
         "counterexample_relevance": None,
         "input_tokens": None,
         "dollars": None,
         "elapsed_seconds": None,
     }
+
+
+def _disposition(row: Mapping[str, Any]) -> str:
+    return str(
+        row.get("reviewer_disposition") or row.get("human_disposition") or row.get("disposition") or ""
+    ).strip().casefold()
+
+
+def _evidence_failure_reasons(row: Mapping[str, Any]) -> list[str]:
+    """Eligibility failures from the evidence rules. Acceptance is not one of them."""
+    found: list[str] = []
+    blocks = row.get("eligibility_blocks")
+    if isinstance(blocks, list):
+        for block in blocks:
+            text = str(block or "").strip()
+            if text and text != "accepted" and text not in found:
+                found.append(text)
+    reason = str(row.get("eligibility_reason") or "").strip()
+    if reason and reason != "accepted" and reason not in found:
+        found.append(reason)
+    if row.get("downstream_eligible") is not True and not found:
+        found.append("ineligible")
+    return [item for item in found if item != "accepted"]
 
 
 def build_metrics(
@@ -759,25 +784,41 @@ def build_metrics(
     examined = {name: 0 for name in classes}
     seen_pairs: set[tuple[str, str]] = set()
     grounded = {name: 0 for name in classes}
+    accepted = {name: 0 for name in classes}
+    rejected = {name: 0 for name in classes}
     additional = {name: 0 for name in classes}
     additional_known = {name: False for name in classes}
     failures: dict[str, dict[str, int]] = {name: {} for name in classes}
+    grouped: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
     for row in relationships:
         if not isinstance(row, Mapping) or row.get("synthetic"):
             continue
         key = _pair_key(row)
+        if by_pair.get(key) in examined:
+            grouped.setdefault(key, []).append(row)
+    for key, rows in grouped.items():
         evidence_class = by_pair.get(key)
         if evidence_class not in examined or key in seen_pairs:
             continue
         seen_pairs.add(key)
         examined[evidence_class] += 1
-        if row.get("downstream_eligible") is True:
+        dispositions = {_disposition(row) for row in rows}
+        if "accepted" in dispositions or "verified" in dispositions:
+            accepted[evidence_class] += 1
+        if "rejected" in dispositions or "reject" in dispositions:
+            rejected[evidence_class] += 1
+            failures[evidence_class]["reviewer_rejected"] = failures[evidence_class].get("reviewer_rejected", 0) + 1
+        if any(row.get("downstream_eligible") is True for row in rows):
             grounded[evidence_class] += 1
         else:
-            reason = str(row.get("reviewer_disposition") or row.get("disposition") or "ineligible")
-            if reason in {"rejected", "reject"}:
-                reason = "reviewer_rejected"
-            failures[evidence_class][reason] = failures[evidence_class].get(reason, 0) + 1
+            pair_reasons: list[str] = []
+            for row in rows:
+                for reason in _evidence_failure_reasons(row):
+                    if reason not in pair_reasons:
+                        pair_reasons.append(reason)
+            for reason in pair_reasons:
+                failures[evidence_class][reason] = failures[evidence_class].get(reason, 0) + 1
+        row = rows[0]
         original = original_cases.get(key)
         cases = {
             str(item.get("case_id"))
@@ -820,6 +861,8 @@ def build_metrics(
         if count:
             metrics["new_pairs_examined"] = count
             metrics["grounded_assertions_per_pair"] = round(grounded[name] / count, 4)
+            metrics["reviewer_accepted"] = accepted[name]
+            metrics["reviewer_rejected"] = rejected[name]
             metrics["eligibility_failures_by_reason"] = dict(failures[name])
         if additional_known[name]:
             metrics["additional_supporting_cases"] = additional[name]
@@ -838,6 +881,8 @@ def build_metrics(
     if total_examined:
         overall["new_pairs_examined"] = total_examined
         overall["grounded_assertions_per_pair"] = round(sum(grounded.values()) / total_examined, 4)
+        overall["reviewer_accepted"] = sum(accepted.values())
+        overall["reviewer_rejected"] = sum(rejected.values())
         merged: dict[str, int] = {}
         for name in classes:
             for reason, count in failures[name].items():
@@ -858,13 +903,24 @@ def build_metrics(
 def counterexample_relevance_by_class(
     judgments: Sequence[Mapping[str, Any]],
     round_rows: Sequence[Mapping[str, Any]],
+    *,
+    calls_by_class: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
-    """Relevant judgments over judgments sent, by the pair's class. Null if none were sent."""
+    """Calls, returned assessments, and relevant assessments stay separate.
+
+    ``counterexample_relevance`` is relevant assessments over returned
+    assessments. It is null only when no assessment was returned. A call
+    with no returned assessment does not make the rate zero.
+    """
     by_pair = {}
     for row in round_rows:
         if isinstance(row, Mapping):
             by_pair[_pair_key(row)] = str(row.get("evidence_class") or row.get("band") or "")
-    counts = {CLASS_SAME: [0, 0], CLASS_LEXICAL: [0, 0]}
+    counts = {CLASS_SAME: {"calls": 0, "returned": 0, "relevant": 0}, CLASS_LEXICAL: {"calls": 0, "returned": 0, "relevant": 0}}
+    if isinstance(calls_by_class, Mapping):
+        for name, count in calls_by_class.items():
+            if name in counts:
+                counts[name]["calls"] = int(count or 0)
     for row in judgments:
         if not isinstance(row, Mapping):
             continue
@@ -874,15 +930,26 @@ def counterexample_relevance_by_class(
         judgment = str(row.get("judgment") or "")
         if not judgment:
             continue
-        counts[evidence_class][1] += 1
+        counts[evidence_class]["returned"] += 1
         if judgment in {"supports", "contradicts", "qualifies"}:
-            counts[evidence_class][0] += 1
+            counts[evidence_class]["relevant"] += 1
     report = {}
-    for name, (relevant, sent) in counts.items():
-        report[name] = None if sent == 0 else round(relevant / sent, 4)
-    sent_total = sum(item[1] for item in counts.values())
-    relevant_total = sum(item[0] for item in counts.values())
-    report["overall"] = None if sent_total == 0 else round(relevant_total / sent_total, 4)
+    for name, item in counts.items():
+        returned = int(item["returned"])
+        report[name] = {
+            "calls": int(item["calls"]),
+            "returned_assessments": returned,
+            "relevant_assessments": int(item["relevant"]),
+            "counterexample_relevance": None if returned == 0 else round(item["relevant"] / returned, 4),
+        }
+    returned_total = sum(item["returned"] for item in counts.values())
+    relevant_total = sum(item["relevant"] for item in counts.values())
+    report["overall"] = {
+        "calls": sum(item["calls"] for item in counts.values()),
+        "returned_assessments": returned_total,
+        "relevant_assessments": relevant_total,
+        "counterexample_relevance": None if returned_total == 0 else round(relevant_total / returned_total, 4),
+    }
     return report
 
 
@@ -907,10 +974,31 @@ def apply_experiment_procedure(procedure: dict[str, Any], spec: Mapping[str, Any
     return procedure
 
 
-def _worst_case_call_cost(stage: str, input_estimate: int) -> float:
+LEDGER_KEY = "exp_attempt_ledger"
+DISPATCHED_ATTEMPT = {"settled", "timeout", "unknown", "failed"}
+TERMINAL_PAIR_STATUS = {
+    "attempted",
+    "successfully_examined",
+    "empty_response",
+    "failed",
+    "budget_blocked",
+}
+
+
+def _number(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return float(value)
+
+
+def _worst_case_call_cost(stage: str, input_estimate: int, output_allowance: int | None = None) -> float:
     in_rate, out_rate = _prices()
-    output = int(STAGE_MAX_OUTPUT.get(stage) or STAGE_MAX_OUTPUT["axial_proposal"])
-    return max(0, int(input_estimate)) / 1_000_000 * in_rate + output / 1_000_000 * out_rate
+    output = int(STAGE_MAX_OUTPUT.get(stage) or STAGE_MAX_OUTPUT["axial_proposal"]) if output_allowance is None else int(output_allowance)
+    return max(0, int(input_estimate)) / 1_000_000 * in_rate + max(0, output) / 1_000_000 * out_rate
+
+
+def _output_allowance(stage: str) -> int:
+    return int(STAGE_MAX_OUTPUT.get(stage) or STAGE_MAX_OUTPUT["axial_proposal"])
 
 
 def _experiment_spec(metadata: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -921,26 +1009,226 @@ def _experiment_spec(metadata: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return None
 
 
-def dispatch_spend_gate(metadata: Mapping[str, Any], stage: str, input_estimate: int) -> str | None:
+def _ledger_rows(metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
+    rows = metadata.get(LEDGER_KEY)
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _ledger_figures(rows: Sequence[Mapping[str, Any]]) -> tuple[float, float, float, bool]:
+    """Known expenditure, possible exposure, unresolved reservations, and unknown flag.
+
+    A reservation is possible exposure while it is open. It is not expenditure.
+    A timeout is possible spend. Unknown provider usage stays out of expenditure.
+    """
+    known = 0.0
+    possible = 0.0
+    unresolved = 0.0
+    unknown = False
+    for row in rows:
+        status = str(row.get("status") or "")
+        reservation = row.get("reservation") if isinstance(row.get("reservation"), Mapping) else {}
+        reserved = _number(reservation.get("dollars"))
+        settlement = row.get("settlement") if isinstance(row.get("settlement"), Mapping) else {}
+        if status == "reserved":
+            unresolved += reserved
+            possible += reserved
+            continue
+        if status in {"budget_blocked", "not_sent", "released"}:
+            continue
+        if status == "timeout" or row.get("timed_out") is True:
+            unknown = True
+            possible += _number(settlement.get("possible_dollars")) or reserved
+            continue
+        usage = row.get("provider_usage")
+        if usage is None or status == "unknown":
+            unknown = True
+            possible += _number(settlement.get("possible_dollars")) or reserved
+            continue
+        spent = _number(settlement.get("dollars"))
+        known += spent
+        possible += spent
+    return known, possible, unresolved, unknown
+
+
+def restore_spend_from_ledger(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild spend from the ledger. A restart does not zero a recorded attempt.
+
+    Caller-supplied counters captured before the first ledger row stay as a
+    baseline. They are prior exposure, not a second copy of the ledger.
+    """
+    if "exp_baseline_locked" not in metadata:
+        metadata["exp_baseline_spent"] = _number(metadata.get("exp_dollars_spent"))
+        metadata["exp_baseline_possible"] = _number(metadata.get("exp_possible_dollars"))
+        metadata["exp_baseline_locked"] = True
+    known, possible, unresolved, unknown = _ledger_figures(_ledger_rows(metadata))
+    baseline_spent = _number(metadata.get("exp_baseline_spent"))
+    baseline_possible = max(_number(metadata.get("exp_baseline_possible")), baseline_spent)
+    metadata["exp_dollars_spent"] = round(baseline_spent + known, 6)
+    metadata["exp_possible_dollars"] = round(baseline_possible + possible, 6)
+    metadata["exp_unresolved_reservation_dollars"] = round(unresolved, 6)
+    if unknown:
+        metadata["exp_spend_unknown"] = True
+    return metadata
+
+
+def _exposure(metadata: Mapping[str, Any]) -> float:
+    if isinstance(metadata, dict):
+        restore_spend_from_ledger(metadata)
+    return max(_number(metadata.get("exp_possible_dollars")), _number(metadata.get("exp_dollars_spent")))
+
+
+def dispatch_spend_gate(
+    metadata: Mapping[str, Any],
+    stage: str,
+    input_estimate: int,
+    output_allowance: int | None = None,
+) -> str | None:
     """Stop before a call when the kill guard or the hard cap would be crossed.
 
-    This is the one check for every experiment stage. Known spend uses reported
-    tokens. Unknown or timed-out usage adds that call's worst case to the
-    possible total and leaves the measured dollars unknown.
+    Exposure is settled usage plus open reservations plus timeout possible
+    spend. The next reservation prices input and the stage's max output.
     """
     if _experiment_spec(metadata) is None:
         return None
-    possible = metadata.get("exp_possible_dollars")
-    possible_n = float(possible) if isinstance(possible, (int, float)) and not isinstance(possible, bool) else 0.0
-    known = metadata.get("exp_dollars_spent")
-    known_n = float(known) if isinstance(known, (int, float)) and not isinstance(known, bool) else 0.0
-    possible_n = max(possible_n, known_n)
-    nxt = _worst_case_call_cost(stage, input_estimate)
-    if possible_n + nxt > HARD_CAP_USD:
+    nxt = _worst_case_call_cost(stage, input_estimate, output_allowance)
+    exposure = _exposure(metadata)
+    if exposure + nxt > HARD_CAP_USD:
         return "hard_cap"
-    if possible_n + nxt > KILL_GUARD_USD:
+    if exposure + nxt > KILL_GUARD_USD:
         return "kill_guard"
     return None
+
+
+def _next_attempt_id(metadata: dict[str, Any]) -> str:
+    seq = int(metadata.get("exp_attempt_seq") or 0) + 1
+    metadata["exp_attempt_seq"] = seq
+    return f"exp-{seq}"
+
+
+def _append_attempt(metadata: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    rows = metadata.get(LEDGER_KEY)
+    if not isinstance(rows, list):
+        rows = []
+        metadata[LEDGER_KEY] = rows
+    rows.append(row)
+    restore_spend_from_ledger(metadata)
+    return row
+
+
+def reserve_attempt(
+    metadata: dict[str, Any],
+    stage: str,
+    input_estimate: int,
+    *,
+    payload_fingerprint: str,
+    output_allowance: int | None = None,
+    attempt_id: str | None = None,
+) -> dict[str, Any]:
+    """Hold input plus maximum output cost before a billable attempt is sent.
+
+    A refused attempt is ``budget_blocked`` and takes no reservation. An open
+    reservation is not expenditure. Provider usage stays null until settlement.
+    """
+    if _experiment_spec(metadata) is None:
+        return {"status": "not_applicable", "attempt_id": "", "stage": stage}
+    pricing = stage if stage in STAGE_MAX_OUTPUT else "axial_proposal"
+    allowance = _output_allowance(pricing) if output_allowance is None else int(output_allowance)
+    estimate = max(0, int(input_estimate))
+    blocked = dispatch_spend_gate(metadata, pricing, estimate, allowance)
+    identifier = attempt_id or _next_attempt_id(metadata)
+    if blocked:
+        return _append_attempt(metadata, {
+            "attempt_id": identifier,
+            "stage": stage,
+            "payload_fingerprint": str(payload_fingerprint),
+            "status": "budget_blocked",
+            "reason": blocked,
+            "estimated_input": estimate,
+            "output_allowance": allowance,
+            "provider_usage": None,
+            "reservation": None,
+            "settlement": None,
+        })
+    dollars = round(_worst_case_call_cost(pricing, estimate, allowance), 6)
+    return _append_attempt(metadata, {
+        "attempt_id": identifier,
+        "stage": stage,
+        "payload_fingerprint": str(payload_fingerprint),
+        "status": "reserved",
+        "reason": "",
+        "estimated_input": estimate,
+        "output_allowance": allowance,
+        "provider_usage": None,
+        "reservation": {
+            "input_tokens": estimate,
+            "output_tokens": allowance,
+            "dollars": dollars,
+        },
+        "settlement": None,
+    })
+
+
+def _find_attempt(metadata: Mapping[str, Any], attempt_id: str) -> dict[str, Any] | None:
+    for row in _ledger_rows(metadata):
+        if str(row.get("attempt_id") or "") == str(attempt_id):
+            return row
+    return None
+
+
+def settle_attempt(
+    metadata: dict[str, Any],
+    attempt_id: str,
+    *,
+    usage: Mapping[str, Any] | None = None,
+    known: bool = False,
+    timed_out: bool = False,
+    failed: bool = False,
+    released: bool = False,
+) -> dict[str, Any] | None:
+    """Close one reservation. An estimate is not written as provider usage."""
+    if _experiment_spec(metadata) is None:
+        return None
+    row = _find_attempt(metadata, attempt_id)
+    if row is None or str(row.get("status") or "") != "reserved":
+        return row
+    reservation = row.get("reservation") if isinstance(row.get("reservation"), Mapping) else {}
+    reserved = _number(reservation.get("dollars"))
+    if released:
+        row["status"] = "released"
+        row["reason"] = str(row.get("reason") or "not_sent")
+        row["provider_usage"] = None
+        row["reservation"] = None
+        row["settlement"] = None
+        restore_spend_from_ledger(metadata)
+        return row
+    if timed_out:
+        row["status"] = "timeout"
+        row["timed_out"] = True
+        row["reason"] = "timeout"
+        row["provider_usage"] = None
+        row["settlement"] = {"dollars": None, "possible_dollars": round(reserved, 6), "kind": "timeout"}
+        metadata["exp_spend_unknown"] = True
+        restore_spend_from_ledger(metadata)
+        return row
+    if not known:
+        row["status"] = "failed" if failed else "unknown"
+        row["reason"] = str(row.get("reason") or row["status"])
+        row["provider_usage"] = None
+        row["settlement"] = {"dollars": None, "possible_dollars": round(reserved, 6), "kind": row["status"]}
+        metadata["exp_spend_unknown"] = True
+        restore_spend_from_ledger(metadata)
+        return row
+    in_rate, out_rate = _prices()
+    input_n = int((usage or {}).get("input_tokens") or 0)
+    output_n = int((usage or {}).get("output_tokens") or 0)
+    spent = input_n / 1_000_000 * in_rate + output_n / 1_000_000 * out_rate
+    row["status"] = "settled"
+    row["provider_usage"] = {"input_tokens": input_n, "output_tokens": output_n}
+    row["settlement"] = {"dollars": round(spent, 6), "possible_dollars": round(spent, 6), "kind": "usage"}
+    restore_spend_from_ledger(metadata)
+    return row
 
 
 def account_call_spend(
@@ -952,23 +1240,38 @@ def account_call_spend(
     timed_out: bool = False,
     input_estimate: int = REQUEST_INPUT_CAP,
 ) -> None:
-    """Record a sent call. A timeout is possible spend. Missing usage stays unknown."""
+    """Settle the open reservation for ``stage``, or record one attempt if none was held.
+
+    A timeout is possible spend. Missing usage stays null and is not expenditure.
+    """
     if _experiment_spec(metadata) is None:
         return
-    possible = metadata.get("exp_possible_dollars")
-    possible_n = float(possible) if isinstance(possible, (int, float)) and not isinstance(possible, bool) else 0.0
-    if timed_out or not known:
-        metadata["exp_spend_unknown"] = True
-        metadata["exp_possible_dollars"] = round(possible_n + _worst_case_call_cost(stage, input_estimate), 6)
-        return
-    in_rate, out_rate = _prices()
-    spent = metadata.get("exp_dollars_spent")
-    spent_n = float(spent) if isinstance(spent, (int, float)) and not isinstance(spent, bool) else 0.0
-    input_n = int((usage or {}).get("input_tokens") or 0)
-    output_n = int((usage or {}).get("output_tokens") or 0)
-    added = input_n / 1_000_000 * in_rate + output_n / 1_000_000 * out_rate
-    metadata["exp_dollars_spent"] = round(spent_n + added, 6)
-    metadata["exp_possible_dollars"] = round(possible_n + added, 6)
+    open_row = None
+    for row in reversed(_ledger_rows(metadata)):
+        if str(row.get("stage") or "") == stage and str(row.get("status") or "") == "reserved":
+            open_row = row
+            break
+    if open_row is None:
+        open_row = reserve_attempt(
+            metadata,
+            stage,
+            int(input_estimate),
+            payload_fingerprint=_sha({"stage": stage, "unreserved_settlement": int(metadata.get("exp_attempt_seq") or 0)}),
+        )
+        if str(open_row.get("status") or "") != "reserved":
+            return
+    settle_attempt(
+        metadata,
+        str(open_row.get("attempt_id") or ""),
+        usage=usage,
+        known=known,
+        timed_out=timed_out,
+        failed=not known and not timed_out,
+    )
+
+
+def payload_fingerprint(payload: Any) -> str:
+    return _sha(payload)
 
 
 def proposal_gate(metadata: Mapping[str, Any], payload: Mapping[str, Any], estimate: int) -> dict[str, Any] | None:
@@ -1058,6 +1361,13 @@ def proposal_gate(metadata: Mapping[str, Any], payload: Mapping[str, Any], estim
         break
     stop = dispatch_spend_gate(metadata, "axial_proposal", estimate)
     if stop:
+        if isinstance(metadata, dict):
+            reserve_attempt(
+                metadata,
+                "axial_proposal",
+                int(estimate),
+                payload_fingerprint=payload_fingerprint({"pairs": [_pair_record(pair)], "estimate": int(estimate)}),
+            )
         return {
             "refused": True,
             "unparsed": False,
@@ -1085,10 +1395,8 @@ def _pair_record(pair: Mapping[str, Any]) -> dict[str, str]:
 
 
 def note_provider_spend(metadata: dict[str, Any], usage: Mapping[str, Any] | None, *, stage: str = "axial_proposal") -> None:
-    known = isinstance(usage, Mapping) and (
-        usage.get("input_tokens") not in (None, 0) or usage.get("output_tokens") not in (None, 0)
-    )
-    account_call_spend(metadata, stage, usage, known=known)
+    """Settlement is recorded at dispatch. This hook must not charge the attempt again."""
+    del metadata, usage, stage
 
 
 def _allowances_for(same: int, lexical: int) -> dict[str, int]:
@@ -1102,17 +1410,239 @@ def _allowances_for(same: int, lexical: int) -> dict[str, int]:
     }
 
 
-def _sent_call_count(prompt_log: Sequence[Any]) -> int:
-    skip = {"omitted", "deferred", "refused", "not_sent", "reused"}
-    count = 0
-    for row in prompt_log:
+def _core_record() -> dict[str, Any]:
+    return {
+        "status": "not_requested",
+        "reason": "evaluated separately",
+        "calls": 0,
+        "dollars": 0,
+    }
+
+
+def _close_without_calls(report: dict[str, Any], *, status: str, reason: str) -> dict[str, Any]:
+    report["status"] = status
+    report["reason"] = reason
+    report["model_calls"] = 0
+    report["round"] = []
+    report["core"] = _core_record()
+    report["saturation"] = {"status": "not_applicable", "reason": reason, "calls": 0}
+    report["pair_outcomes"] = []
+    report["new_spend"] = {
+        "calls": 0,
+        "input_tokens": 0,
+        "dollars": 0,
+        "elapsed_seconds": 0,
+        "note": "No call was sent. A reservation was not opened.",
+    }
+    return report
+
+
+def _empty_scope_status(universe_n: int, draw: Mapping[str, Any]) -> str:
+    available = draw.get("available") if isinstance(draw.get("available"), Mapping) else {}
+    same_n = int(available.get(CLASS_SAME) or 0)
+    lexical_n = int(available.get(CLASS_LEXICAL) or 0)
+    if int(universe_n) <= 0 or (same_n == 0 and lexical_n == 0):
+        return "no_work"
+    return "preflight_blocked"
+
+
+def _pair_status_rank(status: str) -> int:
+    return {
+        "budget_blocked": 1,
+        "attempted": 2,
+        "failed": 3,
+        "empty_response": 4,
+        "successfully_examined": 5,
+    }.get(status, 0)
+
+
+def pair_outcomes(
+    round_rows: Sequence[Mapping[str, Any]],
+    relationships: Sequence[Any],
+    prompt_log: Sequence[Any],
+    *,
+    reuse_ledger: Sequence[Any] | None = None,
+    pair_terminal_status: Mapping[str, Any] | None = None,
+    stop_reason: str = "",
+) -> list[dict[str, Any]]:
+    """One terminal status for every selected pair.
+
+    ``successfully_examined`` is a stored or returned relationship, including
+    a reused proposal. A selected pair that produced no relationship used to
+    disappear from the examined count. It is now ``empty_response``, ``failed``,
+    ``budget_blocked``, or ``attempted``.
+    """
+    order: list[tuple[str, str]] = []
+    classes: dict[tuple[str, str], str] = {}
+    for row in round_rows:
         if not isinstance(row, Mapping):
             continue
-        if str(row.get("status") or "") in skip:
+        key = _pair_key(row)
+        if not key[0] or not key[1] or key in classes:
             continue
-        if row.get("kind") or row.get("checkpoint"):
-            count += 1
-    return count
+        classes[key] = str(row.get("evidence_class") or row.get("band") or "")
+        order.append(key)
+    status: dict[tuple[str, str], str] = {}
+
+    def put(key: tuple[str, str], label: str) -> None:
+        if key not in classes or label not in TERMINAL_PAIR_STATUS:
+            return
+        current = status.get(key)
+        if current is None or _pair_status_rank(label) >= _pair_status_rank(current):
+            status[key] = label
+
+    for row in reuse_ledger or []:
+        if isinstance(row, Mapping) and str(row.get("decision") or "") == "accepted":
+            put(_pair_key(row), "successfully_examined")
+    budget_reasons = {"kill_guard", "hard_cap", "call_allowance", "token_allowance", "dollar_allowance", "budget"}
+    for entry in prompt_log or []:
+        if not isinstance(entry, Mapping):
+            continue
+        kind = str(entry.get("kind") or entry.get("checkpoint") or "")
+        if kind not in {"axial_proposal", "statement_copy_retry"} and entry.get("statement_copy_retry") is not True:
+            continue
+        pairs = entry.get("pairs") if isinstance(entry.get("pairs"), list) else []
+        entry_status = str(entry.get("status") or "")
+        reason = str(entry.get("reason") or "")
+        response = entry.get("response") if isinstance(entry.get("response"), Mapping) else {}
+        parsed = entry.get("parsed") if isinstance(entry.get("parsed"), Mapping) else {}
+        for pair in pairs:
+            if not isinstance(pair, Mapping):
+                continue
+            key = _pair_key(pair)
+            if entry_status in {"not_sent", "omitted", "refused", "deferred"} and reason in budget_reasons:
+                put(key, "budget_blocked")
+            elif entry_status == "reused":
+                put(key, "successfully_examined")
+            elif entry_status in {"schema_unparsed", "error", "parse_failed"}:
+                put(key, "failed")
+            elif response.get("nothing_to_propose") is True or parsed.get("nothing_to_propose") is True:
+                put(key, "empty_response")
+            elif entry_status not in {"omitted", "deferred", "refused", "not_sent"}:
+                put(key, "attempted")
+    stored = pair_terminal_status if isinstance(pair_terminal_status, Mapping) else {}
+    for label, value in stored.items():
+        parts = str(label).split("|")
+        if len(parts) != 2:
+            continue
+        if str(value) == "nothing_to_propose":
+            put((parts[0], parts[1]) if parts[0] <= parts[1] else (parts[1], parts[0]), "empty_response")
+    examined_keys = set()
+    for row in relationships:
+        if not isinstance(row, Mapping) or row.get("synthetic"):
+            continue
+        key = _pair_key(row)
+        if key in classes:
+            examined_keys.add(key)
+            put(key, "successfully_examined")
+    if stop_reason in budget_reasons or any(value == "budget_blocked" for value in status.values()):
+        for key in order:
+            if key not in status:
+                put(key, "budget_blocked")
+    for key in order:
+        if key not in status:
+            put(key, "failed")
+    rows = []
+    for key in order:
+        rows.append({
+            "from_id": key[0],
+            "to_id": key[1],
+            "evidence_class": classes[key],
+            "status": status.get(key) or "failed",
+        })
+    return rows
+
+
+def _counterexample_calls_by_class(
+    prompt_log: Sequence[Any],
+    relationships: Sequence[Any],
+    round_rows: Sequence[Mapping[str, Any]],
+) -> dict[str, int]:
+    by_pair = {}
+    for row in round_rows:
+        if isinstance(row, Mapping):
+            by_pair[_pair_key(row)] = str(row.get("evidence_class") or row.get("band") or "")
+    by_relationship = {}
+    for row in relationships:
+        if isinstance(row, Mapping) and row.get("relationship_id"):
+            by_relationship[str(row.get("relationship_id"))] = by_pair.get(_pair_key(row), "")
+    counts = {CLASS_SAME: 0, CLASS_LEXICAL: 0}
+    for entry in prompt_log or []:
+        if not isinstance(entry, Mapping) or str(entry.get("kind") or "") != "axial_counterexample":
+            continue
+        if str(entry.get("status") or "") in {"not_sent", "omitted", "refused", "reused", "deferred"}:
+            continue
+        text = json.dumps(entry.get("messages") or [], ensure_ascii=False, default=str)
+        evidence_class = ""
+        for relationship_id, label in by_relationship.items():
+            if relationship_id and relationship_id in text:
+                evidence_class = label
+                break
+        if evidence_class in counts:
+            counts[evidence_class] += 1
+    return counts
+
+
+def saturation_record(
+    metadata: Mapping[str, Any],
+    ledger: Sequence[Mapping[str, Any]],
+    *,
+    interrupted: bool = False,
+    interrupt_kind: str = "",
+) -> dict[str, Any]:
+    """The planned saturation review ran, or the report says why it did not."""
+    rows = [row for row in ledger if str(row.get("stage") or "") == "axial_saturation_review"]
+    blocked = [row for row in rows if str(row.get("status") or "") == "budget_blocked"]
+    dispatched = [row for row in rows if str(row.get("status") or "") in DISPATCHED_ATTEMPT]
+    human = metadata.get("researcher_saturation") if isinstance(metadata.get("researcher_saturation"), Mapping) else None
+    model = metadata.get("model_saturation") if isinstance(metadata.get("model_saturation"), Mapping) else None
+    if dispatched or model:
+        return {
+            "status": "executed",
+            "reason": str((model or {}).get("assessment") or ""),
+            "calls": len(dispatched),
+            "actor": "llm",
+        }
+    if human:
+        return {
+            "status": "executed",
+            "reason": str(human.get("decision") or ""),
+            "calls": 0,
+            "actor": str(human.get("actor") or "human"),
+        }
+    if blocked:
+        return {"status": "blocked", "reason": str(blocked[-1].get("reason") or "blocked"), "calls": 0}
+    stop = str(metadata.get("decision_stop") or metadata.get("axial_stop") or "")
+    if stop in {"kill_guard", "hard_cap", "call_allowance", "token_allowance"}:
+        return {"status": "blocked", "reason": stop, "calls": 0}
+    if interrupted and interrupt_kind == "thematic_saturation":
+        return {"status": "not_applicable", "reason": "awaiting_saturation_resume", "calls": 0}
+    if interrupted:
+        return {"status": "not_applicable", "reason": "run_interrupted_before_saturation", "calls": 0}
+    return {"status": "not_applicable", "reason": "saturation_review_did_not_run", "calls": 0}
+
+
+def spend_from_ledger(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Expenditure is settled known usage. Reservations and estimates are not."""
+    if isinstance(metadata, dict):
+        restore_spend_from_ledger(metadata)
+    rows = _ledger_rows(metadata)
+    dispatched = [row for row in rows if str(row.get("status") or "") in DISPATCHED_ATTEMPT]
+    unknown = bool(metadata.get("exp_spend_unknown"))
+    return {
+        "calls": len(dispatched),
+        "input_tokens": None if any(row.get("provider_usage") is None for row in dispatched) else sum(
+            int((row.get("provider_usage") or {}).get("input_tokens") or 0) for row in dispatched
+        ),
+        "dollars": None if unknown else metadata.get("exp_dollars_spent"),
+        "possible_dollars": metadata.get("exp_possible_dollars"),
+        "unresolved_reservation_dollars": metadata.get("exp_unresolved_reservation_dollars"),
+        "note": (
+            "calls counts dispatched attempts. A reservation is not expenditure. "
+            "An estimate is not usage. A timeout is possible spend and leaves dollars null. "
+            "A resumed result is not a new attempt."
+        ),
+    }
 
 
 def exp_axial_w1(
@@ -1186,18 +1716,16 @@ def exp_axial_w1(
             if key in draw
         },
         "draw_method": "direct_seeded_draw",
-        "new_spend": {"calls": None, "input_tokens": None, "dollars": None, "elapsed_seconds": None},
+        "new_spend": {"calls": 0, "input_tokens": 0, "dollars": 0, "elapsed_seconds": 0},
+        "core": _core_record(),
     }
+    del baseline_core
     if draw["status"] != "selected":
-        report["status"] = "stopped"
-        report["model_calls"] = 0
-        return report
+        reason = str(draw.get("reason") or "class_shortfall")
+        return _close_without_calls(report, status=_empty_scope_status(universe_n, draw), reason=reason)
     scope = reduction["reduced_scope"]
     if reduction["reduced"]["fits"] is not True:
-        report["status"] = "stopped"
-        report["reason"] = "workload_does_not_fit"
-        report["model_calls"] = 0
-        return report
+        return _close_without_calls(report, status="preflight_blocked", reason="workload_does_not_fit")
     direct = select_unexamined_draw(
         evidence,
         history["examined_pairs"],
@@ -1206,15 +1734,16 @@ def exp_axial_w1(
         lexical_count=int(scope["lexical_cross_case"]),
     )
     if direct["status"] != "selected":
-        report["status"] = "stopped"
-        report["reason"] = direct.get("reason") or "class_shortfall"
         report["draw"] = {
             key: direct[key]
             for key in ("status", "reason", "shortfall", "available", "seed", "lexical_eligibility")
             if key in direct
         }
-        report["model_calls"] = 0
-        return report
+        return _close_without_calls(
+            report,
+            status=_empty_scope_status(universe_n, direct),
+            reason=str(direct.get("reason") or "class_shortfall"),
+        )
     chosen = _with_original_cases(list(direct.get("round") or []), _endpoint_cases({**source, "codebook": book}))
     report["executed_draw"] = {
         "method": "direct_seeded_draw",
@@ -1238,8 +1767,14 @@ def exp_axial_w1(
         "token_prices": dict(FROZEN_TOKEN_PRICES),
         "hard_cap_usd": HARD_CAP_USD,
         "kill_guard_usd": KILL_GUARD_USD,
-        "baseline_core": None if baseline_core is None else dict(baseline_core),
+        "provider_max_attempts": 1,
+        "provider_retries": "disabled",
+        "provider_retry_note": (
+            "Provider retries are not reserved as separate attempts, so max_retries is 0. "
+            "Quote-copy retries and schema repairs are dispatched through the accounted pool."
+        ),
     }
+    axial_kwargs.pop("provider_max_attempts", None)
     started = time.perf_counter()
     result = axial_code(
         source,
@@ -1253,11 +1788,24 @@ def exp_axial_w1(
         batch_size=1,
         examined_pairs=history["examined_pairs"],
         max_decision_calls=int(allowances["axial_relation_review"]),
+        provider_max_attempts=1,
         experiment=spec,
-        **{key: value for key, value in axial_kwargs.items() if key != "max_decision_calls"},
+        **{key: value for key, value in axial_kwargs.items() if key not in {"max_decision_calls", "provider_max_attempts"}},
     )
     elapsed = time.perf_counter() - started
     relationships = list(result.relationships or [])
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    if isinstance(metadata, dict):
+        restore_spend_from_ledger(metadata)
+    ledger = _ledger_rows(metadata)
+    outcomes = pair_outcomes(
+        chosen,
+        relationships,
+        list(result.prompt_log or []),
+        reuse_ledger=list(metadata.get("exp_axial_w1_reuse_ledger") or []),
+        pair_terminal_status=metadata.get("pair_terminal_status") if isinstance(metadata.get("pair_terminal_status"), Mapping) else {},
+        stop_reason=str(metadata.get("axial_stop") or metadata.get("decision_stop") or ""),
+    )
     metrics = build_metrics(
         round_rows=chosen,
         relationships=relationships,
@@ -1266,78 +1814,76 @@ def exp_axial_w1(
         token_prices=FROZEN_TOKEN_PRICES,
     )
     judgments = []
-    for row in result.metadata.get("counterexample_requests") or []:
-        if isinstance(row, Mapping):
-            judgments.append(row)
-    relevance = counterexample_relevance_by_class(judgments, chosen)
+    relationship_class = {}
+    for row in chosen:
+        relationship_class[_pair_key(row)] = str(row.get("evidence_class") or row.get("band") or "")
+    for row in relationships:
+        if not isinstance(row, Mapping) or row.get("synthetic"):
+            continue
+        evidence_class = relationship_class.get(_pair_key(row), "")
+        for verdict in row.get("counterexamples") or []:
+            if isinstance(verdict, Mapping) and not verdict.get("synthetic"):
+                judgments.append({**dict(verdict), "from_id": row.get("from_id"), "to_id": row.get("to_id"), "evidence_class": evidence_class})
+    call_counts = _counterexample_calls_by_class(list(result.prompt_log or []), relationships, chosen)
+    relevance = counterexample_relevance_by_class(judgments, chosen, calls_by_class=call_counts)
     for name in (CLASS_SAME, CLASS_LEXICAL):
-        metrics["by_class"][name]["counterexample_relevance"] = relevance.get(name)
-    metrics["overall"]["counterexample_relevance"] = relevance.get("overall")
-    snapshot = core_snapshot(relationships, source.get("codebook") if isinstance(source.get("codebook"), Mapping) else {})
-    differs = core_differs(snapshot, baseline_core)
-    in_rate, out_rate = _prices()
-    del out_rate
-    if differs is False:
-        core = {
-            "status": "deferred",
-            "dollars": 0,
-            "calls": 0,
-            "reason": "eligible_set_and_category_counts_match_baseline",
-        }
-    elif differs is None:
-        core = {"status": "not_run", "dollars": None, "calls": 0, "reason": "baseline_missing"}
-    else:
-        selective = selective_code(
-            result,
-            model,
-            seed=int(seed),
-            decision_mode=str(axial_kwargs.get("decision_mode") or "llm"),
-            interrupt=False,
-            include_memos=False,
-            include_storyline=False,
-            one_document_one_respondent=False,
-        )
-        core_rows = [
-            row for row in (selective.prompt_log or [])
-            if isinstance(row, Mapping)
-            and row.get("checkpoint") == "axial_core_review"
-            and str(row.get("status") or "") not in {"omitted", "deferred", "refused", "not_sent", "reused"}
-        ]
-        core_tokens = 0
-        core_tokens_known = False
-        for row in core_rows:
-            usage = row.get("usage") if isinstance(row.get("usage"), Mapping) else {}
-            if usage.get("input_tokens") is None:
-                continue
-            core_tokens += int(usage["input_tokens"])
-            core_tokens_known = True
-        if in_rate is None or not core_tokens_known:
-            core_dollars = None
-        else:
-            core_dollars = round(core_tokens / 1_000_000 * in_rate, 6)
-        core = {
-            "status": "ran",
-            "dollars": core_dollars,
-            "calls": len(core_rows),
-            "input_tokens": core_tokens if core_tokens_known else None,
-            "reason": "eligible_set_or_category_counts_differ",
-        }
-    new_tokens = metrics["overall"]["input_tokens"]
+        detail = relevance.get(name) if isinstance(relevance.get(name), Mapping) else {}
+        metrics["by_class"][name]["counterexample_calls"] = detail.get("calls")
+        metrics["by_class"][name]["counterexample_returned"] = detail.get("returned_assessments")
+        metrics["by_class"][name]["counterexample_relevant"] = detail.get("relevant_assessments")
+        metrics["by_class"][name]["counterexample_relevance"] = detail.get("counterexample_relevance")
+    overall_detail = relevance.get("overall") if isinstance(relevance.get("overall"), Mapping) else {}
+    metrics["overall"]["counterexample_calls"] = overall_detail.get("calls")
+    metrics["overall"]["counterexample_returned"] = overall_detail.get("returned_assessments")
+    metrics["overall"]["counterexample_relevant"] = overall_detail.get("relevant_assessments")
+    metrics["overall"]["counterexample_relevance"] = overall_detail.get("counterexample_relevance")
+    examined = sum(1 for row in outcomes if row.get("status") == "successfully_examined")
+    metrics["overall"]["new_pairs_examined"] = examined
+    metrics["overall"]["selected_pairs"] = len(outcomes)
+    by_status: dict[str, int] = {}
+    for row in outcomes:
+        by_status[str(row.get("status") or "")] = by_status.get(str(row.get("status") or ""), 0) + 1
+    spend = spend_from_ledger(metadata)
+    spend["elapsed_seconds"] = round(elapsed, 6)
+    blocked = [
+        row for row in ledger
+        if str(row.get("status") or "") == "budget_blocked" and str(row.get("stage") or "") != "axial_proposal"
+    ]
     report.update({
-        "status": "completed",
+        "status": "interrupted" if result.interrupted else "completed",
         "round": chosen,
         "allowances": allowances,
-        "reuse_ledger": list(result.metadata.get("exp_axial_w1_reuse_ledger") or []),
-        "metrics": metrics,
-        "core": core,
-        "core_snapshot": snapshot,
-        "result": result,
-        "new_spend": {
-            "calls": _sent_call_count(list(result.prompt_log or [])),
-            "input_tokens": new_tokens,
-            "dollars": None if result.metadata.get("exp_spend_unknown") else result.metadata.get("exp_dollars_spent"),
-            "elapsed_seconds": metrics["overall"]["elapsed_seconds"],
-            "note": "calls counts provider calls sent. It is not the pair count. Historical expenditure is separate. Unknown usage leaves dollars null.",
+        "reuse_ledger": list(metadata.get("exp_axial_w1_reuse_ledger") or []),
+        "attempt_ledger": ledger,
+        "pair_outcomes": outcomes,
+        "pair_coverage": {
+            "selected": len(outcomes),
+            "successfully_examined": examined,
+            "by_status": by_status,
+            "note": (
+                "new_pairs_examined counts successfully_examined pairs. "
+                "A selected pair with no relationship previously disappeared from that count. "
+                "It now has a terminal status: attempted, empty_response, failed, or budget_blocked."
+            ),
         },
+        "metrics": metrics,
+        "counterexamples": overall_detail,
+        "core": _core_record(),
+        "saturation": saturation_record(
+            metadata,
+            ledger,
+            interrupted=bool(result.interrupted) and not metadata.get("researcher_saturation"),
+            interrupt_kind=str((result.interrupt_payload or {}).get("kind") or "") if isinstance(result.interrupt_payload, Mapping) else "",
+        ),
+        "guard_exhaustion": None if not blocked else {
+            "stage": blocked[-1].get("stage"),
+            "reason": blocked[-1].get("reason"),
+            "attempt_id": blocked[-1].get("attempt_id"),
+            "during_execution": True,
+        },
+        "result": result,
+        "new_spend": spend,
+        "provider_retries": "disabled",
+        "provider_max_attempts": 1,
     })
     return report
