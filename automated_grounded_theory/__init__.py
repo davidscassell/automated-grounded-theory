@@ -11,6 +11,7 @@ A saturation decision is a researcher record, or a model judgment stored apart
 from that record. The package does not collect new fieldwork data.
 """
 
+from automated_grounded_theory.exp_axial_w1 import exp_axial_w1
 from automated_grounded_theory.axial import (
     AxialError,
     AxialResult,
@@ -186,6 +187,7 @@ __all__ = [
     "afocused_code",
     "aselective_code",
     "axial_code",
+    "exp_axial_w1",
     "apply_model_claim_decisions",
     "claims_payload",
     "merge_core_nominations",

@@ -4036,7 +4036,8 @@ def _plan_node(state: AxialState) -> dict:
         _pattern_minimum(procedure),
     )
     multi_count = len(metadata["multi_document_pairs"])
-    if calls > 0 and multi_count:
+    experiment = procedure.get("exp_axial_w1") if isinstance(procedure.get("exp_axial_w1"), Mapping) else None
+    if calls > 0 and multi_count and not experiment:
         calls = _prefer_multi_document_calls(metadata, math.ceil(multi_count / batch))
         procedure = metadata.get("procedure") or procedure
     plan = plan_relation_pairs(
@@ -4059,7 +4060,9 @@ def _plan_node(state: AxialState) -> dict:
         if _pair_key(pair)[0] and _pair_key(pair)[1]
     ]
     metadata["examined_pair_count"] = len(metadata["examined_pairs"])
-    if calls > 0 and metadata.get("multi_document_pairs"):
+    if experiment:
+        plan["round"] = [dict(row) for row in (experiment.get("round") or []) if isinstance(row, Mapping)]
+    elif calls > 0 and metadata.get("multi_document_pairs"):
         plan["round"] = _seat_multi_document_round(
             ids,
             metadata["multi_document_pairs"],
@@ -4070,7 +4073,8 @@ def _plan_node(state: AxialState) -> dict:
     priority = metadata.get("multi_document_call_priority") if isinstance(metadata.get("multi_document_call_priority"), Mapping) else {}
     block_reason = str(priority.get("block_reason") or "")
     block_reasons: dict[str, str] = {}
-    for row in metadata.get("multi_document_pairs") or []:
+    multi_rows = [] if experiment else list(metadata.get("multi_document_pairs") or [])
+    for row in multi_rows:
         if not isinstance(row, Mapping):
             continue
         key = _pair_key(row)
@@ -6516,15 +6520,22 @@ def _propose_node(runtime: AxialRuntime):
             if not sent_chunk:
                 break
             if result is None:
-                result = await _structured_call(
-                    runtime,
-                    AxialProposalBatch,
-                    messages,
-                    kind="axial_proposal",
-                    metadata=metadata,
-                    stage="coding",
-                    attempt_repair=False,
-                )
+                from automated_grounded_theory.exp_axial_w1 import note_provider_spend, proposal_gate
+
+                gated = proposal_gate(metadata, payload, estimate)
+                if gated is not None:
+                    result = gated
+                else:
+                    result = await _structured_call(
+                        runtime,
+                        AxialProposalBatch,
+                        messages,
+                        kind="axial_proposal",
+                        metadata=metadata,
+                        stage="coding",
+                        attempt_repair=False,
+                    )
+                    note_provider_spend(metadata, result.get("usage") if isinstance(result, Mapping) else None)
             _log_call_audits(
                 logs,
                 result["audits"],
@@ -6790,7 +6801,8 @@ def _propose_node(runtime: AxialRuntime):
         accounted = metadata.get("pair_accounting") or {}
         if not _proposals_continue(metadata, pending, used):
             propose_before = int(procedure.get("propose_calls") or 0)
-            _transfer_unused_retries(metadata, procedure)
+            if not (procedure.get("exp_axial_w1") if isinstance(procedure.get("exp_axial_w1"), Mapping) else None):
+                _transfer_unused_retries(metadata, procedure)
             procedure = metadata.get("procedure") or procedure
             added = int(procedure.get("propose_calls") or 0) - propose_before
             if added > 0 and _multi_document_rows_open(metadata):
@@ -8108,7 +8120,7 @@ def _call_usage_report(
         if not isinstance(row, Mapping):
             continue
         status = str(row.get("status") or "")
-        if status in {"omitted", "deferred", "refused", "not_sent"}:
+        if status in {"omitted", "deferred", "refused", "not_sent", "reused"}:
             continue
         usage = row.get("usage") if isinstance(row.get("usage"), Mapping) else {}
         has_input = "input_tokens" in usage and usage.get("input_tokens") is not None
@@ -12749,6 +12761,7 @@ async def aaxial_code(
     durability: str = "async",
     examined_pairs: Sequence[Mapping[str, Any]] | None = None,
     exploration_quotas: Mapping[str, int] | None = None,
+    experiment: Mapping[str, Any] | None = None,
 ) -> AxialResult:
     """Propose paradigm relationships and saturation indicators.
 
@@ -12809,14 +12822,28 @@ async def aaxial_code(
         max_core_review_call_hard_limit=max_core_review_call_hard_limit,
         max_core_review_token_hard_limit=max_core_review_token_hard_limit,
     )
+    if experiment is not None:
+        from automated_grounded_theory.exp_axial_w1 import EXPERIMENT_ID, apply_experiment_procedure
+
+        if str(experiment.get("id") or "") != EXPERIMENT_ID:
+            raise AxialError("The only axial experiment is exp-axial-w1.")
+        procedure = apply_experiment_procedure(procedure, experiment)
     metadata = {
         "procedure": procedure,
         "allowance_reserved": {
             "axial_proposal": int(procedure.get("propose_calls") or 0),
             "statement_copy_retry": int(procedure.get("statement_copy_retry_calls") or 0),
             "axial_counterexample": int(procedure.get("counterexample_calls") or 0),
-            "axial_relation_review": int(procedure.get("max_decision_calls") or 0),
-            "axial_saturation_review": int(procedure.get("max_decision_calls") or 0),
+            "axial_relation_review": int(
+                (procedure.get("exp_axial_w1") or {}).get("allowances", {}).get("axial_relation_review")
+                if isinstance(procedure.get("exp_axial_w1"), Mapping)
+                else procedure.get("max_decision_calls") or 0
+            ),
+            "axial_saturation_review": int(
+                (procedure.get("exp_axial_w1") or {}).get("allowances", {}).get("axial_saturation_review")
+                if isinstance(procedure.get("exp_axial_w1"), Mapping)
+                else procedure.get("max_decision_calls") or 0
+            ),
             "axial_core_review": procedure.get("max_core_review_calls"),
         },
         "allowance_transfers": [dict(item) for item in (procedure.get("allowance_transfers") or []) if isinstance(item, Mapping)],
