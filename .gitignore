@@ -8,3 +8,5 @@ build/
 .venv/
 examples/run/
 benchmarks/data/
+exp-axial-w1-history.json
+*.exp-axial-w1-history.json

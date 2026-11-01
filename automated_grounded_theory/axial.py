@@ -4036,7 +4036,8 @@ def _plan_node(state: AxialState) -> dict:
         _pattern_minimum(procedure),
     )
     multi_count = len(metadata["multi_document_pairs"])
-    if calls > 0 and multi_count:
+    experiment = procedure.get("exp_axial_w1") if isinstance(procedure.get("exp_axial_w1"), Mapping) else None
+    if calls > 0 and multi_count and not experiment:
         calls = _prefer_multi_document_calls(metadata, math.ceil(multi_count / batch))
         procedure = metadata.get("procedure") or procedure
     plan = plan_relation_pairs(
@@ -4059,7 +4060,9 @@ def _plan_node(state: AxialState) -> dict:
         if _pair_key(pair)[0] and _pair_key(pair)[1]
     ]
     metadata["examined_pair_count"] = len(metadata["examined_pairs"])
-    if calls > 0 and metadata.get("multi_document_pairs"):
+    if experiment:
+        plan["round"] = [dict(row) for row in (experiment.get("round") or []) if isinstance(row, Mapping)]
+    elif calls > 0 and metadata.get("multi_document_pairs"):
         plan["round"] = _seat_multi_document_round(
             ids,
             metadata["multi_document_pairs"],
@@ -4070,7 +4073,8 @@ def _plan_node(state: AxialState) -> dict:
     priority = metadata.get("multi_document_call_priority") if isinstance(metadata.get("multi_document_call_priority"), Mapping) else {}
     block_reason = str(priority.get("block_reason") or "")
     block_reasons: dict[str, str] = {}
-    for row in metadata.get("multi_document_pairs") or []:
+    multi_rows = [] if experiment else list(metadata.get("multi_document_pairs") or [])
+    for row in multi_rows:
         if not isinstance(row, Mapping):
             continue
         key = _pair_key(row)
@@ -4760,6 +4764,7 @@ async def _structured_call(
     stage: str,
     attempt_repair: bool = True,
     repairs_kind: str | None = None,
+    spend_stage: str | None = None,
 ) -> dict[str, Any]:
     """One structured provider call.
 
@@ -4770,6 +4775,53 @@ async def _structured_call(
     """
     audits: list[dict[str, Any]] = []
     origin = repairs_kind or (None if kind == "schema_repair" else kind)
+    guard_stage = str(origin or kind or stage)
+    from automated_grounded_theory.exp_axial_w1 import _output_allowance, payload_fingerprint, reserve_attempt, settle_attempt
+
+    guard_estimate = request_input_tokens(messages, schema) if messages else 0
+    ledger_stage = "schema_repair" if kind == "schema_repair" else str(spend_stage or guard_stage)
+    pricing_stage = str(repairs_kind or guard_stage) if kind == "schema_repair" else ledger_stage
+    fingerprint_rows = []
+    for message in messages or []:
+        if isinstance(message, Mapping):
+            fingerprint_rows.append({
+                "role": str(message.get("role") or message.get("type") or ""),
+                "content": str(message.get("content") or ""),
+            })
+        else:
+            fingerprint_rows.append({
+                "role": str(getattr(message, "type", "")),
+                "content": str(getattr(message, "content", "")),
+            })
+    held = reserve_attempt(
+        metadata,
+        ledger_stage,
+        guard_estimate,
+        payload_fingerprint=payload_fingerprint({"stage": ledger_stage, "messages": fingerprint_rows}),
+        output_allowance=_output_allowance(pricing_stage),
+    )
+    attempt_id = str(held.get("attempt_id") or "")
+    tracked = str(held.get("status") or "") == "reserved"
+    if str(held.get("status") or "") == "budget_blocked":
+        blocked = str(held.get("reason") or "kill_guard")
+        return {
+            "refused": True,
+            "unparsed": False,
+            "repair_pending": False,
+            "reason": blocked,
+            "parsed": {},
+            "usage": {},
+            "sent": list(messages),
+            "audits": [{
+                "kind": kind,
+                "status": "not_sent",
+                "reason": blocked,
+                "messages": list(messages),
+                "parsed": {},
+                "usage": {},
+                "estimated_input_tokens": guard_estimate,
+            }],
+        }
     try:
         (parsed, usage), sent = await ainvoke_structured(
             runtime.coder,
@@ -4785,7 +4837,13 @@ async def _structured_call(
             allowance_stage=stage,
             call_audits=audits,
         )
+    except TimeoutError:
+        if tracked:
+            settle_attempt(metadata, attempt_id, known=False, timed_out=True)
+        raise
     except AllowanceExhausted as exc:
+        if tracked:
+            settle_attempt(metadata, attempt_id, released=True)
         _sync_allowance(metadata, runtime)
         metadata["axial_stop"] = exc.reason
         _stamp_repair_stage(audits, origin)
@@ -4802,6 +4860,16 @@ async def _structured_call(
     _sync_allowance(metadata, runtime)
     _account_responses(metadata, audits)
     _stamp_repair_stage(audits, origin)
+    known_usage = isinstance(usage, Mapping) and (
+        int(usage.get("input_tokens") or 0) > 0 or int(usage.get("output_tokens") or 0) > 0
+    )
+    if tracked:
+        settle_attempt(
+            metadata,
+            attempt_id,
+            usage=usage if isinstance(usage, Mapping) else None,
+            known=known_usage,
+        )
     repair_pending = bool(isinstance(parsed, Mapping) and parsed.get("needs_repair"))
     unparsed = bool(isinstance(parsed, Mapping) and parsed.get("_agt_unparsed")) and not repair_pending
     if unparsed:
@@ -6516,15 +6584,22 @@ def _propose_node(runtime: AxialRuntime):
             if not sent_chunk:
                 break
             if result is None:
-                result = await _structured_call(
-                    runtime,
-                    AxialProposalBatch,
-                    messages,
-                    kind="axial_proposal",
-                    metadata=metadata,
-                    stage="coding",
-                    attempt_repair=False,
-                )
+                from automated_grounded_theory.exp_axial_w1 import note_provider_spend, proposal_gate
+
+                gated = proposal_gate(metadata, payload, estimate)
+                if gated is not None:
+                    result = gated
+                else:
+                    result = await _structured_call(
+                        runtime,
+                        AxialProposalBatch,
+                        messages,
+                        kind="axial_proposal",
+                        metadata=metadata,
+                        stage="coding",
+                        attempt_repair=False,
+                    )
+                    note_provider_spend(metadata, result.get("usage") if isinstance(result, Mapping) else None)
             _log_call_audits(
                 logs,
                 result["audits"],
@@ -6698,6 +6773,7 @@ def _propose_node(runtime: AxialRuntime):
                         metadata=metadata,
                         stage="coding",
                         attempt_repair=False,
+                        spend_stage="statement_copy_retry",
                     )
                     _log_call_audits(logs, retry_result["audits"], extra={"statement_copy_retry": True})
                     used += 1
@@ -6790,7 +6866,8 @@ def _propose_node(runtime: AxialRuntime):
         accounted = metadata.get("pair_accounting") or {}
         if not _proposals_continue(metadata, pending, used):
             propose_before = int(procedure.get("propose_calls") or 0)
-            _transfer_unused_retries(metadata, procedure)
+            if not (procedure.get("exp_axial_w1") if isinstance(procedure.get("exp_axial_w1"), Mapping) else None):
+                _transfer_unused_retries(metadata, procedure)
             procedure = metadata.get("procedure") or procedure
             added = int(procedure.get("propose_calls") or 0) - propose_before
             if added > 0 and _multi_document_rows_open(metadata):
@@ -7213,7 +7290,8 @@ def _counterexample_node(runtime: AxialRuntime):
         allowance = int(procedure.get("counterexample_calls") or 0)
         batch = max(1, int((metadata.get("performance") or {}).get("batch_size") or 1))
         slots = allowance * batch
-        if _multi_document_rows_open(metadata) and not _hold_is(metadata, "axial_counterexample"):
+        experiment_on = isinstance(procedure.get("exp_axial_w1"), Mapping) and procedure["exp_axial_w1"].get("enabled")
+        if _multi_document_rows_open(metadata) and not _hold_is(metadata, "axial_counterexample") and not experiment_on:
             _assign_multi_document_statuses(metadata, close=False)
             if _multi_document_rows_open(metadata) and allowance > 0 and not metadata.get("counterexample_reallocation_used"):
                 returned_calls, allowance_fit = _permit_reallocated_proposals(
@@ -8108,7 +8186,7 @@ def _call_usage_report(
         if not isinstance(row, Mapping):
             continue
         status = str(row.get("status") or "")
-        if status in {"omitted", "deferred", "refused", "not_sent"}:
+        if status in {"omitted", "deferred", "refused", "not_sent", "reused"}:
             continue
         usage = row.get("usage") if isinstance(row.get("usage"), Mapping) else {}
         has_input = "input_tokens" in usage and usage.get("input_tokens") is not None
@@ -12538,6 +12616,23 @@ class AxialDecisionReviewer:
             metadata["decision_stop"] = stop
             audit.update(status="omitted", reason=stop, needs_review=True, flagged=True)
             return None, audit
+        from automated_grounded_theory.exp_axial_w1 import _output_allowance, payload_fingerprint, reserve_attempt, settle_attempt
+
+        guard_stage = str(checkpoint or "decision_review")
+        held = reserve_attempt(
+            metadata,
+            guard_stage,
+            estimate,
+            payload_fingerprint=payload_fingerprint(audit["messages"]),
+            output_allowance=_output_allowance(guard_stage),
+        )
+        attempt_id = str(held.get("attempt_id") or "")
+        tracked = str(held.get("status") or "") == "reserved"
+        if str(held.get("status") or "") == "budget_blocked":
+            blocked = str(held.get("reason") or "kill_guard")
+            metadata["decision_stop"] = blocked
+            audit.update(status="not_sent", reason=blocked, needs_review=True, flagged=True)
+            return None, audit
         calls = int(metadata.get("decision_calls_used", 0))
         tokens = int(metadata.get("axial_tokens_estimated") or metadata.get("decision_tokens_used") or 0)
         shared = getattr(self.limiter, "provider_allowance", None)
@@ -12556,6 +12651,9 @@ class AxialDecisionReviewer:
                 allowance_stage=stage,
             )
             audit["usage"] = usage_from_result(response)
+            known_usage = int(audit["usage"].get("input_tokens") or 0) > 0 or int(audit["usage"].get("output_tokens") or 0) > 0
+            if tracked:
+                settle_attempt(metadata, attempt_id, usage=audit["usage"], known=known_usage)
             raw = response.get("raw") if isinstance(response, dict) else None
             audit["raw_response"] = str(getattr(raw, "content", ""))
             parsed, _usage = parse_structured(response, schema)
@@ -12575,11 +12673,19 @@ class AxialDecisionReviewer:
             else:
                 metadata["decision_tokens_used"] = tokens + estimate
             return parsed, audit
+        except TimeoutError:
+            if tracked:
+                settle_attempt(metadata, attempt_id, known=False, timed_out=True)
+            raise
         except AllowanceExhausted as exc:
+            if tracked:
+                settle_attempt(metadata, attempt_id, released=True)
             metadata["decision_stop"] = exc.reason
             audit.update(status="omitted", reason=exc.reason, needs_review=True, flagged=True)
             return None, audit
         except Exception as exc:
+            if tracked:
+                settle_attempt(metadata, attempt_id, known=False, failed=True)
             metadata["decision_stop"] = "review_error"
             audit.update(status="error", error=f"{type(exc).__name__}: {exc}")
             return None, audit
@@ -12749,6 +12855,7 @@ async def aaxial_code(
     durability: str = "async",
     examined_pairs: Sequence[Mapping[str, Any]] | None = None,
     exploration_quotas: Mapping[str, int] | None = None,
+    experiment: Mapping[str, Any] | None = None,
 ) -> AxialResult:
     """Propose paradigm relationships and saturation indicators.
 
@@ -12809,14 +12916,28 @@ async def aaxial_code(
         max_core_review_call_hard_limit=max_core_review_call_hard_limit,
         max_core_review_token_hard_limit=max_core_review_token_hard_limit,
     )
+    if experiment is not None:
+        from automated_grounded_theory.exp_axial_w1 import EXPERIMENT_ID, apply_experiment_procedure
+
+        if str(experiment.get("id") or "") != EXPERIMENT_ID:
+            raise AxialError("The only axial experiment is exp-axial-w1.")
+        procedure = apply_experiment_procedure(procedure, experiment)
     metadata = {
         "procedure": procedure,
         "allowance_reserved": {
             "axial_proposal": int(procedure.get("propose_calls") or 0),
             "statement_copy_retry": int(procedure.get("statement_copy_retry_calls") or 0),
             "axial_counterexample": int(procedure.get("counterexample_calls") or 0),
-            "axial_relation_review": int(procedure.get("max_decision_calls") or 0),
-            "axial_saturation_review": int(procedure.get("max_decision_calls") or 0),
+            "axial_relation_review": int(
+                (procedure.get("exp_axial_w1") or {}).get("allowances", {}).get("axial_relation_review")
+                if isinstance(procedure.get("exp_axial_w1"), Mapping)
+                else procedure.get("max_decision_calls") or 0
+            ),
+            "axial_saturation_review": int(
+                (procedure.get("exp_axial_w1") or {}).get("allowances", {}).get("axial_saturation_review")
+                if isinstance(procedure.get("exp_axial_w1"), Mapping)
+                else procedure.get("max_decision_calls") or 0
+            ),
             "axial_core_review": procedure.get("max_core_review_calls"),
         },
         "allowance_transfers": [dict(item) for item in (procedure.get("allowance_transfers") or []) if isinstance(item, Mapping)],
